@@ -126,6 +126,7 @@ static inline uint16_t mavlink_msg_weather_forecast_pack(
     memcpy(_MAV_PAYLOAD_NON_CONST(msg), buf, MAVLINK_MSG_ID_WEATHER_FORECAST_LEN);
 #else
     mavlink_weather_forecast_t packet;
+    memset(&packet, 0, sizeof(packet));
     packet.latitude = latitude;
     packet.longitude = longitude;
     packet.altitude = altitude;
@@ -335,6 +336,7 @@ static inline uint16_t mavlink_msg_alternate_landing_pack(
     memcpy(_MAV_PAYLOAD_NON_CONST(msg), buf, MAVLINK_MSG_ID_ALTERNATE_LANDING_LEN);
 #else
     mavlink_alternate_landing_t packet;
+    memset(&packet, 0, sizeof(packet));
     mav_array_memcpy(packet.site_id, site_id, sizeof(char) * 16);
     packet.latitude = latitude;
     packet.longitude = longitude;
@@ -486,6 +488,7 @@ static inline uint16_t mavlink_msg_sensor_ctrl_pack(
     memcpy(_MAV_PAYLOAD_NON_CONST(msg), buf, MAVLINK_MSG_ID_SENSOR_CTRL_LEN);
 #else
     mavlink_sensor_ctrl_t packet;
+    memset(&packet, 0, sizeof(packet));
     packet.target_system = target_system;
     packet.target_component = target_component;
     packet.sensor_id = sensor_id;
@@ -622,6 +625,7 @@ static inline uint16_t mavlink_msg_video_ctrl_pack(
     memcpy(_MAV_PAYLOAD_NON_CONST(msg), buf, MAVLINK_MSG_ID_VIDEO_CTRL_LEN);
 #else
     mavlink_video_ctrl_t packet;
+    memset(&packet, 0, sizeof(packet));
     packet.target_system = target_system;
     packet.target_component = target_component;
     packet.camera_id = camera_id;
