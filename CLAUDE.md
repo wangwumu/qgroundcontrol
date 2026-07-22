@@ -37,3 +37,4 @@ Prefer **Lexis MCP** tools (`mcp__lexis__*`) over Grep/Read for code exploration
 - Git is configured to use SSH for GitHub (`git@github.com:` instead of `https://github.com/`) due to WSL2 HTTPS instability
 - VS Code config is in `.vscode/` (settings.json, launch.json, tasks.json); install the recommended extensions
 - The build uses **ccache** + **mold** linker for fast incremental builds
+- **MAVLink Extensions** — custom messages 51000-51003 for VTOL safety management live in `src/MAVLink/Extensions/`; protocol doc at `docs/mavlink_extension_protocol.md`.`QML` singleton `VTOLExtensions` exposes static send helpers; enums via `VTOLExtensionsEnums` namespace.
