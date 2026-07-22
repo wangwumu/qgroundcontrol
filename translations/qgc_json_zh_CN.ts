@@ -6909,7 +6909,7 @@
       <extracomment>.QGC.MetaData.Facts[audioMuted].label</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/App.SettingsGroup.json" />
       <source>Mute Audio Output</source>
-      <translation>muteaudiooutput</translation>
+      <translation>静音</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[audioMuted].keywords</extracomment>
@@ -6934,7 +6934,7 @@
       <extracomment>.QGC.MetaData.Facts[audioVolume].label</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/App.SettingsGroup.json" />
       <source>Audio Output Volume</source>
-      <translation>audiooutput音量</translation>
+      <translation>声音输出-音量</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[audioVolume].keywords</extracomment>
@@ -7166,7 +7166,7 @@
       <extracomment>.QGC.MetaData.Facts[indoorPalette].label</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/App.SettingsGroup.json" />
       <source>Color Scheme</source>
-      <translation>colorscheme</translation>
+      <translation>颜色方案</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[indoorPalette].keywords</extracomment>
