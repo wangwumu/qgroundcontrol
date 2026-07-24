@@ -5,16 +5,16 @@ These are **daily build** download links with the latest features. If you are lo
 :::
 
 :::tip
-如果 _QGroundControl_ 没有在安装后启动和正常运行，请参阅[故障排除QGC配置](../troubleshooting/qgc_setup.md)！
+如果 _QGroundControl_ 没有在安装后启动和正常运行,请参阅[故障排除QGC配置](../troubleshooting/qgc_setup.md)！
 :::
 
 ## 系统配置要求
 
 QGC可以在任何当下流行的计算机或移动设备上正常运行。 性能表现将取决于系统环境、第三方应用程序和当前系统可使用的资源状况。
 性能更强的硬件将带来更好的体验。
-一台拥有至少 8GB 内存、固态硬盘、Nvidia 或 AMD 显卡以及英特尔酷睿i5或更优CPU的电脑，将适用于大多数应用场景。
+一台拥有至少 8GB 内存、固态硬盘、Nvidia 或 AMD 显卡以及英特尔酷睿i5或更优CPU的电脑,将适用于大多数应用场景。
 
-为了获得最好的体验和兼容性，我们推荐您使用最新版本的操作系统。
+为了获得最好的体验和兼容性,我们推荐您使用最新版本的操作系统。
 
 ## Windows 系统 {#windows}
 
@@ -26,8 +26,8 @@ Supported versions: Windows 10 (1809 or later), Windows 11:
 2. 双击可执行文件来启动安装程序。
 
 :::info
-Windows 安装程序创建 3 个快捷方式：**QGroundControl**，**GPU 兼容模式**，**GPU 安全模式**。
-使用第一个快捷方式，除非您遇到启动或视频渲染问题。
+Windows 安装程序创建 3 个快捷方式：**QGroundControl**,**GPU 兼容模式**,**GPU 安全模式**。
+使用第一个快捷方式,除非您遇到启动或视频渲染问题。
 更多信息请见[QGC 设置故障排查 > Windows：用户界面渲染 / 视频驱动问题](../troubleshooting/qgc_setup.md#opengl_troubleshooting)。
 :::
 
@@ -40,7 +40,7 @@ Supported versions: macOS 13 (Ventura) or later:
 <!-- usually based on Qt macOS dependency -->
 
 1. Download [QGroundControl.dmg](https://d176tv9ibo4jno.cloudfront.net/builds/master/QGroundControl.dmg).
-2. 双击 .dmg 文件以挂载它，然后将 _QGroundControl_ 应用程序拖动到您的 _Application_ 文件夹。
+2. 双击 .dmg 文件以挂载它,然后将 _QGroundControl_ 应用程序拖动到您的 _Application_ 文件夹。
 
 :::info
 QGroundControl continues to not be signed. You will not to allow permission for it to install based on your macOS version.
@@ -50,8 +50,8 @@ QGroundControl continues to not be signed. You will not to allow permission for 
 
 Supported versions: Ubuntu 22.04, 24.04:
 
-Ubuntu 自带一个串口调制解调器管理器，它会干扰串口（或 USB 转串口）在任何与机器人相关方面的使用。
-在安装 _QGroundControl_ 之前，您应该删除调制解调器管理器并授予自己访问串行端口的权限。
+Ubuntu 自带一个串口调制解调器管理器,它会干扰串口（或 USB 转串口）在任何与机器人相关方面的使用。
+在安装 _QGroundControl_ 之前,您应该删除调制解调器管理器并授予自己访问串行端口的权限。
 您还需要安装 _GStreamer_以支持视频流。
 
 **Before installing _QGroundControl_ for the first time:**

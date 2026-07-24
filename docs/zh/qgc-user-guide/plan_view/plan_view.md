@@ -4,7 +4,7 @@
 If missions fail to upload or download, see [Plan Upload/Download Failures](../troubleshooting/plan_upload_download.md). For mission resume issues, see [Resume Mission Failures](../troubleshooting/resume_mission.md).
 :::
 
-_计划视图_ 用于为你的载具规 划自动化任务_ 并上传到载具。 一旦任务已 [规划](#plan_mission) 并被送往载具，您将切换到[飞行视图](../fly_view/fly_view.md) 来执行任务。
+_计划视图_ 用于为你的载具规 划自动化任务_ 并上传到载具。 一旦任务已 [规划](#plan_mission) 并被送往载具,您将切换到[飞行视图](../fly_view/fly_view.md) 来执行任务。
 
 It is also used to configure the [GeoFence](plan_geofence.md) and [Rally Points](plan_rally_points.md) if these are supported by the firmware.
 

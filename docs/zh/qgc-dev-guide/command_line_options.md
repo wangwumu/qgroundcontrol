@@ -1,10 +1,10 @@
 # 命令行选项
 
-您可以使用命令行选项启动QGroundControl。 这些用于启用日志记录，运行单元测试以及模拟不同的主机环境以进行测试。 These are used to enable logging, run unit tests, and simulate different host environments for testing.
+您可以使用命令行选项启动QGroundControl。 这些用于启用日志记录,运行单元测试以及模拟不同的主机环境以进行测试。 These are used to enable logging, run unit tests, and simulate different host environments for testing.
 
 ## 使用选项启动QGroundControl
 
-您需要打开命令提示符或终端，将目录更改为存储qgroundcontrol.exe的位置，然后运行它。 每个平台如下所示（使用--logging：full选项）： This is shown below for each platform (using the `--logging:full` option):
+您需要打开命令提示符或终端,将目录更改为存储qgroundcontrol.exe的位置,然后运行它。 每个平台如下所示（使用--logging：full选项）： This is shown below for each platform (using the `--logging:full` option):
 
 Windows命令提示符：
 

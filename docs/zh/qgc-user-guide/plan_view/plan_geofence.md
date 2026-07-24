@@ -20,7 +20,7 @@ To create a GeoFence:
    A new region will be added to the map and to the associated list of fences below the buttons.
 
 :::tip
-您可以多次按下按钮创建多个区域，从而能够创建复杂的地理围栏定义。
+您可以多次按下按钮创建多个区域,从而能够创建复杂的地理围栏定义。
 :::
 
 - Circular region:

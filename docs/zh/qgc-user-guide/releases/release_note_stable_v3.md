@@ -4,7 +4,7 @@
 
 ## 稳定版本 3.5
 
-本节包含一个高级和 _非详尽无遗的_ 新功能列表，在版本3.5中添加到 _QGroundControl_。
+本节包含一个高级和 _非详尽无遗的_ 新功能列表,在版本3.5中添加到 _QGroundControl_。
 
 - **整体**
   - 添加了 QGC 的Airmap 集成。 OSX 仅构建。
@@ -27,7 +27,7 @@
   - **编辑位置对话** 在多边形顶点上可用。
 - **飞行**
   - **相机页面** 更新支持新 MAVLInk 相机消息。
-    相机选择相机模式，开始/停止照片/视频，存储配置...
+    相机选择相机模式,开始/停止照片/视频,存储配置...
   - **轨道** 支持改变旋转方向。
   - **仪表盘**
     - 将ESTIMATOR_STATUS值添加到新的estimatorStatus Vehicle FactGroup。
@@ -37,7 +37,7 @@
 
 ## 稳定版本 3.4
 
-本节包含一个高级和 _非详尽无遗的_ 新功能列表，在版本3.4中添加到 _QGroundControl_。 请不要提及每个稳定版本中的大量错误修复。
+本节包含一个高级和 _非详尽无遗的_ 新功能列表,在版本3.4中添加到 _QGroundControl_。 请不要提及每个稳定版本中的大量错误修复。
 
 - **配置**
   - **离线地图**
@@ -49,7 +49,7 @@
   - **固件** 能刷入 PX4 或 ArduPilot Flow 固件。
   - PX4 Pro 固件
     - **飞行模式** 指定所有可用发射器开关的频道。
-    - **调整：高级** 初步实施载具ID调整支持。 请注意，这是一项正在进行中的工作，将在3.5个每日构建中得到改进。
+    - **调整：高级** 初步实施载具ID调整支持。 请注意,这是一项正在进行中的工作,将在3.5个每日构建中得到改进。
   - ArduPilot 固件
     - **电源/安全** 支持新的多电池设置。
     - **Trad Heli** New setup page.
@@ -387,7 +387,7 @@ The additional value that can be specified when planning a mission is the vehicl
 
 <img src="../../../assets/plan/mission/mission_settings_planned_home.jpg" style="width: 150px;"/>
 
-The planned home position allows you to simulate the vehicle's home position while planning a mission. This way you see the waypoint trajectory for your vehicle from takeoff to mission completion. 请记住，这只是“计划的”Home点位置，你应将其设置在计划启动载具的位置。 It has no actual impact on flying the mission. The actual home position of a vehicle is set by the vehicle itself when arming.
+The planned home position allows you to simulate the vehicle's home position while planning a mission. This way you see the waypoint trajectory for your vehicle from takeoff to mission completion. 请记住,这只是“计划的”Home点位置,你应将其设置在计划启动载具的位置。 It has no actual impact on flying the mission. The actual home position of a vehicle is set by the vehicle itself when arming.
 
 #### New Waypoint features
 

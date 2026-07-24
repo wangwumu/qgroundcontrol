@@ -16,7 +16,7 @@ Each first run prompt is a simple dialog which can display ui to the user. Wheth
 
 ## Standard First Run Prompt Dialogs
 
-Each dialog has a unique ID associated with it. 当该对话框向用户显示ID已经被注册，所以它只会发生一次(除非您清除设置)。 The set of first run prompt which are included with upstream QGC are considered the "Standard" set. QGC gets the list of standard prompts to display from the `QGCCorePlugin::firstRunPromptStdIds` call.
+Each dialog has a unique ID associated with it. 当该对话框向用户显示ID已经被注册,所以它只会发生一次(除非您清除设置)。 The set of first run prompt which are included with upstream QGC are considered the "Standard" set. QGC gets the list of standard prompts to display from the `QGCCorePlugin::firstRunPromptStdIds` call.
 
 ```
     /// Returns the standard list of first run prompt ids for possible display. Actual display is based on the

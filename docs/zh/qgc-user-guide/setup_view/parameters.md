@@ -7,7 +7,7 @@ If parameters fail to download, see [Parameter Download Failures](../troubleshoo
 :::
 
 :::info
-PX4 Pro 和 ArduPilot 使用不同的参数集，但它们都是按照本节描述的方式管理的。
+PX4 Pro 和 ArduPilot 使用不同的参数集,但它们都是按照本节描述的方式管理的。
 :::
 
 ## 查找参数
@@ -21,7 +21,7 @@ PX4 Pro 和 ArduPilot 使用不同的参数集，但它们都是按照本节描�
 To change the value of a parameter click on the parameter row in a group or search list. This will open a side dialog in which you can update the value (this dialog also provides additional detailed information about the parameter - including whether a reboot is required for the change to take effect).
 
 :::info
-当您点击 **保存** 时，参数会自动静默地上传到连接的载具。 对于不同的参数，你可能需要重启飞控才能使改变的参数生效。
+当您点击 **保存** 时,参数会自动静默地上传到连接的载具。 对于不同的参数,你可能需要重启飞控才能使改变的参数生效。
 :::
 
 ## 工具

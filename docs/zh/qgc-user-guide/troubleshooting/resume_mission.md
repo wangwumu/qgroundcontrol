@@ -29,7 +29,7 @@ The following steps are required for debugging both types of problems:
    Alternatively you can attempt to reproduce the problem by manually RTL from the middle of the middle of the mission (though this may not always reproduce the problem).
    :::
 
-6. 一旦载具降落并上锁，你应该 _Resume Mission_ 对话框。
+6. 一旦载具降落并上锁,你应该 _Resume Mission_ 对话框。
 
    ::: info
    If not there is a possible bug in QGC.

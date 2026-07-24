@@ -1,11 +1,11 @@
 # 计划文件格式
 
-计划文件存储在 JSON 文件格式，包含任务项目和 (可选) 地理栅栏和路点.
+计划文件存储在 JSON 文件格式,包含任务项目和 (可选) 地理栅栏和路点.
 下面你可以看到计划文件的顶级格式
 
 :::tip
 这是 "近乎最低限度"的计划——必须至少包含一个任务项目。
-当没有任务运行时，计划围栏和集结点（rally points）也用于模式。
+当没有任务运行时,计划围栏和集结点（rally points）也用于模式。
 :::
 
 ```json
@@ -40,7 +40,7 @@
 ## 使命对象 {#mission}
 
 任务对象的结构如下所示。
-`items`字段包含一个逗号分隔的任务项目列表(如下文所示，它必须至少包含一个任务项目)。
+`items`字段包含一个逗号分隔的任务项目列表(如下文所示,它必须至少包含一个任务项目)。
 列表可能既有 [SimpleItem](#mission_simple_item) 对象也有 [ComplexItem](#mission_complex_item) 对象。
 
 ```json
@@ -133,7 +133,7 @@
 | `command`             | The command ([MAV_CMD](https://mavlink.io/en/messages/common.html#MAV_CMD)) for this mission item - see [MISSION_ITEM](https://mavlink.io/en/messages/common.html#MISSION_ITEM).command. |
 | `doJumpId`            | DO_JUMP命令中当前任务项的目标ID。 这些是从1自动编号。 These are auto-numbered from 1.                                                                                                                                                                                 |
 | `frame`               | [MAV_FRAME](https://mavlink.io/en/messages/common.html#MAV_FRAME) (see [MISSION_ITEM](https://mavlink.io/en/messages/common.html#MISSION_ITEM).frame)                                                    |
-| `params`              | MISSION_ITEM.param1,2,3,4，x，y，z（值取决于特定的MAV_CMD）。                                                                                                                                                                            |
+| `params`              | MISSION_ITEM.param1,2,3,4,x,y,z（值取决于特定的MAV_CMD）。                                                                                                                                                                            |
 
 ### 复杂任务项目 {#mission_complex_item}
 
@@ -184,7 +184,7 @@
 | [`TransectStyleComplexItem	`](#TransectStyleComplexItem) | Survey和CorridorScan复杂项目的通用基础定义。                                                                                                                                                                                          |
 | `angle`                                                  | 横断面的角度（度数）。                                                                                                                                                                                                              |
 | `entryLocation`                                          | ?                                                                                                                                                                                                                        |
-| `flyAlternateTransects`                                  | 团结积分信息是可选的。 该计划可以包含任意数量的拉力点，每个拉力点具有纬度，经度和高度（高于原始位置）。 如果是，则载具会跳过每个其他横断面，然后在最后返回并飞行这些替代。 This can be used for fixed wing aircraft when the turnaround would be too acute for the vehicle to make the turn. |
+| `flyAlternateTransects`                                  | 团结积分信息是可选的。 该计划可以包含任意数量的拉力点,每个拉力点具有纬度,经度和高度（高于原始位置）。 如果是,则载具会跳过每个其他横断面,然后在最后返回并飞行这些替代。 This can be used for fixed wing aircraft when the turnaround would be too acute for the vehicle to make the turn. |
 | `polygon`                                                | The polygon array which represents the polygonal survey area. Each point is a latitude, longitude pair for a polygon vertex.                                                             |
 
 #### 走廊扫描 {#corridor_scan}
@@ -270,7 +270,7 @@ StructureScan复杂任务项的对象定义如下。
 | [`CameraCalc`](#CameraCalc) | ?                                                                         |
 | `Layers`                    | ?                                                                         |
 | `StructureHeight`           | ?                                                                         |
-| `altitudeRelative`          | true: altitude相对于主页，false: altitude是AMSL。 |
+| `altitudeRelative`          | true: altitude相对于主页,false: altitude是AMSL。 |
 | `polygon`                   | ?                                                                         |
 
 #### `TransectStyleComplexItem	` {#TransectStyleComplexItem}
@@ -319,7 +319,7 @@ StructureScan复杂任务项的对象定义如下。
 
 ##### CameraCalc {#CameraCalc}
 
-CameraCalc包含用于调查，走廊或结构扫描的摄像机信息。
+CameraCalc包含用于调查,走廊或结构扫描的摄像机信息。
 
 ```
                     "CameraCalc": {
@@ -351,17 +351,17 @@ CameraCalc包含用于调查，走廊或结构扫描的摄像机信息。
 | `AdjustedFootprintSide`     | ?                                                                                                                                                                                                                                                                                                        |
 | `DistanceToSurface`         | ? 单位?                                                                                                                                                                                                                                                                                                    |
 | `DistanceToSurfaceRelative` | ?                                                                                                                                                                                                                                                                                                        |
-| `CameraName`                | 正在使用的摄像机名称（必须对应于QGroundControl已知的摄像机之一或： Manual (no camera specs) (手动（无摄像机规格）用于手动设置， Custom Camera (自定义摄像机)用于自定义设置。 未在“手动”摄像机定义中指定此点后列出的键。 The keys listed after this point are not specified for a "Manual" camera definition. |
+| `CameraName`                | 正在使用的摄像机名称（必须对应于QGroundControl已知的摄像机之一或： Manual (no camera specs) (手动（无摄像机规格）用于手动设置, Custom Camera (自定义摄像机)用于自定义设置。 未在“手动”摄像机定义中指定此点后列出的键。 The keys listed after this point are not specified for a "Manual" camera definition. |
 | `FixedOrientation`          | ? （布尔值）                                                                                                                                                                                                                                                                                                  |
-| `FocalLength`               | 相机镜头的焦距，以毫米为单位。                                                                                                                                                                                                                                                                                          |
+| `FocalLength`               | 相机镜头的焦距,以毫米为单位。                                                                                                                                                                                                                                                                                          |
 | `FrontalOverlap`            | 正面图像重叠的百分比。                                                                                                                                                                                                                                                                                              |
 | `ImageDensity`              | ?                                                                                                                                                                                                                                                                                                        |
 | `ImageHeight`               | 图像高度以px为单位                                                                                                                                                                                                                                                                                               |
 | `ImageWidth`                | 图像宽度以px为单位                                                                                                                                                                                                                                                                                               |
-| `景观`                        | true：相机以横向方向安装在载具上，false：相机以纵向方向安装在载具上。                                                                                                                                                                                                                                                                  |
+| `景观`                        | true：相机以横向方向安装在载具上,false：相机以纵向方向安装在载具上。                                                                                                                                                                                                                                                                  |
 | `MinTriggerInterval`        | ?                                                                                                                                                                                                                                                                                                        |
-| `SensorHeight`              | 传感器高度，以毫米为单位。                                                                                                                                                                                                                                                                                            |
-| `SensorWidth`               | 传感器宽度，以毫米为单位。                                                                                                                                                                                                                                                                                            |
+| `SensorHeight`              | 传感器高度,以毫米为单位。                                                                                                                                                                                                                                                                                            |
+| `SensorWidth`               | 传感器宽度,以毫米为单位。                                                                                                                                                                                                                                                                                            |
 | `SideOverlap`               | 侧面图像重叠的百分比。                                                                                                                                                                                                                                                                                              |
 | `ValueSetIsDistance`        | ? （布尔值）                                                                                                                                                                                                                                                                                                  |
 
@@ -411,7 +411,7 @@ The items define the centre and radius of the circle, and whether or not the spe
 | 键           | 描述                                                                                                                                                              |
 | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `version`   | The version number for the geofence "circle" plan format. 拉力点计划格式的版本号。 记录的版本是2。                                                                 |
-| `circle`    | 圆的定义。 包括 centre (中心)（纬度，经度）和半径，如上所示。 Includes `centre` (latitude, longitude) and `radisu` as shown above. |
+| `circle`    | 圆的定义。 包括 centre (中心)（纬度,经度）和半径,如上所示。 Includes `centre` (latitude, longitude) and `radisu` as shown above. |
 | `inclusion` | 地理围栏是否已启用（true）或已禁用。                                                                                                                                            |
 
 ### 多边形地理围栏 {#polygon_geofence}

@@ -20,24 +20,24 @@ _控制台_ 可以成为诊断 _QGroundControl_ 问题的有用工具。 可以�
 
 ## 从命令行进行日志记录
 
-用于日志记录的替代机制是使用 `--logging` 命令行选项。 如果你试图从 _QGroundControl_ 崩溃的情况下获取日志，这将非常方便。
+用于日志记录的替代机制是使用 `--logging` 命令行选项。 如果你试图从 _QGroundControl_ 崩溃的情况下获取日志,这将非常方便。
 
 执行此作的方式以及跟踪的输出位置因作系统而异：
 
 - Windows
 
-  - 您必须打开命令提示符，将目录更改为**qgroundcontrol.exe** 位置，并从那里运行它：
+  - 您必须打开命令提示符,将目录更改为**qgroundcontrol.exe** 位置,并从那里运行它：
 
     ```sh
     cd "\Program Files (x86)\qgroundcontrol"
     qgroundcontrol --logging:full
     ```
 
-  - 当_QGroundControl_ 启动时，您应该看到一个单独的控制台窗口打开，它将有日志输出
+  - 当_QGroundControl_ 启动时,您应该看到一个单独的控制台窗口打开,它将有日志输出
 
 - OSX
 
-  - 您必须从终端运行 _QGroundControl_ 。 终端应用程序位于应用程序/实用程序。 打开终端后，将以下内容粘贴到其中：
+  - 您必须从终端运行 _QGroundControl_ 。 终端应用程序位于应用程序/实用程序。 打开终端后,将以下内容粘贴到其中：
 
     ```sh
     cd /Applications/qgroundcontrol.app/Contents/MacOS/

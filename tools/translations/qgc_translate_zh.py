@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""QGC 中文翻译脚本 — 将所有未翻译字符串翻译为中文，使用无人机行业标准术语。
+"""QGC 中文翻译脚本 — 将所有未翻译字符串翻译为中文,使用无人机行业标准术语。
 
 用法:
     cd /path/to/qgroundcontrol
@@ -26,7 +26,7 @@ TS_JSON = REPO_ROOT / "translations" / "qgc_json_zh_CN.ts"
 
 
 # ==============================================================================
-# 精确短语翻译表 (大小写敏感，完整匹配)
+# 精确短语翻译表 (大小写敏感,完整匹配)
 # ==============================================================================
 
 PHRASES: dict[str, str] = {
@@ -730,13 +730,13 @@ PHRASES: dict[str, str] = {
     "Camera continues taking images in turn arounds.": "相机在转弯时继续拍摄。",
     "Stop and Hover at each image point before taking image": "在每个拍照点停稳悬停后拍摄",
     "Refly the pattern at a 90 degree angle": "以90度角重飞航线",
-    "Additional waypoints within the transect will be added if the terrain altitude difference grows larger than this tolerance.": "当地形高度差超过容差时，在测绘线内添加额外航点。",
+    "Additional waypoints within the transect will be added if the terrain altitude difference grows larger than this tolerance.": "当地形高度差超过容差时,在测绘线内添加额外航点。",
     "The maximum climb rate from one waypoint to another when adjusting for terrain. Set to 0 for no max.": "地形跟随调整时航点间的最大爬升率。设为0表示无限制。",
     "The maximum descent rate from one waypoint to another when adjusting for terrain. Set to 0 for no max.": "地形跟随调整时航点间的最大下降率。设为0表示无限制。",
 
     # --- 飞行器配置 ---
     "Configure the airframe type that matches your vehicle.": "配置与您的飞行器匹配的机体类型。",
-    " To change this configuration, select the desired frame class below and then reboot the vehicle.": "要更改此配置，请在下方选择所需的机架种类，然后重启飞行器。",
+    " To change this configuration, select the desired frame class below and then reboot the vehicle.": "要更改此配置,请在下方选择所需的机架种类,然后重启飞行器。",
     "Airframe is currently not set.": "当前未设置机体类型。",
 
     # --- 参数错误 ---
@@ -911,7 +911,7 @@ PHRASES: dict[str, str] = {
     "Step 2:": "第二步：",
     "Step 3:": "第三步：",
     "Move all transmitter sticks and switches to their endpoints.": "将所有遥控器摇杆和开关移动至行程端点。",
-    "Center all sticks and move all switches to their neutral position.": "将所有摇杆回中，将所有开关置于中位。",
+    "Center all sticks and move all switches to their neutral position.": "将所有摇杆回中,将所有开关置于中位。",
     "Move throttle to full.": "将油门推至最大。",
     "Click Next when ready.": "准备就绪后点击下一步。",
     "Calibration Complete": "校准完成",
@@ -992,7 +992,7 @@ PHRASES: dict[str, str] = {
 
     # --- JSON 测绘参数描述 ---
     "Hemisphere for position": "位置所在半球",
-    "North,South": "北纬，南纬",
+    "North,South": "北纬,南纬",
     "Altitude for the bottom layer of the structure scan.": "结构扫描底层高度。",
     "Corridor width. Specify 0 width for a single pass scan.": "廊道宽度。设为0表示单次扫描。",
     "Distance between each triggering of the camera. 0 specifies not camera trigger.": "相机触发间隔距离。0表示不触发相机。",
@@ -1612,7 +1612,7 @@ PHRASES: dict[str, str] = {
     "WARNING: Props must be removed from vehicle prior to performing": "警告：操作前必须从飞行器上拆下螺旋桨！",
     "Propellers are removed - Enable sliders": "螺旋桨已拆下 - 启用滑块",
     "Vehicle does not support guided rotate": "飞行器不支持引导旋转",
-    "Click Calibrate to start, then:": "点击校准开始，然后：",
+    "Click Calibrate to start, then:": "点击校准开始,然后：",
     "Set Spin Direction 1": "设置旋转方向1",
     "Set Spin Direction 2": "设置旋转方向2",
     "Clicking 'Apply' will save the changes you have made to your": "点击'应用'将保存您所做的更改",
@@ -1626,7 +1626,7 @@ PHRASES: dict[str, str] = {
     "Allow <br> takeover": "允许<br>接管",
     "Allow takeover": "允许接管",
     "Write characteristic is not valid": "写入特征值无效",
-    "Write queue full, dropping data": "写入队列已满，丢弃数据",
+    "Write queue full, dropping data": "写入队列已满,丢弃数据",
     "Invalid mountpoint name (contains control characters)": "无效的挂载点名称（包含控制字符）",
     "Invalid HTTP response from caster": "来自转发器的HTTP响应无效",
     "Could not create directory %1": "无法创建目录%1",
@@ -1634,7 +1634,7 @@ PHRASES: dict[str, str] = {
     "Make sure your BLE device is powered on and advertising": "确保您的蓝牙设备已开机并正在广播",
     "Make sure your Bluetooth device is powered on and discoverable": "确保您的蓝牙设备已开机且可被发现",
     "This will automatically spin individual motors at 15% thrust": "这将自动以15%油门旋转单个电机",
-    "This will delete all tiles INCLUDING the tile sets you have": "这将删除所有瓦片，包括您已下载的瓦片集",
+    "This will delete all tiles INCLUDING the tile sets you have": "这将删除所有瓦片,包括您已下载的瓦片集",
     "The image directory doesn't contain supported images.": "图像目录不包含支持的图像。",
     "The log file '%1' is corrupt or empty.": "日志文件'%1'已损坏或为空。",
     "Additional errors received": "收到额外错误",
@@ -1764,7 +1764,7 @@ PHRASES: dict[str, str] = {
     "Vehicle voltage telemetry is not available.": "飞行器电压遥测不可用。",
     "Device %1 unpaired": "设备%1已取消配对",
     "Subsystem %1": "子系统%1",
-    "Increase for more responsiveness, reduce if the attitude ove": "增加可提高响应度，如果姿态超调则减小",
+    "Increase for more responsiveness, reduce if the attitude ove": "增加可提高响应度,如果姿态超调则减小",
     "Font Point Size 10": "字体点大小10",
     "Font Point Size 10.5": "字体点大小10.5",
     "Flip abandoned": "翻转中止",
@@ -1939,8 +1939,8 @@ PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"^Battery (\d+) (.+)$", re.I), "电池{0}{1}"),
 
     # JSON 条件
-    (re.compile(r"^If the (.+) is (.+)$", re.I), "如果{0}为{1}，则"),
-    (re.compile(r"^If (.+) is (.+)$", re.I), "如果{0}为{1}，则"),
+    (re.compile(r"^If the (.+) is (.+)$", re.I), "如果{0}为{1},则"),
+    (re.compile(r"^If (.+) is (.+)$", re.I), "如果{0}为{1},则"),
     (re.compile(r"^When (.+) is (.+)$", re.I), "当{0}为{1}时"),
     (re.compile(r"^Automatically (.+)$", re.I), "自动{0}"),
 
@@ -2025,7 +2025,7 @@ def _translate_group(g: str) -> str:
         for w in words:
             tw = _translate_part(w)
             if tw == w:
-                return g  # 有词无法翻译，放弃
+                return g  # 有词无法翻译,放弃
             result.append(tw)
         return ' '.join(result)
     return g
@@ -2090,7 +2090,7 @@ def translate_string(source: str, context: str = "") -> str:
             if result != s:
                 return result
 
-    # --- 4. 保守逐词翻译（≤4词，所有词都必须可译） ---
+    # --- 4. 保守逐词翻译（≤4词,所有词都必须可译） ---
     words = s.split()
     if 1 <= len(words) <= 4 and len(s) < 80:
         translated_parts = []
@@ -2100,7 +2100,7 @@ def translate_string(source: str, context: str = "") -> str:
             punct_before = w[:len(w)-len(clean)]
             punct_after = w[len(clean):]
             t = _translate_part(clean)
-            # 如果词以大写字母开头但找不到，尝试小写
+            # 如果词以大写字母开头但找不到,尝试小写
             if t == clean and clean[0:1].isupper():
                 t = _translate_part(clean[0].lower() + clean[1:])
             if t == clean:
@@ -2121,7 +2121,7 @@ def translate_string(source: str, context: str = "") -> str:
             t = _translate_part(clean) if clean else clean
             if t != clean:
                 known_count += 1
-        # 如果超过60%的词可译，尝试翻译
+        # 如果超过60%的词可译,尝试翻译
         if known_count >= max(2, len(words) * 0.6):
             for w in words:
                 clean = w.strip('.,;:!?()[]{}\'"')
@@ -2138,7 +2138,7 @@ def translate_string(source: str, context: str = "") -> str:
             if result != s:
                 return result
 
-    # --- 无法翻译，返回原文 ---
+    # --- 无法翻译,返回原文 ---
     return s
 
 
@@ -2147,7 +2147,7 @@ def translate_string(source: str, context: str = "") -> str:
 # ==============================================================================
 
 def process_ts_file(ts_path: Path, file_label: str) -> int:
-    """处理一个 .ts 文件，翻译所有未完成的条目。"""
+    """处理一个 .ts 文件,翻译所有未完成的条目。"""
     print(f"\n{'='*60}")
     print(f"处理: {file_label}")
     print(f"路径: {ts_path}")

@@ -16,7 +16,7 @@ This type of release is synchronized with the release of an upstream stable. Onc
 
 ### Out-Of-Band Stable
 
-This a subsequent release of your custom build after you have released a synchronized stable but prior to upstream releasing a new stable. 它只包含您自己自定义构建的新功能，没有上游的新功能。 Work on this type of release would occur on a branch which is either based on your latest synchronized stable or your last out of band release if it exists. You can release out of band stable releases at any time past your first synchronized stable release.
+This a subsequent release of your custom build after you have released a synchronized stable but prior to upstream releasing a new stable. 它只包含您自己自定义构建的新功能,没有上游的新功能。 Work on this type of release would occur on a branch which is either based on your latest synchronized stable or your last out of band release if it exists. You can release out of band stable releases at any time past your first synchronized stable release.
 
 ### Daily
 

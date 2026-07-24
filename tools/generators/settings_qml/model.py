@@ -14,8 +14,8 @@ from ..common.controls import (
 )
 from ..common.validation import clamped_repr, reject_unknown_keys, require_dict, require_list
 
-# Matches C++ FactMetaData::splitTranslatedList: [,，、] (ASCII / fullwidth / enumeration commas).
-_TRANSLATED_LIST_RE = re.compile("[,，、]")
+# Matches C++ FactMetaData::splitTranslatedList: [,,、] (ASCII / fullwidth / enumeration commas).
+_TRANSLATED_LIST_RE = re.compile("[,,、]")
 
 # Fact-backed control settings: "settingsGroupAccessor.factName" (nested fact names allowed).
 # ASCII-only, non-empty segments: fact_name feeds objectNames, which must stay grep-able.

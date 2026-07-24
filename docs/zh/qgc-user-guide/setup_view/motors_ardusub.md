@@ -22,7 +22,7 @@ If the frame selection does not match your vehicle, first select the correct fra
 To manually set up and test the motors, read and follow the instructions on the page.
 
 :::warning
-在拨动开关启动载具并开启测试前，确保电机和螺旋桨无障碍物！
+在拨动开关启动载具并开启测试前,确保电机和螺旋桨无障碍物！
 :::
 
 ## Automatic Direction Detection {#automatic}

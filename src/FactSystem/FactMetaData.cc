@@ -1528,7 +1528,7 @@ void FactMetaData::setVolatileValue(bool bValue)
 
 QStringList FactMetaData::splitTranslatedList(const QString &translatedList)
 {
-    const QRegularExpression splitRegex("[,，、]"); // Note chinese commas for translations which have modified the english comma
+    const QRegularExpression splitRegex("[,,、]"); // Note chinese commas for translations which have modified the english comma
     QStringList valueList = translatedList.split(splitRegex, Qt::SkipEmptyParts);
     for (QString &value: valueList) {
         value = value.trimmed();

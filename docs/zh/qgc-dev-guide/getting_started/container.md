@@ -1,7 +1,7 @@
 # 使用容器构建
 
-社区创建了一个 Docker 镜像，这使得构建基于 Linux 的 QGC 应用程序变得容易得多。
-这可以大大提高您的生产力，并帮助您进行测试。
+社区创建了一个 Docker 镜像,这使得构建基于 Linux 的 QGC 应用程序变得容易得多。
+这可以大大提高您的生产力,并帮助您进行测试。
 
 ## 关于容器
 
@@ -15,7 +15,7 @@ The main advantage of using the container is the usage of the `CMake` build syst
 
 ### 脚本
 
-要使用脚本构建容器，请在 qgc 根目录中运行此命令
+要使用脚本构建容器,请在 qgc 根目录中运行此命令
 
 ```sh
 ./deploy/docker/run-docker.sh ubuntu
@@ -23,8 +23,8 @@ The main advantage of using the container is the usage of the `CMake` build syst
 
 ### 手册
 
-如果你想要手动使用容器构建，那么你必须先构建镜像。
-您可以使用 docker 完成这个操作，从QGC 源代码目录的根目录运行下面的脚本。
+如果你想要手动使用容器构建,那么你必须先构建镜像。
+您可以使用 docker 完成这个操作,从QGC 源代码目录的根目录运行下面的脚本。
 
 ```sh
 docker build --target linux --file ./deploy/docker/Dockerfile -t qgc-ubuntu-docker .
@@ -32,7 +32,7 @@ docker build --target linux --file ./deploy/docker/Dockerfile -t qgc-ubuntu-dock
 
 :::info
 `-t` 选项至关重要。
-请记住，这是为镜像添加标签以便日后引用，因为同一容器可能会有多个构建版本。
+请记住,这是为镜像添加标签以便日后引用,因为同一容器可能会有多个构建版本。
 :::
 
 ::: info
@@ -42,7 +42,7 @@ If building on a Mac computer with an M1 chip you must also specify the build op
 docker build --platform linux/x86_64 --target linux --file ./deploy/docker/Dockerfile -t qgc-ubuntu-docker .
 ```
 
-否则，你将会遇到一个构建错误，比如：
+否则,你将会遇到一个构建错误,比如：
 
 ```sh
 qemu-x86_64: Could not open '/lib64/ld-linux-x86-64.so.2': No such file or directory
@@ -52,8 +52,8 @@ qemu-x86_64: Could not open '/lib64/ld-linux-x86-64.so.2': No such file or direc
 
 ## 使用容器构建QGC
 
-要使用该容器构建 QGC，首先需要定义一个目录来保存构建产物。
-我们建议你在源代码树中创建一个“build”目录，然后从根目录使用上述提供的标签按如下方式运行Docker镜像：
+要使用该容器构建 QGC,首先需要定义一个目录来保存构建产物。
+我们建议你在源代码树中创建一个“build”目录,然后从根目录使用上述提供的标签按如下方式运行Docker镜像：
 
 ```sh
 mkdir build
@@ -75,13 +75,13 @@ docker run --rm -v %cd%:/project/source -v %cd%/build:/project/build qgc-ubuntu-
 
 :::
 
-根据您的系统资源或分配给您的 Docker 守护进程的资源，构建步骤可能需要一些时间。
+根据您的系统资源或分配给您的 Docker 守护进程的资源,构建步骤可能需要一些时间。
 
 ## 故障处理
 
 ### Windows: 'bash\r': No such file or directory
 
-此错误表明正在以Windows换行符格式运行Linux脚本。如果将 `git` 配置为使用Windows换行符，就可能出现这种情况。
+此错误表明正在以Windows换行符格式运行Linux脚本。如果将 `git` 配置为使用Windows换行符,就可能出现这种情况。
 
 ```sh
  > [4/7] RUN /tmp/qt/install-qt-linux.sh:

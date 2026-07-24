@@ -6,18 +6,18 @@ Safety-critical actions (takeoff, land, RTL, etc.) require confirmation before t
 
 ## 飞行检查清单 {#preflight_checklist}
 
-飞行前自动核对表可以用来进行标准检查，检查车辆配置正确，可以安全飞行。
+飞行前自动核对表可以用来进行标准检查,检查车辆配置正确,可以安全飞行。
 
-查看核对表， 首先通过导航到 [应用设置 > 常规> 飞行视图](../settings_view/general.md) 并选择 **使用预览列表** 复选框来启用工具。
+查看核对表, 首先通过导航到 [应用设置 > 常规> 飞行视图](../settings_view/general.md) 并选择 **使用预览列表** 复选框来启用工具。
 然后工具将被添加到 _飞行工具_。
 按下它以打开检查清单：
 
-完成每项测试后，在用户界面上选择该项，将其标记为已完成。
+完成每项测试后,在用户界面上选择该项,将其标记为已完成。
 
 ## 关闭 {#takeoff}
 
 :::tip
-如果你正在为多功能飞行器启动任务，_QGroundControl_ 将自动执行起飞步骤。
+如果你正在为多功能飞行器启动任务,_QGroundControl_ 将自动执行起飞步骤。
 :::
 
 起飞(降落时)：
@@ -26,7 +26,7 @@ Safety-critical actions (takeoff, land, RTL, etc.) require confirmation before t
 2. 在右侧垂直滑块中可选择设置起飞高度。
 
 - 您可以向上/向下滑动以更改高度
-- 您也可以点击指定的高度(例如10英尺)，然后输入特定的海拔。
+- 您也可以点击指定的高度(例如10英尺),然后输入特定的海拔。
 
 1. [Confirm](#confirmation) the action.
 
@@ -47,12 +47,12 @@ Safety-critical actions (takeoff, land, RTL, etc.) require confirmation before t
 :::info
 飞行器通常返回 “Home点”（起飞）位置并着陆。
 这种行为取决于载具类型和配置。
-例如，集结点或飞行任务着陆可能被用作替代返回目标。
+例如,集结点或飞行任务着陆可能被用作替代返回目标。
 :::
 
 ## 更改高度 {#change_altitude}
 
-飞行过程中你可以改变高度，但执行任务时除外：
+飞行过程中你可以改变高度,但执行任务时除外：
 
 1. 按 _飞行工具_ 上的 **操作** 按钮
 2. 选择 _改变高度_ 按钮

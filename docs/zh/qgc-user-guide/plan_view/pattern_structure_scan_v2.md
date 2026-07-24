@@ -46,7 +46,7 @@ To create a scan:
    First select whether you want to perform a manual scan, a scan using a particular camera, or a scan using a custom camera definition.
 
    ::: info
-   模式之间的主要差异是预定义的摄像头已经设置，以正确计算有效的图层高度和触发距离。
+   模式之间的主要差异是预定义的摄像头已经设置,以正确计算有效的图层高度和触发距离。
    :::
 
    Options for the different modes are shown below.

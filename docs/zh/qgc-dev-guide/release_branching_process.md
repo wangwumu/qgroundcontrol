@@ -51,7 +51,7 @@ The released daily build will always match repo HEAD.
 ### Release Stage
 
 When the decision is made to release a new major/minor version the master branch tends to go through an intial lockdown mode.
-在这个地方，只有发布的重要修复被接受为拉取请求。
+在这个地方,只有发布的重要修复被接受为拉取请求。
 
 :::info
 During the lockdown phase, new features are not allowed in master.

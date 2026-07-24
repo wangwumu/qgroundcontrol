@@ -20,6 +20,6 @@
 - `Component-Id` 参数的组件编号
 - `Name` 参数名称
 - `Value` 参数值
-- `Type` 参数类型，使用 MAVLink `MAV_PARAM_TYPE_*` 枚举值
+- `Type` 参数类型,使用 MAVLink `MAV_PARAM_TYPE_*` 枚举值
 
 参数文件包含单个载具的参数。 它可以包含该载具上多个组件的参数。

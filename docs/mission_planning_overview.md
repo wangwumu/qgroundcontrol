@@ -2,7 +2,7 @@
 
 ## 1. 概述
 
-航线（Mission）规划是 QGC 的核心功能之一，允许用户在地图上创建一系列飞行路径点（Waypoints）供无人机自动执行。QGC 支持多种任务类型：简单航点、起降、区域测绘、走廊扫描、建筑物扫描等。
+航线（Mission）规划是 QGC 的核心功能之一,允许用户在地图上创建一系列飞行路径点（Waypoints）供无人机自动执行。QGC 支持多种任务类型：简单航点、起降、区域测绘、走廊扫描、建筑物扫描等。
 
 ---
 
@@ -10,19 +10,19 @@
 
 | 模块 | 文件 | 说明 |
 |------|------|------|
-| **PlanMasterController** | `src/MissionManager/PlanMasterController.h/cc` | 航线管理的顶层控制器，统筹 mission/geofence/rally 三大子模块 |
+| **PlanMasterController** | `src/MissionManager/PlanMasterController.h/cc` | 航线管理的顶层控制器,统筹 mission/geofence/rally 三大子模块 |
 | **MissionController** | `src/MissionManager/MissionController.h/cc` | 航线可视化和管理界面控制器 |
-| **MissionManager** | `src/MissionManager/MissionManager.h/cc` | 继承自 PlanManager，负责与飞控的航线传输 |
+| **MissionManager** | `src/MissionManager/MissionManager.h/cc` | 继承自 PlanManager,负责与飞控的航线传输 |
 | **PlanManager** | `src/MissionManager/PlanManager.h/cc` | 底层协议实现：上下载、清除、断点续传 |
 | **MissionItem** | `src/MissionManager/MissionItem.h/cc` | 单条航线项：command、frame、param1-7 等数据 |
-| **SimpleMissionItem** | `src/MissionManager/SimpleMissionItem.h/cc` | 可视化包装层，添加 UI 相关属性（altitudeFact 等） |
+| **SimpleMissionItem** | `src/MissionManager/SimpleMissionItem.h/cc` | 可视化包装层,添加 UI 相关属性（altitudeFact 等） |
 | **VisualMissionItem** | `src/MissionManager/VisualMissionItem.h/cc` | 所有可视航线项的抽象基类 |
 | **ComplexMissionItem** | `src/MissionManager/ComplexMissionItem.h/cc` | 复杂航线项基类（测绘、扫描等） |
 | **MissionCommandTree** | `src/MissionManager/MissionCommandTree.h/cc` | 固件/机型 → 支持的命令分类树 |
 | **MissionSettingsItem** | `src/MissionManager/MissionSettingsItem.h/cc` | 航线全局设置项（起点相机设置、速度设置） |
 | **PlanView QML** | `src/PlanView/PlanView.qml` | 航线规划 UI |
 | **PlanManager** | `src/MissionManager/PlanManager.h/cc` | **实际执行 MAVLink 协议**（MISSION_COUNT/REQUEST_INT/ITEM_INT/ACK） |
-| **MissionController** | `src/MissionManager/MissionController.h/cc` | `save(missionJson)` 序列化所有航线项，`load(missionJson)` 反序列化 |
+| **MissionController** | `src/MissionManager/MissionController.h/cc` | `save(missionJson)` 序列化所有航线项,`load(missionJson)` 反序列化 |
 
 ### 类继承关系
 
@@ -67,7 +67,7 @@ QObject
 
 ### 3.2 文件格式
 
-#### 3.2.1 `.plan`（JSON，主格式）
+#### 3.2.1 `.plan`（JSON,主格式）
 
 一个 `.plan` 文件包含 mission（航线）、geoFence（地理围栏）、rallyPoints（集结/返航点）三个独立章节：
 
@@ -137,9 +137,9 @@ JSON key 定义参考 `PlanMasterController`：
 - `kJsonGeoFenceObjectKey` = `"geoFence"`
 - `kJsonRallyPointsObjectKey` = `"rallyPoints"`
 
-#### 3.2.2 `.waypoints` / `.txt`（文本旧格式，兼容导入）
+#### 3.2.2 `.waypoints` / `.txt`（文本旧格式,兼容导入）
 
-制表符分隔的文本格式，每行 12 个字段：
+制表符分隔的文本格式,每行 12 个字段：
 
 ```
 <seq> <isCurrent> <frame> <command> <param1> <param2> <param3> <param4> <param5> <param6> <param7> <autoContinue>
@@ -152,7 +152,7 @@ JSON key 定义参考 `PlanMasterController`：
 
 #### 3.2.3 `.kml`（导出格式）
 
-QGC 可将航线导出为 KML（Keyhole Markup Language），用于 Google Earth 等工具展示。不用于导入（仅导出）。
+QGC 可将航线导出为 KML（Keyhole Markup Language）,用于 Google Earth 等工具展示。不用于导入（仅导出）。
 
 ### 3.3 文件操作接口
 
@@ -174,7 +174,7 @@ QGC 可将航线导出为 KML（Keyhole Markup Language），用于 Google Earth
 
 ### 4.1 协议标准
 
-**MAVLink Mission Protocol**（标准 MAVLink 协议，非自定义扩展）：
+**MAVLink Mission Protocol**（标准 MAVLink 协议,非自定义扩展）：
 
 | 消息 | ID | 方向 | 说明 |
 |------|-------|------|------|
@@ -236,7 +236,7 @@ QGC                                Flight Controller
 | `param4` | float | 参数 4（常用于航向 yaw） |
 | `x` / `param5` | int32_t | 纬度 degE7（×10⁷）或本地方位 |
 | `y` / `param6` | int32_t | 经度 degE7（×10⁷）或本地偏移 |
-| `z` / `param7` | float | 高度（米，参考系由 frame 决定） |
+| `z` / `param7` | float | 高度（米,参考系由 frame 决定） |
 | `mission_type` | uint8_t | 任务类型（MAV_MISSION_TYPE） |
 
 **坐标系 (MAV_FRAME)**:
@@ -318,7 +318,7 @@ PlanManager 中的协议参数（`src/MissionManager/PlanManager.h:58-63`）：
 | param4 | 预期航向 (度, NaN=不变) | NaN |
 | x/param5 | 纬度 (度) | — |
 | y/param6 | 经度 (度) | — |
-| z/param7 | 高度 (米，由 frame 决定参考系) | — |
+| z/param7 | 高度 (米,由 frame 决定参考系) | — |
 
 ### 5.3 可选节（Sections）
 
@@ -404,7 +404,7 @@ SimpleMissionItem (可视化包装)
 ### 6.1 协议层限制
 
 - **MAVLink MISSION_COUNT** 中的 count 字段为 `uint16_t` → **最大 65535 个航点**
-- **MAVLink 2.0** 单帧最大 payload 253 字节，每个 MISSION_ITEM_INT 约 37 字节 → 无单边限制
+- **MAVLink 2.0** 单帧最大 payload 253 字节,每个 MISSION_ITEM_INT 约 37 字节 → 无单边限制
 
 ### 6.2 飞控固件限制
 
@@ -488,7 +488,7 @@ MISSION_ACK  →  完成
 
 ### 8.3 断点续传
 
-`MissionManager::generateResumeMission(resumeIndex)` 支持从指定序号生成"断点续传"航线，包含从起始到 resumeIndex 的所有 DO_CMD 项，以及 resumeIndex 之后的完整航线。
+`MissionManager::generateResumeMission(resumeIndex)` 支持从指定序号生成"断点续传"航线,包含从起始到 resumeIndex 的所有 DO_CMD 项,以及 resumeIndex 之后的完整航线。
 
 ---
 
@@ -496,7 +496,7 @@ MISSION_ACK  →  完成
 
 | 扩展方式 | 方法 | 参考 |
 |----------|------|------|
-| 自定义复杂航线项 | 继承 `ComplexMissionItem`，实现 `appendMissionItems()` | `custom-example/src/MissionManager/PerimeterScanComplexItem.*` |
+| 自定义复杂航线项 | 继承 `ComplexMissionItem`,实现 `appendMissionItems()` | `custom-example/src/MissionManager/PerimeterScanComplexItem.*` |
 | 自定义 Plan Creator | 继承 `PlanCreator` | `custom-example/src/MissionManager/PerimeterScanPlanCreator.*` |
 | 自定义命令分类 | `MissionCommandTree` 使用固件+机型分类树 | `src/MissionManager/MissionCommandList.json` |
 | 保存/加载 Hook | `QGCCorePlugin::pre/post Save/Load To/From Json()` | `src/API/QGCCorePlugin.h` |

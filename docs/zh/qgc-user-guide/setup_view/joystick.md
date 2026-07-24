@@ -18,7 +18,7 @@ The joystick is _enabled_ as the last step of the calibration process.
 
 ## Enabling PX4 Joystick Support
 
-若要在 PX4 中启用操纵杆支持，您需要将参数 [`COM_RC_IN_MODE`](https://docs.px4.io/en/main/advanced_config/parameter_reference.html#COM_RC_IN_MODE) 设置为 `1` - _操纵杆_。
+若要在 PX4 中启用操纵杆支持,您需要将参数 [`COM_RC_IN_MODE`](https://docs.px4.io/en/main/advanced_config/parameter_reference.html#COM_RC_IN_MODE) 设置为 `1` - _操纵杆_。
 If this parameter is `0` then _Joystick_ will not be offered as a setup option.
 
 This is enabled by default for PX4 SITL builds (see the [Parameters](../setup_view/parameters.md) topic for information on how to find and set a particular parameter).

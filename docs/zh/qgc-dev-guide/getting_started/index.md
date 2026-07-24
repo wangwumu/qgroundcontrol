@@ -9,7 +9,7 @@ qt_version: 6.10.1
 
 ## 每日构建
 
-如果您只是想测试 (而不是调试) 最近生成的 _QGroundControl_ ，那么请使用[Daily build](../../qgc-user-guide/releases/daily_builds.md)。 官方提供了适用于所有平台的版本。
+如果您只是想测试 (而不是调试) 最近生成的 _QGroundControl_ ,那么请使用[Daily build](../../qgc-user-guide/releases/daily_builds.md)。 官方提供了适用于所有平台的版本。
 官方提供了适用于所有平台的版本。
 
 ## 源代码
@@ -27,13 +27,13 @@ git clone -j8 https://github.com/mavlink/qgroundcontrol.git
 
 ### 使用容器
 
-我们支持使用存储库源代码树上的容器进行 Linux 构建，这可以帮助您开发和部署 QGC 应用程序，而无需在本地环境中安装任何要求。
+我们支持使用存储库源代码树上的容器进行 Linux 构建,这可以帮助您开发和部署 QGC 应用程序,而无需在本地环境中安装任何要求。
 
 [容器指南](../getting_started/container.md)
 
 ### 原生构建
 
-_QGroundControl_ 支持macos、linux、windows 和 Android 平台的构建。 理论上可以为iOS创建一个 QGC 版本，但不再支持作为标准构建。
+_QGroundControl_ 支持macos、linux、windows 和 Android 平台的构建。 理论上可以为iOS创建一个 QGC 版本,但不再支持作为标准构建。
 _QGroundControl_ 使用 [Qt](http://www.qt.io)作为其跨平台支持库。
 
 所需的 Qt 版本为 {{ $frontmatter.qt_version }} **(必须无误)**。
@@ -48,7 +48,7 @@ QGC 已通过指定 Qt 版本（{{ $frontmatter.qt_version }}）的全面测试�
 
 #### 安装Qt
 
-您**必须像下面描述的那样安装Qt** ，而不是使用预构建的软件包，例如Linux发行版。
+您**必须像下面描述的那样安装Qt** ,而不是使用预构建的软件包,例如Linux发行版。
 
 如何安装Qt：
 
@@ -83,7 +83,7 @@ QGC 已通过指定 Qt 版本（{{ $frontmatter.qt_version }}）的全面测试�
 
    ::: info
    依赖操作系统和用户安装的库的可选功能在下面链接/描述。
-   这些功能可以被强制启用/禁用，为qmake指定额外的值。
+   这些功能可以被强制启用/禁用,为qmake指定额外的值。
    :::
 
    - **视频流/Gstream:** - 查看 [视频流](https://github.com/mavlink/qgroundcontrol/blob/master/src/VideoManager/VideoReceiver/GStreamer/README.md)
@@ -101,9 +101,9 @@ Visual Studio is ONLY used to get the compiler. Building _QGroundControl_ is don
 
 #### 使用 Qt Creator {#qt-creator} 进行构建
 
-1. 启动 _Qt Creator_，选择 Open Project 并选择 **CMakeLists.txt** 文件。
+1. 启动 _Qt Creator_,选择 Open Project 并选择 **CMakeLists.txt** 文件。
 
-2. 在 _Configure Project_ 页面上，它应该默认您刚刚使用上面的说明安装的 Qt 版本。 如果不从列表中选择该套件，然后点击 _Configure Project_。
+2. 在 _Configure Project_ 页面上,它应该默认您刚刚使用上面的说明安装的 Qt 版本。 如果不从列表中选择该套件,然后点击 _Configure Project_。
 
    :::tip
    Don't forget to check boxes in case you want to build a Release instead of Debug, or check the other types. To create the installation file go to the "Deploy Settings" Tab, click in the menu button "Add Deploy Step", select "CMake Install" and as argument you must set at least `--config Release`.
@@ -150,21 +150,21 @@ Visual Studio is ONLY used to get the compiler. Building _QGroundControl_ is don
 
 ### Vagrant
 
-[Vagrant](https://www.vagrantup.com/) 可以在 Linux 虚拟机内构建和运行 _QGroundControl_ (如果兼容，也可以在主机机上运行)。
+[Vagrant](https://www.vagrantup.com/) 可以在 Linux 虚拟机内构建和运行 _QGroundControl_ (如果兼容,也可以在主机机上运行)。
 
 1. [下载](https://www.vagrantup.com/downloads.html) 并 [安装](https://www.vagrantup.com/docs/getting-started/) Vagrant
 2. 在 _QGroundControl_ 仓库的根目录运行 `vagrant up`
-3. 若要使用图形环境，请运行 `vagrant reload`
+3. 若要使用图形环境,请运行 `vagrant reload`
 
 ### 所有支持的操作系统的额外构建备注
 
-- **并行构建：** 对于非Windows构建，您可以使用 "-j#" 选项来运行并行构建。
-- **如果你在运行 _QGroundControll_**&#x65F6;遇到此错误: `/usr/lib/x86_64-linux-gnu/libstdc++.so.6: version 'GLIBCXX_3.4.20' not found.`，你需要更新到最新的 _gcc_ ，或者通过使用 `sudo apt-get install libstdc++6` 安装最新的 _libstdc++.6_ 。
-- **单元测试:** 若要运行 [单元测试](../contribute/unit_tests.md)，使用 `QGC_UNITEST_BUILD` 定义在 `debug` 模式下构建，然后复制 `deposition / qgroundcontrol-start。 运行测试前，将 `deploy/qgroundcontrol-start.sh\` 脚本复制到debug目录中。
+- **并行构建：** 对于非Windows构建,您可以使用 "-j#" 选项来运行并行构建。
+- **如果你在运行 _QGroundControll_**&#x65F6;遇到此错误: `/usr/lib/x86_64-linux-gnu/libstdc++.so.6: version 'GLIBCXX_3.4.20' not found.`,你需要更新到最新的 _gcc_ ,或者通过使用 `sudo apt-get install libstdc++6` 安装最新的 _libstdc++.6_ 。
+- **单元测试:** 若要运行 [单元测试](../contribute/unit_tests.md),使用 `QGC_UNITEST_BUILD` 定义在 `debug` 模式下构建,然后复制 `deposition / qgroundcontrol-start。 运行测试前,将 `deploy/qgroundcontrol-start.sh\` 脚本复制到debug目录中。
 
 ## 构建 QGC 安装文件
 
-作为正常构建过程的一部分，您还可以为 _QGroundControl_ 创建安装文件。
+作为正常构建过程的一部分,您还可以为 _QGroundControl_ 创建安装文件。
 
 ```sh
 cmake --install . --config Release

@@ -3,8 +3,8 @@
 [![Discuss](https://img.shields.io/badge/discuss-px4-ff69b4.svg)](http://discuss.px4.io/c/qgroundcontrol/qgroundcontrol-usage)
 [![Discuss](https://img.shields.io/badge/discuss-ardupilot-ff69b4.svg)](http://discuss.ardupilot.org/c/ground-control-software/qgroundcontrol)
 
-_QGroundControl_ 向PX4 或 ArduPilot 驱动的载具平台提供了全方位的飞行控制接口和载具设置接口。 它为初学者提供了方便直接的使用方法，同时仍然为有经验的用户提供高端功能支持。
-它为初学者提供了方便直接的使用方法，同时仍然为有经验的用户提供高端功能支持。
+_QGroundControl_ 向PX4 或 ArduPilot 驱动的载具平台提供了全方位的飞行控制接口和载具设置接口。 它为初学者提供了方便直接的使用方法,同时仍然为有经验的用户提供高端功能支持。
+它为初学者提供了方便直接的使用方法,同时仍然为有经验的用户提供高端功能支持。
 
 **主要特性：**
 

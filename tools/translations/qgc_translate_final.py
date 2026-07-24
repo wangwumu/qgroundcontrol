@@ -75,7 +75,7 @@ TRANSLATIONS = {
     'Video.SettingsGroup.json | videoconvert,nvvidconv,imxvideoconvert,gstreamer,advanced': 'videoconvert, nvvidconv, imxvideoconvert, GStreamer, 高级',
 
     # Signing key
-    'SigningKeyManager | Vehicle is armed. ArduPilot will refuse to disable signing while armed and PX4 will not accept the disable packet without a valid signature. The disable attempt will likely time out and leave the link in an inconsistent state.': '飞行器已解锁。ArduPilot在解锁状态拒绝禁用签名，PX4在无有效签名时不会接受禁用数据包。禁用尝试将超时，导致链路处于不一致状态。',
+    'SigningKeyManager | Vehicle is armed. ArduPilot will refuse to disable signing while armed and PX4 will not accept the disable packet without a valid signature. The disable attempt will likely time out and leave the link in an inconsistent state.': '飞行器已解锁。ArduPilot在解锁状态拒绝禁用签名,PX4在无有效签名时不会接受禁用数据包。禁用尝试将超时,导致链路处于不一致状态。',
     'SigningKeyManager | Are you sure you want to delete \'%1\'?': '确定要删除\'%1\'吗？',
 
     # Motor assignment
@@ -85,8 +85,8 @@ TRANSLATIONS = {
 
     # Calibration
     'RemoteControlCalibration | Before calibrating you should zero all your trims and subtrims. Click Ok to start Calibration.': '校准前请将所有微调和副微调归零。点击"确定"开始校准。',
-    'RemoteControlCalibrationController | * Lower the Throttle stick all the way down as shown in diagram': '* 将油门杆完全拉下，如图所示',
-    'RemoteControlCalibrationController | * Center all sticks as shown in diagram.': '* 将所有摇杆回中，如图所示。',
+    'RemoteControlCalibrationController | * Lower the Throttle stick all the way down as shown in diagram': '* 将油门杆完全拉下,如图所示',
+    'RemoteControlCalibrationController | * Center all sticks as shown in diagram.': '* 将所有摇杆回中,如图所示。',
     'RemoteControlCalibrationController | * Move the %1 Extension stick to its low value position and hold it there...': '* 将%1扩展摇杆移至最低位置并保持住...',
 
     # Parameter editor
@@ -104,7 +104,7 @@ TRANSLATIONS = {
     'NtripConnectionStatus | GGA: %1': 'GGA：%1',
 
     # OfflineMap
-    'OfflineMapEditor | This will delete all tiles INCLUDING the tile sets you have created yourself.': '这将删除所有瓦片，包括您自己创建的瓦片集。',
+    'OfflineMapEditor | This will delete all tiles INCLUDING the tile sets you have created yourself.': '这将删除所有瓦片,包括您自己创建的瓦片集。',
     'OfflineMapEditor | Delete %1 and all its tiles.': '删除%1及其所有瓦片。',
 
     # Log viewer
@@ -181,13 +181,13 @@ TRANSLATIONS = {
     'Logging.SettingsUI.json | gstreamer': 'GStreamer',
 
     # Video settings - technical descriptions
-    'Video.SettingsGroup.json | By default, when a hardware decoder produces GPU-backed frames (DMABuf, GLMemory, D3D11, IOSurface, AHardwareBuffer), the pipeline imports them directly into Qts render thread to avoid a per-frame CPU copy. The pipeline already falls back to the CPU path automatically when a GPU import fails, so this option is only needed for debugging or to work around a broken driver.': '默认情况下，硬件解码器生成的GPU帧（DMABuf、GLMemory、D3D11、IOSurface、AHardwareBuffer）直接导入Qt渲染线程，避免每帧CPU拷贝。GPU导入失败时自动回退CPU路径，此选项仅用于调试或绕开驱动问题。',
-    'Video.SettingsGroup.json | Leave blank to auto-probe (SoC-native imxvideoconvert_g2d / nvvidconv when present, otherwise videoconvert). Set to a specific GStreamer factory name to force that element. Used as a workaround when an SoCs preferred element has a defect; takes effect on next stream restart.': '留空自动探测（优先SoC原生imxvideoconvert_g2d/nvvidconv，否则videoconvert）。设为特定GStreamer工厂名强制使用该元件。用于SoC首选元件有缺陷时的解决方案；下次流重启生效。',
-    'Video.SettingsGroup.json | QGC normally inserts a pixel-aspect-ratio=1/1 capsfilter so non-square-pixel sources (some RTSP cams, DVB) dont render geometrically distorted. A few v4l2 drivers without VIDIOC_CROPCAP deadlock negotiation when PAR is forced; enable this option as a workaround. Takes effect on next stream restart.': 'QGC通常插入像素宽高比1:1的capsfilter，确保非方形像素源（部分RTSP摄像头、DVB）渲染无畸变。部分无VIDIOC_CROPCAP的v4l2驱动在强制PAR时协商死锁；启用此选项作为解决方案。下次流重启生效。',
+    'Video.SettingsGroup.json | By default, when a hardware decoder produces GPU-backed frames (DMABuf, GLMemory, D3D11, IOSurface, AHardwareBuffer), the pipeline imports them directly into Qts render thread to avoid a per-frame CPU copy. The pipeline already falls back to the CPU path automatically when a GPU import fails, so this option is only needed for debugging or to work around a broken driver.': '默认情况下,硬件解码器生成的GPU帧（DMABuf、GLMemory、D3D11、IOSurface、AHardwareBuffer）直接导入Qt渲染线程,避免每帧CPU拷贝。GPU导入失败时自动回退CPU路径,此选项仅用于调试或绕开驱动问题。',
+    'Video.SettingsGroup.json | Leave blank to auto-probe (SoC-native imxvideoconvert_g2d / nvvidconv when present, otherwise videoconvert). Set to a specific GStreamer factory name to force that element. Used as a workaround when an SoCs preferred element has a defect; takes effect on next stream restart.': '留空自动探测（优先SoC原生imxvideoconvert_g2d/nvvidconv,否则videoconvert）。设为特定GStreamer工厂名强制使用该元件。用于SoC首选元件有缺陷时的解决方案；下次流重启生效。',
+    'Video.SettingsGroup.json | QGC normally inserts a pixel-aspect-ratio=1/1 capsfilter so non-square-pixel sources (some RTSP cams, DVB) dont render geometrically distorted. A few v4l2 drivers without VIDIOC_CROPCAP deadlock negotiation when PAR is forced; enable this option as a workaround. Takes effect on next stream restart.': 'QGC通常插入像素宽高比1:1的capsfilter,确保非方形像素源（部分RTSP摄像头、DVB）渲染无畸变。部分无VIDIOC_CROPCAP的v4l2驱动在强制PAR时协商死锁；启用此选项作为解决方案。下次流重启生效。',
     'Video.SettingsGroup.json | Disables the video stream when the vehicle is disarmed to save bandwidth.': '飞行器上锁时禁用视频流以节省带宽。',
 
     # NTRIP
-    'NTRIP.SettingsGroup.json | Listen on a UDP port for incoming RTCM3 correction data and forward it to connected vehicles via MAVLink GPS_RTCM_DATA.': '在UDP端口监听传入的RTCM3修正数据，通过MAVLink GPS_RTCM_DATA转发到已连接的飞行器。',
+    'NTRIP.SettingsGroup.json | Listen on a UDP port for incoming RTCM3 correction data and forward it to connected vehicles via MAVLink GPS_RTCM_DATA.': '在UDP端口监听传入的RTCM3修正数据,通过MAVLink GPS_RTCM_DATA转发到已连接的飞行器。',
 
     # Mavlink settings
     'Mavlink.SettingsGroup.json | Ardupilot Support server to forward mavlink to. i.e: support.ardupilot.org:xxxx': '转发MAVLink的ArduPilot支持服务器。例如：support.ardupilot.org:xxxx',

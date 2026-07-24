@@ -12,9 +12,9 @@ To access this section, select the **Gear** icon (Vehicle Configuration) in the 
 
 ## 飞行模式设置
 
-在 ArduPilot 中，你可以将多达 6 种不同的飞行模式分配到发射器的单个通道上（在固定翼飞行器（Plane）中该通道可选择，而在多旋翼飞行器（Copter）中则固定为通道 5 ）。
+在 ArduPilot 中,你可以将多达 6 种不同的飞行模式分配到发射器的单个通道上（在固定翼飞行器（Plane）中该通道可选择,而在多旋翼飞行器（Copter）中则固定为通道 5 ）。
 ArduCopter还允许您为第 7-12 频道指定额外的 _频道选项_。
-这些允许您将函数分配给这些开关（例如，开启相机或返回启动）。
+这些允许您将函数分配给这些开关（例如,开启相机或返回启动）。
 
 设置飞行模式：
 
@@ -32,13 +32,13 @@ ArduCopter还允许您为第 7-12 频道指定额外的 _频道选项_。
 
 5. **ArduPlane 仅限：** 从下拉列表中选择模式频道。
 
-6. 通过在您的发射机上选择每个模式开关来测试模式是否映射到右转发器切换器。 并检查所需飞行模式是否已激活（在 _QGroundControl_ 上，激活的模式文本会变成黄色）。
+6. 通过在您的发射机上选择每个模式开关来测试模式是否映射到右转发器切换器。 并检查所需飞行模式是否已激活（在 _QGroundControl_ 上,激活的模式文本会变成黄色）。
 
 所有值都在被更改时自动保存。
 
 :::info
 A typical setup uses a three position flight mode switch with an additional option of RTL being on a channel 7 switch.
-你还可以利用发射机上的两个开关以及混合设置来设定6种飞行模式。 向下滚动到这个[页面](http://ardupilot.org/copter/docs/common-rc-transmitter-flight-mode-configuration.html#common-rc-transmitter-flight-mode-configuration)的中间部分，获取有关如何操作的教程。
+你还可以利用发射机上的两个开关以及混合设置来设定6种飞行模式。 向下滚动到这个[页面](http://ardupilot.org/copter/docs/common-rc-transmitter-flight-mode-configuration.html#common-rc-transmitter-flight-mode-configuration)的中间部分,获取有关如何操作的教程。
 :::
 
 ## 另请参考
