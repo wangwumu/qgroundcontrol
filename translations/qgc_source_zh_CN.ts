@@ -7368,7 +7368,8 @@ Click Ok to start the auto-tuning process.
       <location filename="../src/Toolbar/FlightModeIndicator.qml" line="54" />
       <source>FW
 VTOL</source>
-      <translation>fW垂直起降固定翼</translation>
+      <translation>FW
+VTOL</translation>
     </message>
     <message>
       <location filename="../src/Toolbar/FlightModeIndicator.qml" line="54" />
