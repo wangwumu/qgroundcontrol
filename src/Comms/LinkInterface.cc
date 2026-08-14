@@ -5,6 +5,8 @@
 #include "QGCApplication.h"
 #include "QGCLoggingCategory.h"
 #include "SigningController.h"
+#include "Crypto/CryptoCodec.h"
+#include "Crypto/CryptoController.h"
 
 #include <QtQml/QQmlEngine>
 
@@ -107,6 +109,25 @@ void LinkInterface::sendMessageThreadSafe(mavlink_message_t &message)
 
     uint8_t buffer[MAVLINK_MAX_PACKET_LEN];
     const int len = mavlink_msg_to_send_buffer(buffer, &message);
+
+    // 加密链路：Active 状态下，对外发指令加密（deviceID 拆分 + payload AES-GCM）。
+    MAVLinkCrypto::CryptoController* const crypto = MAVLinkCrypto::CryptoController::instance();
+    if (crypto->cryptoEnabled() && crypto->state() == MAVLinkCrypto::CryptoController::State::Active) {
+        MAVLinkCrypto::Key key;
+        uint64_t counter = 0;
+        if (crypto->activeKey(key) && crypto->nextOutgoingCounter(counter)) {
+            const uint8_t crcExtra = mavlink_get_crc_extra(&message);
+            uint8_t encBuffer[MAVLINK_MAX_PACKET_LEN + 32];
+            int encLen = 0;
+            if (MAVLinkCrypto::encryptFrame(buffer, len, crcExtra, crypto->gcsDeviceID(), counter, key, encBuffer, &encLen)) {
+                writeBytesThreadSafe(reinterpret_cast<const char*>(encBuffer), encLen);
+                return;
+            }
+            // 加密失败：回退明文发送（记录日志）
+            qCWarning(LinkInterfaceLog) << "encryptFrame failed for msgid" << message.msgid;
+        }
+    }
+
     writeBytesThreadSafe(reinterpret_cast<const char *>(buffer), len);
 }
 

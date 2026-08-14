@@ -1,0 +1,38 @@
+{
+    "version": 1,
+    "fileType": "FactMetaData",
+    "QGC.MetaData.Facts": [
+        {
+            "name": "cryptoEnabled",
+            "shortDesc": "Enable encrypted MAVLink",
+            "longDesc": "Enable the deviceID + AES-256-GCM encrypted MAVLink link. When enabled, all MAVLink traffic is encrypted and plaintext frames are dropped.",
+            "type": "bool",
+            "default": false,
+            "label": "Enable encrypted link"
+        },
+        {
+            "name": "cryptoGcsServerUrl",
+            "shortDesc": "gcs_server URL",
+            "longDesc": "Base URL of the gcs_server that provides device keys (e.g. https://uav.example.com).",
+            "type": "string",
+            "default": "",
+            "label": "gcs_server URL"
+        },
+        {
+            "name": "cryptoAuthToken",
+            "shortDesc": "Auth token",
+            "longDesc": "Bearer token used to authenticate with gcs_server when fetching device keys.",
+            "type": "string",
+            "default": "",
+            "label": "Auth token"
+        },
+        {
+            "name": "cryptoGcsDeviceID",
+            "shortDesc": "GCS deviceID",
+            "longDesc": "This ground station's own 32-bit deviceID, written into the frame header when sending encrypted frames.",
+            "type": "uint32",
+            "default": 0,
+            "label": "GCS deviceID"
+        }
+    ]
+}

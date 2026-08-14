@@ -38,6 +38,8 @@
 #include "QGCLoggingCategoryManager.h"
 #include "QGCNetworkHelper.h"
 #include "SettingsManager.h"
+#include "CryptoSettings.h"
+#include "Crypto/CryptoController.h"
 #include "Vehicle.h"
 #include "VideoManager.h"
 #include "qgc_version.h"
@@ -87,7 +89,7 @@ QGCApplication::QGCApplication(int& argc, char* argv[], const QGCCommandLinePars
 #ifdef QGC_DAILY_BUILD
         // This gives daily builds their own separate settings space. Allowing you to use daily and stable builds
         // side by side without daily screwing up your stable settings.
-        applicationName = QStringLiteral("%1 Daily").arg(QGC_APP_NAME);
+        applicationName = QStringLiteral("ABC 地面站");
 #else
         applicationName = QGC_APP_NAME;
 #endif
@@ -173,7 +175,7 @@ QGCApplication::QGCApplication(int& argc, char* argv[], const QGCCommandLinePars
 
 void QGCApplication::setLanguage()
 {
-    _locale = QLocale::system();
+    _locale = QLocale(QLocale::Chinese, QLocale::China);  // 强制中文界面
     qCDebug(QGCApplicationLog) << "System reported locale:" << _locale << "; Name" << _locale.name()
                                << "; Preffered (used in maps): "
                                << (QLocale::system().uiLanguages().length() > 0 ? QLocale::system().uiLanguages()[0]
@@ -231,6 +233,17 @@ void QGCApplication::init()
     if (_systemId > 0) {
         qCDebug(QGCApplicationLog) << "Setting MAVLink System ID to:" << _systemId;
         SettingsManager::instance()->mavlinkSettings()->gcsMavlinkSystemID()->setRawValue(_systemId);
+    }
+
+    // 加密 MAVLink 链路配置注入（deviceID + AES-256-GCM）。
+    {
+        CryptoSettings* const cryptoSettings = SettingsManager::instance()->cryptoSettings();
+        MAVLinkCrypto::CryptoController* const crypto = MAVLinkCrypto::CryptoController::instance();
+        crypto->setCryptoEnabled(cryptoSettings->cryptoEnabled()->rawValue().toBool());
+        crypto->setGcsDeviceID(static_cast<MAVLinkCrypto::DeviceID>(
+            cryptoSettings->cryptoGcsDeviceID()->rawValue().toUInt()));
+        crypto->deviceKeyManager()->setServerUrl(cryptoSettings->cryptoGcsServerUrl()->rawValue().toString());
+        crypto->deviceKeyManager()->setAuthToken(cryptoSettings->cryptoAuthToken()->rawValue().toString());
     }
 
     LogManager::instance()->init();

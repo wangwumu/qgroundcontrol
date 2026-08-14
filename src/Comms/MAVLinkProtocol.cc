@@ -23,6 +23,8 @@
 #include "QGCLoggingCategory.h"
 #include "QmlObjectListModel.h"
 #include "SettingsManager.h"
+#include "Crypto/CryptoCodec.h"
+#include "Crypto/CryptoController.h"
 
 QGC_LOGGING_CATEGORY(MAVLinkProtocolLog, "Comms.MAVLinkProtocol")
 
@@ -107,6 +109,12 @@ void MAVLinkProtocol::receiveBytes(LinkInterface* link, const QByteArray& data)
         return;
     }
 
+    // 加密链路：先重组/解密/还原标准帧，再走常规解析。
+    if (MAVLinkCrypto::CryptoController::instance()->cryptoEnabled()) {
+        _receiveEncryptedBytes(link, linkPtr, data);
+        return;
+    }
+
     for (uint8_t byte : data) {
         const uint8_t mavlinkChannel = link->mavlinkChannel();
         mavlink_message_t message{};
@@ -145,6 +153,114 @@ void MAVLinkProtocol::receiveBytes(LinkInterface* link, const QByteArray& data)
 
         if (!_updateStatus(link, linkPtr, mavlinkChannel, message)) {
             break;
+        }
+    }
+}
+
+void MAVLinkProtocol::_receiveEncryptedBytes(LinkInterface* link, const SharedLinkInterfacePtr& linkPtr,
+                                             const QByteArray& data)
+{
+    const uint8_t channel = link->mavlinkChannel();
+    QByteArray& buffer = _cryptoRxBuffer[channel];
+    buffer.append(data);
+
+    // 流式重组完整加密帧：magic(0xFD) + len + 10 字节头 + payload block + CRC。
+    while (buffer.size() >= static_cast<int>(MAVLinkCrypto::kV2HeaderLen)) {
+        if (static_cast<uint8_t>(buffer[0]) != 0xFD) {
+            buffer.remove(0, 1); // 丢弃非 magic 字节，重新同步
+            continue;
+        }
+        const int payloadBlockLen = static_cast<uint8_t>(buffer[1]);
+        const int totalLen = static_cast<int>(MAVLinkCrypto::kV2HeaderLen) + payloadBlockLen +
+                             static_cast<int>(MAVLinkCrypto::kCrcLen);
+        if (buffer.size() < totalLen) {
+            break; // 不完整帧，等待更多字节
+        }
+
+        const QByteArray encFrame = buffer.left(totalLen);
+        buffer.remove(0, totalLen);
+        _processEncryptedFrame(link, linkPtr, channel, encFrame);
+    }
+}
+
+void MAVLinkProtocol::_processEncryptedFrame(LinkInterface* link, const SharedLinkInterfacePtr& linkPtr,
+                                             uint8_t channel, const QByteArray& encFrame)
+{
+    MAVLinkCrypto::CryptoController* const crypto = MAVLinkCrypto::CryptoController::instance();
+    const uint8_t* const encData = reinterpret_cast<const uint8_t*>(encFrame.constData());
+    const int encLen = encFrame.size();
+
+    // 长度检查（规范 §2.6 第 0 步）：payload block >= counter(8) + deviceID(4) + tag(16) = 28
+    const int payloadBlockLen = MAVLinkCrypto::frameLength(encData);
+    if (payloadBlockLen < static_cast<int>(MAVLinkCrypto::kCounterSize + MAVLinkCrypto::kDeviceIDSize +
+                                           MAVLinkCrypto::kTagSize)) {
+        return; // 畸形帧
+    }
+
+    // 重组 deviceID、读 counter
+    const MAVLinkCrypto::DeviceID deviceID = MAVLinkCrypto::deviceIDFromFrame(encData);
+    const uint64_t counter = MAVLinkCrypto::counterFromFrame(encData);
+
+    // 防重放（规范 §2.6 第 3 步）
+    if (!crypto->acceptIncoming(deviceID, counter)) {
+        qCDebug(MAVLinkProtocolLog) << "encrypted frame replay dropped" << deviceID << counter;
+        return;
+    }
+
+    // 取密钥（规范 §2.6 第 5 步）
+    MAVLinkCrypto::Key key;
+    if (!crypto->deviceKeyManager()->keyForDevice(deviceID, key)) {
+        return; // 未登记设备
+    }
+
+    // crc_extra（从帧头 msgid 查）
+    const uint32_t msgid = MAVLinkCrypto::msgidFromFrame(encData);
+    const mavlink_msg_entry_t* const entry = mavlink_get_msg_entry(msgid);
+    if (entry == nullptr) {
+        return; // 未知 msgid，无法验证 CRC
+    }
+    const uint8_t crcExtra = entry->crc_extra;
+
+    // 解密 + 密钥绑定 + 还原标准帧（规范 §2.6 第 6-10 步）
+    uint8_t plainFrame[MAVLINK_MAX_PACKET_LEN];
+    MAVLinkCrypto::DeviceID boundDeviceID;
+    uint64_t boundCounter;
+    int plainLen = 0;
+    if (!MAVLinkCrypto::decryptFrame(encData, encLen, crcExtra, key, &boundDeviceID, &boundCounter, plainFrame,
+                                     &plainLen)) {
+        return; // 解密失败 / tag 校验失败 / 密钥绑定失败
+    }
+
+    // 学习 deviceID ↔ systemID 映射（供上层按 vehicle->id() 触发建链）。
+    crypto->learnDeviceSystemMapping(deviceID, MAVLinkCrypto::systemID(deviceID));
+
+    // 还原的标准帧逐字节喂给标准解析器，复用常规消息处理。
+    for (int i = 0; i < plainLen; ++i) {
+        mavlink_message_t message{};
+        mavlink_status_t status{};
+        const uint8_t framing = mavlink_parse_char(channel, plainFrame[i], &message, &status);
+        if (framing != MAVLINK_FRAMING_OK) {
+            continue;
+        }
+
+        const bool isV1 = (status.flags & MAVLINK_STATUS_FLAG_IN_MAVLINK1);
+        if (isV1 && (message.msgid != MAVLINK_MSG_ID_HEARTBEAT) && (message.msgid != MAVLINK_MSG_ID_RADIO_STATUS)) {
+            link->reportMavlinkV1Traffic();
+            continue;
+        }
+
+        if (!isV1) {
+            link->reportMavlinkV2Traffic();
+            _updateCounters(channel, message);
+        }
+        if (!linkPtr->linkConfiguration()->isForwarding()) {
+            _forward(message);
+            _forwardSupport(message);
+        }
+        _logData(link, message);
+
+        if (!_updateStatus(link, linkPtr, channel, message)) {
+            return;
         }
     }
 }

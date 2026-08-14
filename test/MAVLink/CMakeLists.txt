@@ -5,6 +5,8 @@
 
 target_sources(${CMAKE_PROJECT_NAME}
     PRIVATE
+        CryptoTest.cc
+        CryptoTest.h
         HealthAndArmingCheckReportTest.cc
         HealthAndArmingCheckReportTest.h
         ImageProtocolManagerTest.cc
@@ -23,6 +25,7 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_
 
 add_subdirectory(Signing)
 
+add_qgc_test(CryptoTest LABELS Unit MAVLink)
 add_qgc_test(HealthAndArmingCheckReportTest LABELS Unit MAVLink)
 add_qgc_test(ImageProtocolManagerTest LABELS Unit MAVLink)
 add_qgc_test(MAVLinkStreamConfigTest LABELS Unit MAVLink)

@@ -2,6 +2,7 @@
 #include "MissionController.h"
 #include "Vehicle.h"
 #include "VehicleSupports.h"
+#include "Crypto/CryptoController.h"
 #include "MissionManager.h"
 #include "FlightPathSegment.h"
 #include "FirmwarePlugin.h"
@@ -188,6 +189,11 @@ void MissionController::sendToVehicle(void)
         qCCritical(MissionControllerLog) << "MissionControllerLog::sendToVehicle called while syncInProgress";
     } else {
         qCDebug(MissionControllerLog) << "MissionControllerLog::sendToVehicle";
+        // 加密链路：确定航线 + 选定无人机时触发建链（规范第三部分「QGC 地面站」契约）。
+        if (MAVLinkCrypto::CryptoController::instance()->cryptoEnabled()) {
+            MAVLinkCrypto::CryptoController::instance()->beginLinkingForSystemID(
+                static_cast<uint8_t>(_managerVehicle->id()));
+        }
         if (_visualItems->count() == 1) {
             // This prevents us from sending a possibly bogus home position to the vehicle
             QmlObjectListModel emptyModel;

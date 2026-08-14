@@ -74,6 +74,12 @@ private:
     bool _updateStatus(LinkInterface* link, const SharedLinkInterfacePtr linkPtr, uint8_t mavlinkChannel,
                        const mavlink_message_t& message);
 
+    /// 加密接收：流式重组加密帧 → 解密 → 还原标准帧 → 喂给 mavlink_parse_char。
+    void _receiveEncryptedBytes(LinkInterface* link, const SharedLinkInterfacePtr& linkPtr, const QByteArray& data);
+    /// 处理一条完整加密帧：防重放 + 解密 + 密钥绑定 + 还原标准帧后逐字节喂给解析器。
+    void _processEncryptedFrame(LinkInterface* link, const SharedLinkInterfacePtr& linkPtr, uint8_t channel,
+                                const QByteArray& encFrame);
+
     void _saveTelemetryLog(const QString& tempLogfile);
     bool _checkTelemetrySavePath();
 
@@ -91,6 +97,9 @@ private:
     uint64_t _totalReceiveCounter[MAVLINK_COMM_NUM_BUFFERS]{};
     uint64_t _totalLossCounter[MAVLINK_COMM_NUM_BUFFERS]{};
     float _runningLossPercent[MAVLINK_COMM_NUM_BUFFERS]{};
+
+    /// Per-channel 加密帧接收缓冲（跨 receiveBytes 调用累积字节，重组完整加密帧）。
+    QByteArray _cryptoRxBuffer[MAVLINK_COMM_NUM_BUFFERS];
 
     bool _initialized = false;
 

@@ -112,3 +112,4 @@ qt_add_resources(${CMAKE_PROJECT_NAME} mavlink_component_metadata_schemas
 add_subdirectory(LibEvents)
 add_subdirectory(Signing)
 add_subdirectory(Extensions)
+add_subdirectory(Crypto)
