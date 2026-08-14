@@ -3794,7 +3794,7 @@ Please place your vehicle in water, click the button, and wait. Note that the th
     <message>
       <location filename="../src/AnalyzeView/AnalyzeView.qml" line="169" />
       <source>Requires a connected vehicle</source>
-      <translation>需要已连接的飞行器</translation>
+      <translation>需要连接飞行器</translation>
     </message>
   </context>
   <context>
@@ -12504,7 +12504,7 @@ VTOL</translation>
     <message>
       <location filename="../src/AppSettings/MavlinkActionSettings.qml" line="11" />
       <source>Action JSON files should be created in the '%1' folder.</source>
-      <translation>操作JSON文件应创建在'%1'文件夹中。</translation>
+      <translation>操作 JSON 文件应在 '%1' 文件夹中创建。</translation>
     </message>
     <message>
       <location filename="../src/AppSettings/MavlinkActionSettings.qml" line="17" />
@@ -16927,7 +16927,7 @@ Click 'Ok' to upload the Plan anyway.</source>
     <message>
       <location filename="../src/API/QGCCorePlugin.cc" line="89" />
       <source>Onboard Logs</source>
-      <translation>onboard日志</translation>
+      <translation>机载日志</translation>
     </message>
     <message>
       <location filename="../src/API/QGCCorePlugin.cc" line="84" />

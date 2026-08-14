@@ -4335,7 +4335,7 @@
       <extracomment>.QGC.MetaData.Facts[diskLoggingEnabled].shortDesc</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/LogManager.SettingsGroup.json" />
       <source>Write application log messages to disk in Logs directory.</source>
-      <translation>将应用程序日志消息写入Logs目录的磁盘中。</translation>
+      <translation>将应用日志写入 Logs 目录。</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[diskLoggingEnabled].label</extracomment>
@@ -4347,7 +4347,7 @@
       <extracomment>.QGC.MetaData.Facts[diskLoggingMaxFileSizeMB].shortDesc</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/LogManager.SettingsGroup.json" />
       <source>Maximum size of a single log file in megabytes before rotation.</source>
-      <translation>单个日志文件在轮转前的最大大小（以MB为单位）。</translation>
+      <translation>单个日志文件轮换前的大小上限(兆字节)。</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[diskLoggingMaxFileSizeMB].label</extracomment>
@@ -4359,7 +4359,7 @@
       <extracomment>.QGC.MetaData.Facts[diskLoggingMaxBackupFiles].shortDesc</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/LogManager.SettingsGroup.json" />
       <source>Number of rotated backup log files to keep.</source>
-      <translation>日志循环备份-文件数量</translation>
+      <translation>保留的轮换备份日志文件数</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[diskLoggingMaxBackupFiles].label</extracomment>
@@ -4384,7 +4384,7 @@
       <extracomment>.QGC.MetaData.Facts[saveFormat].label</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/LogManager.SettingsGroup.json" />
       <source>Save Format</source>
-      <translation>保存 格式</translation>
+      <translation>保存格式</translation>
     </message>
   </context>
   <context>
@@ -4393,7 +4393,7 @@
       <extracomment>.QGC.MetaData.Facts[enabled].shortDesc</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/Viewer3D.SettingsGroup.json" />
       <source>Enable 3D terrain and building visualization alongside the 2D map.</source>
-      <translation>启在二维地图旁启用三维地形和建筑可视化</translation>
+      <translation>在2D地图旁启用3D地形与建筑展示</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[enabled].label</extracomment>
@@ -4457,7 +4457,7 @@
       <extracomment>.QGC.MetaData.Facts[buildingLevelHeight].shortDesc</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/Viewer3D.SettingsGroup.json" />
       <source>Average floor-to-floor height in meters used for 3D building visualization.</source>
-      <translation>用于3D建筑物可视化的平均层高（米）。</translation>
+      <translation>用于3D建筑展示的平均层高(米)</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[buildingLevelHeight].label</extracomment>
@@ -4476,7 +4476,7 @@
       <extracomment>.QGC.MetaData.Facts[altitudeBias].shortDesc</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/Viewer3D.SettingsGroup.json" />
       <source>Vertical offset in meters for vehicle rendering in the 3D viewer.</source>
-      <translation>3D查看器中飞行器渲染的垂直偏移量（米）。</translation>
+      <translation>3D视图中飞行器模型的垂直偏移量(米)。</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[altitudeBias].label</extracomment>
@@ -4843,13 +4843,13 @@
       <extracomment>.QGC.MetaData.Facts[adsbServerConnectEnabled].shortDesc</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/ADSBVehicleManager.SettingsGroup.json" />
       <source>Enable connection to an ADS-B SBS-1 server to receive nearby aircraft tracking data.</source>
-      <translation>启用与 ADS-B SBS-1 服务器的连接以接收附近飞行器追踪数据</translation>
+      <translation>启用 ADS-B SBS-1 服务器连接以接收附近飞行器跟踪数据</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[adsbServerConnectEnabled].longDesc</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/ADSBVehicleManager.SettingsGroup.json" />
       <source>Connect to ADSB SBS-1 server using specified address/port</source>
-      <translation>使用指定地址/端口连接到ADSB SBS-1服务器</translation>
+      <translation>使用指定地址/端口连接至 ADSB SBS-1 服务器</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[adsbServerConnectEnabled].label</extracomment>
@@ -5405,13 +5405,13 @@
       <extracomment>.QGC.MetaData.Facts[autoConnectPixhawk].shortDesc</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/AutoConnect.SettingsGroup.json" />
       <source>Automatically connect to Pixhawk autopilots detected on USB.</source>
-      <translation>自动连接到在 USB 上检测到的 Pixhawk 自动驾驶仪</translation>
+      <translation>自动连接 USB 检测到的 Pixhawk 飞控</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[autoConnectPixhawk].longDesc</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/AutoConnect.SettingsGroup.json" />
       <source>If this option is enabled GroundControl will automatically connect to a Pixhawk board which is connected via USB.</source>
-      <translation>如果启用此选项，地面站将自动连接到通过 USB 连接的Pixhawk板</translation>
+      <translation>启用此选项后QGC将自动连接通过USB接入的Pixhawk飞控板</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[autoConnectPixhawk].label</extracomment>
@@ -5436,7 +5436,7 @@
       <extracomment>.QGC.MetaData.Facts[autoConnectSiKRadio].longDesc</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/AutoConnect.SettingsGroup.json" />
       <source>If this option is enabled GroundControl will automatically connect to a vehicle which is detected on a SiK Radio communication link.</source>
-      <translation>如果启用此选项，地面站将自动连接到在 SiK 无线电通信链路上检测到的飞行器</translation>
+      <translation>如果启用此选项，地面站将自·动连接到在 SiK 无线电通信链路上检测到的飞行器</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[autoConnectSiKRadio].label</extracomment>
@@ -5480,13 +5480,13 @@
       <extracomment>.QGC.MetaData.Facts[autoConnectLibrePilot].shortDesc</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/AutoConnect.SettingsGroup.json" />
       <source>Automatically connect to LibrePilot autopilots detected on USB.</source>
-      <translation>自动连接到在 USB 上检测到的 LibrePilot 自动驾驶仪</translation>
+      <translation>自动连接 USB 检测到的 LibrePilot 飞控</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[autoConnectLibrePilot].longDesc</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/AutoConnect.SettingsGroup.json" />
       <source>If this option is enabled GroundControl will automatically connect to a LibrePilot board which is connected via USB.</source>
-      <translation>如果启用此选项，地面站将自动连接到通过 USB 连接的 LibrePilot 板</translation>
+      <translation>启用此选项后 QGC 将自动连接通过 USB 接入的 LibrePilot 飞控板·</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[autoConnectLibrePilot].label</extracomment>
@@ -6123,7 +6123,7 @@
       <extracomment>.QGC.MetaData.Facts[telemetrySaveNotArmed].shortDesc</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/Mavlink.SettingsGroup.json" />
       <source>Also save telemetry logs from sessions where the vehicle was never armed.</source>
-      <translation>同时保存飞行器从未解锁的会话的遥测日志。</translation>
+      <translation>同时保存飞行器未解锁时的遥测日志。</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[telemetrySaveNotArmed].longDesc</extracomment>
@@ -6972,13 +6972,13 @@
       <extracomment>.QGC.MetaData.Facts[virtualJoystickAutoCenterThrottle].shortDesc</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/App.SettingsGroup.json" />
       <source>Returns the throttle stick to center when released instead of holding position.</source>
-      <translation>松开油门摇杆时回中,而不是保持位置。</translation>
+      <translation>松开后油门摇杆回中而非保持位置。</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[virtualJoystickAutoCenterThrottle].longDesc</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/App.SettingsGroup.json" />
       <source>If enabled the throttle stick will snap back to center when released.</source>
-      <translation>启用时,油门摇杆松开后将弹回中位。</translation>
+      <translation>启用后松开油门摇杆将自动回中。</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[virtualJoystickAutoCenterThrottle].label</extracomment>
@@ -7122,7 +7122,7 @@
       <extracomment>.QGC.MetaData.Facts[uiScalePercent].shortDesc</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/App.SettingsGroup.json" />
       <source>Scales the entire user interface including fonts and controls.</source>
-      <translation>缩放在字体和控件在内的整个用户界面。</translation>
+      <translation>缩放包括字体和控件在内的整个用户界面。</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[uiScalePercent].longDesc</extracomment>
@@ -7204,7 +7204,7 @@
       <extracomment>.QGC.MetaData.Facts[androidDontSaveToSDCard].shortDesc, .QGC.MetaData.Facts[androidDontSaveToSDCard].label</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/App.SettingsGroup.json" />
       <source>Don't save to SD card, even if available</source>
-      <translation>即使可用也不要保存到SD卡</translation>
+      <translation>即使 SD 卡可用，也不保存至 SD 卡</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[androidDontSaveToSDCard].longDesc</extracomment>
@@ -7436,7 +7436,7 @@
       <extracomment>.QGC.MetaData.Facts[followTarget].label</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/App.SettingsGroup.json" />
       <source>Stream GCS Position</source>
-      <translation>流地面站位置</translation>
+      <translation>地面站位置跟踪模式</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[followTarget].keywords</extracomment>
@@ -7449,7 +7449,7 @@
       <extracomment>.QGC.MetaData.Facts[qLocaleLanguage].shortDesc</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/App.SettingsGroup.json" />
       <source>Determines the language used for the application interface. Requires restart.</source>
-      <translation>确定应用程序界面使用的语言。需要重启。</translation>
+      <translation>选择程序界面使用的语言，需要重启。</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[qLocaleLanguage].label</extracomment>
@@ -7529,7 +7529,7 @@
       <extracomment>.QGC.MetaData.Facts[showAppLogTimestampAsElapsedTime].label</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/App.SettingsGroup.json" />
       <source>Elapsed Timestamps</source>
-      <translation>已用时间戳</translation>
+      <translation>相对时间戳</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[showAppLogTimestampAsElapsedTime].keywords</extracomment>
@@ -7545,7 +7545,7 @@
       <extracomment>.QGC.MetaData.Facts[guidedMinimumAltitude].shortDesc</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/FlyView.SettingsGroup.json" />
       <source>Minimum altitude allowed for guided mode actions like takeoff and altitude changes.</source>
-      <translation>引导模式操作（如起飞和高度变化）允许的最小高度</translation>
+      <translation>引导模式操作(如起飞和高度变更)允许的最低高度。</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[guidedMinimumAltitude].label</extracomment>
@@ -7564,7 +7564,7 @@
       <extracomment>.QGC.MetaData.Facts[guidedMaximumAltitude].shortDesc</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/FlyView.SettingsGroup.json" />
       <source>Maximum altitude allowed for guided mode actions like takeoff and altitude changes.</source>
-      <translation>引导模式操作（如起飞和高度变化）允许的最大高度</translation>
+      <translation>引导模式操作(如起飞和高度变更)允许的最大高度。</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[guidedMaximumAltitude].label</extracomment>
@@ -7646,7 +7646,7 @@
       <extracomment>.QGC.MetaData.Facts[keepMapCenteredOnVehicle].label</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/FlyView.SettingsGroup.json" />
       <source>Keep Map Centered On Vehicle</source>
-      <translation>保持飞行器正对障碍物中心</translation>
+      <translation>保持飞行器在界面中心</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[keepMapCenteredOnVehicle].keywords</extracomment>
@@ -7665,7 +7665,7 @@
       <extracomment>.QGC.MetaData.Facts[showSimpleCameraControl].label</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/FlyView.SettingsGroup.json" />
       <source>Show simple camera controls (DIGICAM_CONTROL)</source>
-      <translation>显示简单相机拍摄 (DdIGICAM_CONTROLL)</translation>
+      <translation>显示简易相机控制(DIGICAM_CONTROL)</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[showSimpleCameraControl].keywords</extracomment>
@@ -7684,13 +7684,13 @@
       <extracomment>.QGC.MetaData.Facts[maxGoToLocationDistance].shortDesc</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/FlyView.SettingsGroup.json" />
       <source>Maximum allowed distance for go-to-location commands from the vehicle.</source>
-      <translation>飞行器前往指定位置命令允许的最大距离</translation>
+      <translation>Go To Location 指令中目标点与飞行器的最大允许距离</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[maxGoToLocationDistance].label</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/FlyView.SettingsGroup.json" />
       <source>Go To Location Max Distance</source>
-      <translation>前往位置的最大距离</translation>
+      <translation>Go To Location 最大距离</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[maxGoToLocationDistance].keywords</extracomment>
@@ -7703,13 +7703,13 @@
       <extracomment>.QGC.MetaData.Facts[forwardFlightGoToLocationLoiterRad].shortDesc</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/FlyView.SettingsGroup.json" />
       <source>Loiter radius when circling a go-to destination during fixed-wing flight.</source>
-      <translation>固定翼飞行中绕目标点盘旋的待机半径</translation>
+      <translation>固定翼到达目标点后的盘旋半径</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[forwardFlightGoToLocationLoiterRad].label</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/FlyView.SettingsGroup.json" />
       <source>Loiter Radius in Forward Flight Guided Mode</source>
-      <translation>前飞引导模式下的待机半径</translation>
+      <translation>巡航引导模式盘旋半径</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[forwardFlightGoToLocationLoiterRad].keywords</extracomment>
@@ -7722,13 +7722,13 @@
       <extracomment>.QGC.MetaData.Facts[goToLocationRequiresConfirmInGuided].shortDesc</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/FlyView.SettingsGroup.json" />
       <source>Require explicit confirmation for go-to-location commands while in Guided mode.</source>
-      <translation>在引导模式下执行前往位置命令时需要明确确认</translation>
+      <translation>引导模式下，Go To Location 指令需明确确认后才执行</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[goToLocationRequiresConfirmInGuided].label</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/FlyView.SettingsGroup.json" />
       <source>Require Confirmation for Go To Location in Guided Mode</source>
-      <translation>引导模式下前往位置需要确认</translation>
+      <translation>引导模式下执行"Go To Location"前需确认</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[goToLocationRequiresConfirmInGuided].keywords</extracomment>
@@ -7741,7 +7741,7 @@
       <extracomment>.QGC.MetaData.Facts[updateHomePosition].shortDesc</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/FlyView.SettingsGroup.json" />
       <source>Automatically update the vehicle return-to-home position from the GCS GPS location.</source>
-      <translation>自动更新返航点从地面战/GPS.</translation>
+      <translation>自动将地面站 GPS 位置设为飞行器返航点。</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[updateHomePosition].label</extracomment>
@@ -7798,13 +7798,13 @@
       <extracomment>.QGC.MetaData.Facts[enableAutomaticMissionPopups].shortDesc</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/FlyView.SettingsGroup.json" />
       <source>Automatically show mission start and resume confirmation dialogs.</source>
-      <translation>自动显示任务开始/重启确认对话框.</translation>
+      <translation>自动显示航点任务开始和继续的确认对话框。</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[enableAutomaticMissionPopups].label</extracomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Settings/FlyView.SettingsGroup.json" />
       <source>Enable automatic mission start/resume popups</source>
-      <translation>启用自动任务开始/重启对话框</translation>
+      <translation>启用航点任务开始/继续的自动弹窗提示</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[enableAutomaticMissionPopups].keywords</extracomment>
@@ -8499,7 +8499,7 @@
       <translatorcomment>Only use english comma ',' to separate strings</translatorcomment>
       <location filename="/home/runner/work/qgroundcontrol/qgroundcontrol/src/Vehicle/FactGroups/EscStatusFactGroup.json" />
       <source>PPM,Serial Bus,One Shot,I2C,CAN-Bus,DShot</source>
-      <translation>pPM,Serialbus,Oneshot,I2C,CAN-Bus,DShot</translation>
+      <translation>PPM,Serialbus,Oneshot,I2C,CAN-Bus,DShot</translation>
     </message>
     <message>
       <extracomment>.QGC.MetaData.Facts[info].shortDesc</extracomment>
