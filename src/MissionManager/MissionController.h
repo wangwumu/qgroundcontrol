@@ -15,6 +15,7 @@
 #include "QGCMAVLink.h"
 #include "MissionFlightStatus.h"
 #include "MissionFlightStatusCalculator.h"
+#include "Crypto/DeviceID.h"
 
 class FlightPathSegment;
 class VisualMissionItem;
@@ -362,6 +363,9 @@ private slots:
     void _syncTreeRallyPointsRemoved                   (const QModelIndex& parent, int first, int last);
 
     void _syncTreeRallyPointsReset                    (void);
+    // 加密链路：建链完成后补发挂起的航线上传（C5 竞态防护）
+    void _onLinkingConfirmed                (MAVLinkCrypto::DeviceID deviceID);
+    void _onLinkingFailed                   (MAVLinkCrypto::DeviceID deviceID, const QString& error);
 private:
     void                    _init                               (void);
     void                    _setupTreeModel                     (void);
@@ -395,6 +399,7 @@ private:
     static double           _normalizeLat                       (double lat);
     static double           _normalizeLon                       (double lon);
     static bool             _convertToMissionItems              (QmlObjectListModel* visualMissionItems, QList<MissionItem*>& rgMissionItems, QObject* missionItemParent);
+    void                    _sendPlanItemsToVehicle             (void);
 
 private:
     Vehicle*                    _controllerVehicle =            nullptr;
@@ -422,6 +427,8 @@ private:
     MissionSettingsItem*        _settingsItem =                 nullptr;
     PlanViewSettings*           _planViewSettings =             nullptr;
     QmlObjectListModel          _simpleFlightPathSegments;
+    bool                        _pendingCryptoUpload = false;    ///< 加密建链完成前挂起的航线上传
+    bool                        _cryptoLinkConnected = false;    ///< 已连接 CryptoController 信号（一次性）
     QmlObjectListModel          _directionArrows;
     FlightPathSegmentHashTable  _flightPathSegmentHashTable;
     bool                        _firstItemsFromVehicle =        false;

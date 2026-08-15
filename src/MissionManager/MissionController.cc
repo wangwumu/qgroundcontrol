@@ -185,23 +185,71 @@ void MissionController::sendToVehicle(void)
 {
     if (_masterController->offline()) {
         qCCritical(MissionControllerLog) << "MissionControllerLog::sendToVehicle called while offline";
-    } else if (syncInProgress()) {
+        return;
+    }
+    if (syncInProgress()) {
         qCCritical(MissionControllerLog) << "MissionControllerLog::sendToVehicle called while syncInProgress";
+        return;
+    }
+    qCDebug(MissionControllerLog) << "MissionControllerLog::sendToVehicle";
+
+    // 加密链路：确定航线 + 选定无人机时触发建链（规范第三部分「QGC 地面站」契约）。
+    MAVLinkCrypto::CryptoController* const crypto = MAVLinkCrypto::CryptoController::instance();
+    if (crypto->cryptoEnabled()) {
+        crypto->beginLinkingForSystemID(static_cast<uint8_t>(_managerVehicle->id()));
+        if (crypto->state() == MAVLinkCrypto::CryptoController::State::Linking) {
+            // 建链异步进行中（密钥未缓存，正从 gcs_server 拉取）：
+            // 立即发送会产生明文帧（未 Active），接收端在全加密链路上会丢弃 → 首次航线上传必丢。
+            // 挂起本次上传，等 linkingConfirmed 后由 _onLinkingConfirmed 补发。
+            _pendingCryptoUpload = true;
+            if (!_cryptoLinkConnected) {
+                connect(crypto, &MAVLinkCrypto::CryptoController::linkingConfirmed,
+                        this, &MissionController::_onLinkingConfirmed);
+                connect(crypto, &MAVLinkCrypto::CryptoController::linkingFailed,
+                        this, &MissionController::_onLinkingFailed);
+                _cryptoLinkConnected = true;
+            }
+            return;
+        }
+        if (crypto->state() != MAVLinkCrypto::CryptoController::State::Active) {
+            // Standby：未触发建链（deviceID↔systemID 映射未知，无法取密钥）
+            qCWarning(MissionControllerLog) << "crypto: no device mapping for vehicle"
+                                            << _managerVehicle->id() << ", abort plan upload";
+            return;
+        }
+        // Active：链路就绪，直接发送
+    }
+    _sendPlanItemsToVehicle();
+}
+
+void MissionController::_sendPlanItemsToVehicle(void)
+{
+    if (_visualItems->count() == 1) {
+        // This prevents us from sending a possibly bogus home position to the vehicle
+        QmlObjectListModel emptyModel;
+        sendItemsToVehicle(_managerVehicle, &emptyModel);
     } else {
-        qCDebug(MissionControllerLog) << "MissionControllerLog::sendToVehicle";
-        // 加密链路：确定航线 + 选定无人机时触发建链（规范第三部分「QGC 地面站」契约）。
-        if (MAVLinkCrypto::CryptoController::instance()->cryptoEnabled()) {
-            MAVLinkCrypto::CryptoController::instance()->beginLinkingForSystemID(
-                static_cast<uint8_t>(_managerVehicle->id()));
-        }
-        if (_visualItems->count() == 1) {
-            // This prevents us from sending a possibly bogus home position to the vehicle
-            QmlObjectListModel emptyModel;
-            sendItemsToVehicle(_managerVehicle, &emptyModel);
-        } else {
-            sendItemsToVehicle(_managerVehicle, _visualItems);
-        }
-        setDirty(false);
+        sendItemsToVehicle(_managerVehicle, _visualItems);
+    }
+    setDirty(false);
+}
+
+void MissionController::_onLinkingConfirmed(MAVLinkCrypto::DeviceID deviceID)
+{
+    Q_UNUSED(deviceID);
+    if (_pendingCryptoUpload) {
+        _pendingCryptoUpload = false;
+        _sendPlanItemsToVehicle();
+    }
+}
+
+void MissionController::_onLinkingFailed(MAVLinkCrypto::DeviceID deviceID, const QString& error)
+{
+    Q_UNUSED(deviceID);
+    if (_pendingCryptoUpload) {
+        _pendingCryptoUpload = false;
+        // 加密链路建立失败：本次航线上传未发送（丢弃，不发明文），向日志告警
+        qCWarning(MissionControllerLog) << "crypto linking failed, plan upload aborted:" << error;
     }
 }
 

@@ -47,6 +47,22 @@ target_include_directories(${CMAKE_PROJECT_NAME}
                                    ${mavlink_BINARY_DIR}/include/mavlink/${QGC_MAVLINK_DIALECT}
 )
 
+# Remove the mavlink_helpers.h "unknown incompat flag" rejection so the full 31-bit
+# usable deviceID range parses: deviceID bits 25..31 reuse the incompat_flags byte,
+# which the upstream parser would otherwise reject (bit 24 must stay 0 — it is the
+# SIGNED flag — see docs/10_deviceID与payload加密公共规范.md §1.4/§1.5). Applied as a
+# post-generation patch to the CPM-produced header so QGC stays pinned to the upstream
+# mavlink commit. Idempotent, re-applied whenever mavgen regenerates the header.
+set(MAVLINK_PARSER_PATCH "${CMAKE_SOURCE_DIR}/tools/generators/patch_mavlink_parser.py")
+add_custom_target(
+    patch_mavlink_parser
+    COMMAND Python3::Interpreter "${MAVLINK_PARSER_PATCH}" "${mavlink_BINARY_DIR}/include/mavlink/mavlink_helpers.h"
+    DEPENDS mavlink "${MAVLINK_PARSER_PATCH}"
+    COMMENT "Patching mavlink_helpers.h (deviceID incompat_flags fix)"
+    VERBATIM
+)
+add_dependencies(${CMAKE_PROJECT_NAME} patch_mavlink_parser)
+
 # Generate lightweight MAVLinkEnums.h (enum typedefs only, no message pack/unpack code)
 # plus MAVLinkEnumsQml.{h,cc} exposing every enum via Q_NAMESPACE/Q_ENUM_NS for QML.
 set(MAVLINK_ENUMS_H "${CMAKE_BINARY_DIR}/MAVLinkEnums.h")

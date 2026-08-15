@@ -28,6 +28,11 @@ CryptoController::~CryptoController() = default;
 
 void CryptoController::setGcsDeviceID(DeviceID deviceID)
 {
+    // 规范 §1.4 硬性约束：incompatFlag bit0 必须为 0，否则标准解析器误判为签名帧
+    if (!hasValidSignatureBit(deviceID)) {
+        qCWarning(CryptoControllerLog) << "setGcsDeviceID: invalid deviceID (signature bit set)" << deviceID;
+        return;
+    }
     const QMutexLocker locker(&_mutex);
     _gcsDeviceID = deviceID;
 }
@@ -50,6 +55,18 @@ DeviceID CryptoController::activeDeviceID() const
     return _activeDeviceID;
 }
 
+CryptoController::State CryptoController::state() const
+{
+    const QMutexLocker locker(&_mutex);
+    return _state;
+}
+
+DeviceID CryptoController::gcsDeviceID() const
+{
+    const QMutexLocker locker(&_mutex);
+    return _gcsDeviceID;
+}
+
 bool CryptoController::hasActiveKey() const
 {
     const QMutexLocker locker(&_mutex);
@@ -67,6 +84,11 @@ bool CryptoController::activeKey(Key& outKey) const
 
 void CryptoController::beginLinking(DeviceID targetDeviceID)
 {
+    // 拒绝非法目标：sentinel 0 与签名位非法值（规范 §1.4）
+    if (targetDeviceID == kInvalidDeviceID || !hasValidSignatureBit(targetDeviceID)) {
+        qCWarning(CryptoControllerLog) << "beginLinking: invalid target deviceID" << targetDeviceID;
+        return;
+    }
     {
         const QMutexLocker locker(&_mutex);
         if (_state == State::Active && _activeDeviceID == targetDeviceID) {
@@ -121,15 +143,17 @@ bool CryptoController::deviceIDForSystemID(uint8_t systemID, DeviceID& outDevice
 
 void CryptoController::confirmLinking()
 {
+    DeviceID confirmedDevice;
     {
         const QMutexLocker locker(&_mutex);
         if (_state != State::Linking) {
             return;
         }
         _state = State::Active;
+        confirmedDevice = _activeDeviceID;
     }
-    qCDebug(CryptoControllerLog) << "linking confirmed device" << _activeDeviceID;
-    emit linkingConfirmed(_activeDeviceID);
+    qCDebug(CryptoControllerLog) << "linking confirmed device" << confirmedDevice;
+    emit linkingConfirmed(confirmedDevice);
     emit stateChanged();
 }
 
@@ -171,7 +195,13 @@ void CryptoController::_onKeyFetched(DeviceID deviceID)
 
 void CryptoController::_onFetchFailed(DeviceID deviceID, const QString& error)
 {
-    Q_UNUSED(deviceID);
+    {
+        // 与 _onKeyFetched 对称的守卫：陈旧请求的失败不得误杀当前建链目标
+        const QMutexLocker locker(&_mutex);
+        if (_state != State::Linking || _activeDeviceID != deviceID) {
+            return; // 非当前目标 / 状态已变
+        }
+    }
     failLinking(error);
 }
 
@@ -196,10 +226,15 @@ bool CryptoController::nextOutgoingCounter(uint64_t& outCounter)
     return true;
 }
 
-bool CryptoController::acceptIncoming(DeviceID deviceID, uint64_t counter)
+bool CryptoController::isIncomingAcceptable(DeviceID deviceID, uint64_t counter) const
 {
     // ReplayGuard 内部已加锁，独立于本类 _mutex，避免嵌套死锁
-    return _replayGuard.accept(deviceID, counter);
+    return _replayGuard.isAcceptable(deviceID, counter);
+}
+
+void CryptoController::commitIncoming(DeviceID deviceID, uint64_t counter)
+{
+    _replayGuard.commit(deviceID, counter);
 }
 
 void CryptoController::resetReplay(DeviceID deviceID)

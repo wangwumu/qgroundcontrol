@@ -8,6 +8,9 @@
 
 #include <QtTest/QtTest>
 
+#include <QRegularExpression>
+#include <cstring>
+
 namespace {
 
 using namespace MAVLinkCrypto;
@@ -38,6 +41,60 @@ uint8_t heartbeatCrcExtra()
 {
     const mavlink_msg_entry_t* const entry = mavlink_get_msg_entry(MAVLINK_MSG_ID_HEARTBEAT);
     return entry ? entry->crc_extra : 0;
+}
+
+/// 构造一个 incompat_flags 字节为指定值的合法 HEARTBEAT 帧（重算 CRC）。
+/// 用于验证 parser 对 deviceID 高字节复用 incompat_flags（bit1~7）的放行（规范 §1.4/§1.5）。
+QByteArray makeFrameWithIncompat(uint8_t incompat)
+{
+    mavlink_message_t msg{};
+    (void) mavlink_msg_heartbeat_pack(0x0C, 0x0D, &msg, MAV_TYPE_QUADROTOR, MAV_AUTOPILOT_GENERIC, 0, 0, 0);
+
+    uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+    int pos = 0;
+    buf[pos++] = 0xFD;
+    buf[pos++] = msg.len;
+    buf[pos++] = incompat;
+    buf[pos++] = msg.compat_flags;
+    buf[pos++] = msg.seq;
+    buf[pos++] = msg.sysid;
+    buf[pos++] = msg.compid;
+    buf[pos++] = static_cast<uint8_t>(msg.msgid & 0xFFu);
+    buf[pos++] = static_cast<uint8_t>((msg.msgid >> 8) & 0xFFu);
+    buf[pos++] = static_cast<uint8_t>((msg.msgid >> 16) & 0xFFu);
+
+    // CRC 覆盖 len..msgid + payload + crc_extra（与 mavlink_finalize_message_buffer 一致）
+    uint16_t checksum;
+    crc_init(&checksum);
+    for (int i = 1; i < pos; ++i) {
+        crc_accumulate(buf[i], &checksum);
+    }
+    for (int i = 0; i < msg.len; ++i) {
+        crc_accumulate(static_cast<uint8_t>(_MAV_PAYLOAD(&msg)[i]), &checksum);
+    }
+    crc_accumulate(heartbeatCrcExtra(), &checksum);
+
+    for (int i = 0; i < msg.len; ++i) {
+        buf[pos++] = static_cast<uint8_t>(_MAV_PAYLOAD(&msg)[i]);
+    }
+    buf[pos++] = static_cast<uint8_t>(checksum & 0xFFu);
+    buf[pos++] = static_cast<uint8_t>(checksum >> 8);
+
+    return QByteArray(reinterpret_cast<const char*>(buf), pos);
+}
+
+/// 用本地 parser 状态逐字节解析一帧（自包含，不读写全局通道状态）。
+/// 返回最后一字节的 framing；解析过程中填充 message 与 outStatus。
+uint8_t parseFrame(const QByteArray& frame, mavlink_message_t& message, mavlink_status_t& outStatus)
+{
+    mavlink_message_t rxmsg{};
+    mavlink_status_t status{};
+    uint8_t framing = MAVLINK_FRAMING_INCOMPLETE;
+    for (int i = 0; i < frame.size(); ++i) {
+        framing = mavlink_frame_char_buffer(&rxmsg, &status, static_cast<uint8_t>(frame.at(i)),
+                                            &message, &outStatus);
+    }
+    return framing;
 }
 
 } // namespace
@@ -214,6 +271,220 @@ void CryptoTest::_testCodecWrongKey()
     uint64_t boundCounter = 0;
     int decLen = 0;
     QVERIFY(!decryptFrame(encFrame, encLen, crcExtra, wrongKey, &boundDeviceID, &boundCounter, decryptedFrame, &decLen));
+}
+
+void CryptoTest::_testReplayGuardTwoPhase()
+{
+    ReplayGuard guard;
+    const DeviceID deviceID = 0x11223344u;
+
+    // 两阶段：判定通过但未 commit → lastNonce 未前进，重复判定仍通过（首帧）
+    QVERIFY(guard.isAcceptable(deviceID, 100));
+    QVERIFY(guard.isAcceptable(deviceID, 100)); // 未认证帧不得推进重放窗口（C2）
+
+    // 认证通过后 commit
+    guard.commit(deviceID, 100);
+    QVERIFY(!guard.isAcceptable(deviceID, 100)); // 重放拒绝
+    QVERIFY(!guard.isAcceptable(deviceID, 50));  // 乱序拒绝
+    QVERIFY(guard.isAcceptable(deviceID, 101));  // 递增通过
+    QVERIFY(guard.isAcceptable(deviceID, 101));  // 未 commit 前不推进
+    guard.commit(deviceID, 101);
+    QVERIFY(!guard.isAcceptable(deviceID, 101));
+
+    // 不同 deviceID 独立
+    const DeviceID otherDevice = 0x55667788u;
+    QVERIFY(guard.isAcceptable(otherDevice, 1));
+    guard.commit(otherDevice, 1);
+    QVERIFY(!guard.isAcceptable(otherDevice, 1));
+}
+
+void CryptoTest::_testCodecMalformedFrame()
+{
+    const Key key = testKey();
+    const uint8_t crcExtra = heartbeatCrcExtra();
+    DeviceID outDev = 0;
+    uint64_t outCounter = 0;
+    int outLen = 0;
+    uint8_t out[MAVLINK_MAX_PACKET_LEN];
+
+    // 畸形帧：头内 len < 28（counter+deviceID+tag 最小块）→ 防 uint16 下溢与越界（C3）
+    QByteArray shortFrame = makeHeartbeatFrame(0x0C, 0x0D);
+    shortFrame.resize(static_cast<int>(kV2HeaderLen) + 2);
+    shortFrame[1] = 10;
+    QVERIFY(!decryptFrame(reinterpret_cast<const uint8_t*>(shortFrame.constData()), shortFrame.size(), crcExtra,
+                          key, &outDev, &outCounter, out, &outLen));
+
+    // 截断帧：头内 len 声明 100，但输入仅帧头
+    QByteArray truncated = makeHeartbeatFrame(0x0C, 0x0D);
+    truncated.resize(static_cast<int>(kV2HeaderLen));
+    truncated[1] = 100;
+    QVERIFY(!decryptFrame(reinterpret_cast<const uint8_t*>(truncated.constData()), truncated.size(), crcExtra,
+                          key, &outDev, &outCounter, out, &outLen));
+
+    // encryptFrame 防御：标准帧过短
+    QByteArray tinyFrame(5, static_cast<char>(0xFD));
+    uint8_t enc[MAVLINK_MAX_PACKET_LEN + 32];
+    int encLen = 0;
+    QVERIFY(!encryptFrame(reinterpret_cast<const uint8_t*>(tinyFrame.constData()), tinyFrame.size(), crcExtra,
+                          0x0A0B0C0Du, 3, key, enc, &encLen));
+
+    // encryptFrame 防御：零长度 payload 拒绝（规范 §2.2）
+    QByteArray zeroLen = makeHeartbeatFrame(0x0C, 0x0D);
+    zeroLen[1] = 0;
+    expectLogMessage("MAVLink.Crypto.CryptoCodec", QtWarningMsg,
+                     QRegularExpression(QStringLiteral("zero-length payload")));
+    QVERIFY(!encryptFrame(reinterpret_cast<const uint8_t*>(zeroLen.constData()), zeroLen.size(), crcExtra,
+                          0x0A0B0C0Du, 3, key, enc, &encLen));
+    verifyExpectedLogMessage();
+
+    // encryptFrame 防御：签名位非法的 deviceID 拒绝（规范 §1.4）
+    QByteArray plainFrame = makeHeartbeatFrame(0x0C, 0x0D);
+    expectLogMessage("MAVLink.Crypto.CryptoCodec", QtWarningMsg,
+                     QRegularExpression(QStringLiteral("invalid deviceID")));
+    QVERIFY(!encryptFrame(reinterpret_cast<const uint8_t*>(plainFrame.constData()), plainFrame.size(), crcExtra,
+                          0x01000000u, 3, key, enc, &encLen));
+    verifyExpectedLogMessage();
+}
+
+void CryptoTest::_testCodecHeaderTamper()
+{
+    const Key key = testKey();
+    const DeviceID droneID = 0x0A0B0C0Du; // 帧头 deviceID = 目标无人机（C1 语义）
+    const uint64_t counter = 3;
+    const uint8_t crcExtra = heartbeatCrcExtra();
+
+    const QByteArray plainFrame = makeHeartbeatFrame(0x0C, 0x0D);
+
+    uint8_t encFrame[MAVLINK_MAX_PACKET_LEN + 32];
+    int encLen = 0;
+    QVERIFY(encryptFrame(reinterpret_cast<const uint8_t*>(plainFrame.constData()), plainFrame.size(), crcExtra,
+                         droneID, counter, key, encFrame, &encLen));
+
+    // 帧头 deviceID 必须等于加密方传入的目标 ID（PX4 按帧头查自己的密钥）
+    QCOMPARE(deviceIDFromFrame(encFrame), droneID);
+
+    // 篡改帧头 deviceID 为另一设备：nonce 变化 + 密钥绑定失败 → 拒绝
+    uint8_t tampered[MAVLINK_MAX_PACKET_LEN + 32];
+    memcpy(tampered, encFrame, static_cast<size_t>(encLen));
+    const DeviceID attackerID = 0x0A0B0C0Eu;
+    tampered[2] = static_cast<uint8_t>((attackerID >> 24) & 0xFFu);
+    tampered[3] = static_cast<uint8_t>((attackerID >> 16) & 0xFFu);
+    tampered[5] = static_cast<uint8_t>((attackerID >> 8) & 0xFFu);
+    tampered[6] = static_cast<uint8_t>(attackerID & 0xFFu);
+
+    DeviceID outDev = 0;
+    uint64_t outCounter = 0;
+    int outLen = 0;
+    uint8_t out[MAVLINK_MAX_PACKET_LEN];
+    QVERIFY(!decryptFrame(tampered, encLen, crcExtra, key, &outDev, &outCounter, out, &outLen));
+}
+
+void CryptoTest::_testCodecOverflowDegrade()
+{
+    const Key key = testKey();
+    const DeviceID gcsDeviceID = 0x0A0B0C0Du;
+    const uint64_t counter = 7;
+
+    // 构造 payload 253 字节的标准帧（ENCAPSULATED_DATA）：8+4+253+16 = 281 > 255 → 超限
+    mavlink_message_t msg{};
+    uint8_t data[MAVLINK_MSG_ID_ENCAPSULATED_DATA_LEN];
+    memset(data, 0xAB, sizeof(data));
+    (void) mavlink_msg_encapsulated_data_pack(0x0C, 0x0D, &msg, 0, data);
+
+    uint8_t plainFrame[MAVLINK_MAX_PACKET_LEN];
+    const int plainLen = mavlink_msg_to_send_buffer(plainFrame, &msg);
+    const uint8_t crcExtra = mavlink_get_crc_extra(&msg);
+
+    uint8_t encFrame[MAVLINK_MAX_PACKET_LEN + 32];
+    int encLen = 0;
+    expectLogMessage("MAVLink.Crypto.CryptoCodec", QtWarningMsg,
+                     QRegularExpression(QStringLiteral("overflow")));
+    QVERIFY(encryptFrame(plainFrame, plainLen, crcExtra, gcsDeviceID, counter, key, encFrame, &encLen));
+    verifyExpectedLogMessage();
+
+    // 退化帧：payload block = counter(8) + deviceID(4) + tag(16) = 28
+    QCOMPARE(static_cast<int>(encFrame[1]),
+             static_cast<int>(kCounterSize + kDeviceIDSize + kTagSize));
+
+    // 解密还原：payload 为空（供接收方按规范 §2.6 第 10 步丢弃）
+    DeviceID outDev = 0;
+    uint64_t outCounter = 0;
+    int outLen = 0;
+    uint8_t out[MAVLINK_MAX_PACKET_LEN];
+    QVERIFY(decryptFrame(encFrame, encLen, crcExtra, key, &outDev, &outCounter, out, &outLen));
+    QCOMPARE(static_cast<int>(out[1]), 0); // 还原帧 payload 长度 = 0
+}
+
+void CryptoTest::_testCryptoEmptyPlaintext()
+{
+    const Key key = testKey();
+    const DeviceID deviceID = 0x12345678u;
+    const uint64_t counter = 9;
+
+    // 空明文（退化帧支持）：明文仅 deviceID 前缀，密文 = 4 字节
+    uint8_t ciphertext[kDeviceIDSize];
+    uint8_t tag[kTagSize];
+    QVERIFY(encrypt(key, counter, deviceID, nullptr, 0, ciphertext, tag));
+
+    uint8_t decrypted[kDeviceIDSize];
+    QVERIFY(decrypt(key, counter, deviceID, ciphertext, kDeviceIDSize, tag, decrypted));
+
+    // 解密输出 = deviceID 前缀
+    const DeviceID embedded = (static_cast<DeviceID>(decrypted[0]) << 24) |
+                              (static_cast<DeviceID>(decrypted[1]) << 16) |
+                              (static_cast<DeviceID>(decrypted[2]) << 8) |
+                              static_cast<DeviceID>(decrypted[3]);
+    QCOMPARE(embedded, deviceID);
+}
+
+void CryptoTest::_testParserAcceptsHighDeviceID()
+{
+    // deviceID 高字节复用帧头 incompat_flags（bit1~7，规范 §1.4/§1.5）。修复前标准 parser 在
+    // GOT_LENGTH 状态把任何 bit1~7 非零的帧当作"未知标志"拒绝，导致 deviceID ≥ 0x01000000 的
+    // 链路双向静默全断（doc 11）。此处验证 parser 放行这些帧。
+    for (const uint8_t incompat : {uint8_t{0x00}, uint8_t{0x02}, uint8_t{0x12}, uint8_t{0xFE}}) {
+        const QByteArray frame = makeFrameWithIncompat(incompat);
+
+        mavlink_message_t message{};
+        mavlink_status_t outStatus{};
+        const uint8_t framing = parseFrame(frame, message, outStatus);
+
+        QCOMPARE(static_cast<int>(framing), static_cast<int>(MAVLINK_FRAMING_OK));
+        QCOMPARE(static_cast<int>(message.incompat_flags), static_cast<int>(incompat));
+        // 独立校验序列化正确性，避免「序列化自洽但字段写错」被放行结果掩盖
+        QCOMPARE(static_cast<int>(message.sysid), 0x0C);
+        QCOMPARE(static_cast<int>(message.compid), 0x0D);
+        QCOMPARE(static_cast<uint32_t>(message.msgid), static_cast<uint32_t>(MAVLINK_MSG_ID_HEARTBEAT));
+    }
+}
+
+void CryptoTest::_testParserSignedFlagPreserved()
+{
+    // incompat 的 bit0（SIGNED）置位：parser 必须识别为带签名帧并进入 SIGNATURE_WAIT，
+    // 而非放行为 OK。补丁只删 bit1~7 的拒绝，不得破坏 bit0 的 SIGNED 判定（规范 §1.4）。
+    const QByteArray frame = makeFrameWithIncompat(0x01); // 无签名尾
+
+    mavlink_message_t message{};
+    mavlink_status_t outStatus{};
+    const uint8_t framing = parseFrame(frame, message, outStatus);
+
+    QVERIFY(framing != MAVLINK_FRAMING_OK); // 签名未验证完，不得判 OK
+    QCOMPARE(static_cast<int>(outStatus.parse_state), static_cast<int>(MAVLINK_PARSE_STATE_SIGNATURE_WAIT));
+}
+
+void CryptoTest::_testParserRejectsBadCrc()
+{
+    // incompat 置位 + 坏 CRC：补丁只放开 bit1~7 拒绝，不得旁路完整性校验。
+    // 篡改 payload 使 CRC 失配 → 必须判 BAD_CRC。
+    QByteArray frame = makeFrameWithIncompat(0xFE);
+    const int lastPayloadIdx = frame.size() - 3; // CRC 前最后一个 payload 字节
+    frame[lastPayloadIdx] = static_cast<char>(static_cast<uint8_t>(frame.at(lastPayloadIdx)) ^ 0xFFu);
+
+    mavlink_message_t message{};
+    mavlink_status_t outStatus{};
+    const uint8_t framing = parseFrame(frame, message, outStatus);
+
+    QCOMPARE(static_cast<int>(framing), static_cast<int>(MAVLINK_FRAMING_BAD_CRC));
 }
 
 UT_REGISTER_TEST_LIGHTWEIGHT(CryptoTest, TestLabel::Unit)

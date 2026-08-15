@@ -112,20 +112,31 @@ void LinkInterface::sendMessageThreadSafe(mavlink_message_t &message)
 
     // 加密链路：Active 状态下，对外发指令加密（deviceID 拆分 + payload AES-GCM）。
     MAVLinkCrypto::CryptoController* const crypto = MAVLinkCrypto::CryptoController::instance();
-    if (crypto->cryptoEnabled() && crypto->state() == MAVLinkCrypto::CryptoController::State::Active) {
+    if (crypto->cryptoEnabled()) {
+        if (crypto->state() != MAVLinkCrypto::CryptoController::State::Active) {
+            // 加密已启用但链路未就绪：不发明文（全加密链路上接收端会丢弃明文帧）。
+            qCWarning(LinkInterfaceLog) << "crypto enabled, link not Active, dropping msgid" << message.msgid;
+            return;
+        }
         MAVLinkCrypto::Key key;
         uint64_t counter = 0;
         if (crypto->activeKey(key) && crypto->nextOutgoingCounter(counter)) {
             const uint8_t crcExtra = mavlink_get_crc_extra(&message);
             uint8_t encBuffer[MAVLINK_MAX_PACKET_LEN + 32];
             int encLen = 0;
-            if (MAVLinkCrypto::encryptFrame(buffer, len, crcExtra, crypto->gcsDeviceID(), counter, key, encBuffer, &encLen)) {
+            // 帧头/明文内嵌/nonce 的 deviceID 一律用「目标无人机」，接收方按它查自己的密钥；
+            // 用 GCS 自身 deviceID 会导致 PX4 查无密钥而丢弃。
+            if (MAVLinkCrypto::encryptFrame(buffer, len, crcExtra, crypto->activeDeviceID(), counter, key, encBuffer, &encLen)) {
                 writeBytesThreadSafe(reinterpret_cast<const char*>(encBuffer), encLen);
                 return;
             }
-            // 加密失败：回退明文发送（记录日志）
+            // 加密失败：丢弃帧，不回退明文（回退明文会被接收端丢弃，且违反全加密不变量）
             qCWarning(LinkInterfaceLog) << "encryptFrame failed for msgid" << message.msgid;
+            return;
         }
+        // 密钥未就绪（理论不可达：Active 保证有 key）
+        qCWarning(LinkInterfaceLog) << "crypto active but no key/counter, dropping msgid" << message.msgid;
+        return;
     }
 
     writeBytesThreadSafe(reinterpret_cast<const char *>(buffer), len);

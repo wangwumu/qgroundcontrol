@@ -2,18 +2,30 @@
 
 namespace MAVLinkCrypto {
 
-bool ReplayGuard::accept(DeviceID deviceID, uint64_t counter)
+bool ReplayGuard::isAcceptable(DeviceID deviceID, uint64_t counter) const
 {
     const QMutexLocker locker(&_mutex);
 
     const auto it = _lastNonce.constFind(deviceID);
     if (it == _lastNonce.constEnd()) {
-        // 首帧：unset → 接受并登记
-        _lastNonce.insert(deviceID, counter);
-        return true;
+        return true; // 首帧：unset → 通过判定（不登记）
     }
+    return counter > it.value();
+}
 
-    if (counter > it.value()) {
+void ReplayGuard::commit(DeviceID deviceID, uint64_t counter)
+{
+    const QMutexLocker locker(&_mutex);
+    _lastNonce.insert(deviceID, counter);
+}
+
+bool ReplayGuard::accept(DeviceID deviceID, uint64_t counter)
+{
+    const QMutexLocker locker(&_mutex);
+
+    const auto it = _lastNonce.constFind(deviceID);
+    if (it == _lastNonce.constEnd() || counter > it.value()) {
+        // 首帧或严格递增 → 接受并登记
         _lastNonce.insert(deviceID, counter);
         return true;
     }

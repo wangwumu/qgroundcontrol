@@ -8,8 +8,8 @@
 /// - 防重放：按 deviceID 维护全局 lastNonce，`本次 > lastNonce` 才接受；
 /// - 密钥：经 DeviceKeyManager 获取，本控制器持有一个「活跃目标 deviceID + 密钥」。
 ///
-/// 本模块为**状态与 counter 管理核心**，不直接 hook 收发链路（收发 hook 在后续接线阶段接入）。
-/// 线程安全：状态与 lastNonce 由内部锁保护。
+/// 本模块为**状态与 counter 管理核心**；收发 hook 由 LinkInterface/MAVLinkProtocol 接线调用。
+/// 线程安全：状态/映射由本类 `_mutex` 保护；lastNonce 由 ReplayGuard 内部锁保护（二者独立，避免嵌套加锁）。
 
 #include <QtCore/QHash>
 #include <QtCore/QMutex>
@@ -31,7 +31,7 @@ class CryptoController : public QObject
 public:
     enum class State {
         Standby, ///< 待命：只读（解密遥测），不建链、不发指令
-        Linking, ///< 建链中：已取密钥并回传奇数起点，等待 PX4 确认
+        Linking, ///< 建链中：已选定目标、取密钥中/已就绪；密钥就绪后自动进入 Active
         Active,  ///< 正常：可加密下发指令
     };
     Q_ENUM(State)
@@ -55,11 +55,11 @@ public:
     /// 设备密钥管理器（从 gcs_server 取密钥）。
     DeviceKeyManager* deviceKeyManager() { return &_keyManager; }
 
-    /// 当前状态。
-    State state() const { return _state; }
+    /// 当前状态（线程安全，加锁读取）。
+    State state() const;
 
-    /// 本端 GCS 的 deviceID。
-    DeviceID gcsDeviceID() const { return _gcsDeviceID; }
+    /// 本端 GCS 的 deviceID（线程安全，加锁读取）。
+    DeviceID gcsDeviceID() const;
 
     /// 当前建链的目标无人机 deviceID（无任务时为 kInvalidDeviceID）。
     DeviceID activeDeviceID() const;
@@ -90,10 +90,11 @@ public:
     /// @return true=命中，outDeviceID 填充；false=未学习到映射
     bool deviceIDForSystemID(uint8_t systemID, DeviceID& outDeviceID) const;
 
-    /// 收到 PX4 确认后进入 Active（可下发指令）。
+    /// 密钥就绪后进入 Active（可下发指令）。
+    /// 注意：当前实现把「gcs_server 取密钥成功」视为建链确认，并未等待 PX4 的显式确认报文。
     void confirmLinking();
 
-    /// 建链失败（取密钥失败 / 超时），回到 Standby。
+    /// 建链失败（取密钥失败），回到 Standby。
     void failLinking(const QString& error);
 
     /// 任务结束 / 断链，回到 Standby（继续只读遥测）。
@@ -108,9 +109,12 @@ public:
     /// @return true=成功，outCounter 填充；false=非 Active 状态
     bool nextOutgoingCounter(uint64_t& outCounter);
 
-    /// 处理接收帧的 counter：防重放判定 + 更新 lastNonce。
-    /// @return true=接受（首帧或严格递增）；false=重放/乱序
-    bool acceptIncoming(DeviceID deviceID, uint64_t counter);
+    /// 接收帧防重放「判定」（协议 §2.6 第 3 步）：counter > lastNonce[deviceID]？
+    /// 纯检查，不更新状态。@return true=可接受；false=重放/乱序
+    bool isIncomingAcceptable(DeviceID deviceID, uint64_t counter) const;
+
+    /// 接收帧防重放「提交」（协议 §2.6 第 9 步）：解密 + tag 认证通过后更新 lastNonce。
+    void commitIncoming(DeviceID deviceID, uint64_t counter);
 
     /// 重置指定设备的 lastNonce（如建链时清历史）。
     void resetReplay(DeviceID deviceID);

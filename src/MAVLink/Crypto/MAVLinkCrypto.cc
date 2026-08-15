@@ -37,9 +37,14 @@ void makeNonce(uint64_t counter, DeviceID deviceID, uint8_t* nonceOut)
 bool encrypt(const Key& key, uint64_t counter, DeviceID deviceID, const uint8_t* plaintext,
              size_t plaintextLen, uint8_t* ciphertextOut, uint8_t* tagOut)
 {
-    if (plaintext == nullptr || plaintextLen == 0 || ciphertextOut == nullptr || tagOut == nullptr) {
-        return false; // 规范 §2.2：原始消息 payload 长度必须 >= 1 字节
+    if (ciphertextOut == nullptr || tagOut == nullptr) {
+        return false;
     }
+    if (plaintextLen != 0 && plaintext == nullptr) {
+        return false;
+    }
+    // 注：允许 plaintextLen == 0 —— 规范 §2.3 超限退化帧的明文仅 deviceID(4B) 前缀、payload 为空。
+    //     规范 §2.2「零长度消息禁止」由调用方（encryptFrame）在原始 payloadLen==0 时执行。
 
     uint8_t nonce[kNonceSize];
     makeNonce(counter, deviceID, nonce);

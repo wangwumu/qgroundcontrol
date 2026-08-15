@@ -39,11 +39,12 @@ void makeNonce(uint64_t counter, DeviceID deviceID, uint8_t* nonceOut);
 /// @param key            32 字节通信密钥
 /// @param counter        每帧唯一 counter（同时作为 AAD）
 /// @param deviceID       本端 deviceID（写入明文首部，供接收方密钥绑定）
-/// @param plaintext      原始 MAVLink 消息 payload（长度 >= 1，见规范 §2.2 零长度禁止）
+/// @param plaintext      原始 MAVLink 消息 payload；允许为空（规范 §2.3 超限退化帧仅含 deviceID 前缀）
 /// @param plaintextLen   明文长度（不含 4 字节 deviceID 前缀）
 /// @param ciphertextOut  输出密文缓冲，长度 >= plaintextLen
 /// @param tagOut         输出 16 字节 GCM tag
 /// @return true=成功；false=失败（密钥/参数异常）
+/// 注：规范 §2.2「零长度消息禁止」由调用方（encryptFrame）在原始 payloadLen==0 时执行。
 bool encrypt(const Key& key, uint64_t counter, DeviceID deviceID, const uint8_t* plaintext,
              size_t plaintextLen, uint8_t* ciphertextOut, uint8_t* tagOut);
 
@@ -53,7 +54,7 @@ bool encrypt(const Key& key, uint64_t counter, DeviceID deviceID, const uint8_t*
 ///   前 4 字节 = 明文内嵌 deviceID（供调用方做密钥绑定校验，见规范 §2.6 第 8 步）；
 ///   剩余 ciphertextLen - 4 字节 = 原始 MAVLink 消息 payload。
 ///
-/// @param counter      从 payload block 明文前 8 字节读取（非 payload 内）
+/// @param counter      位于 payload block 明文首部 8 字节（不在 GCM 密文内）
 /// @param deviceID     从帧头重组的 deviceID₁（用于构造 nonce）
 /// @param ciphertext   payload block 中的密文（长度 >= kDeviceIDSize）
 /// @param plaintextOut 输出完整明文缓冲，长度 >= ciphertextLen

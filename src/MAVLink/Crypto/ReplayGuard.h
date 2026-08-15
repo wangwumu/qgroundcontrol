@@ -3,11 +3,11 @@
 /// 防重放状态（依据 `docs/10_deviceID与payload加密公共规范.md` §2.5/§2.6）。
 ///
 /// 每个接收方按 deviceID 维护全局 lastNonce（实际存 counter 值，因同一 deviceID 下
-/// nonce 字典序 = counter 数值序）。收到帧后：
-///   counter >  lastNonce[deviceID] → 接受，并更新 lastNonce
-///   counter <= lastNonce[deviceID] → 判定重放/乱序，丢弃
+/// nonce 字典序 = counter 数值序）。协议 §2.6 要求两阶段：
+///   第 3 步  仅判定：counter >  lastNonce[deviceID] ？       → isAcceptable()
+///   第 9 步  认证通过后才更新 lastNonce                      → commit()
 ///
-/// 首帧（unset）即接受并登记。线程安全（接收链路可能多线程）。
+/// 首帧（unset）即判定通过。线程安全（接收链路可能多线程）。
 
 #include <QtCore/QHash>
 #include <QtCore/QMutex>
@@ -26,10 +26,17 @@ public:
     ReplayGuard(const ReplayGuard&) = delete;
     ReplayGuard& operator=(const ReplayGuard&) = delete;
 
-    /// 检查 counter 是否可接受（本次 > last），并原子更新 last。
-    /// @param deviceID 设备标识（从帧头重组）
-    /// @param counter  每帧唯一 counter（从 payload block 明文前 8 字节读取）
-    /// @return true=接受（首帧或严格递增）；false=重放/乱序（counter <= last）
+    /// 纯判定（协议 §2.6 第 3 步）：counter > lastNonce[deviceID]？（首帧未登记即通过）。
+    /// 不修改任何状态。
+    bool isAcceptable(DeviceID deviceID, uint64_t counter) const;
+
+    /// 认证通过后提交（协议 §2.6 第 9 步）：更新 lastNonce[deviceID] = counter。
+    /// 必须在解密与 tag 认证成功之后调用，防止未认证帧污染重放窗口。
+    void commit(DeviceID deviceID, uint64_t counter);
+
+    /// 判定 + 更新（一次性原子操作）。
+    /// 仅用于发送侧原子预留 counter（生成的 counter 必 > last，accept 必成功）；
+    /// 接收侧请使用 isAcceptable() + commit() 两阶段，勿用本方法。
     bool accept(DeviceID deviceID, uint64_t counter);
 
     /// 重置指定设备的 lastNonce（如建链时清历史序列）。

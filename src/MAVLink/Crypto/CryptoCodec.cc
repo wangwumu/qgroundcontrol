@@ -5,6 +5,10 @@
 
 #include <cstring>
 
+#include "QGCLoggingCategory.h"
+
+QGC_LOGGING_CATEGORY(CryptoCodecLog, "MAVLink.Crypto.CryptoCodec")
+
 namespace MAVLinkCrypto {
 
 namespace {
@@ -56,19 +60,42 @@ bool encryptFrame(const uint8_t* plainFrame, int plainLen, uint8_t crcExtra, Dev
     if (plainFrame == nullptr || encFrame == nullptr || encLen == nullptr || plainLen < 0) {
         return false;
     }
-
+    // 防御：标准帧至少含帧头 + CRC
+    if (plainLen < static_cast<int>(kV2HeaderLen + kCrcLen)) {
+        return false;
+    }
+    // 规范 §1.4 硬性约束：incompatFlag bit0 必须为 0，否则标准解析器误判为签名帧
+    if (!hasValidSignatureBit(gcsDeviceID)) {
+        qCWarning(CryptoCodecLog) << "encryptFrame: invalid deviceID (signature bit set)" << gcsDeviceID;
+        return false;
+    }
     const uint8_t payloadLen = plainFrame[1];
+    if (payloadLen == 0) {
+        // 规范 §2.2：零长度消息禁止（避免与超限退化帧形态相同而无法区分）
+        qCWarning(CryptoCodecLog) << "encryptFrame: zero-length payload msgid" << msgidFromFrame(plainFrame);
+        return false;
+    }
     const uint8_t seq = plainFrame[4];
     const uint32_t msgid = msgidFromFrame(plainFrame);
     const uint8_t* payload = plainFrame + kV2HeaderLen;
 
-    // 加密 payload：明文 = deviceID(4B) + payload，密文长度 = payloadLen + 4
+    // 超限检查（规范 §2.3）：counter(8)+deviceID(4)+payload+tag(16) > 255 时，
+    // 明文退化为仅 deviceID(4B)，照发以维持链路时序与 nonce 序列连续。
+    const bool overflow = (kCounterSize + kDeviceIDSize + payloadLen + kTagSize) > 255;
+    const uint8_t* encPlain = overflow ? nullptr : payload;
+    const size_t encPlainLen = overflow ? 0 : payloadLen;
+
+    // 加密 payload：明文 = deviceID(4B) + encPlain，密文长度 = 4 + encPlainLen
     uint8_t ciphertext[MAVLINK_MAX_PAYLOAD_LEN + kDeviceIDSize];
     uint8_t tag[kTagSize];
-    if (!encrypt(key, counter, gcsDeviceID, payload, payloadLen, ciphertext, tag)) {
+    if (!encrypt(key, counter, gcsDeviceID, encPlain, encPlainLen, ciphertext, tag)) {
         return false;
     }
-    const uint16_t ciphertextLen = static_cast<uint16_t>(payloadLen) + kDeviceIDSize;
+    if (overflow) {
+        qCWarning(CryptoCodecLog) << "encryptFrame overflow msgid" << msgid << "payloadLen" << payloadLen
+                                  << ", sending degraded empty-payload frame";
+    }
+    const uint16_t ciphertextLen = kDeviceIDSize + encPlainLen;
 
     // 组装加密帧头（deviceID 拆 4 字节写入 inc/com/sys/comp）
     const uint16_t encPayloadLen = kCounterSize + ciphertextLen + kTagSize;
@@ -107,6 +134,17 @@ bool decryptFrame(const uint8_t* encFrame, int encLen, uint8_t crcExtra, const K
     }
 
     const uint8_t encPayloadLen = encFrame[1];
+
+    // 防御性边界检查（规范 §2.6 第 0 步）：
+    //   - payload block 最小长度 counter(8) + deviceID(4) + tag(16) = 28，否则 ciphertextLen 下溢为巨大值；
+    //   - 输入长度必须完整覆盖帧头 + payload block + CRC，否则后续按头内长度越界读写。
+    if (encPayloadLen < kCounterSize + kDeviceIDSize + kTagSize) {
+        return false; // 畸形帧
+    }
+    if (encLen < static_cast<int>(kV2HeaderLen + kCrcLen) + encPayloadLen) {
+        return false; // 截断帧
+    }
+
     const uint8_t seq = encFrame[4];
     const uint32_t msgid = msgidFromFrame(encFrame);
     const DeviceID deviceID = deviceIDFromFrame(encFrame);

@@ -55,8 +55,25 @@ comp =  deviceID        & 0xFF
 ## 1.4 协议约束
 
 - **deviceID 第 3 字节（帧头 incompatFlag）的 bit0 必须为 0**（等价 `deviceID & 0x01000000 == 0`）。原因是 MAVLink 标准解析器以 `incompatFlag & 0x01` 判断"帧带签名"并读取 13 字节签名；只要 bit0 置位（0x01、0x03、0x05…任一奇数）就会误判。本方案不使用签名机制，此约束确保任何一方（包括标准 MAVLink 解析器）都不会误判帧格式。
+- **incompatFlag 的 bit1~7（deviceID bit25~31）必须由各组件 parser 放行**。MAVLink 标准 parser 会把 bit1~7 当作"必须理解但未知的保留标志"而拒绝整帧（`incompatFlag & ~0x01 != 0` 即丢帧）。各组件（PX4/QGC/mavp2p/data_writer）**必须去掉这一拒绝检查**（见 §1.5），否则 deviceID 只能用到低 24 位。放行后 deviceID 可用 **31 位**（bit24 恒 0，其余 31 位任意）。
 - **帧头其余字段不变**：`magic`（0xFD）、`len`、`seq`、`msgID`、payload、CRC 仍按 MAVLink V2 标准处理。
 - **CRC 计算范围不变**：仍覆盖帧头 + payload block，作为传输层校验。
+
+## 1.5 MAVLink parser 修改约定（各组件必须同步）
+
+deviceID 的 bit25~31 复用 `incompatFlag` 字节的 bit1~7，而 MAVLink 标准 parser 会拒绝这些位（见 §1.4）。各组件必须修改其 MAVLink C 库的 parser，去掉 `incompat_flags & ~MAVLINK_IFLAG_MASK` 的拒绝检查（保留 bit0 的 SIGNED 判定），否则会拒绝 deviceID ≥ `0x01000000` 的帧。
+
+**PX4 侧修改位置（本仓库）**：
+
+- `pymavlink` submodule（`src/modules/mavlink/mavlink/pymavlink`）：
+  - 文件：`generator/C/include_v2.0/mavlink_helpers.h`
+  - 修改：`mavlink_frame_char_buffer()` 的 `MAVLINK_PARSE_STATE_GOT_LENGTH` 分支，去掉 `if ((rxmsg->incompat_flags & ~MAVLINK_IFLAG_MASK) != 0) { ... }` 拒绝块。
+  - fork 与分支：`wangwumu/pymavlink`，分支 `deviceid-incompat-flags`。
+- `mavlink` submodule（`src/modules/mavlink/mavlink`）：
+  - 修改：更新其内 `pymavlink` 子模块指针，指向上述 fork 分支的 commit。
+  - fork 与分支：`wangwumu/mavlink`，分支 `deviceid-incompat-flags`。
+
+**其他组件（QGC / mavp2p / data_writer）**：各自 fork 其 MAVLink 库，做同样的 parser 修改（去掉 `incompat_flags & ~MAVLINK_IFLAG_MASK` 拒绝检查）。
 
 ---
 
@@ -82,6 +99,7 @@ comp =  deviceID        & 0xFF
   > **在线状态公开可见**：帧头 deviceID 为明文，任何观察者（QGC、mavp2p、gcs_server）无需解密即可感知"某 deviceID 在发帧（在线）"；payload 内的状态/位置等为密文，需密钥解密。**待命/心跳用标准 HEARTBEAT（msgID=0）承载**，识别靠解密后的 msgID。
 - **零长度消息禁止**：加密明文 = `deviceID(4B) || 原始消息 payload`，且 **原始消息 payload 长度必须 ≥ 1 字节**——避免与"超限退化帧"（明文仅 deviceID、payload 为空，见 2.3）在接收端形态相同而无法区分。任何一方不得发送 payload 为空的合法消息。
   > **链路范围边界**：本协议适用于**升级组件之间经 mavp2p 的链路**。数传直连链路（PX4 TELEM1 ↔ GCS，应急/监控旁路）是否纳入本加密方案，或作为独立明文旁路，**需另行约定**，不在本协议范围。
+  > **当前约定（PX4 实现）**：PX4 侧不提供 per-link opt-out，**所有 MAVLink 实例（TELEM1 / TELEM2 / USB 等）统一加密，明文帧一律丢弃**——即 TELEM1 直连也纳入加密，不保留明文旁路。若后续需要明文应急旁路，需新增参数（按实例指定加密开关）。
 
 ## 2.3 加密后的 payload block 结构
 

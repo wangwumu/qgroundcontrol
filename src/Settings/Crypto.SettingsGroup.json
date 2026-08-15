@@ -5,7 +5,7 @@
         {
             "name": "cryptoEnabled",
             "shortDesc": "Enable encrypted MAVLink",
-            "longDesc": "Enable the deviceID + AES-256-GCM encrypted MAVLink link. When enabled, all MAVLink traffic is encrypted and plaintext frames are dropped.",
+            "longDesc": "Enable the deviceID + AES-256-GCM encrypted MAVLink link. When enabled, incoming plaintext frames are dropped; outgoing frames are encrypted once the link is Active (task-specific).",
             "type": "bool",
             "default": false,
             "label": "Enable encrypted link"

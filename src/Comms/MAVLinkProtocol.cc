@@ -201,8 +201,14 @@ void MAVLinkProtocol::_processEncryptedFrame(LinkInterface* link, const SharedLi
     const MAVLinkCrypto::DeviceID deviceID = MAVLinkCrypto::deviceIDFromFrame(encData);
     const uint64_t counter = MAVLinkCrypto::counterFromFrame(encData);
 
-    // 防重放（规范 §2.6 第 3 步）
-    if (!crypto->acceptIncoming(deviceID, counter)) {
+    // 学习 deviceID ↔ systemID 映射（供上层按 vehicle->id() 触发建链）。
+    // 明文帧头即可重组，无需密钥；放在取密钥前可打破全新启动的死锁
+    //（否则无密钥→无法解密→无法学习映射→beginLinkingForSystemID 无从触发）。
+    crypto->learnDeviceSystemMapping(deviceID, MAVLinkCrypto::systemID(deviceID));
+
+    // 防重放「判定」（规范 §2.6 第 3 步：仅判定，不更新 lastNonce，
+    // 更新须待解密 + tag 认证通过后，见下方 commitIncoming）。
+    if (!crypto->isIncomingAcceptable(deviceID, counter)) {
         qCDebug(MAVLinkProtocolLog) << "encrypted frame replay dropped" << deviceID << counter;
         return;
     }
@@ -210,6 +216,7 @@ void MAVLinkProtocol::_processEncryptedFrame(LinkInterface* link, const SharedLi
     // 取密钥（规范 §2.6 第 5 步）
     MAVLinkCrypto::Key key;
     if (!crypto->deviceKeyManager()->keyForDevice(deviceID, key)) {
+        qCWarning(MAVLinkProtocolLog) << "no key for device" << deviceID << ", dropping encrypted frame";
         return; // 未登记设备
     }
 
@@ -217,22 +224,31 @@ void MAVLinkProtocol::_processEncryptedFrame(LinkInterface* link, const SharedLi
     const uint32_t msgid = MAVLinkCrypto::msgidFromFrame(encData);
     const mavlink_msg_entry_t* const entry = mavlink_get_msg_entry(msgid);
     if (entry == nullptr) {
+        qCWarning(MAVLinkProtocolLog) << "unknown msgid" << msgid << "for device" << deviceID << ", dropping";
         return; // 未知 msgid，无法验证 CRC
     }
     const uint8_t crcExtra = entry->crc_extra;
 
-    // 解密 + 密钥绑定 + 还原标准帧（规范 §2.6 第 6-10 步）
+    // 解密 + 密钥绑定 + 还原标准帧（规范 §2.6 第 6-8 步）
     uint8_t plainFrame[MAVLINK_MAX_PACKET_LEN];
     MAVLinkCrypto::DeviceID boundDeviceID;
     uint64_t boundCounter;
     int plainLen = 0;
     if (!MAVLinkCrypto::decryptFrame(encData, encLen, crcExtra, key, &boundDeviceID, &boundCounter, plainFrame,
                                      &plainLen)) {
+        qCWarning(MAVLinkProtocolLog) << "decryptFrame failed for device" << deviceID << "msgid" << msgid;
         return; // 解密失败 / tag 校验失败 / 密钥绑定失败
     }
 
-    // 学习 deviceID ↔ systemID 映射（供上层按 vehicle->id() 触发建链）。
-    crypto->learnDeviceSystemMapping(deviceID, MAVLinkCrypto::systemID(deviceID));
+    // 防重放「提交」（规范 §2.6 第 9 步）：认证通过后才更新 lastNonce，
+    // 防止未认证的伪造帧（明文 counter 可伪造）污染重放窗口。
+    crypto->commitIncoming(deviceID, counter);
+
+    // 空 payload 退化帧（规范 §2.3 超限退化）→ 丢弃消息（帧本身已通过认证）
+    if (plainFrame[1] == 0) {
+        qCDebug(MAVLinkProtocolLog) << "dropped empty-payload degraded frame for device" << deviceID << "msgid" << msgid;
+        return;
+    }
 
     // 还原的标准帧逐字节喂给标准解析器，复用常规消息处理。
     for (int i = 0; i < plainLen; ++i) {
