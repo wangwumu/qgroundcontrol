@@ -65,4 +65,4 @@ mavlink_update_checksum(rxmsg, c);
 
 deviceID 从「仅 24 位」恢复到协议设计的 **31 位**（bit24 恒 0，其余 31 位任意）。
 
-**各组件必须同步**：PX4 / QGC / mavp2p / data_writer 都要做同样的 parser 修改，否则仍会拒绝 deviceID ≥ `0x01000000` 的帧。PX4 侧的 fork 与修改位置见 `10_deviceID与payload加密公共规范.md` §1.5。
+**各组件必须同步**：PX4 / QGC / mavp2p / data_writer / mavros（companion computer 侧 MAVLink 透传桥）都要做同样的 parser 修改，否则仍会拒绝 deviceID ≥ `0x01000000` 的帧。PX4 侧的 fork 与修改位置见 `10_deviceID与payload加密公共规范.md` §1.5；mavros 经其 `libmavconn` 依赖 `mavlink` 包（wangwumu fork，parser 放行补丁已就位）获得同一放行。

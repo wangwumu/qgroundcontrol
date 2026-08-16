@@ -1,6 +1,6 @@
 # ============================================================================
 # VTOL Safety Extensions
-# Custom MAVLink messages (msg_id 50000-50003) for VTOL flight safety management
+# Custom MAVLink messages (msg_id 80000-80003) for VTOL flight safety management
 # ============================================================================
 
 target_sources(

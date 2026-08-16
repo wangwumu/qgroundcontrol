@@ -177,9 +177,28 @@ void MAVLinkProtocol::_receiveEncryptedBytes(LinkInterface* link, const SharedLi
             break; // 不完整帧，等待更多字节
         }
 
-        const QByteArray encFrame = buffer.left(totalLen);
+        const QByteArray frame = buffer.left(totalLen);
         buffer.remove(0, totalLen);
-        _processEncryptedFrame(link, linkPtr, channel, encFrame);
+
+        const uint8_t* const frameData = reinterpret_cast<const uint8_t*>(frame.constData());
+        const uint32_t msgid = MAVLinkCrypto::msgidFromFrame(frameData);
+        // 明文待命心跳判定：msgID=0 且 payload block < 28（counter+deviceID+tag 最小块）。
+        // 加密帧 header 的 msgid 也是明文，建链后的加密 HEARTBEAT（msgID=0、payload≥28）
+        // 必须走解密，否则密文会被标准解析器按 HEARTBEAT 字段解析成垃圾值（绕过 GCM 认证）。
+        const bool isPlaintextHeartbeat =
+            (msgid == MAVLINK_MSG_ID_HEARTBEAT) &&
+            (payloadBlockLen < static_cast<int>(MAVLinkCrypto::kCounterSize + MAVLinkCrypto::kDeviceIDSize +
+                                               MAVLinkCrypto::kTagSize));
+        if (isPlaintextHeartbeat) {
+            // 明文特例：待命心跳（msgID=0）不加密、无 counter/tag（规范 §2.2）。
+            // 学习 deviceID↔sysid 映射后走标准解析器，识别在线/待命。
+            const MAVLinkCrypto::DeviceID deviceID = MAVLinkCrypto::deviceIDFromFrame(frameData);
+            MAVLinkCrypto::CryptoController::instance()->learnDeviceSystemMapping(
+                deviceID, MAVLinkCrypto::systemID(deviceID));
+            _feedStandardFrame(link, linkPtr, channel, frameData, frame.size());
+        } else {
+            _processEncryptedFrame(link, linkPtr, channel, frame);
+        }
     }
 }
 
@@ -194,6 +213,10 @@ void MAVLinkProtocol::_processEncryptedFrame(LinkInterface* link, const SharedLi
     const int payloadBlockLen = MAVLinkCrypto::frameLength(encData);
     if (payloadBlockLen < static_cast<int>(MAVLinkCrypto::kCounterSize + MAVLinkCrypto::kDeviceIDSize +
                                            MAVLinkCrypto::kTagSize)) {
+        // 短帧：可能是明文短消息（对端未加密）或损坏帧，打日志便于排查「在线但无遥测」。
+        qCWarning(MAVLinkProtocolLog) << "short frame on crypto link, len" << payloadBlockLen
+                                      << "msgid" << MAVLinkCrypto::msgidFromFrame(encData)
+                                      << "deviceID" << MAVLinkCrypto::deviceIDFromFrame(encData);
         return; // 畸形帧
     }
 
@@ -250,11 +273,17 @@ void MAVLinkProtocol::_processEncryptedFrame(LinkInterface* link, const SharedLi
         return;
     }
 
-    // 还原的标准帧逐字节喂给标准解析器，复用常规消息处理。
-    for (int i = 0; i < plainLen; ++i) {
+    // 还原的标准帧喂给标准解析器，复用常规消息处理。
+    _feedStandardFrame(link, linkPtr, channel, plainFrame, plainLen);
+}
+
+void MAVLinkProtocol::_feedStandardFrame(LinkInterface* link, const SharedLinkInterfacePtr& linkPtr, uint8_t channel,
+                                         const uint8_t* bytes, int len)
+{
+    for (int i = 0; i < len; ++i) {
         mavlink_message_t message{};
         mavlink_status_t status{};
-        const uint8_t framing = mavlink_parse_char(channel, plainFrame[i], &message, &status);
+        const uint8_t framing = mavlink_parse_char(channel, bytes[i], &message, &status);
         if (framing != MAVLINK_FRAMING_OK) {
             continue;
         }

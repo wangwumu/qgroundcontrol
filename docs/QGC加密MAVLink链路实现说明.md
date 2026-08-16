@@ -62,7 +62,7 @@
 
 - 同一 deviceID 使用**一把通信密钥**，PX4 与 QGC 双向共用；
 - **PX4 发偶数 counter，QGC 发奇数 counter**，奇偶不相交 → 全局 nonce 永不碰撞；
-- 发送规则：取「**严格大于该 deviceID 全局 lastNonce 的最小本方向奇偶值**」。
+- 发送规则：**建链首帧由 QGC 取加密安全随机 62 位奇数起点**，此后取「严格大于该 deviceID 全局 lastNonce 的最小本方向奇偶值」（规范 §2.5）。
 
 ### 2.5 防重放（规范 §2.5 / §2.6）
 
@@ -225,7 +225,8 @@ void failLinking(const QString& error);
 void returnToStandby();
 
 // counter 与防重放
-bool nextOutgoingCounter(uint64_t& outCounter);       // 奇数，严格大于 lastNonce
+bool nextOutgoingCounter(uint64_t& outCounter);       // 奇数，首帧随机起点，此后严格大于 lastNonce
+static uint64_t randomOddCounter();                   // 加密安全随机 62 位奇数（§2.5）
 bool isIncomingAcceptable(DeviceID, uint64_t) const;  // 接收防重放「判定」（§2.6 第 3 步）
 void commitIncoming(DeviceID, uint64_t);              // 接收防重放「提交」（§2.6 第 9 步，认证后）
 void resetReplay(DeviceID deviceID);
@@ -239,7 +240,7 @@ signals:
 实现要点：
 - `beginLinking()`：**先校验目标合法性**（`kInvalidDeviceID` 与签名位非法值拒绝），再置 `_activeDeviceID` + `_state=Linking`；密钥已缓存则立即 `confirmLinking()`，否则 `fetchKey()`；
 - `_onKeyFetched()`：状态仍为 Linking 且目标一致时 `confirmLinking()` → Active；`_onFetchFailed()` 有**同款守卫**——陈旧请求的失败不会误杀当前建链目标；
-- `nextOutgoingCounter()`：`last` 为奇数取 `last+2`、偶数取 `last+1`，首帧取 `1`，并原子预留（更新 lastNonce）；
+- `nextOutgoingCounter()`：`last` 为奇数取 `last+2`、偶数取 `last+1`；**首帧取加密安全随机 62 位奇数起点**（`randomOddCounter()`，`QRandomGenerator::system()` + 最低位置 1，规范 §2.5 防重启后 nonce 复用），并原子预留（更新 lastNonce）；
 - `isIncomingAcceptable()` / `commitIncoming()`：**两阶段防重放**（协议 §2.6 第 3 步只判定、第 9 步认证通过后才更新 lastNonce），防止未认证的伪造帧（明文 counter 可伪造）污染重放窗口；
 - `learnDeviceSystemMapping()`：维护 `_deviceToSystem` / `_systemToDevice` 双向映射（接收时由 MAVLinkProtocol 在取密钥前学习，见 §4.2）；
 - `setGcsDeviceID()`：**拒绝签名位非法值**（规范 §1.4）；`state()`/`gcsDeviceID()` **加锁读取**（线程安全）。
@@ -354,7 +355,10 @@ if (MAVLinkCrypto::CryptoController::instance()->cryptoEnabled()) {
 
 新增两个私有方法 + 一个 per-channel 缓冲：
 
-- `_receiveEncryptedBytes()`：按 channel 累积字节到 `_cryptoRxBuffer[channel]`，流式重组完整加密帧（magic `0xFD` 同步 + len 字段定长），逐帧交给 `_processEncryptedFrame()`；
+- `_receiveEncryptedBytes()`：按 channel 累积字节到 `_cryptoRxBuffer[channel]`，流式重组完整帧（magic `0xFD` 同步 + len 字段定长），按 `msgidFromFrame` 分流——
+  - **明文特例：待命心跳（msgID=0）**（规范 §2.2）：不加密、无 counter/tag，`learnDeviceSystemMapping` 学习 deviceID↔sysid 后直接喂 `_feedStandardFrame()`（标准解析器），识别在线/待命；
+  - 其余帧 → `_processEncryptedFrame()` 走解密；
+- `_feedStandardFrame()`：把一段标准 MAVLink 帧字节逐字节喂 `mavlink_parse_char` 并走常规处理（计数/转发/日志/状态更新），供「解密还原帧」与「明文待命心跳」两处复用；
 - `_processEncryptedFrame()`：严格执行规范 §2.6 流程（PR 修复后）——
   1. 长度检查（payload block ≥ 28）
   2. `deviceIDFromFrame` 重组 deviceID、`counterFromFrame` 读 counter
@@ -372,6 +376,7 @@ if (MAVLinkCrypto::CryptoController::instance()->cryptoEnabled()) {
 ```cpp
 void _receiveEncryptedBytes(LinkInterface*, const SharedLinkInterfacePtr&, const QByteArray&);
 void _processEncryptedFrame(LinkInterface*, const SharedLinkInterfacePtr&, uint8_t channel, const QByteArray&);
+void _feedStandardFrame(LinkInterface*, const SharedLinkInterfacePtr&, uint8_t channel, const uint8_t* bytes, int len);
 QByteArray _cryptoRxBuffer[MAVLINK_COMM_NUM_BUFFERS];
 ```
 
@@ -437,7 +442,7 @@ crypto->deviceKeyManager()->setAuthToken(cryptoSettings->cryptoAuthToken()->rawV
 
 | 设置项 | 类型 | 默认 | 说明 |
 |--------|------|------|------|
-| `cryptoEnabled` | bool | `false` | 启用加密 MAVLink 链路（启用后接收端明文帧一律丢弃；发送端仅在 Active 状态加密，其余状态丢弃） |
+| `cryptoEnabled` | bool | `false` | 启用加密 MAVLink 链路（启用后接收端仅放行明文待命心跳 msgID=0，其余明文帧一律丢弃；发送端仅在 Active 状态加密，其余状态丢弃） |
 | `cryptoGcsServerUrl` | string | `""` | gcs_server 地址（提供设备密钥） |
 | `cryptoAuthToken` | string | `""` | 取密钥时的 Bearer 认证 token |
 | `cryptoGcsDeviceID` | uint32 | `0` | 本地面站自身的 32 位 deviceID（写入帧头） |
@@ -477,7 +482,7 @@ LinkInterface 收到字节
 ### 6.3 握手时序
 
 ```
-PX4（偶数 counter）──加密心跳──▶ QGC（Standby，只读解密，不回应）
+PX4 ──明文 HEARTBEAT（msgID=0，无 counter/tag）──▶ QGC（Standby，从帧头 deviceID 识别在线，不回应）
 QGC 确定任务 → MissionController::sendToVehicle
   → beginLinkingForSystemID(vehicleId)
   → fetchKey(deviceID) ──HTTPS GET──▶ gcs_server
@@ -510,8 +515,10 @@ QGC 确定任务 → MissionController::sendToVehicle
 | `_testParserAcceptsHighDeviceID` | parser 放行 deviceID 高字节复用 incompat_flags（bit1~7，规范 §1.4/§1.5） |
 | `_testParserSignedFlagPreserved` | bit0（SIGNED）置位 → 进入 SIGNATURE_WAIT（补丁不得破坏 SIGNED 判定） |
 | `_testParserRejectsBadCrc` | incompat 置位 + 坏 CRC → BAD_CRC（补丁不得旁路完整性校验） |
+| `_testRandomOddCounter` | counter 起点为 62 位奇数（规范 §2.5 防重启 nonce 复用） |
+| `_testNextOutgoingCounter` | `nextOutgoingCounter` 端到端：首帧随机奇数、后续 +2、非 Active 拒绝 |
 
-运行：`./build/Debug/QGroundControl --unittest:CryptoTest` → **18 passed, 0 failed**（16 项测试 + init/cleanup）。
+运行：`./build/Debug/QGroundControl --unittest:CryptoTest` → **20 passed, 0 failed**（18 项测试 + init/cleanup）。
 
 ---
 
@@ -563,6 +570,16 @@ QGC 确定任务 → MissionController::sendToVehicle
 - ✅ **parser 放行 incompat bit1~7**：标准 parser 把 `incompat_flags` 的 bit1~7 当作「未知保留标志」拒绝整帧，导致 deviceID ≥ `0x01000000` 的链路双向静默全断 → 构建期补丁 `tools/generators/patch_mavlink_parser.py` 去掉 `incompat_flags & ~MAVLINK_IFLAG_MASK` 拒绝检查（规范 §1.4/§1.5），deviceID 恢复 31 位可用
 - ✅ 单测 13 → **16 项**（新增 `_testParserAcceptsHighDeviceID` / `_testParserSignedFlagPreserved` / `_testParserRejectsBadCrc`：放行 incompat = 0x02/0x12/0xFE、SIGNED 位进入 SIGNATURE_WAIT、坏 CRC 判 BAD_CRC）
 
+### 已修复（同步 60816.1 规范）
+
+- ✅ **明文待命心跳接收**：PX4 待命心跳改为**明文 HEARTBEAT（msgID=0，无 counter/tag）**（规范 §2.2），`MAVLinkProtocol` 接收路径按 `msgidFromFrame` 分流——msgID=0 走标准解析器识别在线，其余走解密；抽出 `_feedStandardFrame()` 复用常规处理
+- ✅ **counter 随机 62 位奇数起点**：`CryptoController::nextOutgoingCounter` 建链首帧从「1」改为 `randomOddCounter()`（`QRandomGenerator::system()` + 最低位置 1，规范 §2.5 防重启后 nonce 复用）
+- ✅ **VTOL 扩展消息 ID 重编号**：`51000-51003` → `80000-80003`（避开 mavlink vendor 范围 50000-60099，规范 `mavlink_extension_protocol.md`）
+- ✅ 单测 16 → **18 项**（新增 `_testRandomOddCounter` / `_testNextOutgoingCounter`）
+- ✅ **明文心跳分流加长度判据**：msgid=0 且 payload block < 28 才走明文分支，避免建链后加密 HEARTBEAT（msgID=0、payload≥28）被误判为明文、密文被解析成垃圾心跳值
+- ✅ **counter 越界守卫**：`nextOutgoingCounter` 达 `COUNTER_MAX=2^62` 时拒绝发送（需重新建链换密钥，规范 §2.5）
+- ✅ **短帧丢弃打日志**：`_processEncryptedFrame` 的 `<28` 畸形帧丢弃补 `qCWarning`（含 len/msgid/deviceID）
+
 ### 仍待办
 
 - [ ] **mavp2p / PX4 联合测试**：端到端加密互通验证（需实机或模拟链路）；
@@ -570,4 +587,4 @@ QGC 确定任务 → MissionController::sendToVehicle
 - [ ] **密钥存储加固**：规范 §2.7.1 已标注「开发阶段明码存储」，正式部署前需改为加密存储；
 - [ ] **密钥轮换**：规范 §2.7.1 标注「待设计」，QGC 侧当前无轮换流程；
 - [ ] **加密帧 CRC 接收端未校验**：解密路径（`_processEncryptedFrame` / `decryptFrame`）未读取并校验加密帧末尾的 2 字节 CRC。GCM tag 仅认证 `counter`（AAD）+ `ciphertext`，**不认证帧头字段**（`len`/`seq`/`msgid`/deviceID）。帧头受传输噪声破坏时不会被 GCM 检测，只能靠 CRC，而当前该 CRC 未在接收端验证（规范 §2.1 已声明帧头不在认证范围，需业务层防范——此项为待补强点）；
-- [ ] **握手协议完整化**：当前把「gcs_server 取密钥成功」视为建链确认，未实现规范第三部分 PX4 回传奇数起点 X 的显式确认报文处理。
+- [ ] **建链语义核对**：当前把「gcs_server 取密钥成功」视为建链确认；60816.1 §2.5 下 QGC 以首个加密帧携带随机 62 位奇数 X 建链、PX4 收到后据此初始化下行 lastNonce，无需显式确认——需核对 QGC 首个加密帧的发送时机是否满足该语义。

@@ -1,8 +1,8 @@
 # MAVLink 自定义扩展协议
 
 > 本协议定义了 VTOL 飞行安全管理系统与地面站 (QGC) 之间的 MAVLink 自定义消息扩展。
-> 消息 ID 使用 50000-50003 (MAVLink 自定义扩展保留范围 50000-59999),
-> 对 PX4 飞控透明（静默丢弃）,不影响飞行安全。
+> 消息 ID 使用 80000-80004 (避开 mavlink 标准库 vendor 范围 50000-60099)，
+> 对 PX4 飞控透明（静默丢弃），不影响飞行安全。
 
 ---
 
@@ -19,7 +19,7 @@ QGC (扩展) → MAVLink 自定义消息 → mavlink-router (透明转发)
                                           ┌────────┴────────┐
                                           │                 │
                               mavlink_custom_receiver   gs_comms_monitor
-                               (msg_id 50000-50003)     (HEARTBEAT + ACK)
+                               (msg_id 80000-80003)     (HEARTBEAT + ACK)
                                           │
                               ┌───────────┼───────────┐
                               │           │           │
@@ -31,10 +31,10 @@ QGC (扩展) → MAVLink 自定义消息 → mavlink-router (透明转发)
 
 | 节点 | 功能 |
 |------|------|
-| `mavlink_custom_receiver` | 旁路拦截 msg_id 50000-50003,解析为 ROS2 消息,内存存储 |
-| `gs_comms_monitor_node` | 监听地面站 HEARTBEAT (msg_id=0) 和 COMMAND_ACK (msg_id=77),管理通信链路 |
-| `video_monitor_node` | 接收 `/vtol/video_control`,管理多摄像头（框架预留） |
-| `emergency_actuator_node` | 接收 `/vtol/emergency_decision`,执行应急（备降/迫降） |
+| `mavlink_custom_receiver` | 旁路拦截 msg_id 80000-80003，解析为 ROS2 消息，内存存储 |
+| `gs_comms_monitor_node` | 监听地面站 HEARTBEAT (msg_id=0) 和 COMMAND_ACK (msg_id=77)，管理通信链路 |
+| `video_monitor_node` | 接收 `/vtol/video_control`，管理多摄像头（框架预留） |
+| `emergency_actuator_node` | 接收 `/vtol/emergency_decision`，执行应急（备降/迫降） |
 
 **依赖**:
 - `pymavlink` — Python MAVLink 解析库
@@ -46,13 +46,14 @@ QGC (扩展) → MAVLink 自定义消息 → mavlink-router (透明转发)
 
 | msg_id | 名称 | 方向 | 用途 | 实现状态 |
 |--------|------|------|------|----------|
-| 50000 | `WEATHER_FORECAST` | QGC → ROS2 | 天气预报数据（单点） | ✅ 解析框架 |
-| 50001 | `ALTERNATE_LANDING` | QGC → ROS2 | 备降点数据 | ✅ 解析框架 |
-| 50002 | `SENSOR_CTRL` | QGC → ROS2 | 传感器控制命令 | ✅ 解析框架 |
-| 50003 | `VIDEO_CTRL` | QGC → ROS2 | 视频控制命令 | ⚠️ 框架预留 |
+| 80000 | `WEATHER_FORECAST` | QGC → ROS2 | 天气预报数据（单点） | ✅ 解析框架 |
+| 80001 | `ALTERNATE_LANDING` | QGC → ROS2 | 备降点数据 | ✅ 解析框架 |
+| 80002 | `SENSOR_CTRL` | QGC → ROS2 | 传感器控制命令 | ✅ 解析框架 |
+| 80003 | `VIDEO_CTRL` | QGC → ROS2 | 视频控制命令 | ⚠️ 框架预留 |
+| 80004 | `NONCE_SYNC` | mavros → PX4/abc_vtol | nonce 同步（counter，明文） | ⏳ 待实现 |
 
 > **实现状态说明**: 所有消息的 MAVLink 解析框架和 ROS2 消息映射已完成。
-> 模拟模式下使用本地 JSON 数据管道,实时模式需配置 mavlink-router 端点。
+> 模拟模式下使用本地 JSON 数据管道，实时模式需配置 mavlink-router 端点。
 
 ---
 
@@ -112,7 +113,7 @@ QGC (扩展) → MAVLink 自定义消息 → mavlink-router (透明转发)
 | 0 | `VTOL_SENSOR_CMD_DISABLE` | 禁用传感器 |
 | 1 | `VTOL_SENSOR_CMD_ENABLE` | 启用传感器 |
 
-> **安全约定**: 应急状态（EMERGENCY）下,`px4_command_bridge` 状态机拒绝 GCS 传感器控制命令,
+> **安全约定**: 应急状态（EMERGENCY）下，`px4_command_bridge` 状态机拒绝 GCS 传感器控制命令，
 > 确保关键传感器不被误关。
 
 ### 3.6 摄像头 ID (`VTOL_CAMERA_ID`)
@@ -141,9 +142,9 @@ QGC (扩展) → MAVLink 自定义消息 → mavlink-router (透明转发)
 
 ## 4. 消息详细定义
 
-### 4.1 WEATHER_FORECAST (msg_id=50000)
+### 4.1 WEATHER_FORECAST (msg_id=80000)
 
-**用途**: 地面站下发单点天气预报数据。多预报点通过发送多条消息实现,ROS2 端聚合。
+**用途**: 地面站下发单点天气预报数据。多预报点通过发送多条消息实现，ROS2 端聚合。
 
 **MAVLink 字段**:
 
@@ -183,13 +184,13 @@ QGC (扩展) → MAVLink 自定义消息 → mavlink-router (透明转发)
 | `visibility` (m) | `visibility` (float32) | 直通 |
 | `description` (char[21]) | `description` (string) | `rstrip('\x00')` |
 
-**存储**: 最多 50 个预报点（内存字典,键=`"lat,lon,from,to"`）
+**存储**: 最多 50 个预报点（内存字典，键=`"lat,lon,from,to"`）
 
 ---
 
-### 4.2 ALTERNATE_LANDING (msg_id=50001)
+### 4.2 ALTERNATE_LANDING (msg_id=80001)
 
-**用途**: 地面站下发备降点数据。每条消息承载一个备降点,多发多收。
+**用途**: 地面站下发备降点数据。每条消息承载一个备降点，多发多收。
 
 **MAVLink 字段**:
 
@@ -223,11 +224,11 @@ QGC (扩展) → MAVLink 自定义消息 → mavlink-router (透明转发)
 | `distance_from_current` (m) | `distance_from_current` (float32) | 直通 |
 | `description` (char[31]) | `description` (string) | `rstrip('\x00')` |
 
-**存储**: 最多 20 个备降点（内存字典,键=`site_id`）
+**存储**: 最多 20 个备降点（内存字典，键=`site_id`）
 
 ---
 
-### 4.3 SENSOR_CTRL (msg_id=50002)
+### 4.3 SENSOR_CTRL (msg_id=80002)
 
 **用途**: 地面站远程控制上位机传感器的启用/禁用。
 
@@ -255,7 +256,7 @@ QGC (扩展) → MAVLink 自定义消息 → mavlink-router (透明转发)
 
 ---
 
-### 4.4 VIDEO_CTRL (msg_id=50003)
+### 4.4 VIDEO_CTRL (msg_id=80003)
 
 **用途**: 地面站远程控制视频监控节点。支持多摄像头选择、分辨率/帧率/码率调整。
 
@@ -276,7 +277,7 @@ QGC (扩展) → MAVLink 自定义消息 → mavlink-router (透明转发)
 | `codec` | `char[8]` | — | 编码格式 ("h264", "h265", "mjpeg"; 空=不变) |
 | `reserved` | `uint8[6]` | — | 保留 (设为 0) |
 
-**ROS2 Topic**: `/vtol/video_control` → `VideoControl` (直通映射,单位不变)
+**ROS2 Topic**: `/vtol/video_control` → `VideoControl` (直通映射，单位不变)
 
 **状态反馈**: `/vtol/video_status` — `video_monitor_node` 发布 (1 Hz)
 
@@ -302,16 +303,16 @@ QGC (扩展) → MAVLink 自定义消息 → mavlink-router (透明转发)
 |------|------|------|
 | `MAV_CMD_USER_DEFINED_EMERGENCY` | 飞行安全紧急通知 (TBD) | ⚠️ 命令号待注册 |
 
-> **TBD**: 需要通过 MAVLink 官方注册自定义 MAV_CMD ID,避免与现有命令冲突。
+> **TBD**: 需要通过 MAVLink 官方注册自定义 MAV_CMD ID，避免与现有命令冲突。
 
 ---
 
 ## 6. PX4 安全性
 
-所有自定义消息 (50000-50003) 对 PX4 飞控完全透明：
+所有自定义消息 (80000-80003) 对 PX4 飞控完全透明：
 
-1. **静默丢弃**: PX4 不识别这些消息 ID,自动丢弃,不触发任何处理逻辑
-2. **不占用带宽**: 自定义消息通过 mavlink-router 转发到上位机专用端口,不经过 PX4 的串口/MAVLink 链路
+1. **静默丢弃**: PX4 不识别这些消息 ID，自动丢弃，不触发任何处理逻辑
+2. **不占用带宽**: 自定义消息通过 mavlink-router 转发到上位机专用端口，不经过 PX4 的串口/MAVLink 链路
 3. **不修改 PX4**: 无需修改 PX4 固件、mavlink 配置或参数
 4. **故障隔离**: 上位机崩溃不影响 PX4；QGC 不发送自定义消息也不影响 ROS2 安全逻辑（使用本地 JSON 模拟数据）
 

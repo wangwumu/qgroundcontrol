@@ -32,4 +32,8 @@ private slots:
     void _testParserAcceptsHighDeviceID();
     void _testParserSignedFlagPreserved();   // bit0(SIGNED) 置位 → 进入 SIGNATURE_WAIT
     void _testParserRejectsBadCrc();         // incompat 置位 + 坏 CRC → BAD_CRC
+
+    // counter 随机起点（规范 §2.5：62 位奇数，避免重启后 nonce 复用）
+    void _testRandomOddCounter();
+    void _testNextOutgoingCounter();         // nextOutgoingCounter 端到端：首帧随机、+2 递增、非 Active 拒绝
 };

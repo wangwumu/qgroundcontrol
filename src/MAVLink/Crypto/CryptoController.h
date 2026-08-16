@@ -4,7 +4,7 @@
 ///
 /// 职责：
 /// - 状态机：待命(Standby) → 建链中(Linking) → 正常(Active) → 回待命；
-/// - counter 管理：QGC 发送用**奇数**，取「严格大于该 deviceID 全局 lastNonce 的最小奇数」；
+/// - counter 管理：QGC 发送用**奇数**，建链首帧取加密安全随机 62 位奇数起点，此后取「严格大于该 deviceID 全局 lastNonce 的最小奇数」；
 /// - 防重放：按 deviceID 维护全局 lastNonce，`本次 > lastNonce` 才接受；
 /// - 密钥：经 DeviceKeyManager 获取，本控制器持有一个「活跃目标 deviceID + 密钥」。
 ///
@@ -108,6 +108,11 @@ public:
     /// 仅 Active 状态可调用。
     /// @return true=成功，outCounter 填充；false=非 Active 状态
     bool nextOutgoingCounter(uint64_t& outCounter);
+
+    /// 生成加密安全随机 62 位奇数 counter 起点（规范 §2.5：建链首帧用随机起点，
+    /// 避免重启后从 1 重来导致同一密钥下 nonce 复用）。
+    /// @return [1, 2^62) 内的奇数
+    static uint64_t randomOddCounter();
 
     /// 接收帧防重放「判定」（协议 §2.6 第 3 步）：counter > lastNonce[deviceID]？
     /// 纯检查，不更新状态。@return true=可接受；false=重放/乱序

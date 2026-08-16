@@ -1,6 +1,7 @@
 #include "CryptoTest.h"
 
 #include "Crypto/CryptoCodec.h"
+#include "Crypto/CryptoController.h"
 #include "Crypto/DeviceID.h"
 #include "Crypto/MAVLinkCrypto.h"
 #include "Crypto/ReplayGuard.h"
@@ -485,6 +486,57 @@ void CryptoTest::_testParserRejectsBadCrc()
     const uint8_t framing = parseFrame(frame, message, outStatus);
 
     QCOMPARE(static_cast<int>(framing), static_cast<int>(MAVLINK_FRAMING_BAD_CRC));
+}
+
+void CryptoTest::_testRandomOddCounter()
+{
+    // 建链首帧 counter 必须是 62 位奇数（规范 §2.5）：最低位置 1、且 < 2^62，
+    // 留出 +2 递增余量，避免重启后从 1 重来导致同一密钥下 nonce 复用。
+    for (int i = 0; i < 32; ++i) {
+        const uint64_t counter = CryptoController::randomOddCounter();
+        QVERIFY((counter & 1u) != 0u);
+        QVERIFY(counter < (1ull << 62));
+    }
+}
+
+void CryptoTest::_testNextOutgoingCounter()
+{
+    // nextOutgoingCounter 端到端：首帧随机 62 位奇数、后续严格 +2、非 Active 态拒绝。
+    CryptoController* const crypto = CryptoController::instance();
+    const DeviceID deviceID = 0x0A0B0C0Du; // bit24=0，满足签名位约束（规范 §1.4）
+
+    // 复位单例（Q_APPLICATION_STATIC 跨测试共享，需清历史状态）
+    crypto->returnToStandby();
+    crypto->resetReplay(deviceID);
+
+    // 缓存密钥后建链 → 同步进入 Active
+    crypto->deviceKeyManager()->cacheKey(deviceID, testKey());
+    crypto->beginLinking(deviceID);
+    QCOMPARE(crypto->state(), CryptoController::State::Active);
+
+    // 非 Active 态拒绝
+    crypto->returnToStandby();
+    uint64_t rejected = 0;
+    QVERIFY(!crypto->nextOutgoingCounter(rejected));
+    crypto->beginLinking(deviceID);
+    QCOMPARE(crypto->state(), CryptoController::State::Active);
+
+    // 首帧：随机 62 位奇数，不再恒为 1（P(c1==1)=2^-61，实践上不会 flaky）
+    uint64_t c1 = 0;
+    QVERIFY(crypto->nextOutgoingCounter(c1));
+    QVERIFY((c1 & 1u) != 0u);
+    QVERIFY(c1 < (1ull << 62));
+    QVERIFY(c1 != 1);
+
+    // 后续帧：严格 +2（对端依赖的确定性契约）
+    uint64_t c2 = 0;
+    QVERIFY(crypto->nextOutgoingCounter(c2));
+    QCOMPARE(c2, c1 + 2);
+
+    // 清理（单例 + 全局 lastNonce + key cache 均持久，避免污染同进程其他测试）
+    crypto->returnToStandby();
+    crypto->deviceKeyManager()->removeKey(deviceID);
+    crypto->resetReplay(deviceID);
 }
 
 UT_REGISTER_TEST_LIGHTWEIGHT(CryptoTest, TestLabel::Unit)

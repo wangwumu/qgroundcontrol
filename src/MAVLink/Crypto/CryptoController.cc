@@ -2,6 +2,7 @@
 
 #include <QtCore/QApplicationStatic>
 #include <QtCore/QLoggingCategory>
+#include <QtCore/QRandomGenerator>
 
 #include "QGCLoggingCategory.h"
 
@@ -217,13 +218,26 @@ bool CryptoController::nextOutgoingCounter(uint64_t& outCounter)
         // 取严格大于 last 的最小奇数
         outCounter = (last & 1u) ? (last + 2) : (last + 1);
     } else {
-        // 首帧：最小奇数起点
-        outCounter = 1;
+        // 首帧：加密安全随机 62 位奇数起点（避免重启后从 1 重来导致 nonce 复用，规范 §2.5）
+        outCounter = randomOddCounter();
+    }
+
+    // 达到 COUNTER_MAX = 2^62 时停止发送（重新建链换密钥），不得越界（规范 §2.5）
+    if (outCounter >= (1ull << 62)) {
+        qCWarning(CryptoControllerLog) << "outgoing counter reached 2^62, refuse to send (re-key required)";
+        return false;
     }
 
     // 原子预留：更新 lastNonce（outCounter 必 > last，accept 必成功）
     (void) _replayGuard.accept(_activeDeviceID, outCounter);
     return true;
+}
+
+uint64_t CryptoController::randomOddCounter()
+{
+    // 62 位随机，最低位置 1（奇数）；高 2 位清 0 留出 +2 递增余量，避免过早 wrap（规范 §2.5）
+    constexpr uint64_t kCounterMask = (1ull << 62) - 1ull;
+    return (QRandomGenerator::system()->generate64() & kCounterMask) | 1ull;
 }
 
 bool CryptoController::isIncomingAcceptable(DeviceID deviceID, uint64_t counter) const

@@ -74,11 +74,14 @@ private:
     bool _updateStatus(LinkInterface* link, const SharedLinkInterfacePtr linkPtr, uint8_t mavlinkChannel,
                        const mavlink_message_t& message);
 
-    /// 加密接收：流式重组加密帧 → 解密 → 还原标准帧 → 喂给 mavlink_parse_char。
+    /// 加密接收：流式重组帧 → 按 msgid 分流（msgID=0 明文待命心跳直通 / 其余解密还原）→ 喂给 mavlink_parse_char。
     void _receiveEncryptedBytes(LinkInterface* link, const SharedLinkInterfacePtr& linkPtr, const QByteArray& data);
     /// 处理一条完整加密帧：防重放 + 解密 + 密钥绑定 + 还原标准帧后逐字节喂给解析器。
     void _processEncryptedFrame(LinkInterface* link, const SharedLinkInterfacePtr& linkPtr, uint8_t channel,
                                 const QByteArray& encFrame);
+    /// 把一段标准 MAVLink 帧字节逐字节喂给 mavlink_parse_char 并走常规处理（解密还原后 / 明文待命心跳复用）。
+    void _feedStandardFrame(LinkInterface* link, const SharedLinkInterfacePtr& linkPtr, uint8_t channel,
+                            const uint8_t* bytes, int len);
 
     void _saveTelemetryLog(const QString& tempLogfile);
     bool _checkTelemetrySavePath();

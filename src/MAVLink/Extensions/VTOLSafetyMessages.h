@@ -1,7 +1,7 @@
 #pragma once
 
 /// @file VTOLSafetyMessages.h
-/// @brief Custom MAVLink messages (msg_id 51000-51003) for VTOL flight safety management.
+/// @brief Custom MAVLink messages (msg_id 80000-80003) for VTOL flight safety management.
 ///
 /// These messages are defined in docs/mavlink_extension_protocol.md and are
 /// transparent to PX4 (silently dropped). They are forwarded by mavlink-router
@@ -18,13 +18,13 @@ extern "C" {
 // Message ID Constants
 // ============================================================================
 
-#define MAVLINK_MSG_ID_WEATHER_FORECAST  51000
-#define MAVLINK_MSG_ID_ALTERNATE_LANDING 51001
-#define MAVLINK_MSG_ID_SENSOR_CTRL       51002
-#define MAVLINK_MSG_ID_VIDEO_CTRL        51003
+#define MAVLINK_MSG_ID_WEATHER_FORECAST  80000
+#define MAVLINK_MSG_ID_ALTERNATE_LANDING 80001
+#define MAVLINK_MSG_ID_SENSOR_CTRL       80002
+#define MAVLINK_MSG_ID_VIDEO_CTRL        80003
 
 // ============================================================================
-// 51000: WEATHER_FORECAST
+// 80000: WEATHER_FORECAST
 // ============================================================================
 
 MAVPACKED(
@@ -47,17 +47,17 @@ typedef struct __mavlink_weather_forecast_t {
 
 #define MAVLINK_MSG_ID_WEATHER_FORECAST_LEN     54U
 #define MAVLINK_MSG_ID_WEATHER_FORECAST_MIN_LEN  54U
-#define MAVLINK_MSG_ID_51000_LEN                 54U
-#define MAVLINK_MSG_ID_51000_MIN_LEN             54U
+#define MAVLINK_MSG_ID_80000_LEN                 54U
+#define MAVLINK_MSG_ID_80000_MIN_LEN             54U
 
 #define MAVLINK_MSG_ID_WEATHER_FORECAST_CRC 255
-#define MAVLINK_MSG_ID_51000_CRC            255
+#define MAVLINK_MSG_ID_80000_CRC            255
 
 #define MAVLINK_MSG_WEATHER_FORECAST_FIELD_DESCRIPTION_LEN 21
 
 #if MAVLINK_COMMAND_24BIT
 #define MAVLINK_MESSAGE_INFO_WEATHER_FORECAST { \
-    51000, \
+    80000, \
     "WEATHER_FORECAST", \
     14, \
     {  { "latitude", NULL, MAVLINK_TYPE_INT32_T, 0, 0, offsetof(mavlink_weather_forecast_t, latitude) }, \
@@ -246,7 +246,7 @@ static inline uint16_t mavlink_msg_weather_forecast_get_description(const mavlin
     { return _MAV_RETURN_char_array(msg, description, 21, 33); }
 
 // ============================================================================
-// 51001: ALTERNATE_LANDING
+// 80001: ALTERNATE_LANDING
 // ============================================================================
 
 MAVPACKED(
@@ -266,18 +266,18 @@ typedef struct __mavlink_alternate_landing_t {
 
 #define MAVLINK_MSG_ID_ALTERNATE_LANDING_LEN     70U
 #define MAVLINK_MSG_ID_ALTERNATE_LANDING_MIN_LEN  70U
-#define MAVLINK_MSG_ID_51001_LEN                  70U
-#define MAVLINK_MSG_ID_51001_MIN_LEN              70U
+#define MAVLINK_MSG_ID_80001_LEN                  70U
+#define MAVLINK_MSG_ID_80001_MIN_LEN              70U
 
 #define MAVLINK_MSG_ID_ALTERNATE_LANDING_CRC 254
-#define MAVLINK_MSG_ID_51001_CRC            254
+#define MAVLINK_MSG_ID_80001_CRC            254
 
 #define MAVLINK_MSG_ALTERNATE_LANDING_FIELD_SITE_ID_LEN 16
 #define MAVLINK_MSG_ALTERNATE_LANDING_FIELD_DESCRIPTION_LEN 31
 
 #if MAVLINK_COMMAND_24BIT
 #define MAVLINK_MESSAGE_INFO_ALTERNATE_LANDING { \
-    51001, \
+    80001, \
     "ALTERNATE_LANDING", \
     11, \
     {  { "site_id", NULL, MAVLINK_TYPE_CHAR, 16, 0, offsetof(mavlink_alternate_landing_t, site_id) }, \
@@ -426,7 +426,7 @@ static inline uint16_t mavlink_msg_alternate_landing_get_description(const mavli
     { return _MAV_RETURN_char_array(msg, description, 31, 39); }
 
 // ============================================================================
-// 51002: SENSOR_CTRL
+// 80002: SENSOR_CTRL
 // ============================================================================
 
 MAVPACKED(
@@ -440,17 +440,17 @@ typedef struct __mavlink_sensor_ctrl_t {
 
 #define MAVLINK_MSG_ID_SENSOR_CTRL_LEN     8U
 #define MAVLINK_MSG_ID_SENSOR_CTRL_MIN_LEN  8U
-#define MAVLINK_MSG_ID_51002_LEN            8U
-#define MAVLINK_MSG_ID_51002_MIN_LEN        8U
+#define MAVLINK_MSG_ID_80002_LEN            8U
+#define MAVLINK_MSG_ID_80002_MIN_LEN        8U
 
 #define MAVLINK_MSG_ID_SENSOR_CTRL_CRC 255
-#define MAVLINK_MSG_ID_51002_CRC       255
+#define MAVLINK_MSG_ID_80002_CRC       255
 
 #define MAVLINK_MSG_SENSOR_CTRL_FIELD_RESERVED_LEN 4
 
 #if MAVLINK_COMMAND_24BIT
 #define MAVLINK_MESSAGE_INFO_SENSOR_CTRL { \
-    51002, \
+    80002, \
     "SENSOR_CTRL", \
     5, \
     {  { "target_system", NULL, MAVLINK_TYPE_UINT8_T, 0, 0, offsetof(mavlink_sensor_ctrl_t, target_system) }, \
@@ -540,7 +540,7 @@ static inline uint8_t mavlink_msg_sensor_ctrl_get_command(const mavlink_message_
     { return _MAV_RETURN_uint8_t(msg, 3); }
 
 // ============================================================================
-// 51003: VIDEO_CTRL
+// 80003: VIDEO_CTRL
 // ============================================================================
 
 MAVPACKED(
@@ -559,18 +559,18 @@ typedef struct __mavlink_video_ctrl_t {
 
 #define MAVLINK_MSG_ID_VIDEO_CTRL_LEN     25U
 #define MAVLINK_MSG_ID_VIDEO_CTRL_MIN_LEN  25U
-#define MAVLINK_MSG_ID_51003_LEN           25U
-#define MAVLINK_MSG_ID_51003_MIN_LEN       25U
+#define MAVLINK_MSG_ID_80003_LEN           25U
+#define MAVLINK_MSG_ID_80003_MIN_LEN       25U
 
 #define MAVLINK_MSG_ID_VIDEO_CTRL_CRC 63
-#define MAVLINK_MSG_ID_51003_CRC      63
+#define MAVLINK_MSG_ID_80003_CRC      63
 
 #define MAVLINK_MSG_VIDEO_CTRL_FIELD_CODEC_LEN 8
 #define MAVLINK_MSG_VIDEO_CTRL_FIELD_RESERVED_LEN 6
 
 #if MAVLINK_COMMAND_24BIT
 #define MAVLINK_MESSAGE_INFO_VIDEO_CTRL { \
-    51003, \
+    80003, \
     "VIDEO_CTRL", \
     10, \
     {  { "target_system", NULL, MAVLINK_TYPE_UINT8_T, 0, 0, offsetof(mavlink_video_ctrl_t, target_system) }, \

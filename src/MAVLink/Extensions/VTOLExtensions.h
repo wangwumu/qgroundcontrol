@@ -27,7 +27,7 @@ public:
     ~VTOLExtensions() override;
 
     // ------------------------------------------------------------------------
-    // Weather Forecast (msg_id 50000)
+    // Weather Forecast (msg_id 80000)
     // ------------------------------------------------------------------------
     /// Send a single-point weather forecast. Multiple points sent as separate messages.
     /// @param vehicle      Target vehicle (null-checked; silently returns if null)
@@ -55,7 +55,7 @@ public:
         const QString& description);
 
     // ------------------------------------------------------------------------
-    // Alternate Landing (msg_id 50001)
+    // Alternate Landing (msg_id 80001)
     // ------------------------------------------------------------------------
     /// Send an alternate landing site. One message per site.
     /// @param vehicle              Target vehicle
@@ -80,7 +80,7 @@ public:
         const QString& description);
 
     // ------------------------------------------------------------------------
-    // Sensor Control (msg_id 50002)
+    // Sensor Control (msg_id 80002)
     // ------------------------------------------------------------------------
     /// Send a sensor enable/disable command.
     /// @param vehicle          Target vehicle
@@ -94,7 +94,7 @@ public:
         quint8 sensorId, quint8 command);
 
     // ------------------------------------------------------------------------
-    // Video Control (msg_id 50003)
+    // Video Control (msg_id 80003)
     // ------------------------------------------------------------------------
     /// Send a video control command.
     /// @param vehicle          Target vehicle

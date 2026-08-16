@@ -35,7 +35,7 @@ bool VTOLExtensions::_sendMessage(Vehicle* vehicle, mavlink_message_t& msg)
 }
 
 // ----------------------------------------------------------------------------
-// Weather Forecast (msg_id 50000)
+// Weather Forecast (msg_id 80000)
 // ----------------------------------------------------------------------------
 void VTOLExtensions::sendWeatherForecast(
     Vehicle* vehicle,
@@ -86,7 +86,7 @@ void VTOLExtensions::sendWeatherForecast(
 }
 
 // ----------------------------------------------------------------------------
-// Alternate Landing (msg_id 50001)
+// Alternate Landing (msg_id 80001)
 // ----------------------------------------------------------------------------
 void VTOLExtensions::sendAlternateLanding(
     Vehicle* vehicle,
@@ -136,7 +136,7 @@ void VTOLExtensions::sendAlternateLanding(
 }
 
 // ----------------------------------------------------------------------------
-// Sensor Control (msg_id 50002)
+// Sensor Control (msg_id 80002)
 // ----------------------------------------------------------------------------
 void VTOLExtensions::sendSensorCtrl(
     Vehicle* vehicle,
@@ -166,7 +166,7 @@ void VTOLExtensions::sendSensorCtrl(
 }
 
 // ----------------------------------------------------------------------------
-// Video Control (msg_id 50003)
+// Video Control (msg_id 80003)
 // ----------------------------------------------------------------------------
 void VTOLExtensions::sendVideoCtrl(
     Vehicle* vehicle,
