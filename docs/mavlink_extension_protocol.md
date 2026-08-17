@@ -8,37 +8,42 @@
 
 ## 1. 架构
 
+> 80000-80003 业务消息为任务帧，**纳入加密**（文档 10 §2.2）。QGC 以 deviceID=D + 奇数
+> counter 加密，经 mavros Router 透传，由 `mavlink_crypto_node` 解密，再由
+> `mavlink_custom_receiver` 订阅 `/vtol/mavlink_rx` 分发解析。不再走 mavlink-router 明文旁路。
+
 ```
-QGC (扩展) → MAVLink 自定义消息 → mavlink-router (透明转发)
-                                        │
-                       ┌────────────────┼────────────────┐
-                       │                                 │
-                  PX4 飞控                      上位机 ROS2
-              (静默丢弃, 不受影响)           (旁路监听, 拦截解析)
-                                                   │
-                                          ┌────────┴────────┐
-                                          │                 │
-                              mavlink_custom_receiver   gs_comms_monitor
-                               (msg_id 80000-80003)     (HEARTBEAT + ACK)
-                                          │
-                              ┌───────────┼───────────┐
-                              │           │           │
-                     weather_forecast  alt_landing  sensor/video
-                          点存储        备降点存储    ctrl 发布
+QGC (扩展) → 加密 80000-80003 (deviceID=D, 奇数 counter)
+        → mavros Router (router-only, 透传加密帧, /uas1)
+                       │
+          ┌────────────┼────────────┐
+          │                         │
+     PX4 飞控               abc_vtol 上位机 ROS2
+ (静默丢弃, 不受影响)     mavlink_crypto_node (AES-256-GCM 解密)
+                                   │
+                        /vtol/mavlink_rx (MavlinkDecrypted)
+                                   │
+                     mavlink_custom_receiver (msgid 80000-80003 分发)
+                                   │
+              ┌────────────────────┼───────────────┐
+              │                    │               │
+     weather_forecast        alt_landing      sensor/video
+          点存储              备降点存储        ctrl 发布
 ```
 
 **关键节点**:
 
 | 节点 | 功能 |
 |------|------|
-| `mavlink_custom_receiver` | 旁路拦截 msg_id 80000-80003，解析为 ROS2 消息，内存存储 |
+| `mavlink_crypto_node` | AES-256-GCM 解密 PX4/QGC 加密帧，发布 `MavlinkDecrypted` 到 `/vtol/mavlink_rx` |
+| `mavlink_custom_receiver` | 订阅 `/vtol/mavlink_rx`，按 msgid 分发 80000-80003，struct 解析为 ROS2 消息，内存存储 |
 | `gs_comms_monitor_node` | 监听地面站 HEARTBEAT (msg_id=0) 和 COMMAND_ACK (msg_id=77)，管理通信链路 |
 | `video_monitor_node` | 接收 `/vtol/video_control`，管理多摄像头（框架预留） |
 | `emergency_actuator_node` | 接收 `/vtol/emergency_decision`，执行应急（备降/迫降） |
 
 **依赖**:
-- `pymavlink` — Python MAVLink 解析库
-- `mavlink-router` — UDP 端点配置 (`udp://127.0.0.1:14551`)
+- `mavros Router` — router-only 模式透传加密帧（`/uas1/mavlink_source`、`/uas1/mavlink_sink`），不解析 payload
+- `mavlink_crypto_node` — payload 加解密核心（见文档 10 §2.x）
 
 ---
 
@@ -50,10 +55,10 @@ QGC (扩展) → MAVLink 自定义消息 → mavlink-router (透明转发)
 | 80001 | `ALTERNATE_LANDING` | QGC → ROS2 | 备降点数据 | ✅ 解析框架 |
 | 80002 | `SENSOR_CTRL` | QGC → ROS2 | 传感器控制命令 | ✅ 解析框架 |
 | 80003 | `VIDEO_CTRL` | QGC → ROS2 | 视频控制命令 | ⚠️ 框架预留 |
-| 80004 | `NONCE_SYNC` | mavros → PX4/abc_vtol | nonce 同步（counter，明文） | ⏳ 待实现 |
+| 80004 | `NONCE_SYNC` | mavros → PX4/abc_vtol | nonce 同步（counter，明文） | ⚠️ mavros 发方待实现 / abc_vtol 收方已就位 |
 
 > **实现状态说明**: 所有消息的 MAVLink 解析框架和 ROS2 消息映射已完成。
-> 模拟模式下使用本地 JSON 数据管道，实时模式需配置 mavlink-router 端点。
+> 模拟模式下使用本地 JSON 数据管道，实时模式依赖 mavlink_crypto_node 解密结果 (/vtol/mavlink_rx)。
 
 ---
 
@@ -184,7 +189,7 @@ QGC (扩展) → MAVLink 自定义消息 → mavlink-router (透明转发)
 | `visibility` (m) | `visibility` (float32) | 直通 |
 | `description` (char[21]) | `description` (string) | `rstrip('\x00')` |
 
-**存储**: 最多 50 个预报点（内存字典，键=`"lat,lon,from,to"`）
+**存储**: 最多 50 个预报点（内存字典，键=`"lat,lon"` 4 位小数拼接，超限 FIFO 驱逐最旧）
 
 ---
 
@@ -248,7 +253,7 @@ QGC (扩展) → MAVLink 自定义消息 → mavlink-router (透明转发)
 |---------|--------|
 | `sensor_id` (uint8) | `sensor_id` (string) — 查表映射: 0→"front_lidar", 1→"rear_lidar", 2→"front_mmwave", 3→"temp_humidity", 4→"rain", 15→"all" |
 | `command` (uint8) | `command` (uint8) — 直通 (0=DISABLE, 1=ENABLE) |
-| — | `source` = `SOURCE_MAVLINK` (0) |
+| — | `source` = `SOURCE_MAVLINK` (1，`SensorControl.msg` 中 SOURCE_MAVLINK=1) |
 
 **ROS2 Topic**: `/vtol/sensor_control`
 
@@ -312,7 +317,7 @@ QGC (扩展) → MAVLink 自定义消息 → mavlink-router (透明转发)
 所有自定义消息 (80000-80003) 对 PX4 飞控完全透明：
 
 1. **静默丢弃**: PX4 不识别这些消息 ID，自动丢弃，不触发任何处理逻辑
-2. **不占用带宽**: 自定义消息通过 mavlink-router 转发到上位机专用端口，不经过 PX4 的串口/MAVLink 链路
+2. **payload 加密**: 自定义消息为任务帧，payload 已 AES-256-GCM 加密，明文不可见（见文档 10 §2.2）
 3. **不修改 PX4**: 无需修改 PX4 固件、mavlink 配置或参数
 4. **故障隔离**: 上位机崩溃不影响 PX4；QGC 不发送自定义消息也不影响 ROS2 安全逻辑（使用本地 JSON 模拟数据）
 
@@ -323,7 +328,8 @@ QGC (扩展) → MAVLink 自定义消息 → mavlink-router (透明转发)
 | 文件 | 说明 |
 |------|------|
 | `mavlink_dialect/vtol_safety.xml` | MAVLink XML 方言定义（协议源头） |
-| `mavlink_custom_receiver.py` | 消息拦截 + 解析 + 存储节点 |
+| `mavlink_custom_receiver.py` | 订阅 `/vtol/mavlink_rx` 解密结果，按 msgid 分发解析 80000-80003 + 存储节点 |
+| `mavlink_crypto_node.py` | AES-256-GCM 解密 + 握手获取密钥（文档 10 §2.8） |
 | `gs_comms_monitor_node.py` | 地面站心跳监听 + 链路管理 |
 | `weather_forecast_client.py` | 天气预报 HTTP API 客户端（备用） |
 | `video_monitor_node.cpp` | 视频监控/图传节点 |
@@ -334,8 +340,8 @@ QGC (扩展) → MAVLink 自定义消息 → mavlink-router (透明转发)
 
 | 项目 | 优先级 | 说明 |
 |------|--------|------|
-| QGC 自定义插件 | 低 | QGC 需扩展 UI 以发送自定义消息（目前通过 JSON 模拟） |
-| mavlink-router 端点配置 | 中 | 实飞时配置 UDP 14551 端口旁路监听 |
+| QGC 自定义插件 | 低 | QGC 需扩展 UI 以加密发送自定义消息（目前通过 JSON 模拟） |
+| QGC 加密 80000-80003 发送 | 中 | QGC 侧以 deviceID=D + 奇数 counter 加密 80000-80003 上行（文档 10 §2.5/§2.6） |
 | MAV_CMD ID 注册 | 低 | 通过 MAVLink 官方注册 `MAV_CMD_USER_DEFINED_EMERGENCY` |
 | weather_forecast 实时 API | 低 | 备用 HTTP API 客户端 (`weather_forecast_client`) |
 | 视频推流 | 低 | GStreamer/V4L2 采集 + RTSP/WebRTC 推流 |

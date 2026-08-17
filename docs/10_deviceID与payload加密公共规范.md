@@ -99,6 +99,7 @@ deviceID 的 bit25~31 复用 `incompatFlag` 字节的 bit1~7，而 MAVLink 标�
   - **待命心跳**：PX4 上电无时钟/GPS 授时，无法安全初始化加密 nonce，**以标准 HEARTBEAT（msgID=0）明文承载**——不加密、无 counter/tag、不参与 nonce 序列（见 §2.5）；
   - **NONCE_SYNC（msgid=80004）**：mavros 发出的 nonce 同步报文，仅同步 counter，不加密（见 §2.5「mavros 同步」）。
   接收方收到这两个特例之外的**非加密帧**（明文 payload）一律丢弃并记录日志。
+  80000-80003 业务消息（QGC→companion computer 的天气预报/备降点/传感器控制/视频控制）为任务帧，**纳入加密**：QGC 以 deviceID=D + 奇数 counter 加密上行，经 mavros Router 透传，由 `mavlink_crypto_node` 解密发布到 `/vtol/mavlink_rx`，`mavlink_custom_receiver` 订阅并按 msgid 分发解析到业务 topic。**不再有 mavlink-router 明文旁路**（见 `mavlink_extension_protocol.md`）。
   > **在线状态公开可见**：帧头 deviceID 为明文，任何观察者（QGC、mavp2p、gcs_server、companion computer abc_vtol）无需解密即可感知"某 deviceID 在发帧（在线）"；payload 内的状态/位置等为密文，需密钥解密。**待命/心跳用标准 HEARTBEAT（msgID=0）明文承载**，识别靠帧头 deviceID + 明文 msgID=0。
 - **零长度消息禁止**：加密明文 = `deviceID(4B) || 原始消息 payload`，且 **原始消息 payload 长度必须 ≥ 1 字节**——避免与"超限退化帧"（明文仅 deviceID、payload 为空，见 2.3）在接收端形态相同而无法区分。任何一方不得发送 payload 为空的合法消息。
   > **链路范围边界**：本协议适用于**升级组件之间经 mavp2p 的链路**。数传直连链路（PX4 TELEM1 ↔ GCS，应急/监控旁路）是否纳入本加密方案，或作为独立明文旁路，**需另行约定**，不在本协议范围。
@@ -146,8 +147,8 @@ payload block 受 MAVLink `len` 字段上限 **255 字节**约束，即 `N + 24 
 
 ```
 ┌──────────────┬──────────────────────────────┐
-│ deviceID(4B) │  原始 MAVLink 消息 (变长)      │
-│  设备标识     │  按 msgID 标准格式序列化        │
+│ deviceID(4B) │  原始 MAVLink 消息 (变长)     │
+│  设备标识     │  按 msgID 标准格式序列化      │
 └──────────────┴──────────────────────────────┘
 ```
 
@@ -307,6 +308,7 @@ companion computer（本方案中为 **abc_vtol**，PX4 的 ROS2 上位机）需
 **PX4 侧 uORB `.msg` 文件（`msg/` 目录，与上表字段一一对应）**：
 
 `msg/device_credential_request.msg`：
+
 ```
 uint64 timestamp   # time since system start (microseconds)
 
@@ -314,6 +316,7 @@ uint32 req_id
 ```
 
 `msg/device_credential.msg`：
+
 ```
 uint64 timestamp   # time since system start (microseconds)
 
@@ -324,6 +327,7 @@ uint32 cred_seq
 ```
 
 `msg/device_credential_ack.msg`：
+
 ```
 uint64 timestamp   # time since system start (microseconds)
 
@@ -442,7 +446,7 @@ CC (abc_vtol)                              PX4
 | **data_writer** | 本仓库 `~/uavm/data_writer` | 从帧头重组 deviceID，写入遥测记录的设备归属字段 | 对下行遥测执行 2.6 完整流程（长度检查 → 防重放 `> lastNonce` → 用 key 解密 → 密钥绑定 → 解析写库；空 payload 消息丢弃）；对待命心跳（按明文 msgID=0 识别）更新该无人机在线状态；密钥取自 `table_device_key` 表 |
 | **gcs_server** | 本仓库 `~/uavm/gcs_server` | 无人机注册 API 提供 `device_id` 字段登记；设备标识以 deviceID 为准 | ① 管理密钥（登记、查询、轮换）；② 向 QGC 提供 HTTPS 取密钥接口；③ 不接触实时加密帧 |
 | **QGC 地面站** | QGC | 从帧头重组 deviceID 显示/关联设备 | ① **感知在线**：从明文帧头 deviceID 识别在线无人机，不回应与自己无关的心跳；② **任务建链**：确定航线+选定无人机后，从 gcs_server 取该 deviceID 密钥，加密回传**随机 62 位奇数起点 X**（`secrets.randbits(62)\|1`，见 2.5）；③ 解密下行遥测：用 key（2.6 流程）；④ 加密上行指令：用 key，**counter 从建链起点 +2 递增**，组包前做超限检查；⑤ 维护该 deviceID 全局 lastNonce（含 PX4 遥测），判重 `本次 > lastNonce`；⑥ key 经 HTTPS 向 gcs_server 获取，不落 MAVLink；⑦ 非任务 QGC 只读，不响应握手、不发指令 |
-| **companion computer（abc_vtol）** | 本仓库 abc_vtol | 从帧头重组 deviceID，用于解密密钥绑定 | ① 密钥经本地 DDS/uXRCE 握手获取（§2.8）；② 解密 PX4 下行遥测（2.6 流程）；③ 加密下行应答/通知，counter 用偶数（步长 +100，见 §2.5「下行偶数的协调」）；④ 维护下行 lastNonce（经 mavros 同步，协调）与全局 lastNonce（防重放），判重 `本次 > lastNonce`；⑤ 是 PX4 的马甲（共用 deviceID=D），下行偶数方，与 PX4 共享 nonce 序列 |
+| **companion computer（abc_vtol）** | 本仓库 abc_vtol | 从帧头重组 deviceID，用于解密密钥绑定 | ① 密钥经本地 DDS/uXRCE 握手获取（§2.8）；② 解密 PX4 下行遥测（2.6 流程）；③ 加密下行应答/通知，counter 用偶数（步长 +100，见 §2.5「下行偶数的协调」）；④ 维护下行 lastNonce（经 mavros 同步，协调）与全局 lastNonce（防重放），判重 `本次 > lastNonce`；⑤ 是 PX4 的马甲（共用 deviceID=D），下行偶数方，与 PX4 共享 nonce 序列；⑥ 解密 QGC 下发的 80000-80003 业务消息并经 `/vtol/mavlink_rx` 分发（见 §2.2） |
 | **table_device_key 表** | 数据库（本仓库） | 以 deviceID 为主键 | 存 deviceID ↔ key、密钥版本、状态（active/revoked），密钥加密存储 |
 | **table_uav 表** | 数据库（本仓库） | `device_id`（BIGINT，全局唯一）为新设备标识；`uid` 为信任根（加密存储、API 不返回） | — |
 

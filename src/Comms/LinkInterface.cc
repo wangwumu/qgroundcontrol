@@ -7,6 +7,7 @@
 #include "SigningController.h"
 #include "Crypto/CryptoCodec.h"
 #include "Crypto/CryptoController.h"
+#include "Extensions/VTOLSafetyMessages.h"
 
 #include <QtQml/QQmlEngine>
 
@@ -121,7 +122,12 @@ void LinkInterface::sendMessageThreadSafe(mavlink_message_t &message)
         MAVLinkCrypto::Key key;
         uint64_t counter = 0;
         if (crypto->activeKey(key) && crypto->nextOutgoingCounter(counter)) {
-            const uint8_t crcExtra = mavlink_get_crc_extra(&message);
+            // 80000-80003 未注册进 mavlink 生成层，mavlink_get_crc_extra 返回 0；
+            // 走自定义 CRC 助手，否则加密帧 CRC 与接收端不一致（规范 mavlink_extension_protocol.md）。
+            uint8_t crcExtra = 0;
+            if (!mavlink_msg_vtol_crc_extra(message.msgid, &crcExtra)) {
+                crcExtra = mavlink_get_crc_extra(&message);
+            }
             uint8_t encBuffer[MAVLINK_MAX_PACKET_LEN + 32];
             int encLen = 0;
             // 帧头/明文内嵌/nonce 的 deviceID 一律用「目标无人机」，接收方按它查自己的密钥；

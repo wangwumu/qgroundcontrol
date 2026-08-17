@@ -6,6 +6,7 @@
 #include "Crypto/MAVLinkCrypto.h"
 #include "Crypto/ReplayGuard.h"
 #include "MAVLinkLib.h"
+#include "Extensions/VTOLSafetyMessages.h"
 
 #include <QtTest/QtTest>
 
@@ -537,6 +538,94 @@ void CryptoTest::_testNextOutgoingCounter()
     crypto->returnToStandby();
     crypto->deviceKeyManager()->removeKey(deviceID);
     crypto->resetReplay(deviceID);
+}
+
+void CryptoTest::_testVtolMessages()
+{
+    // 1) CRC_EXTRA：必须与 pymavlink message_checksum 一致（算法已用 HEARTBEAT=50 校验）。
+    //    旧值为占位 255/254/255/63，会导致加密帧 CRC 与接收端不符。
+    uint8_t crc = 0;
+    QVERIFY(mavlink_msg_vtol_crc_extra(MAVLINK_MSG_ID_WEATHER_FORECAST, &crc));
+    QCOMPARE(crc, static_cast<uint8_t>(152));
+    QVERIFY(mavlink_msg_vtol_crc_extra(MAVLINK_MSG_ID_ALTERNATE_LANDING, &crc));
+    QCOMPARE(crc, static_cast<uint8_t>(84));
+    QVERIFY(mavlink_msg_vtol_crc_extra(MAVLINK_MSG_ID_SENSOR_CTRL, &crc));
+    QCOMPARE(crc, static_cast<uint8_t>(78));
+    QVERIFY(mavlink_msg_vtol_crc_extra(MAVLINK_MSG_ID_VIDEO_CTRL, &crc));
+    QCOMPARE(crc, static_cast<uint8_t>(22));
+    // 非 VTOL 消息 → 返回 false（调用方回退 mavlink_get_crc_extra）
+    QVERIFY(!mavlink_msg_vtol_crc_extra(MAVLINK_MSG_ID_HEARTBEAT, &crc));
+
+    // 2) 字段排序：MAVLink 要求类型大小降序（pymavlink 强制），offsetof 反映 wire 布局。
+    //    旧 struct 把 uint8 组排在 uint16 组之前，导致与接收端逐字节错位。
+    QCOMPARE(offsetof(mavlink_weather_forecast_t, wind_speed), size_t(20));
+    QCOMPARE(offsetof(mavlink_weather_forecast_t, weather_type), size_t(30));
+    QCOMPARE(offsetof(mavlink_alternate_landing_t, distance_from_current), size_t(12));
+    QCOMPARE(offsetof(mavlink_alternate_landing_t, runway_length), size_t(16));
+    QCOMPARE(offsetof(mavlink_alternate_landing_t, site_id), size_t(20));
+    QCOMPARE(offsetof(mavlink_alternate_landing_t, site_type), size_t(36));
+    QCOMPARE(offsetof(mavlink_video_ctrl_t, resolution_w), size_t(0));
+    QCOMPARE(offsetof(mavlink_video_ctrl_t, target_system), size_t(6));
+    QCOMPARE(offsetof(mavlink_video_ctrl_t, codec), size_t(11));
+
+    // 3) pack → decode 往返（字段映射一致性）。
+    mavlink_message_t msg{};
+
+    mavlink_msg_weather_forecast_pack(0x01, 0x02, &msg, 10000000, 20000000, 30000, 111, 222, 3, 2, 80, 1500, 27000, 250,
+                                      1200, 5000, "sunny");
+    mavlink_weather_forecast_t wf{};
+    mavlink_msg_weather_forecast_decode(&msg, &wf);
+    QCOMPARE(wf.latitude, static_cast<int32_t>(10000000));
+    QCOMPARE(wf.longitude, static_cast<int32_t>(20000000));
+    QCOMPARE(wf.altitude, static_cast<int32_t>(30000));
+    QCOMPARE(wf.valid_from, static_cast<uint32_t>(111));
+    QCOMPARE(wf.valid_to, static_cast<uint32_t>(222));
+    QCOMPARE(wf.weather_type, static_cast<uint8_t>(3));
+    QCOMPARE(wf.severity, static_cast<uint8_t>(2));
+    QCOMPARE(wf.confidence, static_cast<uint8_t>(80));
+    QCOMPARE(wf.wind_speed, static_cast<uint16_t>(1500));
+    QCOMPARE(wf.wind_direction, static_cast<uint16_t>(27000));
+    QCOMPARE(wf.temperature, static_cast<int16_t>(250));
+    QCOMPARE(wf.rainfall, static_cast<uint16_t>(1200));
+    QCOMPARE(wf.visibility, static_cast<uint16_t>(5000));
+    QCOMPARE(QByteArray(wf.description, 5), QByteArray("sunny"));
+
+    mavlink_msg_alternate_landing_pack(0x01, 0x02, &msg, "SITE01", 10000000, 20000000, 30000, 1, 2, 500, 9000, 3, 7500,
+                                       "field");
+    mavlink_alternate_landing_t al{};
+    mavlink_msg_alternate_landing_decode(&msg, &al);
+    QCOMPARE(al.latitude, static_cast<int32_t>(10000000));
+    QCOMPARE(al.longitude, static_cast<int32_t>(20000000));
+    QCOMPARE(al.altitude, static_cast<int32_t>(30000));
+    QCOMPARE(al.site_type, static_cast<uint8_t>(1));
+    QCOMPARE(al.priority, static_cast<uint8_t>(2));
+    QCOMPARE(al.runway_length, static_cast<uint16_t>(500));
+    QCOMPARE(al.runway_heading, static_cast<uint16_t>(9000));
+    QCOMPARE(al.surface_condition, static_cast<uint8_t>(3));
+    QCOMPARE(al.distance_from_current, static_cast<uint32_t>(7500));
+    QCOMPARE(QByteArray(al.site_id, 6), QByteArray("SITE01"));
+    QCOMPARE(QByteArray(al.description, 5), QByteArray("field"));
+
+    mavlink_msg_sensor_ctrl_pack(0x01, 0x02, &msg, 10, 20, 3, 1);
+    mavlink_sensor_ctrl_t sc{};
+    mavlink_msg_sensor_ctrl_decode(&msg, &sc);
+    QCOMPARE(sc.target_system, static_cast<uint8_t>(10));
+    QCOMPARE(sc.target_component, static_cast<uint8_t>(20));
+    QCOMPARE(sc.sensor_id, static_cast<uint8_t>(3));
+    QCOMPARE(sc.command, static_cast<uint8_t>(1));
+
+    mavlink_msg_video_ctrl_pack(0x01, 0x02, &msg, 10, 20, 5, 1, 1920, 1080, 30, 4000, "h264");
+    mavlink_video_ctrl_t vc{};
+    mavlink_msg_video_ctrl_decode(&msg, &vc);
+    QCOMPARE(vc.target_system, static_cast<uint8_t>(10));
+    QCOMPARE(vc.target_component, static_cast<uint8_t>(20));
+    QCOMPARE(vc.camera_id, static_cast<uint8_t>(5));
+    QCOMPARE(vc.command, static_cast<uint8_t>(1));
+    QCOMPARE(vc.resolution_w, static_cast<uint16_t>(1920));
+    QCOMPARE(vc.resolution_h, static_cast<uint16_t>(1080));
+    QCOMPARE(vc.framerate, static_cast<uint8_t>(30));
+    QCOMPARE(vc.bitrate_kbps, static_cast<uint16_t>(4000));
+    QCOMPARE(QByteArray(vc.codec, 4), QByteArray("h264"));
 }
 
 UT_REGISTER_TEST_LIGHTWEIGHT(CryptoTest, TestLabel::Unit)

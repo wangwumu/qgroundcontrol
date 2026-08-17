@@ -580,6 +580,13 @@ QGC 确定任务 → MissionController::sendToVehicle
 - ✅ **counter 越界守卫**：`nextOutgoingCounter` 达 `COUNTER_MAX=2^62` 时拒绝发送（需重新建链换密钥，规范 §2.5）
 - ✅ **短帧丢弃打日志**：`_processEncryptedFrame` 的 `<28` 畸形帧丢弃补 `qCWarning`（含 len/msgid/deviceID）
 
+### 已修复（同步 60817.0 规范）
+
+- ✅ **80000-80003 业务消息纳入加密**：规范 §2.2 明确天气预报/备降点/传感器/视频控制为任务帧、纳入加密链路（不再走 mavlink-router 明文旁路）。QGC 侧 `LinkInterface::sendMessageThreadSafe` 本就在 crypto Active 时加密所有出站帧，本次补齐缺口：`mavlink_msg_vtol_crc_extra()` 助手返回自定义消息的正确 CRC_EXTRA，供 `encryptFrame` 计算加密帧 CRC（此前 `mavlink_get_crc_extra` 对未注册的 80000-80003 返回 0，加密帧 CRC 与接收端不一致而静默失效）
+- ✅ **VTOL 消息 CRC_EXTRA 占位值修正**：`255/254/255/63`（占位 0xFF/0xFE）→ 按 pymavlink `message_checksum` 算法重算的 **`152/84/78/22`**（算法已用 HEARTBEAT=50 校验一致）
+- ✅ **VTOL 消息字段排序修正**：原 struct 把 `weather_type/severity/confidence`（uint8）排在 `wind_speed`（uint16）之前，违反 MAVLink「类型大小降序」要求，与 pymavlink 接收端逐字节错位 → 按类型大小降序重排 struct + `MAVLINK_MESSAGE_INFO` + pack/get 偏移（WEATHER_FORECAST / ALTERNATE_LANDING / VIDEO_CTRL）
+- ✅ 单测 18 → **19 项**（新增 `_testVtolMessages`：CRC_EXTRA 常量、offsetof 排序断言、四消息 pack→decode 往返）
+
 ### 仍待办
 
 - [ ] **mavp2p / PX4 联合测试**：端到端加密互通验证（需实机或模拟链路）；

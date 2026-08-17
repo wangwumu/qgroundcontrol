@@ -30,6 +30,8 @@
 
 7 个枚举：`VTOL_WEATHER_TYPE`、`VTOL_WEATHER_SEVERITY`、`VTOL_ALT_TYPE`、`VTOL_SENSOR_ID`、`VTOL_SENSOR_CMD`、`VTOL_CAMERA_ID`、`VTOL_VIDEO_CMD`。
 
+> 80000-80003 已**纳入加密链路**（任务帧，见文档 10 §2.2）：QGC 以 deviceID=D + 奇数 counter 加密，经 mavros Router 透传 + `mavlink_crypto_node` 解密，`mavlink_custom_receiver` 订阅 `/vtol/mavlink_rx` 分发。不再走 mavlink-router 明文旁路。
+
 **字段、ROS2 转换映射、存储、安全机制详见 `mavlink_extension_protocol.md`。**
 
 ---
@@ -80,6 +82,7 @@ ComposableNode(
 - 同步须用 **reliable QoS**（不丢同步报文）
 - 扩展报文仅同步 counter（明文，不涉密），**不加密**
 - 攻击者伪造同步报文最多导致判重丢帧，不会造成 nonce 复用
+- **接收端奇偶校验**：PX4 / abc_vtol 解析 NONCE_SYNC 时须校验 counter 为**偶数**，拒绝奇数 counter（下行 counter 恒为偶数，见文档 10 §2.5 奇偶分家；拒绝奇数可防止攻击者伪造奇数 counter 导致跨通道 nonce 碰撞）。abc_vtol 侧已实现（`mavlink_crypto_node._handle_nonce_sync` 的 `if counter & 1: return`）；PX4 侧须同样校验
 
 **步长错开**（配合同步，降低并发碰撞概率）：
 - 两者共享**下行 lastNonce**（恒为偶数，初始为 QGC 建链奇数 X 的最小偶数后继 X+1）
