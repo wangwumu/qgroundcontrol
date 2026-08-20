@@ -20,4 +20,6 @@ public:
     DEFINE_SETTINGFACT(cryptoGcsServerUrl)
     DEFINE_SETTINGFACT(cryptoAuthToken)
     DEFINE_SETTINGFACT(cryptoGcsDeviceID)
+    DEFINE_SETTINGFACT(cryptoKeySource)
+    DEFINE_SETTINGFACT(cryptoLocalKeyDeviceID)
 };

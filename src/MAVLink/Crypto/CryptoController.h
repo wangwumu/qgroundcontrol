@@ -55,6 +55,13 @@ public:
     /// 设备密钥管理器（从 gcs_server 取密钥）。
     DeviceKeyManager* deviceKeyManager() { return &_keyManager; }
 
+    /// 调试注入：从本地 key 文件读取 32 字节 AES-256 密钥并缓存到指定 deviceID。
+    /// 用于绕过 gcs_server 的本地联调（QGC ↔ PX4 直连调通加密协议）。
+    /// @param path       key 文件路径（须为恰好 32 字节原始密钥）
+    /// @param deviceID   目标无人机 deviceID（应与 PX4 侧 MAV_DEVICE_ID 一致）
+    /// @return true=读取并注入成功；false=文件不存在/长度错误/注入失败
+    bool injectLocalKeyFromFile(const QString& path, DeviceID deviceID);
+
     /// 当前状态（线程安全，加锁读取）。
     State state() const;
 

@@ -10,7 +10,10 @@
 
 #include <QtTest/QtTest>
 
+#include <QDir>
+#include <QFile>
 #include <QRegularExpression>
+#include <QTemporaryFile>
 #include <cstring>
 
 namespace {
@@ -626,6 +629,57 @@ void CryptoTest::_testVtolMessages()
     QCOMPARE(vc.framerate, static_cast<uint8_t>(30));
     QCOMPARE(vc.bitrate_kbps, static_cast<uint16_t>(4000));
     QCOMPARE(QByteArray(vc.codec, 4), QByteArray("h264"));
+}
+
+void CryptoTest::_testInjectLocalKey()
+{
+    // 用 QTemporaryFile（自动带 PID/随机后缀，避免并行测试冲突）写 32 字节测试密钥，
+    // 验证 injectLocalKeyFromFile 的成功与失败路径。
+    CryptoController* const crypto = CryptoController::instance();
+
+    // --- 成功路径：32 字节文件 → 注入 → 命中 ---
+    QTemporaryFile file(QStringLiteral("qgc_test_mavlink_key_XXXXXX.bin"));
+    QVERIFY(file.open());
+    const Key testK = testKey();
+    QCOMPARE(file.write(reinterpret_cast<const char*>(testK.data()), static_cast<qint64>(testK.size())),
+             static_cast<qint64>(testK.size()));
+    file.close();
+
+    QVERIFY(crypto->injectLocalKeyFromFile(file.fileName(), 1));
+    Key outKey{};
+    QVERIFY(crypto->deviceKeyManager()->keyForDevice(1, outKey));
+    QVERIFY(outKey == testK);
+    crypto->deviceKeyManager()->removeKey(1);
+
+    // --- 失败路径 1：长度错误（31 字节）---
+    QTemporaryFile shortFile(QStringLiteral("qgc_test_mavlink_key_short_XXXXXX.bin"));
+    QVERIFY(shortFile.open());
+    QCOMPARE(shortFile.write(reinterpret_cast<const char*>(testK.data()), static_cast<qint64>(testK.size() - 1)),
+             static_cast<qint64>(testK.size() - 1));
+    shortFile.close();
+    expectLogMessage("MAVLink.Crypto.CryptoController", QtWarningMsg,
+                     QRegularExpression(QStringLiteral("key file size")));
+    QVERIFY(!crypto->injectLocalKeyFromFile(shortFile.fileName(), 1));
+    verifyExpectedLogMessage();
+    QVERIFY(!crypto->deviceKeyManager()->hasKey(1));
+
+    // --- 失败路径 2：非法 deviceID（0 与 bit24 置位）---
+    expectLogMessage("MAVLink.Crypto.CryptoController", QtWarningMsg,
+                     QRegularExpression(QStringLiteral("invalid deviceID 0")));
+    QVERIFY(!crypto->injectLocalKeyFromFile(file.fileName(), 0));
+    verifyExpectedLogMessage();
+    expectLogMessage("MAVLink.Crypto.CryptoController", QtWarningMsg,
+                     QRegularExpression(QStringLiteral("invalid deviceID 16777216")));
+    QVERIFY(!crypto->injectLocalKeyFromFile(file.fileName(), 0x01000000u));
+    verifyExpectedLogMessage();
+
+    // --- 失败路径 3：文件不存在 ---
+    expectLogMessage("MAVLink.Crypto.CryptoController", QtWarningMsg,
+                     QRegularExpression(QStringLiteral("cannot open")));
+    QVERIFY(!crypto->injectLocalKeyFromFile(QStringLiteral("/nonexistent/mavlink_key.bin"), 1));
+    verifyExpectedLogMessage();
+
+    // QTemporaryFile 析构自动清理
 }
 
 UT_REGISTER_TEST_LIGHTWEIGHT(CryptoTest, TestLabel::Unit)

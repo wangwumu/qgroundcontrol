@@ -39,4 +39,7 @@ private slots:
 
     // VTOL 自定义消息（80000-80003）：字段排序 + CRC_EXTRA + 往返（纳入加密链路）
     void _testVtolMessages();
+
+    // 本地 key 文件注入（调试路径）：读 32 字节文件 → 缓存 → keyForDevice 可命中
+    void _testInjectLocalKey();
 };

@@ -1,6 +1,11 @@
 #include "CryptoController.h"
 
+#include <algorithm>
+
+#include <openssl/crypto.h>
+
 #include <QtCore/QApplicationStatic>
+#include <QtCore/QFile>
 #include <QtCore/QLoggingCategory>
 #include <QtCore/QRandomGenerator>
 
@@ -36,6 +41,45 @@ void CryptoController::setGcsDeviceID(DeviceID deviceID)
     }
     const QMutexLocker locker(&_mutex);
     _gcsDeviceID = deviceID;
+}
+
+bool CryptoController::injectLocalKeyFromFile(const QString& path, DeviceID deviceID)
+{
+    // 目标 deviceID 合法性校验（规范 §1.4：bit24 必须为 0）
+    if (deviceID == kInvalidDeviceID || !hasValidSignatureBit(deviceID)) {
+        qCWarning(CryptoControllerLog) << "injectLocalKeyFromFile: invalid deviceID" << deviceID;
+        return false;
+    }
+
+    QFile keyFile(path);
+    if (!keyFile.open(QIODevice::ReadOnly)) {
+        qCWarning(CryptoControllerLog) << "injectLocalKeyFromFile: cannot open" << path << keyFile.errorString();
+        return false;
+    }
+
+    // 先按文件大小校验，避免误放的大文件被整读进内存
+    if (keyFile.size() != static_cast<qint64>(kKeySize)) {
+        qCWarning(CryptoControllerLog) << "injectLocalKeyFromFile: key file size" << keyFile.size()
+                                       << "!= expected" << kKeySize << "for" << path;
+        return false;
+    }
+
+    QByteArray data = keyFile.read(kKeySize);
+    if (data.size() != static_cast<int>(kKeySize)) {
+        qCWarning(CryptoControllerLog) << "injectLocalKeyFromFile: read" << data.size()
+                                       << "!= expected" << kKeySize << "for" << path;
+        return false;
+    }
+
+    Key key{};
+    std::copy(data.constBegin(), data.constEnd(), key.begin());
+    _keyManager.cacheKey(deviceID, key);
+    // 擦除栈上密钥副本（密钥已入缓存，由 DeviceKeyManager 管理生命周期）。
+    // 用 OPENSSL_cleanse 而非 fill(0)：后者可能被优化器做死存储消除，前者是防优化安全清零。
+    OPENSSL_cleanse(key.data(), key.size());
+    OPENSSL_cleanse(data.data(), static_cast<size_t>(data.size()));
+    qCInfo(CryptoControllerLog) << "injectLocalKeyFromFile: injected local key for device" << deviceID << "from" << path;
+    return true;
 }
 
 void CryptoController::setCryptoEnabled(bool enabled)
@@ -106,6 +150,10 @@ void CryptoController::beginLinking(DeviceID targetDeviceID)
     if (_keyManager.hasKey(targetDeviceID)) {
         confirmLinking();
     } else {
+        // 密钥未缓存：本地注入模式（cryptoKeySource=0）下若目标 deviceID 与本地注入的不一致，
+        // 会走到这里走 gcs_server 网络拉取——这是预期的降级，但记录日志便于排查"本地联调却走了网络"。
+        qCDebug(CryptoControllerLog) << "beginLinking: no cached key for device" << targetDeviceID
+                                     << ", fetching from gcs_server";
         _keyManager.fetchKey(targetDeviceID);
     }
 }

@@ -1,8 +1,11 @@
 #include "QGCApplication.h"
 
+#include <QtCore/QDir>
 #include <QtCore/QEvent>
 #include <QtCore/QFile>
+#include <QtCore/QFileInfo>
 #include <QtCore/QMetaMethod>
+#include <QtCore/QStandardPaths>
 #include <QtCore/QMetaObject>
 #include <QtCore/QRegularExpression>
 #include <QtCore/private/qthread_p.h>
@@ -244,6 +247,29 @@ void QGCApplication::init()
             cryptoSettings->cryptoGcsDeviceID()->rawValue().toUInt()));
         crypto->deviceKeyManager()->setServerUrl(cryptoSettings->cryptoGcsServerUrl()->rawValue().toString());
         crypto->deviceKeyManager()->setAuthToken(cryptoSettings->cryptoAuthToken()->rawValue().toString());
+
+        // 密钥来源选择（cryptoKeySource）：0 = 本地 key 文件（本地联调直连）；1 = gcs_server/数据库。
+        // 本地模式下，从 AppConfigLocation/mavlink_key.bin 读 32 字节密钥，注入到 cryptoLocalKeyDeviceID
+        // 指定的目标无人机；成功后该 deviceID 的密钥即就绪，beginLinking 时 hasKey 命中、不再走 gcs_server。
+        if (crypto->cryptoEnabled() && cryptoSettings->cryptoKeySource()->rawValue().toUInt() == 0) {
+            const QString localKeyPath = QDir(QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation))
+                                             .filePath(QStringLiteral("mavlink_key.bin"));
+            const MAVLinkCrypto::DeviceID localDeviceID = static_cast<MAVLinkCrypto::DeviceID>(
+                cryptoSettings->cryptoLocalKeyDeviceID()->rawValue().toUInt());
+            if (QFileInfo::exists(localKeyPath)) {
+                if (crypto->injectLocalKeyFromFile(localKeyPath, localDeviceID)) {
+                    qCInfo(QGCApplicationLog) << "crypto key source=local: injected key for device" << localDeviceID
+                                              << "from" << localKeyPath << "(gcs_server bypassed)";
+                } else {
+                    qCWarning(QGCApplicationLog) << "crypto key source=local: failed to inject key for device"
+                                                 << localDeviceID << "from" << localKeyPath
+                                                 << "(will fall back to gcs_server if available)";
+                }
+            } else {
+                qCInfo(QGCApplicationLog) << "crypto key source=local: no key file at" << localKeyPath
+                                          << "(falling back to gcs_server)";
+            }
+        }
     }
 
     LogManager::instance()->init();

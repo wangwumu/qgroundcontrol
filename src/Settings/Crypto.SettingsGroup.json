@@ -33,6 +33,24 @@
             "type": "uint32",
             "default": 0,
             "label": "GCS deviceID"
+        },
+        {
+            "name": "cryptoKeySource",
+            "shortDesc": "Key source",
+            "longDesc": "Where QGC obtains device communication keys. 0 = local key file (mavlink_key.bin in AppConfigLocation, for local link bring-up); 1 = gcs_server / database (HTTPS fetch).",
+            "type": "uint32",
+            "default": 1,
+            "enumStrings": "Local key file,Database (gcs_server)",
+            "enumValues": "0,1",
+            "label": "Key source"
+        },
+        {
+            "name": "cryptoLocalKeyDeviceID",
+            "shortDesc": "Local key deviceID",
+            "longDesc": "Target deviceID the local key file binds to, used when cryptoKeySource = 0 (local key file). Should match the drone's MAV_DEVICE_ID.",
+            "type": "uint32",
+            "default": 1,
+            "label": "Local key deviceID"
         }
     ]
 }
