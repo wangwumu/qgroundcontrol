@@ -631,6 +631,58 @@ void CryptoTest::_testVtolMessages()
     QCOMPARE(QByteArray(vc.codec, 4), QByteArray("h264"));
 }
 
+void CryptoTest::_testQgcRegistration()
+{
+    // CRC_EXTRA 助手：80005 应命中 138
+    uint8_t crc = 0;
+    QVERIFY(mavlink_msg_vtol_crc_extra(MAVLINK_MSG_ID_QGC_REGISTRATION, &crc));
+    QCOMPARE(crc, static_cast<uint8_t>(138));
+
+    // pack：帧头 deviceID 拆分（10000 → sysid=39, compid=16），变长 len，CRC 与序列化一致
+    mavlink_message_t msg{};
+    // 1 个 deviceID = 0x00410C31（大端表示最低字节非 0，不会被裁剪——测试精确 len）
+    const uint8_t deviceBytes[4] = { 0x00, 0x41, 0x0C, 0x31 };
+    const uint16_t len = mavlink_msg_qgc_registration_pack(QGC_REGISTRATION_DEVICE_ID_DEFAULT, &msg,
+                                                           deviceBytes, 1);
+    QVERIFY(len != 0);
+
+    // 帧头 deviceID = 10000 = 0x00002710 → sysid=0x27(39), compid=0x10(16)
+    QCOMPARE(msg.sysid, static_cast<uint8_t>(39));
+    QCOMPARE(msg.compid, static_cast<uint8_t>(16));
+    QCOMPARE(msg.incompat_flags, static_cast<uint8_t>(0));
+    QCOMPARE(msg.compat_flags, static_cast<uint8_t>(0));
+    QCOMPARE(msg.msgid, static_cast<uint32_t>(80005));
+
+    // 变长 len = 1 + 1×4 = 5（deviceID 最低字节 0x31 非 0，不裁剪）
+    QCOMPARE(msg.len, static_cast<uint8_t>(5));
+    // payload[0] = deviceID_num
+    QCOMPARE(_MAV_PAYLOAD(&msg)[0], static_cast<uint8_t>(1));
+    // checksum：用 pymavlink x25crc 数学验证（帧头 9 字节 + payload + crc_extra=138）
+    QCOMPARE(msg.checksum, static_cast<uint16_t>(0xF55D));
+
+    // 序列化：确认帧字节布局正确（len 精确、帧头 deviceID 拆分正确、CRC 与 len 一致）
+    uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+    const int bufLen = mavlink_msg_to_send_buffer(buf, &msg);
+    QVERIFY(bufLen > 0);
+
+    // 帧头：magic=0xFD, len=5, incompat=0, compat=0, seq=0, sysid=39, compid=16
+    QCOMPARE(buf[0], static_cast<uint8_t>(0xFD));
+    QCOMPARE(buf[1], static_cast<uint8_t>(5));
+    QCOMPARE(buf[2], static_cast<uint8_t>(0));
+    QCOMPARE(buf[3], static_cast<uint8_t>(0));
+    QCOMPARE(buf[5], static_cast<uint8_t>(39));
+    QCOMPARE(buf[6], static_cast<uint8_t>(16));
+
+    // C1 裁剪场景：deviceID 最低字节为 0（0x27100000）→ 尾部零被裁，len=3，
+    // pack 必须按裁剪后 len 算 CRC（否则线上 CRC 与接收端不一致）。
+    const uint8_t zeroLowBytes[4] = { 0x27, 0x10, 0x00, 0x00 };
+    mavlink_message_t msg2{};
+    const uint16_t len2 = mavlink_msg_qgc_registration_pack(QGC_REGISTRATION_DEVICE_ID_DEFAULT, &msg2, zeroLowBytes, 1);
+    QVERIFY(len2 != 0);
+    QCOMPARE(msg2.len, static_cast<uint8_t>(3));          // 1 + 4 - 2（尾部两个 0 被裁）
+    QCOMPARE(msg2.checksum, static_cast<uint16_t>(0xCD74)); // 按 len=3 算的完整 CRC
+}
+
 void CryptoTest::_testInjectLocalKey()
 {
     // 用 QTemporaryFile（自动带 PID/随机后缀，避免并行测试冲突）写 32 字节测试密钥，

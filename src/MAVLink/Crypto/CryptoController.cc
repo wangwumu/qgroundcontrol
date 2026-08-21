@@ -9,6 +9,9 @@
 #include <QtCore/QLoggingCategory>
 #include <QtCore/QRandomGenerator>
 
+#include "Comms/LinkInterface.h"
+#include "Comms/LinkManager.h"
+#include "Extensions/VTOLSafetyMessages.h"
 #include "QGCLoggingCategory.h"
 
 QGC_LOGGING_CATEGORY(CryptoControllerLog, "MAVLink.Crypto.CryptoController")
@@ -92,6 +95,101 @@ bool CryptoController::cryptoEnabled() const
 {
     const QMutexLocker locker(&_mutex);
     return _cryptoEnabled;
+}
+
+void CryptoController::setRegistrationEnabled(bool enabled, int intervalMs)
+{
+    {
+        const QMutexLocker locker(&_mutex);
+        _registrationEnabled = enabled;
+    }
+
+    if (_registrationTimer == nullptr) {
+        _registrationTimer = new QTimer(this);
+        _registrationTimer->setTimerType(Qt::CoarseTimer);
+        connect(_registrationTimer, &QTimer::timeout, this, &CryptoController::_sendRegistration);
+    }
+
+    if (enabled) {
+        // 上电/启用即发一条（登记），随后周期保活
+        _sendRegistration();
+        _registrationTimer->start(intervalMs > 0 ? intervalMs : kRegistrationIntervalMs);
+        qCDebug(CryptoControllerLog) << "registration enabled, interval" << intervalMs << "ms";
+    } else {
+        _registrationTimer->stop();
+        qCDebug(CryptoControllerLog) << "registration disabled";
+    }
+}
+
+bool CryptoController::registrationEnabled() const
+{
+    const QMutexLocker locker(&_mutex);
+    return _registrationEnabled;
+}
+
+void CryptoController::addLinkedDevice(DeviceID deviceID)
+{
+    // 规范 §1.4：PX4 deviceID 的 bit24（incompatFlag bit0）必须为 0
+    if (deviceID == kInvalidDeviceID || !hasValidSignatureBit(deviceID)) {
+        qCWarning(CryptoControllerLog) << "addLinkedDevice: invalid deviceID" << deviceID;
+        return;
+    }
+    const QMutexLocker locker(&_mutex);
+    if (!_linkedDevices.contains(deviceID)) {
+        _linkedDevices.append(deviceID);
+        qCDebug(CryptoControllerLog) << "linked device added" << deviceID;
+    }
+}
+
+void CryptoController::_sendRegistration()
+{
+    // 收集关联 PX4 deviceID（当前单设备场景：活跃目标 + 手动关联的设备）
+    QList<DeviceID> devices;
+    {
+        const QMutexLocker locker(&_mutex);
+        devices = _linkedDevices;
+        if (_activeDeviceID != kInvalidDeviceID && !devices.contains(_activeDeviceID)) {
+            devices.append(_activeDeviceID);
+        }
+    }
+
+    // 帧头 deviceID 用 GCS 段固定值（文档 §1.3 QGC_REGISTRATION_DEVICE_ID_DEFAULT），
+    // 由 pack 函数拆入帧头 4 字节（方案 B）。payload 填关联 PX4 deviceID 集合。
+    const int deviceCount = qMin(devices.size(), static_cast<int>(MAX_QGC_LINKED_PX4));
+    uint8_t deviceBytes[MAX_QGC_LINKED_PX4 * 4] = {};
+    for (int i = 0; i < deviceCount; i++) {
+        const uint32_t dev = devices[i];
+        deviceBytes[i * 4 + 0] = static_cast<uint8_t>(dev >> 24);
+        deviceBytes[i * 4 + 1] = static_cast<uint8_t>(dev >> 16);
+        deviceBytes[i * 4 + 2] = static_cast<uint8_t>(dev >> 8);
+        deviceBytes[i * 4 + 3] = static_cast<uint8_t>(dev);
+    }
+
+    mavlink_message_t message{};
+    const uint16_t packLen = mavlink_msg_qgc_registration_pack(QGC_REGISTRATION_DEVICE_ID_DEFAULT, &message,
+                                                               deviceCount > 0 ? deviceBytes : nullptr,
+                                                               static_cast<uint8_t>(deviceCount));
+    if (packLen == 0) {
+        qCWarning(CryptoControllerLog) << "registration: pack failed (invalid deviceID), skip";
+        return;
+    }
+
+    // 遍历已连接 UDP link，明文发送（规范 §2.2/§3.2：80005 仅 mavp2p 消费，
+    // 只发广域网 UDP 链路，不发给串口/USB/模拟器等 PX4 直连链路）。
+    const auto links = LinkManager::instance()->links();
+    bool sent = false;
+    for (const auto& link : links) {
+        if (!link || !link->isConnected()) {
+            continue;
+        }
+        const auto cfg = link->linkConfiguration();
+        if (!cfg || cfg->type() != LinkConfiguration::TypeUdp) {
+            continue; // 仅 UDP（mavp2p/广域网）链路
+        }
+        link->sendPlaintextMessageThreadSafe(message);
+        sent = true;
+    }
+    qCDebug(CryptoControllerLog) << "registration sent, devices" << deviceCount << (sent ? "delivered" : "no udp link");
 }
 
 DeviceID CryptoController::activeDeviceID() const
@@ -227,6 +325,8 @@ void CryptoController::returnToStandby()
         _activeDeviceID = kInvalidDeviceID;
         _state = State::Standby;
     }
+    // 回待命 = 连接解除，停用失联监测（不再误报，C2 修正）
+    _stopLinkLossMonitor();
     qCDebug(CryptoControllerLog) << "return to standby";
     emit stateChanged();
 }
@@ -297,6 +397,67 @@ bool CryptoController::isIncomingAcceptable(DeviceID deviceID, uint64_t counter)
 void CryptoController::commitIncoming(DeviceID deviceID, uint64_t counter)
 {
     _replayGuard.commit(deviceID, counter);
+    // 收到活跃 PX4 的合法下行（含心跳）→ 重置失联检测。
+    // 仅对当前活跃目标监测（单设备场景；多 PX4 会话时 `_linkLossDevice` 单值
+    // 会被最后收到的设备覆盖，需改为按 deviceID 分列的计时器——待多设备会话实现）。
+    _startLinkLossMonitor(deviceID);
+}
+
+void CryptoController::setLinkLossTimeout(int timeoutMs)
+{
+    if (_linkLossTimer == nullptr) {
+        _linkLossTimer = new QTimer(this);
+        _linkLossTimer->setTimerType(Qt::CoarseTimer);
+        _linkLossTimer->setSingleShot(true);
+        connect(_linkLossTimer, &QTimer::timeout, this, &CryptoController::_onLinkLossTimeout);
+    }
+    _linkLossTimer->setInterval(timeoutMs > 0 ? timeoutMs : kLinkLossTimeoutMs);
+}
+
+void CryptoController::_startLinkLossMonitor(DeviceID deviceID)
+{
+    // 失联监测仅在已建链（Active）且是当前活跃设备时才有意义：
+    // Standby 时 PX4 只发明文待命心跳（广播存在性，未建立任何 QGC 连接），不构成"失联"（C2 修正）。
+    {
+        const QMutexLocker locker(&_mutex);
+        if (!_cryptoEnabled || deviceID == kInvalidDeviceID || _state != State::Active ||
+            deviceID != _activeDeviceID) {
+            return;
+        }
+        _linkLossDevice = deviceID;
+    }
+    if (_linkLossTimer == nullptr) {
+        setLinkLossTimeout(kLinkLossTimeoutMs);
+    }
+    // QTimer 操作在锁外（timer 归属主线程，避免持锁调用）
+    _linkLossTimer->start();
+}
+
+void CryptoController::_stopLinkLossMonitor()
+{
+    if (_linkLossTimer != nullptr) {
+        _linkLossTimer->stop();
+    }
+    {
+        const QMutexLocker locker(&_mutex);
+        _linkLossDevice = kInvalidDeviceID;
+    }
+}
+
+void CryptoController::_onLinkLossTimeout()
+{
+    DeviceID lostDevice;
+    {
+        const QMutexLocker locker(&_mutex);
+        lostDevice = _linkLossDevice;
+    }
+    if (lostDevice != kInvalidDeviceID) {
+        qCWarning(CryptoControllerLog) << "PX4 link loss detected for device" << lostDevice;
+        emit px4LinkLost(lostDevice);
+        // 触发后清空，避免计时器意外重启时重复报陈旧设备
+        const QMutexLocker locker(&_mutex);
+        _linkLossDevice = kInvalidDeviceID;
+    }
 }
 
 void CryptoController::resetReplay(DeviceID deviceID)

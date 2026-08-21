@@ -710,18 +710,121 @@ static inline uint16_t mavlink_msg_video_ctrl_get_codec(const mavlink_message_t*
     { return _MAV_RETURN_char_array(msg, codec, 8, 11); }
 
 // ============================================================================
+// 80005: QGC_REGISTRATION（QGC 明文登记/保活心跳）
+// ============================================================================
+//
+// 与 80000-80003（加密任务帧）不同，80005 是**明文特例**（文档 10 §2.2）：
+// - 不加密、无 counter/tag、不参与 nonce 序列；
+// - 仅 mavp2p 消费，不转发给 PX4；
+// - 帧头 deviceID 用 GCS 段固定值（GCS_DEVICE_ID_DEFAULT）；
+// - payload = deviceID_num(1B) + deviceIDs(240B)，前 deviceID_num×4 字节有效。
+// CRC_EXTRA=138 按 pymavlink message_checksum 计算（uint8_t deviceID_num + uint8_t[240] deviceIDs）。
+
+#define MAVLINK_MSG_ID_QGC_REGISTRATION 80005
+#define MAVLINK_MSG_ID_80005_CRC        138
+#define MAVLINK_MSG_ID_QGC_REGISTRATION_CRC 138
+#define MAVLINK_MSG_ID_QGC_REGISTRATION_LEN     241U
+#define MAVLINK_MSG_ID_QGC_REGISTRATION_MIN_LEN 1U
+
+/// 单 QGC 最多关联的 PX4 数量（规范附录 A：默认 16，对应 payload 上限 16×4=64 字节）。
+#define MAX_QGC_LINKED_PX4 16
+/// QGC 登记/保活心跳帧头统一使用的 GCS 段固定 deviceID（规范 §1.3：默认 10000）。
+#define QGC_REGISTRATION_DEVICE_ID_DEFAULT 10000U
+
+/// @brief 打包 80005 QGC_REGISTRATION 明文登记心跳。
+///
+/// 变长 payload：`deviceID_num` 声明有效 deviceID 数量，`deviceIDs` 前
+/// `deviceID_num×4` 字节为实际 deviceID（每 4 字节一个大端序 uint32），
+/// 其余为填充（设 0）。实际发送的 `len = 1 + deviceID_num×4`，由帧头 len 表达。
+///
+/// **帧头 deviceID（方案 B）**：本消息帧头 4 字节（incompat/compat/sysid/compid）承载
+/// 完整的 32 位 `gcsDeviceID`（GCS 段固定值），供 mavp2p 按号段识别 QGC。
+/// 因 `mavlink_finalize_message` 会重置 incompat/compat flags 且其 CRC 基于原始帧头，
+/// 本函数手工构造帧头并重算 CRC（与 mavlink_finalize_message 的 CRC 算法一致）。
+///
+/// @param gcsDeviceID    帧头 32 位 deviceID（GCS 段固定值，bit24 必须为 0）
+/// @param deviceIDs      关联 PX4 的 deviceID 数组（每项 4 字节大端序）
+/// @param deviceIDCount  deviceID 数量（0..60）
+static inline uint16_t mavlink_msg_qgc_registration_pack(uint32_t gcsDeviceID,
+                                                         mavlink_message_t* msg,
+                                                         const uint8_t* deviceIDs, uint8_t deviceIDCount)
+{
+    if (deviceIDCount > 60) {
+        deviceIDCount = 60; // 上限：240 字节 / 4
+    }
+
+    // 帧头 4 字节 = deviceID 完整拆分（规范 §1.2 编码公式）
+    const uint8_t inc = static_cast<uint8_t>((gcsDeviceID >> 24) & 0xFFu);
+    const uint8_t com = static_cast<uint8_t>((gcsDeviceID >> 16) & 0xFFu);
+    const uint8_t sys = static_cast<uint8_t>((gcsDeviceID >> 8) & 0xFFu);
+    const uint8_t cid = static_cast<uint8_t>(gcsDeviceID & 0xFFu);
+
+    // 约束（规范 §1.4）：incompatFlag bit0（= deviceID bit24）必须为 0；
+    // bit25-31（incompatFlag bit1-7）必须为 0，否则标准解析器会把帧当 MAVLink1（bit31）
+    // 或视为未知保留标志而拒收（bit25-30）。GCS 段固定值（高字节 0x00）天然满足。
+    if (gcsDeviceID & 0xFF000000u) {
+        return 0; // 非法 deviceID（高字节非 0），拒绝打包
+    }
+
+    uint8_t payload[MAVLINK_MSG_ID_QGC_REGISTRATION_LEN] = {};
+    payload[0] = deviceIDCount;
+    if (deviceIDs != nullptr && deviceIDCount > 0) {
+        memcpy(payload + 1, deviceIDs, static_cast<size_t>(deviceIDCount) * 4u);
+    }
+
+    // 变长 payload：最终 len 须与线上序列化一致。`mavlink_msg_to_send_buffer` 会调
+    // `_mav_trim_payload` 裁剪尾部零字节（最少保留 1 字节），故这里先按相同语义裁剪，
+    // 用裁剪后的长度设 msg->len 并算 CRC，否则序列化裁剪后 CRC 与线上不一致（C1）。
+    uint16_t payloadLen = static_cast<uint16_t>(1u + static_cast<unsigned>(deviceIDCount) * 4u);
+    while (payloadLen > 1 && payload[payloadLen - 1] == 0) {
+        payloadLen--;
+    }
+
+    msg->magic = 0xFD; // MAVLink V2 STX
+    msg->len = payloadLen;
+    msg->incompat_flags = inc;
+    msg->compat_flags = com;
+    msg->seq = 0;
+    msg->sysid = sys;
+    msg->compid = cid;
+    msg->msgid = MAVLINK_MSG_ID_QGC_REGISTRATION;
+    memcpy(_MAV_PAYLOAD_NON_CONST(msg), payload, payloadLen);
+
+    // CRC 计算（与 mavlink_finalize_message_buffer 一致：帧头[1..] + payload + crc_extra）
+    uint8_t headerBuf[MAVLINK_CORE_HEADER_LEN + 1];
+    headerBuf[0] = msg->magic;
+    headerBuf[1] = msg->len;
+    headerBuf[2] = msg->incompat_flags;
+    headerBuf[3] = msg->compat_flags;
+    headerBuf[4] = msg->seq;
+    headerBuf[5] = msg->sysid;
+    headerBuf[6] = msg->compid;
+    headerBuf[7] = msg->msgid & 0xFFu;
+    headerBuf[8] = (msg->msgid >> 8) & 0xFFu;
+    headerBuf[9] = (msg->msgid >> 16) & 0xFFu;
+
+    uint16_t checksum = crc_calculate(&headerBuf[1], MAVLINK_CORE_HEADER_LEN);
+    crc_accumulate_buffer(&checksum, reinterpret_cast<const char*>(payload), payloadLen);
+    crc_accumulate(MAVLINK_MSG_ID_QGC_REGISTRATION_CRC, &checksum);
+    msg->checksum = checksum;
+
+    return payloadLen;
+}
+
+// ============================================================================
 // CRC_EXTRA 查询助手
 // ============================================================================
 
-/// @brief 返回 80000-80003 自定义消息的 CRC_EXTRA。
+/// @brief 返回 80000-80003 及 80005 自定义消息的 CRC_EXTRA。
 ///
 /// 这些消息独立于 mavlink 生成层，未注册进 `MAVLINK_MESSAGE_CRCS` 表，
 /// 因此 `mavlink_get_crc_extra()` 对它们返回 0。加密链路（`encryptFrame`）
 /// 需要正确的 crc_extra 计算加密帧 CRC，否则接收端 CRC 校验失败。
+/// 80005 是明文帧，其 CRC 由标准序列化（`mavlink_finalize_message`）计算。
 ///
 /// @param msgid     MAVLink 消息 ID
 /// @param out_crc   输出 CRC_EXTRA（命中时写入）
-/// @return true=命中 80000-80003；false=非 VTOL 消息（调用方回退 mavlink_get_crc_extra）
+/// @return true=命中 80000-80003/80005；false=非 VTOL 消息（调用方回退 mavlink_get_crc_extra）
 static inline bool mavlink_msg_vtol_crc_extra(uint32_t msgid, uint8_t* out_crc)
 {
     switch (msgid) {
@@ -729,6 +832,7 @@ static inline bool mavlink_msg_vtol_crc_extra(uint32_t msgid, uint8_t* out_crc)
         case MAVLINK_MSG_ID_ALTERNATE_LANDING: *out_crc = MAVLINK_MSG_ID_ALTERNATE_LANDING_CRC; return true;
         case MAVLINK_MSG_ID_SENSOR_CTRL:       *out_crc = MAVLINK_MSG_ID_SENSOR_CTRL_CRC;       return true;
         case MAVLINK_MSG_ID_VIDEO_CTRL:        *out_crc = MAVLINK_MSG_ID_VIDEO_CTRL_CRC;        return true;
+        case MAVLINK_MSG_ID_QGC_REGISTRATION:  *out_crc = MAVLINK_MSG_ID_QGC_REGISTRATION_CRC;  return true;
         default: return false;
     }
 }

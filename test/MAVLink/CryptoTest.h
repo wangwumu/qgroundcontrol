@@ -40,6 +40,9 @@ private slots:
     // VTOL 自定义消息（80000-80003）：字段排序 + CRC_EXTRA + 往返（纳入加密链路）
     void _testVtolMessages();
 
+    // 80005 QGC 登记心跳：CRC_EXTRA + pack 帧字节（帧头 deviceID 拆分 + 变长 len + CRC 一致）
+    void _testQgcRegistration();
+
     // 本地 key 文件注入（调试路径）：读 32 字节文件 → 缓存 → keyForDevice 可命中
     void _testInjectLocalKey();
 };

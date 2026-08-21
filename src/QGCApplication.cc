@@ -18,6 +18,7 @@
 #include <QtQuickControls2/QQuickStyle>
 #include <QtSvg/QSvgRenderer>
 
+#include "AppMessages.h"
 #include "AppSettings.h"
 #include "AudioOutput.h"
 #include "ColoredSvgImageProvider.h"
@@ -269,6 +270,26 @@ void QGCApplication::init()
                 qCInfo(QGCApplicationLog) << "crypto key source=local: no key file at" << localKeyPath
                                           << "(falling back to gcs_server)";
             }
+        }
+
+        // 80005 QGC 登记/保活心跳（明文特例，规范 §2.2/§3.2）：cryptoEnabled 时向 mavp2p
+        // 周期发送登记心跳（GCS_KEEPALIVE_INTERVAL），报告本 QGC 在线并维持映射缓冲。
+        if (crypto->cryptoEnabled()) {
+            // 本地密钥注入的目标 deviceID 加入关联集合（单设备场景）
+            if (cryptoSettings->cryptoKeySource()->rawValue().toUInt() == 0) {
+                const MAVLinkCrypto::DeviceID localDeviceID = static_cast<MAVLinkCrypto::DeviceID>(
+                    cryptoSettings->cryptoLocalKeyDeviceID()->rawValue().toUInt());
+                crypto->addLinkedDevice(localDeviceID);
+            }
+            crypto->setRegistrationEnabled(true);
+            crypto->setLinkLossTimeout(MAVLinkCrypto::CryptoController::kLinkLossTimeoutMs);
+            // PX4 失联告警：超 LINK_LOSS_TIMEOUT 未收到下行 → 弹窗提示（规范 §3.2 QGC 职责⑨）
+            (void) connect(crypto, &MAVLinkCrypto::CryptoController::px4LinkLost,
+                           this, [](MAVLinkCrypto::DeviceID deviceID) {
+                QGC::showAppMessage(tr("加密链路 PX4 失联（deviceID=%1）：%2 ms 内未收到任何下行数据，请检查网络与飞控。")
+                                        .arg(deviceID)
+                                        .arg(MAVLinkCrypto::CryptoController::kLinkLossTimeoutMs));
+            });
         }
     }
 

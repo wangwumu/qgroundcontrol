@@ -148,6 +148,15 @@ void LinkInterface::sendMessageThreadSafe(mavlink_message_t &message)
     writeBytesThreadSafe(reinterpret_cast<const char *>(buffer), len);
 }
 
+void LinkInterface::sendPlaintextMessageThreadSafe(const mavlink_message_t& message)
+{
+    // 明文特例（规范 §2.2）：如 80005 QGC 登记/保活心跳——不加密、无 counter/tag。
+    // 直接序列化后写入，绕过 sendMessageThreadSafe 的加密路径（加密会破坏明文特例语义）。
+    uint8_t buffer[MAVLINK_MAX_PACKET_LEN];
+    const int len = mavlink_msg_to_send_buffer(buffer, &message);
+    writeBytesThreadSafe(reinterpret_cast<const char*>(buffer), len);
+}
+
 void LinkInterface::removeVehicleReference()
 {
     if (_vehicleReferenceCount != 0) {

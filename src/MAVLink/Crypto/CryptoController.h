@@ -12,10 +12,12 @@
 /// 线程安全：状态/映射由本类 `_mutex` 保护；lastNonce 由 ReplayGuard 内部锁保护（二者独立，避免嵌套加锁）。
 
 #include <QtCore/QHash>
+#include <QtCore/QList>
 #include <QtCore/QMutex>
 #include <QtCore/QMutexLocker>
 #include <QtCore/QObject>
 #include <QtCore/QString>
+#include <QtCore/QTimer>
 
 #include "DeviceID.h"
 #include "DeviceKeyManager.h"
@@ -36,6 +38,12 @@ public:
     };
     Q_ENUM(State)
 
+    /// 80005 登记心跳默认周期（毫秒）。规范 §3.2/附录 A：`GCS_KEEPALIVE_INTERVAL`
+    /// 须远小于 mavp2p 的 MAP_TTL 且小于 NAT UDP idle timeout。默认 10s。
+    static constexpr int kRegistrationIntervalMs = 10000;
+    /// PX4 失联报警默认超时（毫秒，规范附录 A LINK_LOSS_TIMEOUT：心跳周期×3~5，典型 5s）。
+    static constexpr int kLinkLossTimeoutMs = 5000;
+
     explicit CryptoController(QObject* parent = nullptr);
     ~CryptoController() override;
 
@@ -51,6 +59,17 @@ public:
     /// 是否启用加密链路（由 CryptoSettings 注入）。
     void setCryptoEnabled(bool enabled);
     bool cryptoEnabled() const;
+
+    /// 启用/停用 80005 QGC 登记/保活心跳（明文特例，规范 §2.2/§3.2）。
+    /// 启用后按 `GCS_KEEPALIVE_INTERVAL` 周期向 mavp2p 发 80005。
+    /// @param enabled  是否启用（由 CryptoSettings 注入）
+    /// @param intervalMs  保活周期（毫秒，默认见 `kRegistrationIntervalMs`）
+    void setRegistrationEnabled(bool enabled, int intervalMs = kRegistrationIntervalMs);
+    bool registrationEnabled() const;
+
+    /// 声明本 QGC 关联的 PX4 deviceID（加入登记心跳 payload）。
+    /// 单设备场景：建链目标 deviceID 即关联对象。
+    void addLinkedDevice(DeviceID deviceID);
 
     /// 设备密钥管理器（从 gcs_server 取密钥）。
     DeviceKeyManager* deviceKeyManager() { return &_keyManager; }
@@ -131,14 +150,25 @@ public:
     /// 重置指定设备的 lastNonce（如建链时清历史）。
     void resetReplay(DeviceID deviceID);
 
+    /// 设置 PX4 失联报警超时（规范附录 A LINK_LOSS_TIMEOUT，默认见 kLinkLossTimeoutMs）。
+    /// 启用加密时生效：收到活跃 PX4 下行报文重置计时器，超时未收到则发 px4LinkLost 信号。
+    void setLinkLossTimeout(int timeoutMs);
+
 signals:
     void stateChanged();
     void linkingConfirmed(DeviceID deviceID);
     void linkingFailed(DeviceID deviceID, const QString& error);
+    /// PX4 失联：linkLossTimeoutMs 内未收到该 deviceID 的任何下行（含心跳）。
+    /// 由上层（如 QGCApplication）连接做 UI 弹窗告警。
+    void px4LinkLost(DeviceID deviceID);
 
 private:
     void _onKeyFetched(DeviceID deviceID);
     void _onFetchFailed(DeviceID deviceID, const QString& error);
+    void _sendRegistration(); ///< 发送 80005 登记/保活心跳（周期触发）
+    void _startLinkLossMonitor(DeviceID deviceID); ///< 启动/重置失联检测（仅 Active 状态）
+    void _stopLinkLossMonitor(); ///< 停止失联检测（回待命时）
+    void _onLinkLossTimeout(); ///< 失联超时：发 px4LinkLost 信号
 
     State _state = State::Standby;
     DeviceID _gcsDeviceID = kInvalidDeviceID;
@@ -148,6 +178,11 @@ private:
     ReplayGuard _replayGuard;
     QHash<DeviceID, uint8_t> _deviceToSystem; ///< deviceID → systemID 映射（接收端学习）
     QHash<uint8_t, DeviceID> _systemToDevice; ///< systemID → deviceID 反向映射
+    QTimer* _registrationTimer = nullptr; ///< 80005 周期发送定时器
+    bool _registrationEnabled = false;
+    QList<DeviceID> _linkedDevices; ///< 本 QGC 关联的 PX4 deviceID（登记心跳 payload）
+    QTimer* _linkLossTimer = nullptr; ///< PX4 失联检测定时器
+    DeviceID _linkLossDevice = kInvalidDeviceID; ///< 正在监测失联的活跃 deviceID
     mutable QMutex _mutex;
 };
 

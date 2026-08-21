@@ -39,6 +39,10 @@ public:
     /// Single message-level send chokepoint: re-signs (if signing is active), serializes, then writes. All
     /// outbound mavlink_message_t sends must route through here so signing can't be bypassed.
     void sendMessageThreadSafe(mavlink_message_t &message);
+    /// 明文发送：绕过加密路径，直接把消息序列化后写入链路。
+    /// 用于协议明文特例（如 80005 QGC 登记/保活心跳），此类帧不加密、不参与 nonce 序列
+    ///（规范 §2.2 明文特例）。调用方须确保该消息确属明文特例，否则会破坏全加密不变量。
+    void sendPlaintextMessageThreadSafe(const mavlink_message_t& message);
     void addVehicleReference() { ++_vehicleReferenceCount; }
     void removeVehicleReference();
     /// Called for each received v1 message which QGC drops. The warning is deferred by a grace
