@@ -188,3 +188,6 @@ Qt*-linux*.tar.*
 .tool-versions
 .python-version
 !tools/.python-version
+
+# abc 品牌图标（尚未接线到 UI 资源，暂不纳入版本控制）
+resources/icons/abc-icon*
