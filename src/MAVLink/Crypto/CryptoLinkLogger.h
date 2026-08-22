@@ -33,15 +33,20 @@ public:
     static bool enabled();
 
     /// 记录一个 QGC 发出的报文（bytes/len 为完整帧字节）。
+    /// @param plainBytes/plainLen 明文帧字节：加密帧=加密前的原始标准帧；明文帧=可传 null
+    ///        （bytes 本身即明文）。日志内容会解析出可读字段（如 GLOBAL_POSITION_INT 的坐标）。
     /// @param parseOk 发送侧解析状态：加密帧=加密是否成功，明文=恒 true
     /// @param failReason parseOk=false 时写入报文内容的失败原因
     void logOutgoing(uint32_t msgid, uint32_t deviceID, bool encrypted, const char* bytes, int len,
-                     bool parseOk, const QString& failReason = QString());
+                     const char* plainBytes, int plainLen, bool parseOk,
+                     const QString& failReason = QString());
     /// 记录一个收到的（PX4 发出）报文。
+    /// @param plainBytes/plainLen 明文帧字节：加密帧=解密后的标准帧；明文帧=可传 null
     /// @param parseOk 接收侧解析状态：加密帧=解密认证是否成功，明文=恒 true
     /// @param failReason parseOk=false 时写入报文内容的失败原因
     void logIncoming(uint32_t msgid, uint32_t deviceID, bool encrypted, const char* bytes, int len,
-                     bool parseOk, const QString& failReason = QString());
+                     const char* plainBytes, int plainLen, bool parseOk,
+                     const QString& failReason = QString());
 
     /// 命令类消息判定（用户命令触发 vs 自动发送）。
     static bool isCommandMessage(uint32_t msgid);
@@ -59,8 +64,13 @@ private:
                  const QString& failReason = QString());
     /// 说明文本（20 汉字内，描述报文用途）。
     static QString _describeMsgid(uint32_t msgid);
-    /// 报文内容解析（按 msgid + 明文/密文）。
-    static QString _parseContent(uint32_t msgid, bool encrypted, const char* bytes, int len);
+    /// 报文内容解析（按 msgid + 明文/密文 + 明文帧）。
+    static QString _parseContent(uint32_t msgid, bool encrypted, const char* bytes, int len,
+                                 const char* plainBytes, int plainLen);
+    /// 标准帧字节 → 可读字段文本（按 msgid 解析关键字段）。
+    static QString _parsePlainFields(uint32_t msgid, const char* plainBytes, int plainLen);
+    /// 标准帧字节 → mavlink_message_t（手动解析，无需 mavlink channel）。
+    static void _frameToMessage(const char* bytes, int len, mavlink_message_t& msg);
 
     /// 按 CJK 宽度填充到指定显示列宽（不足右补空格）。
     static QString _padToWidth(const QString& s, int width);

@@ -82,7 +82,8 @@ bool CryptoLinkLogger::enabled()
 }
 
 void CryptoLinkLogger::logOutgoing(uint32_t msgid, uint32_t deviceID, bool encrypted,
-                                   const char* bytes, int len, bool parseOk,
+                                   const char* bytes, int len,
+                                   const char* plainBytes, int plainLen, bool parseOk,
                                    const QString& failReason)
 {
 #ifdef QGC_CRYPTO_LINK_LOG
@@ -91,20 +92,23 @@ void CryptoLinkLogger::logOutgoing(uint32_t msgid, uint32_t deviceID, bool encry
                                        (len - static_cast<int>(kV2HeaderLen) -
                                         static_cast<int>(kCrcLen));
     _append(true, encrypted, parseOk, msgid, deviceID, _describeMsgid(msgid), payloadLen,
-            _parseContent(msgid, encrypted, bytes, len), failReason);
+            _parseContent(msgid, encrypted, bytes, len, plainBytes, plainLen), failReason);
 #else
     Q_UNUSED(msgid)
     Q_UNUSED(deviceID)
     Q_UNUSED(encrypted)
     Q_UNUSED(bytes)
     Q_UNUSED(len)
+    Q_UNUSED(plainBytes)
+    Q_UNUSED(plainLen)
     Q_UNUSED(parseOk)
     Q_UNUSED(failReason)
 #endif
 }
 
 void CryptoLinkLogger::logIncoming(uint32_t msgid, uint32_t deviceID, bool encrypted,
-                                   const char* bytes, int len, bool parseOk,
+                                   const char* bytes, int len,
+                                   const char* plainBytes, int plainLen, bool parseOk,
                                    const QString& failReason)
 {
 #ifdef QGC_CRYPTO_LINK_LOG
@@ -113,13 +117,15 @@ void CryptoLinkLogger::logIncoming(uint32_t msgid, uint32_t deviceID, bool encry
                                        (len - static_cast<int>(kV2HeaderLen) -
                                         static_cast<int>(kCrcLen));
     _append(false, encrypted, parseOk, msgid, deviceID, _describeMsgid(msgid), payloadLen,
-            _parseContent(msgid, encrypted, bytes, len), failReason);
+            _parseContent(msgid, encrypted, bytes, len, plainBytes, plainLen), failReason);
 #else
     Q_UNUSED(msgid)
     Q_UNUSED(deviceID)
     Q_UNUSED(encrypted)
     Q_UNUSED(bytes)
     Q_UNUSED(len)
+    Q_UNUSED(plainBytes)
+    Q_UNUSED(plainLen)
     Q_UNUSED(parseOk)
     Q_UNUSED(failReason)
 #endif
@@ -219,32 +225,125 @@ QString CryptoLinkLogger::_describeMsgid(uint32_t msgid)
     }
 }
 
-QString CryptoLinkLogger::_parseContent(uint32_t msgid, bool encrypted, const char* bytes, int len)
+QString CryptoLinkLogger::_parseContent(uint32_t msgid, bool encrypted, const char* bytes, int len,
+                                        const char* plainBytes, int plainLen)
 {
 #ifdef QGC_CRYPTO_LINK_LOG
     if (encrypted) {
+        QString prefix;
         if (bytes != nullptr && len >= static_cast<int>(kV2HeaderLen) +
                                             static_cast<int>(kCounterSize)) {
-            const uint64_t counter = counterFromFrame(
-                reinterpret_cast<const uint8_t*>(bytes));
-            return QStringLiteral("counter=%1,密文").arg(counter);
+            prefix = QStringLiteral("counter=%1").arg(
+                counterFromFrame(reinterpret_cast<const uint8_t*>(bytes)));
         }
-        return QStringLiteral("密文");
+        // 解密后的明文帧 → 解析可读字段（密文解开成可读内容）
+        if (plainBytes != nullptr && plainLen > 0) {
+            const QString fields = _parsePlainFields(msgid, plainBytes, plainLen);
+            return prefix.isEmpty() ? fields : prefix + QLatin1Char(' ') + fields;
+        }
+        return prefix.isEmpty() ? QStringLiteral("密文") : prefix + QStringLiteral(" 密文");
     }
     if (msgid == MAVLINK_MSG_ID_QGC_REGISTRATION) { // 80005
         return parseRegistrationPayload(bytes, len);
     }
-    if (msgid == 0) {
-        return QStringLiteral("待命心跳");
-    }
-    return QStringLiteral("msgid=%1").arg(msgid);
+    // 明文帧：解析可读字段（含 msgid=0 待命心跳的 type/mode）
+    return _parsePlainFields(msgid, bytes, len);
 #else
     Q_UNUSED(msgid)
     Q_UNUSED(encrypted)
     Q_UNUSED(bytes)
     Q_UNUSED(len)
+    Q_UNUSED(plainBytes)
+    Q_UNUSED(plainLen)
     return QString();
 #endif
+}
+
+QString CryptoLinkLogger::_parsePlainFields(uint32_t msgid, const char* plainBytes, int plainLen)
+{
+#ifdef QGC_CRYPTO_LINK_LOG
+    if (plainBytes == nullptr || plainLen <= 0) {
+        return QStringLiteral("msgid=%1").arg(msgid);
+    }
+    mavlink_message_t msg {};
+    _frameToMessage(plainBytes, plainLen, msg);
+
+    switch (msgid) {
+    case 0: { // HEARTBEAT
+        const uint8_t type = mavlink_msg_heartbeat_get_type(&msg);
+        const uint8_t baseMode = mavlink_msg_heartbeat_get_base_mode(&msg);
+        return QStringLiteral("待命心跳 type=%1,mode=0x%2").arg(type).arg(baseMode, 2, 16, QLatin1Char('0'));
+    }
+    case 33: { // GLOBAL_POSITION_INT
+        const int32_t lat = mavlink_msg_global_position_int_get_lat(&msg);
+        const int32_t lon = mavlink_msg_global_position_int_get_lon(&msg);
+        const int32_t alt = mavlink_msg_global_position_int_get_alt(&msg);
+        return QStringLiteral("lat=%1,lon=%2,alt=%3m").arg(lat / 1e7, 0, 'f', 7).arg(lon / 1e7, 0, 'f', 7).arg(alt / 1000.0, 0, 'f', 1);
+    }
+    case 24: { // GPS_RAW_INT
+        const uint8_t fix = mavlink_msg_gps_raw_int_get_fix_type(&msg);
+        const uint8_t sat = mavlink_msg_gps_raw_int_get_satellites_visible(&msg);
+        return QStringLiteral("fix=%1,sat=%2").arg(fix).arg(sat);
+    }
+    case 30: { // ATTITUDE
+        const float roll = mavlink_msg_attitude_get_roll(&msg);
+        const float pitch = mavlink_msg_attitude_get_pitch(&msg);
+        const float yaw = mavlink_msg_attitude_get_yaw(&msg);
+        return QStringLiteral("roll=%1,pitch=%2,yaw=%3").arg(roll, 0, 'f', 2).arg(pitch, 0, 'f', 2).arg(yaw, 0, 'f', 2);
+    }
+    case 74: { // VFR_HUD
+        const float air = mavlink_msg_vfr_hud_get_airspeed(&msg);
+        const float gnd = mavlink_msg_vfr_hud_get_groundspeed(&msg);
+        const float alt = mavlink_msg_vfr_hud_get_alt(&msg);
+        return QStringLiteral("airspeed=%1,gnd=%2,alt=%3m").arg(air, 0, 'f', 1).arg(gnd, 0, 'f', 1).arg(alt, 0, 'f', 1);
+    }
+    case 147: { // BATTERY_STATUS
+        const int32_t remaining = mavlink_msg_battery_status_get_battery_remaining(&msg);
+        return QStringLiteral("battery=%1%%").arg(remaining);
+    }
+    case 253: { // STATUSTEXT
+        char text[51] = {};
+        mavlink_msg_statustext_get_text(&msg, text);
+        return QStringLiteral("text=%1").arg(QString::fromLatin1(text));
+    }
+    case 76: { // COMMAND_LONG
+        const uint16_t cmd = mavlink_msg_command_long_get_command(&msg);
+        const float p1 = mavlink_msg_command_long_get_param1(&msg);
+        return QStringLiteral("cmd=%1,p1=%2").arg(cmd).arg(p1, 0, 'f', 1);
+    }
+    default:
+        return QStringLiteral("msgid=%1").arg(msgid);
+    }
+#else
+    Q_UNUSED(msgid)
+    Q_UNUSED(plainBytes)
+    Q_UNUSED(plainLen)
+    return QString();
+#endif
+}
+
+void CryptoLinkLogger::_frameToMessage(const char* bytes, int len, mavlink_message_t& msg)
+{
+    memset(&msg, 0, sizeof(msg));
+    if (bytes == nullptr || len < static_cast<int>(kV2HeaderLen)) {
+        return;
+    }
+    const uint8_t* const p = reinterpret_cast<const uint8_t*>(bytes);
+    if (p[0] != 0xFD) {
+        return; // 仅支持 MAVLink V2
+    }
+    msg.magic = p[0];
+    msg.len = p[1];
+    msg.incompat_flags = p[2];
+    msg.compat_flags = p[3];
+    msg.seq = p[4];
+    msg.sysid = p[5];
+    msg.compid = p[6];
+    msg.msgid = p[7] | (uint32_t(p[8]) << 8) | (uint32_t(p[9]) << 16);
+    const int payloadLen = qMin<int>(msg.len, len - static_cast<int>(kV2HeaderLen));
+    if (payloadLen > 0) {
+        memcpy(msg.payload64, p + kV2HeaderLen, static_cast<size_t>(payloadLen));
+    }
 }
 
 QString CryptoLinkLogger::_padToWidth(const QString& s, int width)

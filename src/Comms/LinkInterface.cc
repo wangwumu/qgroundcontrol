@@ -136,7 +136,8 @@ void LinkInterface::sendMessageThreadSafe(mavlink_message_t &message)
             if (MAVLinkCrypto::encryptFrame(buffer, len, crcExtra, crypto->activeDeviceID(), counter, key, encBuffer, &encLen)) {
                 MAVLinkCrypto::CryptoLinkLogger::instance()->logOutgoing(
                     message.msgid, crypto->activeDeviceID(), true,
-                    reinterpret_cast<const char*>(encBuffer), encLen, true);
+                    reinterpret_cast<const char*>(encBuffer), encLen,
+                    reinterpret_cast<const char*>(buffer), len, true);
                 writeBytesThreadSafe(reinterpret_cast<const char*>(encBuffer), encLen);
                 return;
             }
@@ -144,6 +145,7 @@ void LinkInterface::sendMessageThreadSafe(mavlink_message_t &message)
             qCWarning(LinkInterfaceLog) << "encryptFrame failed for msgid" << message.msgid;
             MAVLinkCrypto::CryptoLinkLogger::instance()->logOutgoing(
                 message.msgid, crypto->activeDeviceID(), true,
+                reinterpret_cast<const char*>(buffer), len,
                 reinterpret_cast<const char*>(buffer), len, false);
             return;
         }
@@ -155,7 +157,7 @@ void LinkInterface::sendMessageThreadSafe(mavlink_message_t &message)
     MAVLinkCrypto::CryptoLinkLogger::instance()->logOutgoing(
         message.msgid,
         MAVLinkCrypto::CryptoLinkLogger::deviceIDFromFrameBytes(reinterpret_cast<const char*>(buffer), len),
-        false, reinterpret_cast<const char*>(buffer), len, true);
+        false, reinterpret_cast<const char*>(buffer), len, nullptr, 0, true);
     writeBytesThreadSafe(reinterpret_cast<const char *>(buffer), len);
 }
 
@@ -167,7 +169,7 @@ void LinkInterface::sendPlaintextMessageThreadSafe(const mavlink_message_t& mess
     const int len = mavlink_msg_to_send_buffer(buffer, &message);
     MAVLinkCrypto::CryptoLinkLogger::instance()->logOutgoing(
         message.msgid, QGC_REGISTRATION_DEVICE_ID_DEFAULT, false,
-        reinterpret_cast<const char*>(buffer), len, true);
+        reinterpret_cast<const char*>(buffer), len, nullptr, 0, true);
     writeBytesThreadSafe(reinterpret_cast<const char*>(buffer), len);
 }
 

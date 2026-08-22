@@ -764,11 +764,13 @@ void CryptoTest::_testCryptoLinkLogger()
                  reinterpret_cast<const char*>(regFrame), static_cast<int>(sizeof(regFrame))),
              QStringLiteral("10000001,10000002"));
 
-    // 记录发出（QGC）80005 + 收到（PX4）加密帧
+    // 记录发出（QGC）80005 + 收到（PX4）加密帧（本用例传 null 明文，可读字段解析见独立验证）
     MAVLinkCrypto::CryptoLinkLogger::instance()->logOutgoing(
-        80005, 10000, false, reinterpret_cast<const char*>(regFrame), static_cast<int>(sizeof(regFrame)), true);
+        80005, 10000, false, reinterpret_cast<const char*>(regFrame), static_cast<int>(sizeof(regFrame)),
+        nullptr, 0, true);
     MAVLinkCrypto::CryptoLinkLogger::instance()->logIncoming(
-        33, 66051, true, reinterpret_cast<const char*>(encFrame), static_cast<int>(sizeof(encFrame)), true);
+        33, 66051, true, reinterpret_cast<const char*>(encFrame), static_cast<int>(sizeof(encFrame)),
+        nullptr, 0, true);
 
     // 读日志文件，断言最后两行格式与内容（logger 单例序号持续递增，不校验具体序号值）
     QFile f(QStringLiteral("/tmp/qgc_crypto_link.log"));

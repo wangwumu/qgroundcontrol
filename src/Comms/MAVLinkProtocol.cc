@@ -195,7 +195,7 @@ void MAVLinkProtocol::_receiveEncryptedBytes(LinkInterface* link, const SharedLi
             // 学习 deviceID↔sysid 映射后走标准解析器，识别在线/待命。
             const MAVLinkCrypto::DeviceID deviceID = MAVLinkCrypto::deviceIDFromFrame(frameData);
             MAVLinkCrypto::CryptoLinkLogger::instance()->logIncoming(
-                0, deviceID, false, reinterpret_cast<const char*>(frameData), frame.size(), true);
+                0, deviceID, false, reinterpret_cast<const char*>(frameData), frame.size(), nullptr, 0, true);
             MAVLinkCrypto::CryptoController::instance()->learnDeviceSystemMapping(
                 deviceID, MAVLinkCrypto::systemID(deviceID));
             _feedStandardFrame(link, linkPtr, channel, frameData, frame.size());
@@ -225,7 +225,7 @@ void MAVLinkProtocol::_processEncryptedFrame(LinkInterface* link, const SharedLi
                                       << "msgid" << msgid
                                       << "deviceID" << deviceID;
         MAVLinkCrypto::CryptoLinkLogger::instance()->logIncoming(
-            msgid, deviceID, true, reinterpret_cast<const char*>(encData), encLen, false,
+            msgid, deviceID, true, reinterpret_cast<const char*>(encData), encLen, nullptr, 0, false,
             QStringLiteral("畸形短帧"));
         return; // 畸形帧
     }
@@ -243,7 +243,7 @@ void MAVLinkProtocol::_processEncryptedFrame(LinkInterface* link, const SharedLi
     if (!crypto->isIncomingAcceptable(deviceID, counter)) {
         qCDebug(MAVLinkProtocolLog) << "encrypted frame replay dropped" << deviceID << counter;
         MAVLinkCrypto::CryptoLinkLogger::instance()->logIncoming(
-            msgid, deviceID, true, reinterpret_cast<const char*>(encData), encLen, false,
+            msgid, deviceID, true, reinterpret_cast<const char*>(encData), encLen, nullptr, 0, false,
             QStringLiteral("防重放拒绝"));
         return;
     }
@@ -253,7 +253,7 @@ void MAVLinkProtocol::_processEncryptedFrame(LinkInterface* link, const SharedLi
     if (!crypto->deviceKeyManager()->keyForDevice(deviceID, key)) {
         qCWarning(MAVLinkProtocolLog) << "no key for device" << deviceID << ", dropping encrypted frame";
         MAVLinkCrypto::CryptoLinkLogger::instance()->logIncoming(
-            msgid, deviceID, true, reinterpret_cast<const char*>(encData), encLen, false,
+            msgid, deviceID, true, reinterpret_cast<const char*>(encData), encLen, nullptr, 0, false,
             QStringLiteral("无密钥"));
         return; // 未登记设备
     }
@@ -263,7 +263,7 @@ void MAVLinkProtocol::_processEncryptedFrame(LinkInterface* link, const SharedLi
     if (entry == nullptr) {
         qCWarning(MAVLinkProtocolLog) << "unknown msgid" << msgid << "for device" << deviceID << ", dropping";
         MAVLinkCrypto::CryptoLinkLogger::instance()->logIncoming(
-            msgid, deviceID, true, reinterpret_cast<const char*>(encData), encLen, false,
+            msgid, deviceID, true, reinterpret_cast<const char*>(encData), encLen, nullptr, 0, false,
             QStringLiteral("未知msgid"));
         return; // 未知 msgid，无法验证 CRC
     }
@@ -278,7 +278,7 @@ void MAVLinkProtocol::_processEncryptedFrame(LinkInterface* link, const SharedLi
                                      &plainLen)) {
         qCWarning(MAVLinkProtocolLog) << "decryptFrame failed for device" << deviceID << "msgid" << msgid;
         MAVLinkCrypto::CryptoLinkLogger::instance()->logIncoming(
-            msgid, deviceID, true, reinterpret_cast<const char*>(encData), encLen, false,
+            msgid, deviceID, true, reinterpret_cast<const char*>(encData), encLen, nullptr, 0, false,
             QStringLiteral("解密失败"));
         return; // 解密失败 / tag 校验失败 / 密钥绑定失败
     }
@@ -291,13 +291,14 @@ void MAVLinkProtocol::_processEncryptedFrame(LinkInterface* link, const SharedLi
     if (plainFrame[1] == 0) {
         qCDebug(MAVLinkProtocolLog) << "dropped empty-payload degraded frame for device" << deviceID << "msgid" << msgid;
         MAVLinkCrypto::CryptoLinkLogger::instance()->logIncoming(
-            msgid, deviceID, true, reinterpret_cast<const char*>(encData), encLen, true);
+            msgid, deviceID, true, reinterpret_cast<const char*>(encData), encLen, nullptr, 0, true);
         return;
     }
 
-    // 解密成功：记录收到 + 还原的标准帧喂给标准解析器，复用常规消息处理。
+    // 解密成功：记录收到（明文内容=解密后的可读字段）+ 还原的标准帧喂给标准解析器。
     MAVLinkCrypto::CryptoLinkLogger::instance()->logIncoming(
-        msgid, deviceID, true, reinterpret_cast<const char*>(encData), encLen, true);
+        msgid, deviceID, true, reinterpret_cast<const char*>(encData), encLen,
+        reinterpret_cast<const char*>(plainFrame), plainLen, true);
     _feedStandardFrame(link, linkPtr, channel, plainFrame, plainLen);
 }
 
