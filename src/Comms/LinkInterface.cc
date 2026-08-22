@@ -7,6 +7,7 @@
 #include "SigningController.h"
 #include "Crypto/CryptoCodec.h"
 #include "Crypto/CryptoController.h"
+#include "Crypto/CryptoLinkLogger.h"
 #include "Extensions/VTOLSafetyMessages.h"
 
 #include <QtQml/QQmlEngine>
@@ -133,11 +134,17 @@ void LinkInterface::sendMessageThreadSafe(mavlink_message_t &message)
             // 帧头/明文内嵌/nonce 的 deviceID 一律用「目标无人机」，接收方按它查自己的密钥；
             // 用 GCS 自身 deviceID 会导致 PX4 查无密钥而丢弃。
             if (MAVLinkCrypto::encryptFrame(buffer, len, crcExtra, crypto->activeDeviceID(), counter, key, encBuffer, &encLen)) {
+                MAVLinkCrypto::CryptoLinkLogger::instance()->logOutgoing(
+                    message.msgid, crypto->activeDeviceID(), true,
+                    reinterpret_cast<const char*>(encBuffer), encLen, true);
                 writeBytesThreadSafe(reinterpret_cast<const char*>(encBuffer), encLen);
                 return;
             }
             // 加密失败：丢弃帧，不回退明文（回退明文会被接收端丢弃，且违反全加密不变量）
             qCWarning(LinkInterfaceLog) << "encryptFrame failed for msgid" << message.msgid;
+            MAVLinkCrypto::CryptoLinkLogger::instance()->logOutgoing(
+                message.msgid, crypto->activeDeviceID(), true,
+                reinterpret_cast<const char*>(buffer), len, false);
             return;
         }
         // 密钥未就绪（理论不可达：Active 保证有 key）
@@ -145,6 +152,10 @@ void LinkInterface::sendMessageThreadSafe(mavlink_message_t &message)
         return;
     }
 
+    MAVLinkCrypto::CryptoLinkLogger::instance()->logOutgoing(
+        message.msgid,
+        MAVLinkCrypto::CryptoLinkLogger::deviceIDFromFrameBytes(reinterpret_cast<const char*>(buffer), len),
+        false, reinterpret_cast<const char*>(buffer), len, true);
     writeBytesThreadSafe(reinterpret_cast<const char *>(buffer), len);
 }
 
@@ -154,6 +165,9 @@ void LinkInterface::sendPlaintextMessageThreadSafe(const mavlink_message_t& mess
     // 直接序列化后写入，绕过 sendMessageThreadSafe 的加密路径（加密会破坏明文特例语义）。
     uint8_t buffer[MAVLINK_MAX_PACKET_LEN];
     const int len = mavlink_msg_to_send_buffer(buffer, &message);
+    MAVLinkCrypto::CryptoLinkLogger::instance()->logOutgoing(
+        message.msgid, QGC_REGISTRATION_DEVICE_ID_DEFAULT, false,
+        reinterpret_cast<const char*>(buffer), len, true);
     writeBytesThreadSafe(reinterpret_cast<const char*>(buffer), len);
 }
 

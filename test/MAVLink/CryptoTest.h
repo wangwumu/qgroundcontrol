@@ -45,4 +45,7 @@ private slots:
 
     // 本地 key 文件注入（调试路径）：读 32 字节文件 → 缓存 → keyForDevice 可命中
     void _testInjectLocalKey();
+
+    // 报文链路日志器格式验证（联调宏 QGC_CRYPTO_LINK_LOG 启用时断言）
+    void _testCryptoLinkLogger();
 };

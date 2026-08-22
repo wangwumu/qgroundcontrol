@@ -2,6 +2,7 @@
 
 #include "Crypto/CryptoCodec.h"
 #include "Crypto/CryptoController.h"
+#include "Crypto/CryptoLinkLogger.h"
 #include "Crypto/DeviceID.h"
 #include "Crypto/MAVLinkCrypto.h"
 #include "Crypto/ReplayGuard.h"
@@ -732,6 +733,59 @@ void CryptoTest::_testInjectLocalKey()
     verifyExpectedLogMessage();
 
     // QTemporaryFile 析构自动清理
+}
+
+void CryptoTest::_testCryptoLinkLogger()
+{
+    if (!MAVLinkCrypto::CryptoLinkLogger::enabled()) {
+        QSKIP("QGC_CRYPTO_LINK_LOG not enabled (联调构建开启后此用例生效)");
+        return;
+    }
+    // 80005 明文登记心跳帧：帧头 deviceID=10000（GCS 段），payload=2 个 PX4 deviceID（10000001/10000002）
+    const uint8_t regFrame[] = {
+        0xFD, 0x09, 0x00, 0x00, 0x00, 0x27, 0x10, 0x89, 0x38, 0x01, // header：len=9 deviceID=10000 msgid=80005
+        0x02, 0x00, 0x98, 0x96, 0x81, 0x00, 0x98, 0x96, 0x82,         // payload：num=2, deviceID 集合
+        0x00, 0x00,                                                  // crc
+    };
+    // 加密帧：deviceID=66051(0x00010203)，counter=123，msgid=33，payload=28（8 counter + 20 密文/tag）
+    const uint8_t encFrame[] = {
+        0xFD, 0x1C, 0x00, 0x01, 0x00, 0x02, 0x03, 0x21, 0x00, 0x00, // len=28 deviceID=66051 msgid=33
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7B,              // counter=123（8B 大端）
+        0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,  // 密文(4)+tag(16)
+        0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00,
+        0x00, 0x00,                                                  // crc
+    };
+
+    // 帧头 deviceID 重组 + 80005 payload 解析
+    QCOMPARE(MAVLinkCrypto::CryptoLinkLogger::deviceIDFromFrameBytes(
+                 reinterpret_cast<const char*>(regFrame), static_cast<int>(sizeof(regFrame))),
+             10000u);
+    QCOMPARE(MAVLinkCrypto::CryptoLinkLogger::parseRegistrationPayload(
+                 reinterpret_cast<const char*>(regFrame), static_cast<int>(sizeof(regFrame))),
+             QStringLiteral("10000001,10000002"));
+
+    // 记录发出（QGC）80005 + 收到（PX4）加密帧
+    MAVLinkCrypto::CryptoLinkLogger::instance()->logOutgoing(
+        80005, 10000, false, reinterpret_cast<const char*>(regFrame), static_cast<int>(sizeof(regFrame)), true);
+    MAVLinkCrypto::CryptoLinkLogger::instance()->logIncoming(
+        33, 66051, true, reinterpret_cast<const char*>(encFrame), static_cast<int>(sizeof(encFrame)), true);
+
+    // 读日志文件，断言最后两行格式与内容（logger 单例序号持续递增，不校验具体序号值）
+    QFile f(QStringLiteral("/tmp/qgc_crypto_link.log"));
+    QVERIFY(f.open(QIODevice::ReadOnly | QIODevice::Text));
+    const QList<QByteArray> lines = f.readAll().split('\n');
+    f.close();
+    QVERIFY2(lines.size() >= 3, "日志文件应有至少两条记录");
+    const QString lineReg  = QString::fromUtf8(lines[lines.size() - 3]);
+    const QString lineEnc  = QString::fromUtf8(lines[lines.size() - 2]);
+    // 80005：... QGC A 80005 10000 M S QGC登记心跳 9 10000001,10000002
+    QVERIFY2(lineReg.contains(QStringLiteral("QGC")) && lineReg.contains(QStringLiteral("80005")) &&
+                 lineReg.contains(QStringLiteral("10000001,10000002")),
+             qPrintable(QStringLiteral("80005 行格式异常: %1").arg(lineReg)));
+    // 加密帧：... PX4 A 33 66051 C S 位置遥测 28 counter=123,密文
+    QVERIFY2(lineEnc.contains(QStringLiteral("PX4")) && lineEnc.contains(QStringLiteral("66051")) &&
+                 lineEnc.contains(QStringLiteral("counter=123")),
+             qPrintable(QStringLiteral("加密帧行格式异常: %1").arg(lineEnc)));
 }
 
 UT_REGISTER_TEST_LIGHTWEIGHT(CryptoTest, TestLabel::Unit)

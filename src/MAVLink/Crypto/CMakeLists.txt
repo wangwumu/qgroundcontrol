@@ -9,6 +9,8 @@ target_sources(
             CryptoCodec.h
             CryptoController.cc
             CryptoController.h
+            CryptoLinkLogger.cc
+            CryptoLinkLogger.h
             DeviceID.h
             DeviceKeyManager.cc
             DeviceKeyManager.h
@@ -19,6 +21,18 @@ target_sources(
 )
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+# ----------------------------------------------------------------------------
+# 联调开关：QGC ↔ PX4 报文链路日志（CryptoLinkLogger）。
+# 默认 OFF（方法体为空，零开销）；联调构建时 -DQGC_CRYPTO_LINK_LOG=ON 启用，
+# 把 QGC 收发报文按时序写入 /tmp/qgc_crypto_link.log。
+# ----------------------------------------------------------------------------
+option(QGC_CRYPTO_LINK_LOG "Enable crypto link message logging (联调观察)" OFF)
+if(QGC_CRYPTO_LINK_LOG)
+    # 只对 CryptoLinkLogger.cc 加宏（enabled() 运行时暴露开关），避免改全局 compile flags
+    # 触发全量重编；其余文件（含 CryptoTest）经 CryptoLinkLogger::enabled() 运行时判断。
+    set_source_files_properties(CryptoLinkLogger.cc PROPERTIES COMPILE_DEFINITIONS QGC_CRYPTO_LINK_LOG)
+endif()
 
 # ----------------------------------------------------------------------------
 # OpenSSL (AES-256-GCM)
