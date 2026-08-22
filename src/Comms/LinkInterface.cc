@@ -143,10 +143,11 @@ void LinkInterface::sendMessageThreadSafe(mavlink_message_t &message)
             }
             // 加密失败：丢弃帧，不回退明文（回退明文会被接收端丢弃，且违反全加密不变量）
             qCWarning(LinkInterfaceLog) << "encryptFrame failed for msgid" << message.msgid;
+            // 无线上密文帧：以明文记录（encrypted=false，避免把明文当密文读 counter 产生垃圾值）
             MAVLinkCrypto::CryptoLinkLogger::instance()->logOutgoing(
-                message.msgid, crypto->activeDeviceID(), true,
-                reinterpret_cast<const char*>(buffer), len,
-                reinterpret_cast<const char*>(buffer), len, false);
+                message.msgid, crypto->activeDeviceID(), false,
+                reinterpret_cast<const char*>(buffer), len, nullptr, 0, false,
+                QStringLiteral("加密失败"));
             return;
         }
         // 密钥未就绪（理论不可达：Active 保证有 key）

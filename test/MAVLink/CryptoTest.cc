@@ -737,13 +737,9 @@ void CryptoTest::_testInjectLocalKey()
 
 void CryptoTest::_testCryptoLinkLogger()
 {
-    if (!MAVLinkCrypto::CryptoLinkLogger::enabled()) {
-        QSKIP("QGC_CRYPTO_LINK_LOG not enabled (联调构建开启后此用例生效)");
-        return;
-    }
     // 80005 明文登记心跳帧：帧头 deviceID=10000（GCS 段），payload=2 个 PX4 deviceID（10000001/10000002）
     const uint8_t regFrame[] = {
-        0xFD, 0x09, 0x00, 0x00, 0x00, 0x27, 0x10, 0x89, 0x38, 0x01, // header：len=9 deviceID=10000 msgid=80005
+        0xFD, 0x09, 0x00, 0x00, 0x00, 0x27, 0x10, 0x85, 0x38, 0x01, // header：len=9 deviceID=10000 msgid=80005(0x13885)
         0x02, 0x00, 0x98, 0x96, 0x81, 0x00, 0x98, 0x96, 0x82,         // payload：num=2, deviceID 集合
         0x00, 0x00,                                                  // crc
     };
@@ -755,8 +751,16 @@ void CryptoTest::_testCryptoLinkLogger()
         0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00,
         0x00, 0x00,                                                  // crc
     };
+    // 解密后的明文 GLOBAL_POSITION_INT 帧（msgid=33，类型降序布局）：lat=31.2345678 lon=121.4567890 alt=50m
+    const uint8_t plainPos[] = {
+        0xFD, 0x1C, 0x00, 0x00, 0x00, 0x98, 0x81, 0x21, 0x00, 0x00, // len=28 msgid=33
+        0x00, 0x00, 0x00, 0x00, 0xCE, 0xFF, 0x9D, 0x12, 0x52, 0x6B, // time_boot_ms=0, lat=312345678, lon=1214567890
+        0x65, 0x48, 0x50, 0xC3, 0x00, 0x00, 0x40, 0x9C, 0x00, 0x00, // alt=50000, relative_alt=40000
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,             // vx,vy,vz,hdg=0
+        0x00, 0x00,                                                  // crc
+    };
 
-    // 帧头 deviceID 重组 + 80005 payload 解析
+    // 纯解析逻辑无条件可测（宏关闭时解析函数仍编译，见 CryptoLinkLogger.cc）
     QCOMPARE(MAVLinkCrypto::CryptoLinkLogger::deviceIDFromFrameBytes(
                  reinterpret_cast<const char*>(regFrame), static_cast<int>(sizeof(regFrame))),
              10000u);
@@ -764,13 +768,19 @@ void CryptoTest::_testCryptoLinkLogger()
                  reinterpret_cast<const char*>(regFrame), static_cast<int>(sizeof(regFrame))),
              QStringLiteral("10000001,10000002"));
 
-    // 记录发出（QGC）80005 + 收到（PX4）加密帧（本用例传 null 明文，可读字段解析见独立验证）
+    // 文件写入验证需 enabled()（宏 OFF 或 /tmp 打开失败则跳过）
+    if (!MAVLinkCrypto::CryptoLinkLogger::enabled()) {
+        QSKIP("文件日志未启用（QGC_CRYPTO_LINK_LOG OFF 或 /tmp 打开失败），跳过文件写入断言");
+        return;
+    }
+
+    // 记录发出（QGC）80005 + 收到（PX4）加密帧（明文=解密后的 GLOBAL_POSITION_INT，验证密文解开成可读字段）
     MAVLinkCrypto::CryptoLinkLogger::instance()->logOutgoing(
         80005, 10000, false, reinterpret_cast<const char*>(regFrame), static_cast<int>(sizeof(regFrame)),
         nullptr, 0, true);
     MAVLinkCrypto::CryptoLinkLogger::instance()->logIncoming(
         33, 66051, true, reinterpret_cast<const char*>(encFrame), static_cast<int>(sizeof(encFrame)),
-        nullptr, 0, true);
+        reinterpret_cast<const char*>(plainPos), static_cast<int>(sizeof(plainPos)), true);
 
     // 读日志文件，断言最后两行格式与内容（logger 单例序号持续递增，不校验具体序号值）
     QFile f(QStringLiteral("/tmp/qgc_crypto_link.log"));
@@ -784,9 +794,11 @@ void CryptoTest::_testCryptoLinkLogger()
     QVERIFY2(lineReg.contains(QStringLiteral("QGC")) && lineReg.contains(QStringLiteral("80005")) &&
                  lineReg.contains(QStringLiteral("10000001,10000002")),
              qPrintable(QStringLiteral("80005 行格式异常: %1").arg(lineReg)));
-    // 加密帧：... PX4 A 33 66051 C S 位置遥测 28 counter=123,密文
+    // 加密帧：... PX4 A 33 66051 C S 位置遥测 28 counter=123 lat=31.2345678,lon=121.4567890,alt=50.0m
     QVERIFY2(lineEnc.contains(QStringLiteral("PX4")) && lineEnc.contains(QStringLiteral("66051")) &&
-                 lineEnc.contains(QStringLiteral("counter=123")),
+                 lineEnc.contains(QStringLiteral("counter=123")) &&
+                 lineEnc.contains(QStringLiteral("lat=31.2345678")) &&
+                 lineEnc.contains(QStringLiteral("lon=121.4567890")),
              qPrintable(QStringLiteral("加密帧行格式异常: %1").arg(lineEnc)));
 }
 

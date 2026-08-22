@@ -6,30 +6,37 @@
 
 #include <cstdint>
 
+// 前向声明 mavlink_message_t（QGC 经 mavlink_types.h 定义，避免本头依赖 PCH 注入）
+typedef struct __mavlink_message mavlink_message_t;
+
 namespace MAVLinkCrypto {
 
 /// 报文链路日志器（联调观察工具）。
 ///
 /// 把 QGC 发出的和收到的 MAVLink 报文按时序写入固定路径文件（/tmp/qgc_crypto_link.log），
-/// 供联调排查加密链路（QGC ↔ PX4 直连）。**仅在编译宏 `QGC_CRYPTO_LINK_LOG` 定义时启用**，
-/// 正常构建零开销（方法体为空）。
+/// 供联调排查加密链路（QGC ↔ PX4 直连）。**仅当编译宏 `QGC_CRYPTO_LINK_LOG` 定义时**文件写入生效
+/// （`enabled()` 同时反映文件是否打开成功）；宏关闭时方法体为空——纯解析函数仍无条件编译
+/// （可在默认构建测试），但**不做文件 IO / 格式化**。调用点仍执行单例查询与参数构造，
+/// 开销可忽略（纳秒级 vs AES-GCM 微秒级）。
 ///
 /// 日志格式（空格分隔，字段对齐，每报文一行）：
 /// ```
-/// 序号(5位右) 时间(HH:MM:SS) 发送端(QGC/PX4) C/A mavlink命令 deviceID(6位右) M/C S/F 说明(20汉字) payload长度(3位右) 内容
+/// 序号(5位右) 时间(HH:MM:SS.zzz) 发送端(QGC/PX4) C/A msgid(8位右) deviceID(6位右) M/C S/F 说明(20汉字) 长度(3位右) 内容
 /// ```
-/// - C/A：命令触发（C，COMMAND/MISSION/80000-80003 等）/ 自动发送（A，心跳/登记心跳/遥测）
+/// - C/A：命令触发（C，COMMAND/MISSION/SET_*/PARAM_SET/80000-80003 等）/ 自动发送（A，心跳/登记心跳/遥测）
 /// - M/C：明文 / 密文
-/// - S/F：解析成功 / 失败（加密帧=解密认证结果）
+/// - S/F：解析成功 / 失败（加密帧=解密认证结果；失败时内容附 `（失败原因）`）
+/// - 长度列：明文=payload 字节数；加密帧=帧头 len（payload block：counter+deviceID+payload+tag）
 ///
 /// 报文内容按消息类型解析为可读文本：80005 的 payload 解析为 deviceID 集合
-/// （"001111,001112"），加密帧解析 counter 等。
+/// （"001111,001112"），加密帧解析 counter + 解密后的可读字段（密文解开成可读内容）。
 class CryptoLinkLogger
 {
 public:
     /// 单例（首次调用时创建，进程生命周期内有效）。
     static CryptoLinkLogger* instance();
-    /// 日志是否启用（联调宏 QGC_CRYPTO_LINK_LOG 控制，供调用方/测试运行时判断）。
+    /// 日志是否真正生效：宏 QGC_CRYPTO_LINK_LOG 定义 **且** 日志文件打开成功。
+    /// 宏开但文件打不开时返回 false（避免调用方误以为在记录）。供调用方/测试运行时判断。
     static bool enabled();
 
     /// 记录一个 QGC 发出的报文（bytes/len 为完整帧字节）。
@@ -48,8 +55,6 @@ public:
                      const char* plainBytes, int plainLen, bool parseOk,
                      const QString& failReason = QString());
 
-    /// 命令类消息判定（用户命令触发 vs 自动发送）。
-    static bool isCommandMessage(uint32_t msgid);
     /// 80005 登记心跳 payload → deviceID 集合文本（"001111,001112"）。
     static QString parseRegistrationPayload(const char* bytes, int len);
     /// 从帧字节重组帧头 deviceID（§1.2：incompat<<24|compat<<16|sys<<8|comp）。

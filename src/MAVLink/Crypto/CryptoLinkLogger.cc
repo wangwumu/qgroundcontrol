@@ -3,7 +3,8 @@
 // ============================================================================
 // 联调开关：QGC ↔ PX4 报文链路日志。
 // 由 CMake option `QGC_CRYPTO_LINK_LOG` 控制（src/MAVLink/Crypto/CMakeLists.txt）：
-//   默认 OFF（方法体为空，零开销）；联调构建时配置 -DQGC_CRYPTO_LINK_LOG=ON 启用。
+//   默认 OFF——文件写入/格式化方法体为空；纯解析函数仍无条件编译（可测试）。
+//   联调构建时配置 -DQGC_CRYPTO_LINK_LOG=ON 启用文件日志。
 // ============================================================================
 
 #include <QTime>
@@ -52,7 +53,9 @@ CryptoLinkLogger::CryptoLinkLogger()
 #ifdef QGC_CRYPTO_LINK_LOG
     _file.setFileName(QLatin1String(kLogPath));
     if (!_file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
-        // 打开失败（如 /tmp 不可写）：静默，日志不落盘（联调观察，不阻塞链路）
+        // 打开失败（如 /tmp 不可写）：只告警一次（enabled() 反映 false，写路径不再触碰关闭的 QFile）。
+        // 用 Qt 全局 qWarning（不用 QGC_LOGGING_CATEGORY，保持本调试工具可独立编译/测试）。
+        qWarning("CryptoLinkLogger: cannot open log %s: %s", kLogPath, qPrintable(_file.errorString()));
     }
 #endif
 }
@@ -75,7 +78,7 @@ CryptoLinkLogger* CryptoLinkLogger::instance()
 bool CryptoLinkLogger::enabled()
 {
 #ifdef QGC_CRYPTO_LINK_LOG
-    return true;
+    return instance()->_file.isOpen();
 #else
     return false;
 #endif
@@ -87,10 +90,11 @@ void CryptoLinkLogger::logOutgoing(uint32_t msgid, uint32_t deviceID, bool encry
                                    const QString& failReason)
 {
 #ifdef QGC_CRYPTO_LINK_LOG
-    const int payloadLen = encrypted ? static_cast<int>(frameLength(
-                                           reinterpret_cast<const uint8_t*>(bytes))) :
-                                       (len - static_cast<int>(kV2HeaderLen) -
-                                        static_cast<int>(kCrcLen));
+    const int payloadLen = (bytes == nullptr)
+                               ? 0 // 加密失败无线上帧（bytes 可传 null）
+                               : (encrypted
+                                      ? static_cast<int>(frameLength(reinterpret_cast<const uint8_t*>(bytes)))
+                                      : (len - static_cast<int>(kV2HeaderLen) - static_cast<int>(kCrcLen)));
     _append(true, encrypted, parseOk, msgid, deviceID, _describeMsgid(msgid), payloadLen,
             _parseContent(msgid, encrypted, bytes, len, plainBytes, plainLen), failReason);
 #else
@@ -112,10 +116,11 @@ void CryptoLinkLogger::logIncoming(uint32_t msgid, uint32_t deviceID, bool encry
                                    const QString& failReason)
 {
 #ifdef QGC_CRYPTO_LINK_LOG
-    const int payloadLen = encrypted ? static_cast<int>(frameLength(
-                                           reinterpret_cast<const uint8_t*>(bytes))) :
-                                       (len - static_cast<int>(kV2HeaderLen) -
-                                        static_cast<int>(kCrcLen));
+    const int payloadLen = (bytes == nullptr)
+                               ? 0 // 加密失败无线上帧（bytes 可传 null）
+                               : (encrypted
+                                      ? static_cast<int>(frameLength(reinterpret_cast<const uint8_t*>(bytes)))
+                                      : (len - static_cast<int>(kV2HeaderLen) - static_cast<int>(kCrcLen)));
     _append(false, encrypted, parseOk, msgid, deviceID, _describeMsgid(msgid), payloadLen,
             _parseContent(msgid, encrypted, bytes, len, plainBytes, plainLen), failReason);
 #else
@@ -140,7 +145,7 @@ void CryptoLinkLogger::_append(bool outgoing, bool encrypted, bool parseOk, uint
 
     QString line;
     line += _padLeft(QString::number(_seq), 5) + QLatin1Char(' ');
-    line += QTime::currentTime().toString(QStringLiteral("HH:mm:ss")) + QLatin1Char(' ');
+    line += QTime::currentTime().toString(QStringLiteral("HH:mm:ss.zzz")) + QLatin1Char(' ');
     line += QLatin1String(outgoing ? "QGC" : "PX4") + QLatin1Char(' ');
     line += QLatin1String(isCommandMsgid(msgid) ? "C" : "A") + QLatin1Char(' ');
     line += _padLeft(QString::number(msgid), 8) + QLatin1Char(' ');
@@ -159,14 +164,8 @@ void CryptoLinkLogger::_append(bool outgoing, bool encrypted, bool parseOk, uint
     _file.flush();
 }
 
-bool CryptoLinkLogger::isCommandMessage(uint32_t msgid)
-{
-    return isCommandMsgid(msgid);
-}
-
 QString CryptoLinkLogger::parseRegistrationPayload(const char* bytes, int len)
 {
-#ifdef QGC_CRYPTO_LINK_LOG
     if (bytes == nullptr || len < static_cast<int>(kV2HeaderLen) + 1) {
         return QString();
     }
@@ -184,25 +183,14 @@ QString CryptoLinkLogger::parseRegistrationPayload(const char* bytes, int len)
         ids << QStringLiteral("%1").arg(did, 6, 10, QLatin1Char('0'));
     }
     return ids.join(QLatin1String(","));
-#else
-    Q_UNUSED(bytes)
-    Q_UNUSED(len)
-    return QString();
-#endif
 }
 
 uint32_t CryptoLinkLogger::deviceIDFromFrameBytes(const char* bytes, int len)
 {
-#ifdef QGC_CRYPTO_LINK_LOG
     if (bytes == nullptr || len < 7) {
         return 0;
     }
     return deviceIDFromFrame(reinterpret_cast<const uint8_t*>(bytes));
-#else
-    Q_UNUSED(bytes)
-    Q_UNUSED(len)
-    return 0;
-#endif
 }
 
 QString CryptoLinkLogger::_describeMsgid(uint32_t msgid)
@@ -228,7 +216,6 @@ QString CryptoLinkLogger::_describeMsgid(uint32_t msgid)
 QString CryptoLinkLogger::_parseContent(uint32_t msgid, bool encrypted, const char* bytes, int len,
                                         const char* plainBytes, int plainLen)
 {
-#ifdef QGC_CRYPTO_LINK_LOG
     if (encrypted) {
         QString prefix;
         if (bytes != nullptr && len >= static_cast<int>(kV2HeaderLen) +
@@ -248,25 +235,19 @@ QString CryptoLinkLogger::_parseContent(uint32_t msgid, bool encrypted, const ch
     }
     // 明文帧：解析可读字段（含 msgid=0 待命心跳的 type/mode）
     return _parsePlainFields(msgid, bytes, len);
-#else
-    Q_UNUSED(msgid)
-    Q_UNUSED(encrypted)
-    Q_UNUSED(bytes)
-    Q_UNUSED(len)
-    Q_UNUSED(plainBytes)
-    Q_UNUSED(plainLen)
-    return QString();
-#endif
 }
 
 QString CryptoLinkLogger::_parsePlainFields(uint32_t msgid, const char* plainBytes, int plainLen)
 {
-#ifdef QGC_CRYPTO_LINK_LOG
     if (plainBytes == nullptr || plainLen <= 0) {
         return QStringLiteral("msgid=%1").arg(msgid);
     }
     mavlink_message_t msg {};
     _frameToMessage(plainBytes, plainLen, msg);
+    // 帧无效（非 V2 / 截断）或 msgid 与调用方不一致 → 回退，不显示误导性全零字段
+    if (msg.magic != 0xFD || msg.msgid != msgid) {
+        return QStringLiteral("msgid=%1").arg(msgid);
+    }
 
     switch (msgid) {
     case 0: { // HEARTBEAT
@@ -314,12 +295,6 @@ QString CryptoLinkLogger::_parsePlainFields(uint32_t msgid, const char* plainByt
     default:
         return QStringLiteral("msgid=%1").arg(msgid);
     }
-#else
-    Q_UNUSED(msgid)
-    Q_UNUSED(plainBytes)
-    Q_UNUSED(plainLen)
-    return QString();
-#endif
 }
 
 void CryptoLinkLogger::_frameToMessage(const char* bytes, int len, mavlink_message_t& msg)
