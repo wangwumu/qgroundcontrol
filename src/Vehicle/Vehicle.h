@@ -834,6 +834,9 @@ signals:
 
 private slots:
     void _mavlinkMessageReceived            (LinkInterface* link, mavlink_message_t message);
+    /// 加密心跳 EXT 注入的合成遥测（经 MAVLinkProtocol::telemetryInjected 到达）。
+    /// 消费遥测（FactGroup/各 handler），但绕过 seq/丢包统计（合成消息 seq 取自 QGC 发送侧，非车辆序列）。
+    void _syntheticTelemetryReceived        (LinkInterface* link, const mavlink_message_t& message);
     void _sendMessageMultipleNext           ();
     void _parametersReady                   (bool parametersReady);
     void _handleFlightModeChanged           (const QString& flightMode);
@@ -860,6 +863,8 @@ private slots:
 
 private:
     void _activeVehicleChanged          (Vehicle* newActiveVehicle);
+    /// 统一消息处理：synthetic=true 时为本地注入的合成遥测（跳过 link 活性/计数/seq 统计）。
+    void _processMavlinkMessage         (LinkInterface* link, mavlink_message_t message, bool synthetic);
     void _handlePing                    (LinkInterface* link, mavlink_message_t& message);
     void _handleHomePosition            (mavlink_message_t& message);
     void _handleHeartbeat               (mavlink_message_t& message);

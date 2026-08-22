@@ -25,6 +25,7 @@
 #include "SettingsManager.h"
 #include "Crypto/CryptoCodec.h"
 #include "Crypto/CryptoController.h"
+#include "Crypto/CryptoHeartbeatExt.h"
 #include "Crypto/CryptoLinkLogger.h"
 
 QGC_LOGGING_CATEGORY(MAVLinkProtocolLog, "Comms.MAVLinkProtocol")
@@ -152,6 +153,15 @@ void MAVLinkProtocol::receiveBytes(LinkInterface* link, const QByteArray& data)
         }
         _logData(link, message);
 
+        // 联调日志：非加密接收路径（cryptoEnabled=false）也记录收到的帧，
+        // 使 QGC 侧日志包含双方信息（与 PX4 mavlink_trace 双向记录对应）。
+        // 加密路径（_receiveEncryptedBytes）已在各分支记录 incoming，此处不重复。
+        uint8_t logFrame[MAVLINK_MAX_PACKET_LEN];
+        const int logFrameLen = mavlink_msg_to_send_buffer(logFrame, &message);
+        MAVLinkCrypto::CryptoLinkLogger::instance()->logIncoming(
+            message.msgid, MAVLinkCrypto::fromMessage(message), false,
+            reinterpret_cast<const char*>(logFrame), logFrameLen, nullptr, 0, true);
+
         if (!_updateStatus(link, linkPtr, mavlinkChannel, message)) {
             break;
         }
@@ -198,6 +208,18 @@ void MAVLinkProtocol::_receiveEncryptedBytes(LinkInterface* link, const SharedLi
                 0, deviceID, false, reinterpret_cast<const char*>(frameData), frame.size(), nullptr, 0, true);
             MAVLinkCrypto::CryptoController::instance()->learnDeviceSystemMapping(
                 deviceID, MAVLinkCrypto::systemID(deviceID));
+
+            // 自动建链（C2 修正）：待命心跳声明 PX4 在线，且本地已缓存该 deviceID 的密钥 → 自动建链。
+            // 否则 QGC 初始连接状态机发出的 COMMAND_LONG 等命令在 Standby 下全被 LinkInterface 丢弃，
+            // PX4 永远收不到任何请求 → 初始连接死锁（航线 UI 又依赖连接完成，形成鸡生蛋）。
+            // 只对「本地已注入密钥」的设备自动建链：cryptoKeySource=0 本地联调 / 已缓存密钥的设备安全可控；
+            // 无密钥设备维持原语义（用户发航线时手动 beginLinkingForSystemID）。
+            MAVLinkCrypto::CryptoController* const crypto = MAVLinkCrypto::CryptoController::instance();
+            if (crypto->state() == MAVLinkCrypto::CryptoController::State::Standby &&
+                crypto->deviceKeyManager()->hasKey(deviceID)) {
+                crypto->beginLinking(deviceID);
+            }
+
             _feedStandardFrame(link, linkPtr, channel, frameData, frame.size());
         } else {
             _processEncryptedFrame(link, linkPtr, channel, frame);
@@ -299,7 +321,25 @@ void MAVLinkProtocol::_processEncryptedFrame(LinkInterface* link, const SharedLi
     MAVLinkCrypto::CryptoLinkLogger::instance()->logIncoming(
         msgid, deviceID, true, reinterpret_cast<const char*>(encData), encLen,
         reinterpret_cast<const char*>(plainFrame), plainLen, true);
+
+    // 先喂标准帧（加密心跳内嵌的标准 HEARTBEAT：Vehicle 学 defaultComponentId + 更新模式/武装），
+    // 再注入 EXT 遥测（协议 60822.0）：PX4 精简 GCS 链路独立遥测后，加密心跳是遥测唯一来源，
+    // 明文 HEARTBEAT payload > 9 → 解析 EXT(37B) 构造标准遥测消息，替代原独立遥测流。
     _feedStandardFrame(link, linkPtr, channel, plainFrame, plainLen);
+    // payload > 9 说明含 EXT。解析失败（PX4 版本漂移 / EXT 长度变更）会丢全部遥测——
+    // 必须告警 + 日志，避免"在线但无遥测"静默（遥测唯一来源失效）。
+    if (msgid == MAVLINK_MSG_ID_HEARTBEAT && plainFrame[1] > 9) {
+        MAVLinkCrypto::HeartbeatExt ext;
+        if (MAVLinkCrypto::parseHeartbeatExtFromFrame(msgid, plainFrame, plainLen, &ext)) {
+            _injectHeartbeatExt(link, linkPtr, channel, plainFrame, ext);
+        } else {
+            qCWarning(MAVLinkProtocolLog) << "encrypted heartbeat EXT parse failed: device" << deviceID
+                                          << "payloadLen" << static_cast<int>(plainFrame[1]);
+            MAVLinkCrypto::CryptoLinkLogger::instance()->logIncoming(
+                msgid, deviceID, true, reinterpret_cast<const char*>(encData), encLen, nullptr, 0, false,
+                QStringLiteral("EXT解析失败"));
+        }
+    }
 }
 
 void MAVLinkProtocol::_feedStandardFrame(LinkInterface* link, const SharedLinkInterfacePtr& linkPtr, uint8_t channel,
@@ -332,6 +372,20 @@ void MAVLinkProtocol::_feedStandardFrame(LinkInterface* link, const SharedLinkIn
         if (!_updateStatus(link, linkPtr, channel, message)) {
             return;
         }
+    }
+}
+
+void MAVLinkProtocol::_injectHeartbeatExt(LinkInterface* link, const SharedLinkInterfacePtr& linkPtr, uint8_t channel,
+                                          const uint8_t* plainFrame, const MAVLinkCrypto::HeartbeatExt& ext)
+{
+    Q_UNUSED(linkPtr)
+    Q_UNUSED(channel)
+
+    // 打包逻辑（门控/哨兵/字段映射）提取在 CryptoHeartbeatExt::buildHeartbeatExtTelemetry（可单测）。
+    // 此处只遍历 emit，经 telemetryInjected 走 Vehicle 消费（绕过 seq/丢包统计，避免合成消息污染 _messagesLost）。
+    const QList<mavlink_message_t> msgs = MAVLinkCrypto::buildHeartbeatExtTelemetry(plainFrame, ext);
+    for (const mavlink_message_t& msg : msgs) {
+        emit telemetryInjected(link, msg);
     }
 }
 

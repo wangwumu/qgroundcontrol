@@ -12,6 +12,10 @@
 
 class QFile;
 
+namespace MAVLinkCrypto {
+struct HeartbeatExt;
+}
+
 /// \brief MAVLink micro air vehicle protocol reference implementation.
 ///
 class MAVLinkProtocol : public QObject
@@ -48,6 +52,11 @@ signals:
 
     void messageReceived(LinkInterface* link, const mavlink_message_t& message);
 
+    /// 加密心跳 EXT 注入的合成遥测（本地构造的标准遥测消息，非线上帧）。
+    /// Vehicle 经它消费位置/姿态/GPS/电池，但**不参与丢包/seq 统计**——合成消息的 seq
+    /// 取自 QGC 发送侧（MAVLINK_COMM_0），与车辆真实接收序列无关，混入会污染 _messagesLost。
+    void telemetryInjected(LinkInterface* link, const mavlink_message_t& message);
+
     void mavlinkMessageStatus(int sysid, uint64_t totalSent, uint64_t totalReceived, uint64_t totalLoss,
                               float lossPercent);
 
@@ -82,6 +91,11 @@ private:
     /// 把一段标准 MAVLink 帧字节逐字节喂给 mavlink_parse_char 并走常规处理（解密还原后 / 明文待命心跳复用）。
     void _feedStandardFrame(LinkInterface* link, const SharedLinkInterfacePtr& linkPtr, uint8_t channel,
                             const uint8_t* bytes, int len);
+    /// 加密心跳 EXT（协议 60822.0「加密心跳扩展基础状态」）：把解析出的基础状态构造标准遥测消息
+    /// 注入 Vehicle 处理链（emit telemetryInjected，绕过 seq/丢包统计），替代原独立遥测流
+    /// （PX4 精简后 EXT 是遥测唯一来源）。
+    void _injectHeartbeatExt(LinkInterface* link, const SharedLinkInterfacePtr& linkPtr, uint8_t channel,
+                             const uint8_t* plainFrame, const MAVLinkCrypto::HeartbeatExt& ext);
 
     void _saveTelemetryLog(const QString& tempLogfile);
     bool _checkTelemetrySavePath();

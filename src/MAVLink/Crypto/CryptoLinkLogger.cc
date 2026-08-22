@@ -6,13 +6,20 @@
 //   默认注释（关闭）：文件写入/格式化方法体为空（零 IO）；纯解析函数仍无条件编译。
 //   联调时取消注释并重新构建（只重编本文件 + 链接，增量，避免 QGC 全量重编）。
 //   enabled() 同时反映日志文件是否打开成功（打不开时不误报日志生效）。
+//   注意：宏打开会每帧同步写盘（flush），属联调调试行为，勿默认启用提交。
 // ============================================================================
 // #define QGC_CRYPTO_LINK_LOG
 
 #include <QTime>
 
 #include "CryptoCodec.h"
+#include "CryptoController.h"
+#include "CryptoHeartbeatExt.h"
 #include "Extensions/VTOLSafetyMessages.h"
+#include "CryptoSettings.h"
+#include "SettingsManager.h"
+
+#include <QSettings>
 
 namespace MAVLinkCrypto {
 
@@ -54,10 +61,38 @@ CryptoLinkLogger::CryptoLinkLogger()
 {
 #ifdef QGC_CRYPTO_LINK_LOG
     _file.setFileName(QLatin1String(kLogPath));
-    if (!_file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
+    // WriteOnly（不带 Append）：每次 QGC 启动截断重建日志，避免跨会话累积。
+    if (!_file.open(QIODevice::WriteOnly | QIODevice::Text)) {
         // 打开失败（如 /tmp 不可写）：只告警一次（enabled() 反映 false，写路径不再触碰关闭的 QFile）。
         // 用 Qt 全局 qWarning（不用 QGC_LOGGING_CATEGORY，保持本调试工具可独立编译/测试）。
         qWarning("CryptoLinkLogger: cannot open log %s: %s", kLogPath, qPrintable(_file.errorString()));
+    }
+    if (_file.isOpen()) {
+        // 诊断首行：加密链路配置状态（联调排错——对比 Fact 值 vs QSettings 直接读 vs Fact metaData）。
+        const bool cryptoEnabled = CryptoController::instance()->cryptoEnabled();
+        QSettings qs;
+        qs.beginGroup("Crypto");
+        const QVariant qsCrypto = qs.value(QStringLiteral("cryptoEnabled"));
+        qs.endGroup();
+        // Fact metaData 诊断：defaultValueAvailable 决定 SettingsFact 是否读 QSettings
+        QString mdInfo = QStringLiteral("no-fact");
+        if (SettingsManager::instance() && SettingsManager::instance()->cryptoSettings()) {
+            if (Fact* const cryptoFact = SettingsManager::instance()->cryptoSettings()->cryptoEnabled()) {
+                const FactMetaData* const md = cryptoFact->metaData();
+                mdInfo = QStringLiteral("defaultAvail=%1 rawDefault=%2 rawValue=%3")
+                             .arg(md ? md->defaultValueAvailable() : false)
+                             .arg(md ? md->rawDefaultValue().toString() : QStringLiteral("null"))
+                             .arg(cryptoFact->rawValue().toString());
+            }
+        }
+        const QString settingsFile = QSettings().fileName();
+        _file.write(QStringLiteral("SYS cryptoEnabled=%1 qsCrypto=%2(%3) %4 settings=%5\n")
+                        .arg(cryptoEnabled)
+                        .arg(qsCrypto.toString())
+                        .arg(qsCrypto.typeName())
+                        .arg(mdInfo)
+                        .arg(settingsFile)
+                        .toUtf8());
     }
 #endif
 }
@@ -255,7 +290,18 @@ QString CryptoLinkLogger::_parsePlainFields(uint32_t msgid, const char* plainByt
     case 0: { // HEARTBEAT
         const uint8_t type = mavlink_msg_heartbeat_get_type(&msg);
         const uint8_t baseMode = mavlink_msg_heartbeat_get_base_mode(&msg);
-        return QStringLiteral("待命心跳 type=%1,mode=0x%2").arg(type).arg(baseMode, 2, 16, QLatin1Char('0'));
+        // 加密心跳（60822.0）明文 HEARTBEAT payload > 9 → 含 EXT，追加基础状态字段；
+        // 明文待命心跳（payload=9B）无 EXT。
+        HeartbeatExt ext;
+        const bool hasExt = parseHeartbeatExtFromFrame(msgid, reinterpret_cast<const uint8_t*>(plainBytes), plainLen, &ext);
+        QString s = QStringLiteral("%1 type=%2,mode=0x%3")
+                        .arg(hasExt ? QStringLiteral("加密心跳") : QStringLiteral("待命心跳"))
+                        .arg(type)
+                        .arg(baseMode, 2, 16, QLatin1Char('0'));
+        if (hasExt) {
+            s += QLatin1String(" EXT:") + heartbeatExtToText(ext);
+        }
+        return s;
     }
     case 33: { // GLOBAL_POSITION_INT
         const int32_t lat = mavlink_msg_global_position_int_get_lat(&msg);
@@ -297,6 +343,28 @@ QString CryptoLinkLogger::_parsePlainFields(uint32_t msgid, const char* plainByt
     default:
         return QStringLiteral("msgid=%1").arg(msgid);
     }
+}
+
+QString CryptoLinkLogger::heartbeatExtToText(const HeartbeatExt& ext)
+{
+    const auto deg = [](int32_t v) -> QString {
+        return v == HeartbeatExt::kInvalidInt32 ? QStringLiteral("NA") : QStringLiteral("%1").arg(v / 1e7, 0, 'f', 7);
+    };
+    const auto meters = [](int32_t v) -> QString {
+        return v == HeartbeatExt::kInvalidInt32 ? QStringLiteral("NA") : QStringLiteral("%1m").arg(v / 1000.0, 0, 'f', 1);
+    };
+    const auto vel = [](int16_t v) -> QString {
+        return v == HeartbeatExt::kInvalidInt16 ? QStringLiteral("NA") : QString::number(v);
+    };
+
+    QString s;
+    s += QStringLiteral("lat=%1,lon=%2,alt=%3").arg(deg(ext.lat), deg(ext.lon), meters(ext.alt));
+    s += QStringLiteral(",v=%1/%2/%3").arg(vel(ext.vx), vel(ext.vy), vel(ext.vz));
+    s += QStringLiteral(",rpy=%1/%2/%3").arg(ext.roll, 0, 'f', 2).arg(ext.pitch, 0, 'f', 2).arg(ext.yaw, 0, 'f', 2);
+    s += QStringLiteral(",fix=%1,sat=%2").arg(ext.fixType).arg(ext.satellitesUsed);
+    s += QStringLiteral(",batt=%1mV/%2%").arg(ext.voltage).arg(ext.remaining);
+    s += QStringLiteral(",nav=%1,arm=%2").arg(ext.navState).arg(ext.armingState);
+    return s;
 }
 
 void CryptoLinkLogger::_frameToMessage(const char* bytes, int len, mavlink_message_t& msg)

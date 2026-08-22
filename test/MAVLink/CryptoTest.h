@@ -48,4 +48,9 @@ private slots:
 
     // 报文链路日志器格式验证（联调宏 QGC_CRYPTO_LINK_LOG 启用时断言）
     void _testCryptoLinkLogger();
+
+    // 加密心跳扩展基础状态（60822.0 EXT）：37B 小端解析 + 哨兵 + 往返（block=74）
+    void _testHeartbeatExt();
+    // EXT 注入层：buildHeartbeatExtTelemetry 门控/哨兵/字段映射（合成遥测）
+    void _testHeartbeatExtInjection();
 };

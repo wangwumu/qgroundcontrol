@@ -9,6 +9,8 @@ target_sources(
             CryptoCodec.h
             CryptoController.cc
             CryptoController.h
+            CryptoHeartbeatExt.cc
+            CryptoHeartbeatExt.h
             CryptoLinkLogger.cc
             CryptoLinkLogger.h
             DeviceID.h

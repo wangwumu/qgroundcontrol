@@ -121,6 +121,7 @@ Vehicle::Vehicle(LinkInterface*             link,
     connect(MultiVehicleManager::instance(), &MultiVehicleManager::activeVehicleChanged, this, &Vehicle::_activeVehicleChanged);
 
     connect(MAVLinkProtocol::instance(), &MAVLinkProtocol::messageReceived,        this, &Vehicle::_mavlinkMessageReceived);
+    connect(MAVLinkProtocol::instance(), &MAVLinkProtocol::telemetryInjected,      this, &Vehicle::_syntheticTelemetryReceived);
     connect(MAVLinkProtocol::instance(), &MAVLinkProtocol::mavlinkMessageStatus,   this, &Vehicle::_mavlinkMessageStatus);
 
     connect(this, &Vehicle::flightModeChanged,          this, &Vehicle::_handleFlightModeChanged);
@@ -518,6 +519,19 @@ void Vehicle::resetCounters()
 
 void Vehicle::_mavlinkMessageReceived(LinkInterface* link, mavlink_message_t message)
 {
+    _processMavlinkMessage(link, message, false);
+}
+
+void Vehicle::_syntheticTelemetryReceived(LinkInterface* link, const mavlink_message_t& message)
+{
+    // 加密心跳 EXT 注入的合成遥测（MAVLinkProtocol::telemetryInjected）：消费位置/姿态/GPS/电池，
+    // 但 seq 取自 QGC 发送侧（MAVLINK_COMM_0），与车辆真实接收序列无关——必须跳过 link 活性/
+    // _messagesReceived/seq 统计，否则 _messagesLost 被持续虚高（合成消息污染丢包统计）。
+    _processMavlinkMessage(link, message, true);
+}
+
+void Vehicle::_processMavlinkMessage(LinkInterface* link, mavlink_message_t message, bool synthetic)
+{
     if (message.sysid != _systemID && message.sysid != 0) {
         // We allow RADIO_STATUS messages which come from a link the vehicle is using to pass through and be handled
         if (!(message.msgid == MAVLINK_MSG_ID_RADIO_STATUS && _vehicleLinkManager->containsLink(link))) {
@@ -525,32 +539,34 @@ void Vehicle::_mavlinkMessageReceived(LinkInterface* link, mavlink_message_t mes
         }
     }
 
-    // We give the link manager first whack since it it reponsible for adding new links
-    _vehicleLinkManager->mavlinkMessageReceived(link, message);
+    if (!synthetic) {
+        // We give the link manager first whack since it it reponsible for adding new links
+        _vehicleLinkManager->mavlinkMessageReceived(link, message);
 
-    //-- Check link status
-    _messagesReceived++;
-    emit messagesReceivedChanged();
-    if(!_heardFrom) {
-        if(message.msgid == MAVLINK_MSG_ID_HEARTBEAT) {
-            _heardFrom  = true;
-            _compID     = message.compid;
-            _messageSeq = message.seq + 1;
-        }
-    } else {
-        if(_compID == message.compid) {
-            uint16_t seq_received = static_cast<uint16_t>(message.seq);
-            uint16_t packet_lost_count = 0;
-            //-- Account for overflow during packet loss
-            if(seq_received < _messageSeq) {
-                packet_lost_count = (seq_received + 255) - _messageSeq;
-            } else {
-                packet_lost_count = seq_received - _messageSeq;
+        //-- Check link status
+        _messagesReceived++;
+        emit messagesReceivedChanged();
+        if(!_heardFrom) {
+            if(message.msgid == MAVLINK_MSG_ID_HEARTBEAT) {
+                _heardFrom  = true;
+                _compID     = message.compid;
+                _messageSeq = message.seq + 1;
             }
-            _messageSeq = message.seq + 1;
-            _messagesLost += packet_lost_count;
-            if(packet_lost_count)
-                emit messagesLostChanged();
+        } else {
+            if(_compID == message.compid) {
+                uint16_t seq_received = static_cast<uint16_t>(message.seq);
+                uint16_t packet_lost_count = 0;
+                //-- Account for overflow during packet loss
+                if(seq_received < _messageSeq) {
+                    packet_lost_count = (seq_received + 255) - _messageSeq;
+                } else {
+                    packet_lost_count = seq_received - _messageSeq;
+                }
+                _messageSeq = message.seq + 1;
+                _messagesLost += packet_lost_count;
+                if(packet_lost_count)
+                    emit messagesLostChanged();
+            }
         }
     }
 

@@ -11,6 +11,8 @@ typedef struct __mavlink_message mavlink_message_t;
 
 namespace MAVLinkCrypto {
 
+struct HeartbeatExt;
+
 /// 报文链路日志器（联调观察工具）。
 ///
 /// 把 QGC 发出的和收到的 MAVLink 报文按时序写入固定路径文件（/tmp/qgc_crypto_link.log），
@@ -59,6 +61,8 @@ public:
     static QString parseRegistrationPayload(const char* bytes, int len);
     /// 从帧字节重组帧头 deviceID（§1.2：incompat<<24|compat<<16|sys<<8|comp）。
     static uint32_t deviceIDFromFrameBytes(const char* bytes, int len);
+    /// EXT（60822.0 加密心跳扩展基础状态）→ 可读字段文本（哨兵显示 NA）。public 供测试直接断言格式化。
+    static QString heartbeatExtToText(const HeartbeatExt& ext);
 
 private:
     explicit CryptoLinkLogger();
