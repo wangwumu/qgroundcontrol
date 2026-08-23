@@ -6,8 +6,8 @@ bool ReplayGuard::isAcceptable(DeviceID deviceID, uint64_t counter) const
 {
     const QMutexLocker locker(&_mutex);
 
-    const auto it = _lastNonce.constFind(deviceID);
-    if (it == _lastNonce.constEnd()) {
+    const auto it = _downLastNonce.constFind(deviceID);
+    if (it == _downLastNonce.constEnd()) {
         return true; // 首帧：unset → 通过判定（不登记）
     }
     return counter > it.value();
@@ -16,17 +16,17 @@ bool ReplayGuard::isAcceptable(DeviceID deviceID, uint64_t counter) const
 void ReplayGuard::commit(DeviceID deviceID, uint64_t counter)
 {
     const QMutexLocker locker(&_mutex);
-    _lastNonce.insert(deviceID, counter);
+    _downLastNonce.insert(deviceID, counter);
 }
 
 bool ReplayGuard::accept(DeviceID deviceID, uint64_t counter)
 {
     const QMutexLocker locker(&_mutex);
 
-    const auto it = _lastNonce.constFind(deviceID);
-    if (it == _lastNonce.constEnd() || counter > it.value()) {
+    const auto it = _upLastNonce.constFind(deviceID);
+    if (it == _upLastNonce.constEnd() || counter > it.value()) {
         // 首帧或严格递增 → 接受并登记
-        _lastNonce.insert(deviceID, counter);
+        _upLastNonce.insert(deviceID, counter);
         return true;
     }
 
@@ -37,26 +37,28 @@ bool ReplayGuard::accept(DeviceID deviceID, uint64_t counter)
 void ReplayGuard::reset(DeviceID deviceID)
 {
     const QMutexLocker locker(&_mutex);
-    _lastNonce.remove(deviceID);
+    _upLastNonce.remove(deviceID);
+    _downLastNonce.remove(deviceID);
 }
 
 void ReplayGuard::clear()
 {
     const QMutexLocker locker(&_mutex);
-    _lastNonce.clear();
+    _upLastNonce.clear();
+    _downLastNonce.clear();
 }
 
 bool ReplayGuard::hasDevice(DeviceID deviceID) const
 {
     const QMutexLocker locker(&_mutex);
-    return _lastNonce.contains(deviceID);
+    return _upLastNonce.contains(deviceID);
 }
 
 bool ReplayGuard::peekLastNonce(DeviceID deviceID, uint64_t& outLast) const
 {
     const QMutexLocker locker(&_mutex);
-    const auto it = _lastNonce.constFind(deviceID);
-    if (it == _lastNonce.constEnd()) {
+    const auto it = _upLastNonce.constFind(deviceID);
+    if (it == _upLastNonce.constEnd()) {
         return false;
     }
     outLast = it.value();

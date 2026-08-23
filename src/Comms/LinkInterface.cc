@@ -142,7 +142,8 @@ void LinkInterface::sendMessageThreadSafe(mavlink_message_t &message)
                 return;
             }
             // 加密失败：丢弃帧，不回退明文（回退明文会被接收端丢弃，且违反全加密不变量）
-            qCWarning(LinkInterfaceLog) << "encryptFrame failed for msgid" << message.msgid;
+            qCWarning(LinkInterfaceLog) << "encryptFrame failed for msgid" << message.msgid
+                                        << "counter" << counter << "device" << crypto->activeDeviceID();
             // 无线上密文帧：以明文记录（encrypted=false，避免把明文当密文读 counter 产生垃圾值）
             MAVLinkCrypto::CryptoLinkLogger::instance()->logOutgoing(
                 message.msgid, crypto->activeDeviceID(), false,

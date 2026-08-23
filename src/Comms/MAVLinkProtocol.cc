@@ -309,6 +309,15 @@ void MAVLinkProtocol::_processEncryptedFrame(LinkInterface* link, const SharedLi
     // 防止未认证的伪造帧（明文 counter 可伪造）污染重放窗口。
     crypto->commitIncoming(deviceID, counter);
 
+    // 自动建链（加密心跳也触发，不依赖明文待命心跳）：
+    // 若 PX4 已建链（发加密心跳）而未发明文待命心跳，QGC 的明文分支自动建链
+    // 不会触发 → QGC 保持 Standby、不发加密帧 → 命令/参数请求无法发出 → 初始连接死锁。
+    // 收到解密认证通过的加密帧且本地有该设备密钥时，直接建链。
+    if (crypto->state() == MAVLinkCrypto::CryptoController::State::Standby &&
+        crypto->deviceKeyManager()->hasKey(deviceID)) {
+        crypto->beginLinking(deviceID);
+    }
+
     // 空 payload 退化帧（规范 §2.3 超限退化）→ 丢弃消息（帧本身已通过认证）
     if (plainFrame[1] == 0) {
         qCDebug(MAVLinkProtocolLog) << "dropped empty-payload degraded frame for device" << deviceID << "msgid" << msgid;

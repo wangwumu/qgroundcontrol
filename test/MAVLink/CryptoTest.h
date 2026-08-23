@@ -19,6 +19,7 @@ private slots:
     // 防重放
     void _testReplayGuard();
     void _testReplayGuardTwoPhase();
+    void _testReplayGuardUpDownSeparation();  // 上下行 lastNonce 分离：互不污染、reset/clear 双清
 
     // 加密帧编解码（标准帧 ↔ 加密帧）
     void _testCodecRoundTrip();

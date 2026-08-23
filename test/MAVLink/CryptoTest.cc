@@ -405,6 +405,47 @@ void CryptoTest::_testReplayGuardTwoPhase()
     QVERIFY(!guard.isAcceptable(otherDevice, 1));
 }
 
+void CryptoTest::_testReplayGuardUpDownSeparation()
+{
+    ReplayGuard guard;
+    const DeviceID deviceID = 0x11223344u;
+
+    // 上行 accept 登记（发送侧，奇数序列）
+    QVERIFY(guard.accept(deviceID, 101));
+
+    // 下行独立窗口：首帧 unset 通过，commit 一个更大的偶数（接收侧）
+    QVERIFY(guard.isAcceptable(deviceID, 1000));
+    guard.commit(deviceID, 1000);
+
+    // 核心不变量：下行 commit(1000) 不得污染上行——上行仍按 101→103→105 递增
+    // （若共用单 map：103 > 1000 为假 → 本断言失败，即回归被捕获）
+    QVERIFY(guard.accept(deviceID, 103));
+    QVERIFY(!guard.accept(deviceID, 101)); // 上行重放仍拒绝
+    QVERIFY(guard.accept(deviceID, 105));
+
+    // peekLastNonce 只读上行窗口（发送侧）
+    uint64_t last = 0;
+    QVERIFY(guard.peekLastNonce(deviceID, last));
+    QCOMPARE(last, static_cast<uint64_t>(105)); // 若共用：读到 1000 → 失败
+
+    // 反向：上行 accept 不得污染下行——下行重放仍拒绝、严格递增
+    QVERIFY(!guard.isAcceptable(deviceID, 1000));
+    QVERIFY(guard.isAcceptable(deviceID, 1001));
+    guard.commit(deviceID, 1001);
+
+    // reset 同时清 up 与 down
+    guard.reset(deviceID);
+    QVERIFY(guard.accept(deviceID, 1));
+    QVERIFY(guard.isAcceptable(deviceID, 1));
+
+    // clear 同时清 up 与 down（此前 clear 无任何测试）
+    guard.accept(deviceID, 10);
+    guard.commit(deviceID, 20);
+    guard.clear();
+    QVERIFY(guard.accept(deviceID, 5));
+    QVERIFY(guard.isAcceptable(deviceID, 5));
+}
+
 void CryptoTest::_testCodecMalformedFrame()
 {
     const Key key = testKey();
