@@ -364,6 +364,17 @@ QString CryptoLinkLogger::heartbeatExtToText(const HeartbeatExt& ext)
     s += QStringLiteral(",fix=%1,sat=%2").arg(ext.fixType).arg(ext.satellitesUsed);
     s += QStringLiteral(",batt=%1mV/%2%").arg(ext.voltage).arg(ext.remaining);
     s += QStringLiteral(",nav=%1,arm=%2").arg(ext.navState).arg(ext.armingState);
+    // 60824.0 新增字段（offset 37-54）：有哨兵的显示 NA/DIS；timeBootMs/vtol/landed/failsafe
+    // 无哨兵（0 合法），仅当存在扩展段（hasExtendedFields，55B 帧）才显示，37B 兼容帧显示 NA
+    s += QStringLiteral(",boot=%1").arg(ext.hasExtendedFields ? QString::number(ext.timeBootMs) : QStringLiteral("NA"));
+    s += QStringLiteral(",relalt=%1").arg(ext.relAlt == HeartbeatExt::kInvalidInt32 ? QStringLiteral("NA") : meters(ext.relAlt));
+    s += QStringLiteral(",air=%1").arg(vel(ext.airspeed));
+    s += QStringLiteral(",airsrc=%1").arg(ext.airspeedSource == HeartbeatExt::kAirspeedSourceDisabled ? QStringLiteral("DIS") : QString::number(ext.airspeedSource));
+    s += QStringLiteral(",vtol=%1,land=%2").arg(ext.hasExtendedFields ? QString::number(ext.vtolState) : QStringLiteral("NA"))
+        .arg(ext.hasExtendedFields ? QString::number(ext.landed) : QStringLiteral("NA"));
+    s += QStringLiteral(",curr=%1").arg(ext.current == HeartbeatExt::kInvalidInt16 ? QStringLiteral("NA") : QString::number(ext.current));
+    s += QStringLiteral(",temp=%1").arg(ext.temperature == HeartbeatExt::kInvalidInt16 ? QStringLiteral("NA") : QString::number(ext.temperature));
+    s += QStringLiteral(",fail=%1").arg(ext.hasExtendedFields ? QString::number(ext.failsafe) : QStringLiteral("NA"));
     return s;
 }
 

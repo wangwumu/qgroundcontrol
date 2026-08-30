@@ -104,12 +104,24 @@ uint8_t parseFrame(const QByteArray& frame, mavlink_message_t& message, mavlink_
     return framing;
 }
 
-/// 构造 EXT 37B（小端序，协议 60822.0 §4）。
+/// 构造 EXT 55B（小端序，协议 60824.0 §4）。前 37B 为 60822.0 基段，尾部 9 字段为
+/// 60824.0 新增；新字段参数默认哨兵（供"仅解析基段"兼容用例复用）。
 QByteArray makeExtBytes(int32_t lat, int32_t lon, int32_t alt, int16_t vx, int16_t vy, int16_t vz,
-                        uint8_t fix, uint8_t sat, uint16_t volt, int8_t rem, uint8_t nav, uint8_t arm)
+                        uint8_t fix, uint8_t sat, uint16_t volt, int8_t rem, uint8_t nav, uint8_t arm,
+                        uint32_t bootMs = 0, int32_t relAlt = HeartbeatExt::kInvalidInt32,
+                        int16_t airspeed = HeartbeatExt::kInvalidInt16, uint8_t airsrc = HeartbeatExt::kAirspeedSourceDisabled,
+                        uint8_t vtol = 0, uint8_t land = 0,
+                        int16_t curr = HeartbeatExt::kInvalidInt16, int16_t temp = HeartbeatExt::kInvalidInt16,
+                        uint8_t fail = 0)
 {
     QByteArray b(HeartbeatExt::kExtSize, 0);
     const auto putI32 = [&b](int off, int32_t v) {
+        b[off] = static_cast<char>(v & 0xFF);
+        b[off + 1] = static_cast<char>((v >> 8) & 0xFF);
+        b[off + 2] = static_cast<char>((v >> 16) & 0xFF);
+        b[off + 3] = static_cast<char>((v >> 24) & 0xFF);
+    };
+    const auto putU32 = [&b](int off, uint32_t v) {
         b[off] = static_cast<char>(v & 0xFF);
         b[off + 1] = static_cast<char>((v >> 8) & 0xFF);
         b[off + 2] = static_cast<char>((v >> 16) & 0xFF);
@@ -139,20 +151,25 @@ QByteArray makeExtBytes(int32_t lat, int32_t lon, int32_t alt, int16_t vx, int16
     b[34] = static_cast<char>(rem);
     b[35] = static_cast<char>(nav);
     b[36] = static_cast<char>(arm);
+    // 60824.0 新增字段（offset 37-54）
+    putU32(37, bootMs);
+    putI32(41, relAlt);
+    putI16(45, airspeed);
+    b[47] = static_cast<char>(airsrc);
+    b[48] = static_cast<char>(vtol);
+    b[49] = static_cast<char>(land);
+    putI16(50, curr);
+    putI16(52, temp);
+    b[54] = static_cast<char>(fail);
     return b;
 }
 
-/// 组装加密心跳标准帧：header(10) + HEARTBEAT payload(9B) + EXT(37B) + CRC，len=46。
-QByteArray makeExtFrame(int32_t lat, int32_t lon, int32_t alt, int16_t vx, int16_t vy, int16_t vz,
-                        uint8_t fix, uint8_t sat, uint16_t volt, int8_t rem, uint8_t nav, uint8_t arm)
+/// 组装加密心跳标准帧：header(10) + 给定 payload（HEARTBEAT 9B + EXT）+ CRC。
+QByteArray makeHeartbeatExtFrameFromPayload(const QByteArray& payload)
 {
-    const QByteArray hbPayload = makeHeartbeatFrame(0x0C, 0x0D).mid(10, 9); // 标准 HEARTBEAT payload
-    // 9B HEARTBEAT + 37B EXT = 46（makeExtBytes 固定 kExtSize=37）
-    const QByteArray payload = hbPayload + makeExtBytes(lat, lon, alt, vx, vy, vz, fix, sat, volt, rem, nav, arm);
-
     QByteArray frame;
     frame.append(static_cast<char>(0xFD));                 // magic
-    frame.append(static_cast<char>(payload.size()));       // len=46
+    frame.append(static_cast<char>(payload.size()));       // len
     frame.append(static_cast<char>(0));                    // incompat_flags
     frame.append(static_cast<char>(0));                    // compat_flags
     frame.append(static_cast<char>(0));                    // seq
@@ -172,6 +189,23 @@ QByteArray makeExtFrame(int32_t lat, int32_t lon, int32_t alt, int16_t vx, int16
     frame.append(static_cast<char>(crc & 0xFF));
     frame.append(static_cast<char>(crc >> 8));
     return frame;
+}
+
+/// 组装加密心跳标准帧：HEARTBEAT payload(9B) + EXT(55B)，len=64。
+QByteArray makeExtFrame(int32_t lat, int32_t lon, int32_t alt, int16_t vx, int16_t vy, int16_t vz,
+                        uint8_t fix, uint8_t sat, uint16_t volt, int8_t rem, uint8_t nav, uint8_t arm,
+                        uint32_t bootMs = 0, int32_t relAlt = HeartbeatExt::kInvalidInt32,
+                        int16_t airspeed = HeartbeatExt::kInvalidInt16, uint8_t airsrc = HeartbeatExt::kAirspeedSourceDisabled,
+                        uint8_t vtol = 0, uint8_t land = 0,
+                        int16_t curr = HeartbeatExt::kInvalidInt16, int16_t temp = HeartbeatExt::kInvalidInt16,
+                        uint8_t fail = 0)
+{
+    const QByteArray hbPayload = makeHeartbeatFrame(0x0C, 0x0D).mid(10, 9); // 标准 HEARTBEAT payload
+    // 9B HEARTBEAT + 55B EXT = 64
+    const QByteArray payload = hbPayload
+        + makeExtBytes(lat, lon, alt, vx, vy, vz, fix, sat, volt, rem, nav, arm,
+                       bootMs, relAlt, airspeed, airsrc, vtol, land, curr, temp, fail);
+    return makeHeartbeatExtFrameFromPayload(payload);
 }
 
 /// 对给定加密心跳标准帧做 encrypt→decrypt，返回解密后的标准帧与解析出的 EXT。
@@ -949,20 +983,22 @@ void CryptoTest::_testHeartbeatExt()
 {
     using namespace MAVLinkCrypto;
 
-    // --- 往返：加密（block=74）→ 解密 → 解析 EXT ---
+    // --- 往返：加密（block=92）→ 解密 → 解析 EXT(55B) ---
     // （makeExtBytes/makeExtFrame 为文件级辅助，供本方法与注入层测试复用）
     const Key key = testKey();
     const DeviceID deviceID = 66051u; // 0x00010203，PX4 段
     const uint64_t counter = 1000;    // 下行偶数
     const uint8_t crcExtra = heartbeatCrcExtra();
 
-    const QByteArray extFrame = makeExtFrame(312345678, 1214567890, 50000, 100, 200, -50, 3, 12, 11100, 85, 6, 1);
+    // 12 个基段参数 + 9 个 60824.0 新增字段参数（bootMs, relAlt, airspeed, airsrc, vtol, land, curr, temp, fail）
+    const QByteArray extFrame = makeExtFrame(312345678, 1214567890, 50000, 100, 200, -50, 3, 12, 11100, 85, 6, 1,
+                                             12345, 4321, 5678, 1, 4, 3, -5, 20, 0x03);
     uint8_t encBuffer[MAVLINK_MAX_PACKET_LEN + 32];
     int encLen = 0;
     QVERIFY(encryptFrame(reinterpret_cast<const uint8_t*>(extFrame.constData()), extFrame.size(), crcExtra,
                          deviceID, counter, key, encBuffer, &encLen));
-    // block = counter(8) + ciphertext(4+46=50) + tag(16) = 74
-    QCOMPARE(encBuffer[1], static_cast<uint8_t>(74));
+    // block = counter(8) + ciphertext(4+9+55=68) + tag(16) = 92
+    QCOMPARE(encBuffer[1], static_cast<uint8_t>(92));
     QCOMPARE(counterFromFrame(encBuffer), counter);
 
     uint8_t plainOut[MAVLINK_MAX_PACKET_LEN];
@@ -971,7 +1007,7 @@ void CryptoTest::_testHeartbeatExt()
     int plainOutLen = 0;
     QVERIFY(decryptFrame(encBuffer, encLen, crcExtra, key, &boundDev, &boundCounter, plainOut, &plainOutLen));
     QCOMPARE(boundDev, deviceID);
-    QCOMPARE(plainOut[1], static_cast<uint8_t>(46)); // HEARTBEAT(9) + EXT(37)
+    QCOMPARE(plainOut[1], static_cast<uint8_t>(64)); // HEARTBEAT(9) + EXT(55)
     QCOMPARE(plainOutLen, extFrame.size());
 
     HeartbeatExt ext;
@@ -995,6 +1031,18 @@ void CryptoTest::_testHeartbeatExt()
     QVERIFY(ext.hasAltitude());
     QVERIFY(ext.hasVelocity());
     QVERIFY(ext.hasBattery());
+    // 60824.0 新增字段
+    QCOMPARE(ext.timeBootMs, static_cast<uint32_t>(12345));
+    QCOMPARE(ext.relAlt, static_cast<int32_t>(4321));
+    QCOMPARE(ext.airspeed, static_cast<int16_t>(5678));
+    QCOMPARE(ext.airspeedSource, static_cast<uint8_t>(1));
+    QCOMPARE(ext.vtolState, static_cast<uint8_t>(4));
+    QCOMPARE(ext.landed, static_cast<uint8_t>(3));
+    QCOMPARE(ext.current, static_cast<int16_t>(-5));
+    QCOMPARE(ext.temperature, static_cast<int16_t>(20));
+    QCOMPARE(ext.failsafe, static_cast<uint8_t>(0x03));
+    QVERIFY(ext.hasRelativeAltitude());
+    QVERIFY(ext.hasCurrent());
 
     // --- 哨兵：无效位置/速度/电池须被识别（不得当作 0 坐标 / 0V 真实数据） ---
     const QByteArray sentinelFrame = makeExtFrame(HeartbeatExt::kInvalidInt32, HeartbeatExt::kInvalidInt32,
@@ -1037,6 +1085,36 @@ void CryptoTest::_testHeartbeatExt()
     QVERIFY(partial.hasBattery());  // voltage>0
     QCOMPARE(partial.remaining, static_cast<int8_t>(-1)); // -1 未知保留
 
+    // --- 兼容：旧版 37B EXT（60822.0）→ 解析前 37B，新字段保持默认哨兵 ---
+    {
+        QByteArray ext37 = makeExtBytes(312345678, 1214567890, 50000, 100, 200, -50, 3, 12, 11100, 85, 6, 1);
+        ext37.resize(HeartbeatExt::kExtBaseSize); // 截断到 37B（模拟旧 PX4 发送）
+        const QByteArray hbPayload = makeHeartbeatFrame(0x0C, 0x0D).mid(10, 9);
+        const QByteArray frame37 = makeHeartbeatExtFrameFromPayload(hbPayload + ext37); // len=46
+
+        uint8_t enc37[MAVLINK_MAX_PACKET_LEN + 32];
+        int enc37Len = 0;
+        QVERIFY(encryptFrame(reinterpret_cast<const uint8_t*>(frame37.constData()), frame37.size(), crcExtra,
+                             deviceID, counter + 8, key, enc37, &enc37Len));
+        uint8_t plain37[MAVLINK_MAX_PACKET_LEN];
+        DeviceID dev37 = 0;
+        uint64_t cnt37 = 0;
+        int plain37Len = 0;
+        QVERIFY(decryptFrame(enc37, enc37Len, crcExtra, key, &dev37, &cnt37, plain37, &plain37Len));
+        HeartbeatExt ext37out;
+        QVERIFY(parseHeartbeatExtFromFrame(0, plain37, plain37Len, &ext37out));
+        QCOMPARE(ext37out.lat, static_cast<int32_t>(312345678));  // 基段正常解析
+        QCOMPARE(ext37out.remaining, static_cast<int8_t>(85));
+        QCOMPARE(ext37out.relAlt, HeartbeatExt::kInvalidInt32);   // 新字段默认哨兵
+        QCOMPARE(ext37out.airspeed, HeartbeatExt::kInvalidInt16);
+        QCOMPARE(ext37out.airspeedSource, HeartbeatExt::kAirspeedSourceDisabled);
+        QCOMPARE(ext37out.current, HeartbeatExt::kInvalidInt16);
+        QCOMPARE(ext37out.temperature, HeartbeatExt::kInvalidInt16);
+        QVERIFY(!ext37out.hasRelativeAltitude());
+        QVERIFY(!ext37out.hasCurrent());
+        QVERIFY(!ext37out.hasExtendedFields); // 37B 兼容帧无扩展段
+    }
+
     // --- 明文待命心跳（payload=9B）→ 不解析 EXT ---
     const QByteArray standby = makeHeartbeatFrame(0x0C, 0x0D);
     HeartbeatExt noExt;
@@ -1062,15 +1140,33 @@ void CryptoTest::_testHeartbeatExt()
         logExt.remaining = 85;
         logExt.navState = 6;
         logExt.armingState = 1;
+        // 60824.0 新增字段
+        logExt.hasExtendedFields = true; // 日志对 boot/vtol/land/fail 仅在 55B 扩展段存在时显示
+        logExt.timeBootMs = 12345;
+        logExt.relAlt = 4321;
+        logExt.airspeed = 5678;
+        logExt.airspeedSource = 1;
+        logExt.vtolState = 4;
+        logExt.landed = 3;
+        logExt.current = -5;
+        logExt.temperature = 20;
+        logExt.failsafe = 0x03;
         const QString text = CryptoLinkLogger::heartbeatExtToText(logExt);
         QVERIFY2(text.contains(QStringLiteral("lat=31.2345678")) && text.contains(QStringLiteral("alt=50.0m")) &&
                      text.contains(QStringLiteral("batt=11100mV/85%")) && text.contains(QStringLiteral("nav=6")) &&
-                     text.contains(QStringLiteral("arm=1")),
+                     text.contains(QStringLiteral("arm=1")) &&
+                     text.contains(QStringLiteral("boot=12345")) && text.contains(QStringLiteral("relalt=4.3m")) &&
+                     text.contains(QStringLiteral("air=5678")) && text.contains(QStringLiteral("airsrc=1")) &&
+                     text.contains(QStringLiteral("vtol=4,land=3")) && text.contains(QStringLiteral("curr=-5")) &&
+                     text.contains(QStringLiteral("temp=20")) && text.contains(QStringLiteral("fail=3")),
                  qPrintable(QStringLiteral("EXT 日志文本异常: %1").arg(text)));
-        // 哨兵 → NA
+        // 哨兵 → NA / DIS
         const QString invalidText = CryptoLinkLogger::heartbeatExtToText(HeartbeatExt{});
         QVERIFY2(invalidText.contains(QStringLiteral("lat=NA")) && invalidText.contains(QStringLiteral("alt=NA")) &&
-                     invalidText.contains(QStringLiteral("v=NA/NA/NA")),
+                     invalidText.contains(QStringLiteral("v=NA/NA/NA")) &&
+                     invalidText.contains(QStringLiteral("relalt=NA")) && invalidText.contains(QStringLiteral("air=NA")) &&
+                     invalidText.contains(QStringLiteral("airsrc=DIS")) && invalidText.contains(QStringLiteral("curr=NA")) &&
+                     invalidText.contains(QStringLiteral("temp=NA")),
                  qPrintable(QStringLiteral("EXT 哨兵日志文本异常: %1").arg(invalidText)));
     }
 
@@ -1100,9 +1196,11 @@ void CryptoTest::_testHeartbeatExtInjection()
     const DeviceID deviceID = 66051u; // 0x00010203 → sys=0x02, comp=0x03
     const uint64_t counter = 1000;
 
-    // --- 有效 EXT → 4 条遥测：GLOBAL_POSITION_INT / ATTITUDE / GPS_RAW_INT / BATTERY_STATUS ---
+    // --- 有效 EXT(55B) → 4 条遥测：GLOBAL_POSITION_INT / ATTITUDE / GPS_RAW_INT / BATTERY_STATUS ---
     const ExtRoundTrip good = roundTripExt(
-        makeExtFrame(312345678, 1214567890, 50000, 100, 200, -50, 3, 12, 11100, 85, 6, 1), key, deviceID, counter);
+        makeExtFrame(312345678, 1214567890, 50000, 100, 200, -50, 3, 12, 11100, 85, 6, 1,
+                     12345, 4321, 5678, 1, 4, 3, -5, 20, 0x03),
+        key, deviceID, counter);
     QVERIFY(!good.decFrame.isEmpty());
     const QList<mavlink_message_t> goodMsgs = buildHeartbeatExtTelemetry(
         reinterpret_cast<const uint8_t*>(good.decFrame.constData()), good.ext);
@@ -1121,6 +1219,8 @@ void CryptoTest::_testHeartbeatExtInjection()
     QCOMPARE(gpi.lon, static_cast<int32_t>(1214567890));
     QCOMPARE(gpi.alt, static_cast<int32_t>(50000));
     QCOMPARE(gpi.vx, static_cast<int16_t>(100));
+    QCOMPARE(gpi.relative_alt, static_cast<int32_t>(4321));   // 60824.0 rel_alt 注入
+    QCOMPARE(gpi.time_boot_ms, static_cast<uint32_t>(12345)); // 60824.0 飞控时间戳注入
     mavlink_attitude_t att;
     mavlink_msg_attitude_decode(&goodMsgs[1], &att);
     QCOMPARE(att.roll, 0.1f);
@@ -1134,6 +1234,8 @@ void CryptoTest::_testHeartbeatExtInjection()
     mavlink_msg_battery_status_decode(&goodMsgs[3], &batt);
     QCOMPARE(batt.voltages[0], static_cast<uint16_t>(11100));
     QCOMPARE(batt.battery_remaining, static_cast<int8_t>(85));
+    QCOMPARE(batt.current_battery, static_cast<int16_t>(-50)); // 60824.0 current 0.1A×10 → cA
+    QCOMPARE(batt.temperature, static_cast<int16_t>(200));     // cdegC（EXT 0.1°C×10：20×0.1°C=2.0°C → 200 cdegC）
 
     // --- 位置全哨兵 → 仅 ATTITUDE（GLOBAL/GPS 跳过；无电池数据跳过） ---
     const ExtRoundTrip sentinelRt = roundTripExt(
@@ -1175,6 +1277,29 @@ void CryptoTest::_testHeartbeatExtInjection()
     mavlink_msg_battery_status_decode(&battOnlyMsgs[1], &battOnly);
     QCOMPARE(battOnly.voltages[0], static_cast<uint16_t>(UINT16_MAX)); // 未知电压 → NaN
     QCOMPARE(battOnly.battery_remaining, static_cast<int8_t>(50));
+
+    // --- 电流/温度有效但电压未知（voltage=0, remaining=-1）→ BATTERY 仍打包（门控含 hasCurrent/hasTemperature），
+    // 电流/温度按 cA/cdegC 注入，电压保持 NaN ---
+    const ExtRoundTrip currTempRt = roundTripExt(
+        makeExtFrame(HeartbeatExt::kInvalidInt32, HeartbeatExt::kInvalidInt32, HeartbeatExt::kInvalidInt32,
+                     HeartbeatExt::kInvalidInt16, HeartbeatExt::kInvalidInt16, HeartbeatExt::kInvalidInt16,
+                     0, 0, 0, -1, 6, 1,
+                     0, HeartbeatExt::kInvalidInt32, HeartbeatExt::kInvalidInt16, HeartbeatExt::kAirspeedSourceDisabled,
+                     0, 0, 35, 255, 0),
+        key, deviceID, counter + 8);
+    QVERIFY(!currTempRt.decFrame.isEmpty());
+    QVERIFY(!currTempRt.ext.hasBattery()); // voltage=0, remaining=-1
+    QVERIFY(currTempRt.ext.hasCurrent());
+    QVERIFY(currTempRt.ext.hasTemperature());
+    const QList<mavlink_message_t> currTempMsgs = buildHeartbeatExtTelemetry(
+        reinterpret_cast<const uint8_t*>(currTempRt.decFrame.constData()), currTempRt.ext);
+    QCOMPARE(currTempMsgs.size(), 2);  // ATTITUDE + BATTERY（门控含 current/temp，BATTERY 不丢）
+    QCOMPARE(currTempMsgs[1].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_BATTERY_STATUS));
+    mavlink_battery_status_t ctBatt;
+    mavlink_msg_battery_status_decode(&currTempMsgs[1], &ctBatt);
+    QCOMPARE(ctBatt.voltages[0], static_cast<uint16_t>(UINT16_MAX)); // 电压未知 → NaN
+    QCOMPARE(ctBatt.current_battery, static_cast<int16_t>(350));     // 35 0.1A × 10 = 350 cA
+    QCOMPARE(ctBatt.temperature, static_cast<int16_t>(2550));        // 255 0.1°C × 10 = 2550 cdegC
 
     // --- hasBattery 谓词三分支（直接构造结构体） ---
     {

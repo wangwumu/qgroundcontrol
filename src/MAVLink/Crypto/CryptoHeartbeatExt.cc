@@ -38,10 +38,12 @@ inline float readF32LE(const uint8_t* p)
 
 bool parseHeartbeatExt(const uint8_t* extBytes, int extLen, HeartbeatExt* out)
 {
-    if (extBytes == nullptr || out == nullptr || extLen < HeartbeatExt::kExtSize) {
+    // 兼容最小 37B（60822.0）；len∈[37,55) 只解析前 37B，新增字段保持默认哨兵。
+    if (extBytes == nullptr || out == nullptr || extLen < HeartbeatExt::kExtBaseSize) {
         return false;
     }
     HeartbeatExt e;
+    // 60822.0 基段（offset 0-36）
     e.lat            = readI32LE(extBytes + 0);
     e.lon            = readI32LE(extBytes + 4);
     e.alt            = readI32LE(extBytes + 8);
@@ -57,6 +59,19 @@ bool parseHeartbeatExt(const uint8_t* extBytes, int extLen, HeartbeatExt* out)
     e.remaining      = static_cast<int8_t>(extBytes[34]);
     e.navState       = extBytes[35];
     e.armingState    = extBytes[36];
+    // 60824.0 新增字段（offset 37-54）：仅当 len 足够 55B 时解析，否则保持默认哨兵
+    if (extLen >= HeartbeatExt::kExtSize) {
+        e.hasExtendedFields = true;
+        e.timeBootMs     = readU32LE(extBytes + 37);
+        e.relAlt         = readI32LE(extBytes + 41);
+        e.airspeed       = readI16LE(extBytes + 45);
+        e.airspeedSource = extBytes[47];
+        e.vtolState      = extBytes[48];
+        e.landed         = extBytes[49];
+        e.current        = readI16LE(extBytes + 50);
+        e.temperature    = readI16LE(extBytes + 52);
+        e.failsafe       = extBytes[54];
+    }
     *out = e;
     return true;
 }
@@ -101,10 +116,10 @@ QList<mavlink_message_t> buildHeartbeatExtTelemetry(const uint8_t* plainFrame, c
         mavlink_message_t msg{};
         (void) mavlink_msg_global_position_int_pack(
             sysid, compid, &msg,
-            0,                                        // time_boot_ms
+            ext.hasExtendedFields ? static_cast<uint32_t>(ext.timeBootMs) : 0, // time_boot_ms（60824.0；37B 兼容帧无扩展段 → 0=未知）
             ext.lat, ext.lon,                         // degE7
             ext.alt,                                  // alt(mm)，MSL
-            0,                                        // relative_alt(mm)：EXT 仅 MSL，无相对高度
+            ext.relAlt != HeartbeatExt::kInvalidInt32 ? ext.relAlt : 0, // relative_alt(mm，60824.0)
             ext.vx != HeartbeatExt::kInvalidInt16 ? ext.vx : 0, // cm/s
             ext.vy != HeartbeatExt::kInvalidInt16 ? ext.vy : 0,
             ext.vz != HeartbeatExt::kInvalidInt16 ? ext.vz : 0,
@@ -143,19 +158,21 @@ QList<mavlink_message_t> buildHeartbeatExtTelemetry(const uint8_t* plainFrame, c
         msgs.append(msg);
     }
 
-    // BATTERY_STATUS：有电池数据才打包；voltage==0（未知）→ UINT16_MAX（BatteryFactGroup 求和得 NaN）。
-    if (ext.hasBattery()) {
+    // BATTERY_STATUS：有电池数据（电压/剩余）或电流/温度之一才打包；voltage==0（未知）
+    // → UINT16_MAX（BatteryFactGroup 求和得 NaN）。门控含 hasCurrent/hasTemperature：
+    // 仅电流/温度传感器在线（电压未知、remaining=-1）时不能丢弃整条消息。
+    if (ext.hasBattery() || ext.hasCurrent() || ext.hasTemperature()) {
         mavlink_battery_status_t batt{};
         batt.id = 0;                                 // 默认电池槽位（BatteryFactGroup id 匹配）
         batt.voltages[0] = (ext.voltage == 0) ? UINT16_MAX : ext.voltage; // 总电压填 cell0
         for (int i = 1; i < 10; i++) {
             batt.voltages[i] = UINT16_MAX;           // 未知 cell
         }
-        batt.current_battery = -1;                   // 无电流测量
+        batt.current_battery = (ext.current != HeartbeatExt::kInvalidInt16) ? static_cast<int16_t>(ext.current * 10) : -1; // cA（EXT 0.1A × 10）
         batt.current_consumed = -1;
         batt.energy_consumed = -1;
         batt.battery_remaining = ext.remaining;      // -1 → percentRemaining NaN（无电池估算）
-        batt.temperature = INT16_MAX;                // 未知温度
+        batt.temperature = ext.hasTemperature() ? static_cast<int16_t>(ext.temperature * 10) : INT16_MAX; // cdegC（EXT 0.1°C × 10）；未知 → INT16_MAX
         batt.time_remaining = 0;
         mavlink_message_t msg{};
         (void) mavlink_msg_battery_status_encode(sysid, compid, &msg, &batt);
