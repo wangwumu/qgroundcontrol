@@ -19,6 +19,10 @@ qt_add_qml_module(QGroundControlModule
     QML_FILES
         MainWindow/MainWindow.qml
         MainWindow/MainWindowSavedState.qml
+        Auth/LoginDialog.qml
+        Auth/HandoverDialog.qml
+        Auth/UnlockDialog.qml
+        Auth/LockScreenOverlay.qml
     IMPORTS
         QGC
     NO_PLUGIN
@@ -36,6 +40,7 @@ endif()
 add_subdirectory(ADSB)
 add_subdirectory(AnalyzeView)
 add_subdirectory(API)
+add_subdirectory(Auth)
 add_subdirectory(AutoPilotPlugins)
 add_subdirectory(Camera)
 add_subdirectory(Comms)

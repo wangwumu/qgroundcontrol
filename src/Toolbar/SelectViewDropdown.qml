@@ -16,6 +16,45 @@ ToolIndicatorPage {
             columnSpacing: ScreenTools.defaultFontPixelWidth
             rowSpacing: columnSpacing
 
+            // 用户会话：未登录为「登陆」，登录成功切换为「交接班」。
+            SubMenuButton {
+                objectName: "toolbar_authLogin"
+                implicitHeight: root._toolButtonHeight
+                Layout.fillWidth: true
+                text: AuthController.loggedIn ? qsTr("交接班") : qsTr("登陆")
+                imageResource: "/res/QGCLogoWhite.svg"
+                onClicked: {
+                    if (mainWindow.allowViewSwitch()) {
+                        mainWindow.closeIndicatorDrawer()
+                        if (AuthController.loggedIn) {
+                            mainWindow.openHandoverDialog()
+                        } else {
+                            mainWindow.openLoginDialog()
+                        }
+                    }
+                }
+            }
+
+            // 屏幕锁定：未登录禁用；锁定态变为「屏幕解锁」（可点）。
+            SubMenuButton {
+                objectName: "toolbar_screenLock"
+                implicitHeight: root._toolButtonHeight
+                Layout.fillWidth: true
+                enabled: AuthController.loggedIn
+                text: AuthController.screenLocked ? qsTr("屏幕解锁") : qsTr("屏幕锁定")
+                imageResource: "/res/QGCLogoWhite.svg"
+                onClicked: {
+                    if (mainWindow.allowViewSwitch()) {
+                        mainWindow.closeIndicatorDrawer()
+                        if (AuthController.screenLocked) {
+                            mainWindow.openUnlockDialog()
+                        } else {
+                            AuthController.lockScreen()
+                        }
+                    }
+                }
+            }
+
             SubMenuButton {
                 objectName: "toolbar_viewFly"
                 implicitHeight: root._toolButtonHeight

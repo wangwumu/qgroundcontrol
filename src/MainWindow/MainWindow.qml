@@ -776,4 +776,47 @@ ApplicationWindow {
             }
         }
     }
+
+    //-------------------------------------------------------------------------
+    //-- 用户会话：登录 / 交接班 / 屏幕解锁对话框 与 屏幕锁定覆盖层
+    //-------------------------------------------------------------------------
+
+    QGCPopupDialogFactory {
+        id: loginDialogFactory
+        dialogComponent: loginDialogComponent
+    }
+
+    Component {
+        id: loginDialogComponent
+        LoginDialog {}
+    }
+
+    QGCPopupDialogFactory {
+        id: handoverDialogFactory
+        dialogComponent: handoverDialogComponent
+    }
+
+    Component {
+        id: handoverDialogComponent
+        HandoverDialog {}
+    }
+
+    QGCPopupDialogFactory {
+        id: unlockDialogFactory
+        dialogComponent: unlockDialogComponent
+    }
+
+    Component {
+        id: unlockDialogComponent
+        UnlockDialog {}
+    }
+
+    function openLoginDialog() { loginDialogFactory.open() }
+    function openHandoverDialog() { handoverDialogFactory.open() }
+    function openUnlockDialog() { unlockDialogFactory.open() }
+
+    // 屏幕锁定覆盖层：全屏遮罩 + 解锁按钮。z 最高，压过 toolDrawer/FlyView；
+    // 半透明区域不消费滚轮/触摸，地图仍可缩放拖动；鼠标按钮与键盘由
+    // AuthController 的 qApp 事件过滤器吞掉（解锁按钮位置例外）。
+    LockScreenOverlay {}
 }
