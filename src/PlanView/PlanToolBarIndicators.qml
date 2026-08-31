@@ -27,11 +27,38 @@ RowLayout {
     property var _syncInProgress: _planMasterController.syncInProgress
     property var _visualItems: _missionController.visualItems
     property bool _hasPlanItems: _planMasterController.containsItems
+    property var _uavDisplayList: []     ///< 无人机下拉显示文本（uav_no (deviceID xx)）
 
     readonly property real _margins: ScreenTools.defaultFontPixelWidth
 
+    function _refreshUavDisplayList() {
+        var list = []
+        for (var i = 0; i < planUploader.uavList.length; i++) {
+            var uav = planUploader.uavList[i]
+            list.push(uav.uav_no + " (deviceID " + uav.device_id + ")")
+        }
+        _uavDisplayList = list
+        uavCombo.currentIndex = -1   // 列表刷新后需重新选择
+    }
+
+    // 上传按钮改义：上传到后台创建临时飞行计划 + 飞行任务（等待批准），
+    // 不再 MAVLink 上传到无人机。需已登录、已选无人机（任务创建必填 uav_id）、
+    // 且航线标题非空（route_name，便于区分多条临时航线）。
     function _uploadClicked() {
-        _planMasterController.upload()
+        if (!AuthController.loggedIn) {
+            QGroundControl.showMessageDialog(root, qsTr("Upload"), qsTr("请先登录后再上传航线"))
+            return
+        }
+        if (titleField.text.trim() === "") {
+            QGroundControl.showMessageDialog(root, qsTr("Upload"), qsTr("请先输入航线标题"))
+            return
+        }
+        if (uavCombo.currentIndex < 0 || uavCombo.currentIndex >= planUploader.uavList.length) {
+            QGroundControl.showMessageDialog(root, qsTr("Upload"), qsTr("请先选择无人机"))
+            return
+        }
+        var uavId = planUploader.uavList[uavCombo.currentIndex].id
+        planUploader.uploadPlan(_planMasterController, uavId, titleField.text.trim())
     }
 
     function _downloadClicked() {
@@ -132,14 +159,38 @@ RowLayout {
         onClicked: { toolbarButtonClicked(); _saveButtonClicked() }
     }
 
+    // 无人机选择（上传后台创建飞行任务需要 uav_id）：登录后可见，列表来自 GET /api/uavs
+    QGCComboBox {
+        id: uavCombo
+        objectName: "planToolbar_uavCombo"
+        visible: AuthController.loggedIn
+        enabled: AuthController.loggedIn && !_syncInProgress
+        alternateText: currentIndex === -1 ? qsTr("选择无人机") : ""   // 未选中显示占位，选中后显示所选
+        model: _uavDisplayList
+        currentIndex: -1
+        sizeToContents: true
+        font.pointSize: ScreenTools.smallFontPointSize
+    }
+
+    // 航线标题（必填）：上传创建临时航线时作 route_name，便于区分多条临时航线
+    QGCTextField {
+        id: titleField
+        objectName: "planToolbar_routeTitle"
+        visible: AuthController.loggedIn
+        enabled: AuthController.loggedIn && !_syncInProgress
+        placeholderText: qsTr("航线标题（必填）")
+        maximumLength: 50
+        Layout.preferredWidth: ScreenTools.defaultFontPixelWidth * 16
+    }
+
     QGCButton {
         id: uploadButton
         objectName: "planToolbar_uploadButton"
         text: qsTr("Upload")
         iconSource: "/res/UploadToVehicle.svg"
-        enabled: !_syncInProgress && _hasPlanItems && !_controllerOffline
+        enabled: !_syncInProgress && _hasPlanItems && AuthController.loggedIn && !planUploader.uploading
         visible: !_syncInProgress
-        primary: _uploadDirty && !_controllerOffline
+        primary: _uploadDirty && AuthController.loggedIn
         onClicked: { toolbarButtonClicked(); _uploadClicked() }
     }
 
@@ -203,6 +254,39 @@ RowLayout {
                     }
                 }
             }
+        }
+    }
+
+    // 上传结果提示
+    Connections {
+        target: planUploader
+        function onUploadSucceeded(message) {
+            QGroundControl.showMessageDialog(root, qsTr("Upload"), message)
+        }
+        function onUploadFailed(error) {
+            QGroundControl.showMessageDialog(root, qsTr("Upload"), error)
+        }
+        function onUavListError(error) {
+            QGroundControl.showMessageDialog(root, qsTr("Upload"), error)
+        }
+        function onUavListChanged() {
+            _refreshUavDisplayList()
+        }
+    }
+
+    // 登录后拉取无人机列表（供下拉选择）
+    Connections {
+        target: AuthController
+        function onLoggedInChanged() {
+            if (AuthController.loggedIn) {
+                planUploader.fetchUavs()
+            }
+        }
+    }
+
+    Component.onCompleted: {
+        if (AuthController.loggedIn) {
+            planUploader.fetchUavs()
         }
     }
 }

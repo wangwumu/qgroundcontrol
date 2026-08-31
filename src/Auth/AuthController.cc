@@ -21,6 +21,7 @@
 #include "Utilities/Network/QGCNetworkHelper.h"
 #include "MAVLink/Crypto/CryptoController.h"
 #include "MAVLink/Crypto/DeviceKeyManager.h"
+#include "MissionManager/PlanUploader.h"
 
 #include <algorithm>
 
@@ -100,6 +101,8 @@ void AuthController::login(const QString& username, const QString& password)
     QJsonObject body;
     body.insert(QStringLiteral("username"), username);
     body.insert(QStringLiteral("password"), password);
+    // 声明 QGC 客户端：后端按 qgc 处理并返回设备密钥集合 devices
+    body.insert(QStringLiteral("client_type"), QStringLiteral("qgc"));
 
     QNetworkReply* reply = _postJson(QStringLiteral("/api/auth/login"), body);
     if (reply == nullptr) {
@@ -157,6 +160,7 @@ void AuthController::_onLoginFinished(QNetworkReply* reply)
         // 解锁路径：仅校验当前用户密码，token 顺带刷新，不重置会话状态
         _token = token;
         MAVLinkCrypto::CryptoController::instance()->deviceKeyManager()->setAuthToken(token);
+        PlanUploader::instance()->setAuthToken(token);   // 航线上传后台会话 token
         _screenLocked = false;
         qGuiApp->removeEventFilter(this);
         _unlockButton = nullptr;
@@ -172,14 +176,35 @@ void AuthController::_onLoginFinished(QNetworkReply* reply)
     if (_currentUser.isEmpty()) {
         _currentUser = _pendingUsername;
     }
+    // 监控主界面（OpsView）所需的用户画像：id/display_name/roles
+    _userId = data.value(QStringLiteral("user_id")).toVariant().toLongLong();
+    _displayName = data.value(QStringLiteral("display_name")).toString();
+    if (_displayName.isEmpty()) {
+        _displayName = _currentUser;
+    }
+    _roles.clear();
+    const QJsonArray roleArr = data.value(QStringLiteral("roles")).toArray();
+    for (const QJsonValue& rv : roleArr) {
+        const QString role = rv.toString();
+        if (!role.isEmpty()) {
+            _roles.append(role);
+        }
+    }
     _loggedIn = true;
 
     // 会话 token 注入 DeviceKeyManager（衔接加密链路取密钥鉴权）
-    MAVLinkCrypto::DeviceKeyManager* const keyManager =
-        MAVLinkCrypto::CryptoController::instance()->deviceKeyManager();
+    MAVLinkCrypto::CryptoController* const crypto = MAVLinkCrypto::CryptoController::instance();
+    MAVLinkCrypto::DeviceKeyManager* const keyManager = crypto->deviceKeyManager();
     keyManager->setAuthToken(_token);
+    PlanUploader::instance()->setAuthToken(_token);   // 航线上传后台会话 token
 
-    // 设备密钥集合：解析 {devices:[{deviceID,key}]}，逐条写入内存缓存（QHash<DeviceID,Key>，不落地）。
+    // 设备密钥集合：解析 {devices:[{deviceID,key}]}，逐条
+    //  ① cacheKey(deviceID, key)：密钥写入内存缓存（QHash<DeviceID,Key>，不落地）；
+    //  ② addLinkedDevice(deviceID)：deviceID 加入关联集合 —— 80005 明文登记心跳的
+    //     payload 即此集合（规范 §3.2.4.2「QGC 重启恢复」：重新登录→取回 deviceID 集合→
+    //     登记心跳携带该集合）。两者一起，QGC 才既持有解密密钥、又能向 mavp2p 声明关联。
+    // 关键约束：deviceID 只与站点相关、不随登录用户变化——同一站点任意用户（登录/重登/
+    // 交接班）取回的集合完全相同，故无需按用户区分或清空 _linkedDevices。
     // 获取规则暂未定义：后端测试时返回 table_device_key 全部，QGC 侧按此格式解析。
     const QJsonArray devices = data.value(QStringLiteral("devices")).toArray();
     int cachedCount = 0;
@@ -196,12 +221,18 @@ void AuthController::_onLoginFinished(QNetworkReply* reply)
         MAVLinkCrypto::Key key{};
         std::copy(keyBytes.constBegin(), keyBytes.constEnd(), key.begin());
         keyManager->cacheKey(deviceID, key);
+        crypto->addLinkedDevice(deviceID);   // 80005 登记集合 = 登录取回的 deviceID 集合
         ++cachedCount;
     }
-    qCInfo(AuthControllerLog) << "login success:" << _currentUser << "cached" << cachedCount << "device keys";
+    qCInfo(AuthControllerLog) << "login success:" << _currentUser << "cached" << cachedCount << "device keys"
+                              << "(site-scoped: deviceID set independent of user, same for any login; "
+                                 "linked set used as 80005 registration payload)";
 
     emit loggedInChanged();
     emit currentUserChanged();
+    emit displayNameChanged();
+    emit userIdChanged();
+    emit rolesChanged();
     emit loginSucceeded();
 }
 
@@ -279,6 +310,8 @@ void AuthController::unlock(const QString& password)
     QJsonObject body;
     body.insert(QStringLiteral("username"), _currentUser);
     body.insert(QStringLiteral("password"), password);
+    // 解锁同样走 qgc 客户端通道（后端按 qgc 处理）
+    body.insert(QStringLiteral("client_type"), QStringLiteral("qgc"));
 
     QNetworkReply* reply = _postJson(QStringLiteral("/api/auth/login"), body);
     if (reply == nullptr) {

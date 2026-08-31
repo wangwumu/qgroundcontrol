@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xml:space="preserve" width="72" height="72" viewBox="0 0 72 72">
+  <!-- 外侧白圆角框：Q 图标同款 rx，白描边线宽取细档（原图约一半） -->
+  <rect x="3.5" y="3.5" width="65" height="65" rx="18" fill="none" stroke="#ffffff" stroke-width="3"/>
+  <!-- 白色对勾：粗描边圆头折线（左短臂 -> 中下尖 -> 右长臂） -->
+  <polyline points="20,30 31,44 52,22" fill="none" stroke="#ffffff" stroke-width="9"
+            stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

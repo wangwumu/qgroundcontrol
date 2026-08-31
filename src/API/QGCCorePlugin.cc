@@ -8,6 +8,7 @@
 #include "HorizontalFactValueGrid.h"
 #include "InstrumentValueData.h"
 #include "JoystickManager.h"
+#include "MissionManager/PlanUploader.h"
 #include "QGCLoggingCategory.h"
 #include "QGCOptions.h"
 #include "QmlComponentInfo.h"
@@ -284,6 +285,8 @@ QQmlApplicationEngine *QGCCorePlugin::createQmlApplicationEngine(QObject *parent
     QQmlApplicationEngine *const qmlEngine = new QQmlApplicationEngine(parent);
     qmlEngine->addImportPath(QStringLiteral("qrc:/qml"));
     qmlEngine->rootContext()->setContextProperty(QStringLiteral("joystickManager"), JoystickManager::instance());
+    // 航线上传后台（PlanUploader）：C++ 先注入 serverUrl/token，QML 经此属性访问同一实例
+    qmlEngine->rootContext()->setContextProperty(QStringLiteral("planUploader"), PlanUploader::instance());
     return qmlEngine;
 }
 

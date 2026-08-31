@@ -51,7 +51,7 @@ Popup {
     property bool   destroyOnClose:         true
     property bool   preventClose:           false
     property bool   bypassNavigationCheck:  false
-
+    property bool   autoFocusFirstField:    true    // 打开后焦点自动落到内容里第一个文本输入框
     property real maxContentAvailableWidth:    mainWindow.width - _contentMargin * 6
     property real maxContentAvailableHeight:   mainWindow.height - titleRowLayout.height - _contentMargin * 7
 
@@ -96,6 +96,16 @@ Popup {
         setupDialogButtons(buttons)
     }
 
+    onOpened: {
+        // 打开完成后把焦点交给内容里第一个文本输入项，用户可直接键入而无需先点选。
+        if (autoFocusFirstField) {
+            const field = _findFirstTextField(dialogContentParent)
+            if (field) {
+                field.forceActiveFocus()
+            }
+        }
+    }
+
     onClosed: {
         globals.validationErrorCount = _previousValidationErrorCount
         Qt.inputMethod.hide()
@@ -105,6 +115,24 @@ Popup {
     }
 
     onButtonsChanged: setupDialogButtons(buttons)
+
+    function _findFirstTextField(item) {
+        if (item === undefined || item === null) {
+            return undefined
+        }
+        // 内容可能多层嵌套（ColumnLayout / 自定义容器），此处用 duck-typing 识别任意文本输入控件。
+        if ("placeholderText" in item && item.activeFocusOnTab) {
+            return item
+        }
+        var children = item.children
+        for (var i = 0; i < children.length; i++) {
+            var found = _findFirstTextField(children[i])
+            if (found !== undefined) {
+                return found
+            }
+        }
+        return undefined
+    }
 
     function _accept() {
         if (_acceptAllowed && (bypassNavigationCheck || mainWindow.allowViewSwitch(_previousValidationErrorCount))) {

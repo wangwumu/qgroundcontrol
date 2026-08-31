@@ -54,6 +54,8 @@ target_sources(${CMAKE_PROJECT_NAME}
         PlanManager.h
         PlanMasterController.cc
         PlanMasterController.h
+        PlanUploader.cc
+        PlanUploader.h
         RallyPoint.cc
         RallyPointController.cc
         RallyPointController.h

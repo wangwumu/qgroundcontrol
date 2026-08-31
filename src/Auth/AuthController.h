@@ -16,6 +16,7 @@
 
 #include <QtCore/QObject>
 #include <QtCore/QString>
+#include <QtCore/QStringList>
 #include <QtNetwork/QNetworkAccessManager>
 #include <QtQmlIntegration/QtQmlIntegration>
 
@@ -33,6 +34,9 @@ class AuthController : public QObject
 
     Q_PROPERTY(bool      loggedIn         READ loggedIn         NOTIFY loggedInChanged)
     Q_PROPERTY(QString   currentUser      READ currentUser      NOTIFY currentUserChanged)
+    Q_PROPERTY(QString   displayName      READ displayName      NOTIFY displayNameChanged)
+    Q_PROPERTY(qint64    userId           READ userId           NOTIFY userIdChanged)
+    Q_PROPERTY(QStringList roles          READ roles            NOTIFY rolesChanged)
     Q_PROPERTY(bool      screenLocked     READ screenLocked     NOTIFY screenLockedChanged)
     Q_PROPERTY(bool      unlockDialogOpen READ unlockDialogOpen WRITE setUnlockDialogOpen NOTIFY unlockDialogOpenChanged)
     Q_PROPERTY(QString   errorString      READ errorString      NOTIFY errorStringChanged)
@@ -49,6 +53,10 @@ public:
 
     bool    loggedIn() const { return _loggedIn; }
     QString currentUser() const { return _currentUser; }
+    QString     displayName() const { return _displayName; }
+    qint64      userId() const { return _userId; }
+    QStringList roles() const { return _roles; }
+    Q_INVOKABLE bool hasRole(const QString& role) const { return _roles.contains(role); }
     bool    screenLocked() const { return _screenLocked; }
     bool    unlockDialogOpen() const { return _unlockDialogOpen; }
     void    setUnlockDialogOpen(bool open);
@@ -72,9 +80,15 @@ public:
     /// 会话是否已持有 token（DeviceKeyManager 取密钥时用 Bearer）。
     Q_INVOKABLE bool hasToken() const { return !_token.isEmpty(); }
 
+    /// 会话 token（OpsView 网络层 XHR 鉴权用，Authorization: Bearer <token>）。
+    Q_INVOKABLE QString authToken() const { return _token; }
+
 signals:
     void loggedInChanged();
     void currentUserChanged();
+    void displayNameChanged();
+    void userIdChanged();
+    void rolesChanged();
     void screenLockedChanged();
     void unlockDialogOpenChanged();
     void errorStringChanged();
@@ -99,6 +113,9 @@ private:
     QNetworkAccessManager* _networkManager = nullptr;
     QString _token;                 ///< 会话 token（仅内存）
     QString _currentUser;
+    QString _displayName;           ///< display_name（命令条显示名；回退 username）
+    qint64  _userId = 0;            ///< user_id（交接方向判别 proposed_by == 当前用户）
+    QStringList _roles;             ///< roles（界面按角色渲染/分流）
     QString _pendingUsername;
     bool    _loggedIn = false;
     bool    _screenLocked = false;

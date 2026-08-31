@@ -58,6 +58,7 @@ add_subdirectory(Joystick)
 add_subdirectory(MAVLink)
 add_subdirectory(MissionManager)
 add_subdirectory(PlanView)
+add_subdirectory(OpsView)
 add_subdirectory(PositionManager)
 add_subdirectory(QmlControls)
 add_subdirectory(Settings)
@@ -144,6 +145,7 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
         FlyViewModule
         FlightMapModule
         PlanViewModule
+        OpsViewModule
         QGroundControlControlsModule
         QGroundControlModule
         ToolbarModule

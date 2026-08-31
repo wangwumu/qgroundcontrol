@@ -44,6 +44,7 @@
 #include "SettingsManager.h"
 #include "CryptoSettings.h"
 #include "Crypto/CryptoController.h"
+#include "MissionManager/PlanUploader.h"
 #include "Vehicle.h"
 #include "VideoManager.h"
 #include "qgc_version.h"
@@ -248,6 +249,8 @@ void QGCApplication::init()
             cryptoSettings->cryptoGcsDeviceID()->rawValue().toUInt()));
         crypto->deviceKeyManager()->setServerUrl(cryptoSettings->cryptoGcsServerUrl()->rawValue().toString());
         crypto->deviceKeyManager()->setAuthToken(cryptoSettings->cryptoAuthToken()->rawValue().toString());
+        // 航线上传后台（PlanUploader）：serverUrl 随设置注入，token 在 AuthController 登录时刷新
+        PlanUploader::instance()->setServerUrl(cryptoSettings->cryptoGcsServerUrl()->rawValue().toString());
 
         // 密钥来源选择（cryptoKeySource）：0 = 本地 key 文件（本地联调直连）；1 = gcs_server/数据库。
         // 本地模式下，从 AppConfigLocation/mavlink_key.bin 读 32 字节密钥，注入到 cryptoLocalKeyDeviceID

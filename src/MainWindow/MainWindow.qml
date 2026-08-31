@@ -9,6 +9,7 @@ import QGroundControl.Controls
 import QGroundControl.FactControls
 import QGroundControl.FlyView
 import QGroundControl.FlightMap
+import QGroundControl.OpsView
 import QGroundControl.PlanView
 import QGroundControl.Toolbar
 
@@ -21,8 +22,19 @@ ApplicationWindow {
     flags:      Qt.Window | (ScreenTools.isAndroid ? Qt.ExpandedClientAreaHint | Qt.NoTitleBarBackgroundHint : 0)
 
     Component.onCompleted: {
+        // 登录成功后按操作岗位分流：
+        //   SITE_ATC / ROUTE_MONITOR → 监控主界面（OpsView）；其余角色 → 原飞行视图
+        AuthController.loginSucceeded.connect(_onLoginSucceededForRole)
         // Start the sequence of first run prompt(s)
         firstRunPromptManager.nextPrompt()
+    }
+
+    function _onLoginSucceededForRole() {
+        if (AuthController.hasRole("SITE_ATC") || AuthController.hasRole("ROUTE_MONITOR")) {
+            showOpsView()
+        } else {
+            showFlyView()
+        }
     }
 
     /// Saves main window position and size and re-opens it in the same position and size next time
@@ -128,13 +140,26 @@ ApplicationWindow {
     function showPlanView() {
         flyView.visible = false
         planView.visible = true
+        opsView.visible = false
         toolDrawer.visible = false
     }
 
     function showFlyView() {
         flyView.visible = true
         planView.visible = false
+        opsView.visible = false
         toolDrawer.visible = false
+    }
+
+    function showOpsView() {
+        flyView.visible = false
+        planView.visible = false
+        opsView.visible = true
+        toolDrawer.visible = false
+    }
+
+    function hideOpsView() {
+        opsView.visible = false
     }
 
     function showTool(toolTitle, toolSource, toolIcon) {
@@ -314,6 +339,13 @@ ApplicationWindow {
     PlanView {
         id:             planView
         objectName:     "mainView_plan"
+        anchors.fill:   parent
+        visible:        false
+    }
+
+    OpsView {
+        id:             opsView
+        objectName:     "mainView_ops"
         anchors.fill:   parent
         visible:        false
     }
