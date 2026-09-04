@@ -37,4 +37,5 @@ Prefer **Lexis MCP** tools (`mcp__lexis__*`) over Grep/Read for code exploration
 - Git is configured to use SSH for GitHub (`git@github.com:` instead of `https://github.com/`) due to WSL2 HTTPS instability
 - VS Code config is in `.vscode/` (settings.json, launch.json, tasks.json); install the recommended extensions
 - The build uses **ccache** + **mold** linker for fast incremental builds
-- **MAVLink Extensions** — custom messages 80000-80003 for VTOL safety management live in `src/MAVLink/Extensions/`; protocol doc at `docs/mavlink_extension_protocol.md`.`QML` singleton `VTOLExtensions` exposes static send helpers; enums via `VTOLExtensionsEnums` namespace.
+- **MAVLink Extensions** — custom messages 80000-80003 for VTOL safety management live in `src/MAVLink/Extensions/`; protocol doc at `docs/docs/60824.0/mavlink_extension_protocol.md`（`docs/docs` 是指向 `~/abc_common/docs` 的符号链接）。`QML` singleton `VTOLExtensions` exposes static send helpers; enums via `VTOLExtensionsEnums` namespace.
+- **本模块文档** — QGC 界面/功能设计文档集中在 `docs/docs/qgc/`（qgc界面修改规范、飞行监控主界面设计、QGC加密MAVLink链路实现说明、mission_planning_overview）。

@@ -40,6 +40,8 @@ class AuthController : public QObject
     Q_PROPERTY(bool      screenLocked     READ screenLocked     NOTIFY screenLockedChanged)
     Q_PROPERTY(bool      unlockDialogOpen READ unlockDialogOpen WRITE setUnlockDialogOpen NOTIFY unlockDialogOpenChanged)
     Q_PROPERTY(QString   errorString      READ errorString      NOTIFY errorStringChanged)
+    /// 本站点 id（来自 login 响应 role_sites 单值；site_id 仅存内存，绝不落配置文件）。
+    Q_PROPERTY(qint64    siteId           READ siteId           NOTIFY siteIdChanged)
 
 public:
     explicit AuthController(QObject* parent = nullptr);
@@ -61,6 +63,7 @@ public:
     bool    unlockDialogOpen() const { return _unlockDialogOpen; }
     void    setUnlockDialogOpen(bool open);
     QString errorString() const { return _errorString; }
+    qint64  siteId() const { return _siteId; }          ///< 本站点 id（仅内存，登录 role_sites 单值）
 
     /// 登录：POST /api/auth/login。成功后解析 token + devices(设备密钥集合) 并内存缓存。
     Q_INVOKABLE void login(const QString& username, const QString& password);
@@ -92,6 +95,7 @@ signals:
     void screenLockedChanged();
     void unlockDialogOpenChanged();
     void errorStringChanged();
+    void siteIdChanged();
     void loginSucceeded();
     void loginFailed(const QString& error);
     void unlockSucceeded();
@@ -109,12 +113,21 @@ private:
     /// 事件坐标是否落在锁定覆盖层「解锁按钮」上（该按钮在锁定时保持可点）。
     bool _isOnUnlockButton(QObject* watched, QEvent* event) const;
     void _setError(const QString& error);
+    /// 从 AppConfigLocation/qgc_device.cfg 读本机 QGC 设备序列号（key=value，# 注释跳过）。
+    /// ⚠️ 安全局限：本期明文，可被拷贝；正式版须硬件 IC 卡（序列号在加密芯片内）。
+    /// 失败/未配置返回空串。只读序列号，绝不读写 site_id。
+    /// 由 _deviceSerialForAuth() 在 kDevDisableDeviceGate=false（正式版）时调用。
+    QString _readDeviceSerial() const;
+    /// login/unlock 携带的设备序列号（site 归属门禁）。kDevDisableDeviceGate=true（开发期）返回固定值，
+    /// false 返回 _readDeviceSerial()（真实序列号）。⚠️ 上线前置 false，否则产品无校验地用固定序列号登录。
+    QString _deviceSerialForAuth() const;
 
     QNetworkAccessManager* _networkManager = nullptr;
     QString _token;                 ///< 会话 token（仅内存）
     QString _currentUser;
     QString _displayName;           ///< display_name（命令条显示名；回退 username）
     qint64  _userId = 0;            ///< user_id（交接方向判别 proposed_by == 当前用户）
+    qint64  _siteId = 0;            ///< 本站点 id（login role_sites 单值；仅内存，绝不落配置文件）
     QStringList _roles;             ///< roles（界面按角色渲染/分流）
     QString _pendingUsername;
     bool    _loggedIn = false;

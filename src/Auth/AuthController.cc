@@ -1,10 +1,15 @@
 #include "AuthController.h"
 
+#include <QtCore/QDir>
+#include <QtCore/QFile>
+#include <QtCore/QFileInfo>
 #include <QtCore/QJsonArray>
 #include <QtCore/QJsonDocument>
 #include <QtCore/QJsonObject>
 #include <QtCore/QLoggingCategory>
 #include <QtCore/QRectF>
+#include <QtCore/QRegularExpression>
+#include <QtCore/QStandardPaths>
 #include <QtGui/QGuiApplication>
 #include <QtGui/QKeyEvent>
 #include <QtGui/QMouseEvent>
@@ -67,6 +72,67 @@ QString AuthController::serverUrl() const
     return SettingsManager::instance()->cryptoSettings()->cryptoGcsServerUrl()->rawValue().toString().trimmed();
 }
 
+// ---------------------------------------------------------------------------
+// 设备序列号
+// ---------------------------------------------------------------------------
+
+QString AuthController::_readDeviceSerial() const
+{
+    // 由 _deviceSerialForAuth() 在 kDevDisableDeviceGate=false（正式版）时调用，读取本机真实序列号。
+    // AppConfigLocation/qgc_device.cfg（与 mavlink_key.bin 同目录，见 QGCApplication.cc 读密钥先例）。
+    // ⚠️ 安全局限：本期明文存 cfg，可被拷贝；正式版须硬件 IC 卡（序列号在加密芯片内，不可导出）。
+    // 只读序列号，绝不读写 site_id（site_id 仅在内存+HTTPS 链路）。
+    const QString path = QDir(QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation))
+                             .filePath(QStringLiteral("qgc_device.cfg"));
+    QFileInfo info(path);
+    if (!info.exists() || !info.isFile()) {
+        // 文件不存在：属部署配置问题（运维需放置 cfg），与「文件存在但缺键」区分开。
+        qCWarning(AuthControllerLog) << "设备序列号配置不存在（部署需放置 qgc_device.cfg）:" << path;
+        return QString();
+    }
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        qCWarning(AuthControllerLog) << "无法读取设备序列号配置:" << path;
+        return QString();
+    }
+    const QRegularExpression lineRe(QStringLiteral(R"(^\s*([^#;\s][^=]*?)\s*=\s*(.*?)\s*$)"));
+    const QRegularExpression keyRe(QStringLiteral("^device_serial$"), QRegularExpression::CaseInsensitiveOption);
+    // 值截取到首个行内注释符（# 或 ;）前，再 trim，避免 `device_serial=SN # note` 带上注释。
+    const QRegularExpression inlineRe(QStringLiteral(R"(\s*[#;].*$)"));
+    while (!file.atEnd()) {
+        const QString line = file.readLine().trimmed();
+        if (line.isEmpty() || line.startsWith(QLatin1Char('#')) || line.startsWith(QLatin1Char(';'))) {
+            continue;
+        }
+        const QRegularExpressionMatch m = lineRe.match(line);
+        if (!m.hasMatch()) {
+            continue;
+        }
+        if (keyRe.match(m.captured(1).trimmed()).hasMatch()) {
+            QString serial = m.captured(2);
+            serial = serial.remove(inlineRe).trimmed();
+            if (!serial.isEmpty()) {
+                return serial;
+            }
+        }
+    }
+    // 文件存在但缺 device_serial 键：属配置缺项，与「文件不存在」区分。
+    qCWarning(AuthControllerLog) << "设备序列号配置缺 device_serial 键:" << path;
+    return QString();
+}
+
+// 返回本次 login/unlock 携带的设备序列号（site 归属门禁）。
+// ⚠️ 上线前必须把 kDevDisableDeviceGate 置为 false，否则产品会继续无校验地用固定序列号登录。
+// false 时改读 qgc_device.cfg 的真实序列号（后端门禁恢复后强制归属校验）。
+QString AuthController::_deviceSerialForAuth() const
+{
+    const bool kDevDisableDeviceGate = true;   // ⚠️【开发期临时禁用】上线前置 false，恢复站点归属门禁
+    if (kDevDisableDeviceGate) {
+        return QStringLiteral("UAVM-QGC-DEV");
+    }
+    return _readDeviceSerial();
+}
+
 QNetworkReply* AuthController::_postJson(const QString& path, const QJsonObject& body)
 {
     const QString url = QStringLiteral("%1%2").arg(serverUrl(), path);
@@ -94,6 +160,12 @@ void AuthController::login(const QString& username, const QString& password)
         emit loginFailed(errorString());
         return;
     }
+    // 站点归属门禁：QGC 登录必须携带本机设备序列号（后端校验设备绑定站点与用户站点匹配，恢复门禁后生效）。
+    // 【开发期临时】kDevDisableDeviceGate=true 时用固定序列号（见 _deviceSerialForAuth），不读 cfg：
+    // 避免开发/联调因 cfg 缺失或未登记而登录失败。后端对应校验目前已注释掉（见 auth.go），固定值不会被校验。
+    // 正式上线前：① 置 kDevDisableDeviceGate=false（改读 qgc_device.cfg）；② 恢复后端校验。
+    // 见《07-界面功能设计.md》「站点归属设备序列号机制（开发期临时禁用）」一节。
+    const QString deviceSerial = _deviceSerialForAuth();
 
     _pendingUsername = username;
     _unlockInProgress = false;
@@ -103,6 +175,8 @@ void AuthController::login(const QString& username, const QString& password)
     body.insert(QStringLiteral("password"), password);
     // 声明 QGC 客户端：后端按 qgc 处理并返回设备密钥集合 devices
     body.insert(QStringLiteral("client_type"), QStringLiteral("qgc"));
+    // 设备序列号（站点归属门禁）：后端查表得绑定站点并与用户站点匹配，匹配才放行（恢复门禁后生效）
+    body.insert(QStringLiteral("device_serial"), deviceSerial);
 
     QNetworkReply* reply = _postJson(QStringLiteral("/api/auth/login"), body);
     if (reply == nullptr) {
@@ -120,7 +194,22 @@ void AuthController::login(const QString& username, const QString& password)
 void AuthController::_onLoginFinished(QNetworkReply* reply)
 {
     if (!QGCNetworkHelper::isSuccess(reply)) {
-        const QString error = QGCNetworkHelper::errorMessage(reply);
+        // 优先透出后端返回的具体原因（QGC 设备序列号未登记/停用/站点不匹配 等含差异提示），
+        // 而非通用 "HTTP 403: Forbidden"——否则用户无法区分该去登记设备、恢复设备还是换账号。
+        QString error = QGCNetworkHelper::errorMessage(reply);
+        // 不走 parseJsonReply——它在 reply->error()!=NoError（即任何 4xx/5xx，含 403）时直接返回
+        // 空文档、不 readAll()，导致后端返回的具体 error（序列号未登记/停用/站点不匹配）永远透不出来。
+        // 此处直接读 body：先用 looksLikeJson 排除 nginx/网关错误页，再取后端 error 字段。
+        const QByteArray body = reply->readAll();
+        if (QGCNetworkHelper::looksLikeJson(body)) {
+            const QJsonDocument doc = QJsonDocument::fromJson(body);
+            if (doc.isObject()) {
+                const QString apiError = doc.object().value(QStringLiteral("error")).toString();
+                if (!apiError.isEmpty()) {
+                    error = apiError;
+                }
+            }
+        }
         _setError(error);
         if (_unlockInProgress) {
             emit unlockFailed(error);
@@ -190,6 +279,26 @@ void AuthController::_onLoginFinished(QNetworkReply* reply)
             _roles.append(role);
         }
     }
+    // 本站点 id：登录响应 role_sites{role:[site_id...]}。业务假定「一用户只属一个站点」（创建/修改
+    // 用户界面保证），故此处取 role_sites 中首个非零 site_id 作为本站（OpsView 判定基准）。
+    // 注：后端 role_sites 理论可为多值（表未硬约束），但用户界面已保证单站点；如未来放行多站点，
+    // 应改用登录门禁匹配的权威 site_id 而非在此扫首个。site_id 仅存内存，绝不落文件。
+    // 每次正常登录无条件重解析：换账号（交接班/登出重登）会覆盖旧站点值，避免残留上一账号站点。
+    _siteId = 0;
+    const QJsonObject roleSites = data.value(QStringLiteral("role_sites")).toObject();
+    for (const QJsonValue& sitesVal : roleSites) {
+        const QJsonArray sites = sitesVal.toArray();
+        for (const QJsonValue& s : sites) {
+            const qint64 site = s.toVariant().toLongLong();
+            if (site > 0) {
+                _siteId = site;
+                break;
+            }
+        }
+        if (_siteId > 0) {
+            break;
+        }
+    }
     _loggedIn = true;
 
     // 会话 token 注入 DeviceKeyManager（衔接加密链路取密钥鉴权）
@@ -233,6 +342,7 @@ void AuthController::_onLoginFinished(QNetworkReply* reply)
     emit displayNameChanged();
     emit userIdChanged();
     emit rolesChanged();
+    emit siteIdChanged();
     emit loginSucceeded();
 }
 
@@ -304,6 +414,10 @@ void AuthController::unlock(const QString& password)
         emit unlockFailed(errorString());
         return;
     }
+    // 解锁同样走 qgc 客户端通道（后端序列号校验在【开发期临时禁用】，见 auth.go；
+    // 恢复启用后缺序列号才会返回 403）。
+    // 设备序列号同 login：kDevDisableDeviceGate=true 时固定值；上线置 false 后读 qgc_device.cfg。
+    const QString deviceSerial = _deviceSerialForAuth();
 
     _unlockInProgress = true;
 
@@ -312,6 +426,7 @@ void AuthController::unlock(const QString& password)
     body.insert(QStringLiteral("password"), password);
     // 解锁同样走 qgc 客户端通道（后端按 qgc 处理）
     body.insert(QStringLiteral("client_type"), QStringLiteral("qgc"));
+    body.insert(QStringLiteral("device_serial"), deviceSerial);
 
     QNetworkReply* reply = _postJson(QStringLiteral("/api/auth/login"), body);
     if (reply == nullptr) {
