@@ -54,6 +54,22 @@ Item {
     property string _assignSlotError: ""      // 指定机位失败原因（slotDialog 展示，成功/重开时清空）
     property string _handoverActionError: ""  // 交接确认/拒绝/撤回失败提示（handoverDialog 保留可重试）
     property var   _mySiteId:       AuthController.siteId
+    // 任务卡片之间的竖直间距。**单点定义**：站点视图与监控员视图是两个 ListView，
+    // 但用的是同一个 taskDelegate、看起来必须是同一种卡，间距就得是**同一个值**——
+    // 两处各写一个字面量就是两个"决定者"，改一处忘一处会得到两种疏密
+    //（数值上恰好等于 _slotGap 纯属巧合，别拿它代用：机位间距是另一件事）。
+    property real  _taskCardGap:   6
+    // 任务卡片**左**侧留白：与机位那两列的左空隙**对齐**（2026-09-17 用户要求"参照机位左侧的空位"）。
+    // 直接引用 _slotMargin 而不是另抄一个 10 —— 用户要的就是"和机位左空隙一样"，
+    // 所以将来调机位留白时卡片应当跟着对齐，而不是各调各的。
+    property real  _taskCardMargin: _slotMargin
+    // 任务卡片**右**侧留白：就是原代码 `width: ListView.view.width - 20` 里那个 20。
+    // ‼️ 加左空位**不得吃掉它**（用户明确要求"不能挤到右侧的滚动条"）⇒ 左空位是从卡片**宽度**里
+    // 减出来的，不是把卡片整体右移；右边缘位置因此一个像素都不变。
+    // ⚠️ 实测本文件**没有任何 ScrollBar**（`ScrollBar` 在 OpsView.qml 零命中；QGC 用 Qt `Basic`
+    // 风格，该风格也不会给 ListView 自动附加滚动条），所以这 20 到底是给谁留的无法从代码确认
+    // ——按"来历不明的右侧留白"对待，只保持原值、不替它编一个用途。
+    property real  _taskCardRightGap: 20
     // 机位两列 Grid 几何（宽随 rightPanel，高=宽/2；机位区高≤站点区一半）
     property int   _slotCols:      2
     property real  _slotGap:       6
@@ -324,7 +340,10 @@ Item {
         return _statusLabel(task.status)
     }
     function _phaseToLabel(p) { return p === "ROUTE" ? "航线监控" : p === "LANDING" ? "降落指挥" : p }
-    function _isMine(handover) { return handover && handover.proposed_by === AuthController.userId }
+    // 判定函数一律返回**真 bool**（`!!` 不可省）：返回 undefined 会让调用点的 `A && B`
+    // 短路求值成 undefined，而 QML 把 undefined 当成「这个绑定没有值」，属性退回**默认值**——
+    // `visible`/`enabled` 的默认值都是 true，于是无交接的任务反而长出「撤回交接」按钮（见 :1110）。
+    function _isMine(handover) { return !!(handover && handover.proposed_by === AuthController.userId) }
     // deadline_at 由后端以 UTC 裸串落库/返回（time.Now().UTC().Format("2006-01-02 15:04:05")，无 T/时区标记）；
     // ECMAScript 对无时区串按本地时区解析（中国 CST=UTC+8 → 会提前 8h 判"超时"）。此处补 'T' 与 'Z' 使其按 UTC
     // 解析，与后端 datetime('now') 比较口径及遥测 timestamp（RFC3339 带 Z）一致；已是 ISO+时区则原样放行。
@@ -807,6 +826,11 @@ Item {
                             clip: true
                             model: _siteTasks()
                             delegate: taskDelegate
+                            // 左空位（委托宽度里已为它预留，见 taskDelegate）
+                            leftMargin: _taskCardMargin
+                            // 卡片间距：不留缝时相邻两张卡各自 1px 的描边直接贴合，
+                            // 看上去是连成一片的一张卡（选中态那道亮蓝描边尤其明显）。
+                            spacing: _taskCardGap
                         }
                         // ── 下部：机位（两列、从底向上、内容超出可滚动）──
                         Flickable {
@@ -857,10 +881,16 @@ Item {
                         ListView {
                             Layout.fillWidth: true
                             Layout.fillHeight: true
-                            Layout.leftMargin: 8; Layout.rightMargin: 8; Layout.topMargin: 4
+                            // 横向留白一律交给委托（_taskCardMargin / _taskCardRightGap）单点决定：
+                            // 这里原本另有 Layout.leftMargin/rightMargin = 8，与委托的 x 叠加后
+                            // 同一张卡在两个视图里会得到两种左空位（8+10 vs 10）——两个"决定者"。
+                            Layout.topMargin: 4
                             clip: true
                             model: _routeTasks()
                             delegate: taskDelegate
+                            // 与站点视图同一个 delegate，间距与左空位都取同一份值
+                            leftMargin: _taskCardMargin
+                            spacing: _taskCardGap
                         }
                     }
                 }
@@ -963,7 +993,13 @@ Item {
     Component {
         id: taskDelegate
         Rectangle {
-            width: ListView.view.width - 20
+            // 宽度为左空位**预留**（右边缘因此纹丝不动，右侧留白仍是完整的 _taskCardRightGap）。
+            // ‼️ 左空位**绝不能**靠本委托写 `x:` 来让位——纵向 ListView 会把委托的 x 压回 **0**
+            //（QT_QPA_PLATFORM=offscreen 实测：布局跑完后三张卡的 x 全是 0）。那样宽度是少了、
+            //   位置却没动 ⇒ **空位全长在右边**，正好与要求相反。让位只能靠 ListView 的 leftMargin
+            //（同样实测：`leftMargin: 10` 下 item 映射到根的 x = 10、右留白仍为 20），
+            //   见两个 ListView 上的 `leftMargin: _taskCardMargin`。
+            width: ListView.view.width - _taskCardRightGap - _taskCardMargin
             height: taskBody.height + 12
             radius: 4
             color: "#16233c"
@@ -1008,9 +1044,20 @@ Item {
                 Row {
                     width: parent.width
                     spacing: 8
+                    // 未指派无人机的任务**整行不可见**（2026-09-17 用户裁定），过滤落在服务端：
+                    // `handlers/ops.go` Overview 的**共享 WHERE** 里有 `COALESCE(t.uav_id,0) <> 0`，
+                    // 所以本视图正常**只会拿到已派机的任务**，下面 `uav_id` 为假的那一支走不到。
+                    // 保留另一支是**断路器**，不是"这类任务会显示"：万一后端过滤被改回去/绕过，
+                    // 界面会明说「未指派无人机」，而不是回落显示 task_no 把任务号伪装成航班号
+                    //——那正是本视图改前的老行为，也正是用户报障时看到的那一条。
+                    // ‼️ 判据用 uav_id（后端 `COALESCE(t.uav_id,0)`，0=未指派），**不用 uav_no 空串**
+                    //——与 _canTakeoff(:469)/_slotForTask(:444) 同解，全视图对「有没有派机」只有一份判据。
                     Text {
-                        color: "#9fb3d4"; font.pixelSize: 11
-                        text: qsTr("航班：") + (modelData.uav_no ? modelData.uav_no : (modelData.task_no ? modelData.task_no : "—"))
+                        color: modelData.uav_id ? "#9fb3d4" : "#ffc107"
+                        font.pixelSize: 11
+                        text: modelData.uav_id
+                              ? qsTr("航班：") + (modelData.uav_no ? modelData.uav_no : "—")
+                              : qsTr("航班：未指派无人机（%1）").arg(modelData.task_no ? modelData.task_no : "—")
                     }
                     Text {
                         color: "#9fb3d4"; font.pixelSize: 11
@@ -1095,7 +1142,12 @@ Item {
                     }
                     // 撤回/拒绝（提出方或接收方在交接弹框内处理；此处提供撤回）
                     Button {
-                        visible: _handoverFor(modelData) && _isMine(_handoverFor(modelData))
+                        // ‼️ 必须是三元式而不是 `_handoverFor(modelData) && _isMine(...)`：
+                        // 无交接时 `_handoverFor` 返回 undefined，`&&` 直接在**左操作数**上短路，
+                        // 整个表达式求值为 undefined（不是 false）；QML 视其为「绑定无值」，
+                        // visible 遂退回 Item 默认值 **true** ⇒ 每一张卡片都显示「撤回交接」。
+                        // 同 :725/:1039 的写法。判据仍与徽标同源，只有「求值成真 bool」这一条不同。
+                        visible: _handoverFor(modelData) ? _isMine(_handoverFor(modelData)) : false
                         height: 24; padding: 0
                         text: qsTr("撤回交接")
                         onClicked: _cancelHandover(_handoverFor(modelData).handover_id)
