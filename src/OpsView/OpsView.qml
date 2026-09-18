@@ -37,7 +37,14 @@ Item {
     //-------------------------------------------------------------------------
     property var  _tasks:          []      // /ops/overview 任务数组（已按角色过滤）
     property var  _pending:        []      // /handovers/pending 待确认交接数组
-    property var  _slots:          []      // 本站机位（site_id=_mySiteId）
+    // ‼️ 两个机位集合**刻意分开**，别合并（2026-09-18）：
+    //   `_slots`    = 缺省档「**可用**机位」（已核准 ∧ status='FREE'）——**使用面**的唯一来源：
+    //                 「指定机位」弹窗的按钮、`_slotById`、`_slotForTask`。维护/故障机位必须不在其中，
+    //                 否则操作员会拿到一个永不成功的起降目标。
+    //   `_slotsAll` = 第二档「**已核准**机位」（不论 status）——**只喂机位平面图**，见 `_slotsMapView`。
+    // 两档由**后端** `site.go ListSlots` 的参数分流（QGC 侧不做任何过滤，判据全程在后端）。
+    property var  _slots:          []      // 本站可用机位（site_id=_mySiteId）
+    property var  _slotsAll:       []      // 本站已核准机位（含维护/故障；仅平面图用）
     property var  _handoverById:   ({})    // task_id -> pending handover
     property var  _seenHandovers:  []      // 已提示过的 handover id（防重复弹框）
     property var  _selectedTaskId: -1
@@ -59,7 +66,8 @@ Item {
     // 两处各写一个字面量就是两个"决定者"，改一处忘一处会得到两种疏密
     //（数值上恰好等于 _slotGap 纯属巧合，别拿它代用：机位间距是另一件事）。
     property real  _taskCardGap:   6
-    // 任务卡片**左**侧留白：与机位那两列的左空隙**对齐**（2026-09-17 用户要求"参照机位左侧的空位"）。
+    // 任务卡片**左**侧留白：与机位图的左空隙**对齐**（2026-09-17 用户要求"参照机位左侧的空位"；
+    // 机位图侧由 SlotLayout.edgeMargin 承担，两者同源）。
     // 直接引用 _slotMargin 而不是另抄一个 10 —— 用户要的就是"和机位左空隙一样"，
     // 所以将来调机位留白时卡片应当跟着对齐，而不是各调各的。
     property real  _taskCardMargin: _slotMargin
@@ -70,15 +78,86 @@ Item {
     // 风格，该风格也不会给 ListView 自动附加滚动条），所以这 20 到底是给谁留的无法从代码确认
     // ——按"来历不明的右侧留白"对待，只保持原值、不替它编一个用途。
     property real  _taskCardRightGap: 20
-    // 机位两列 Grid 几何（宽随 rightPanel，高=宽/2；机位区高≤站点区一半）
-    property int   _slotCols:      2
-    property real  _slotGap:       6
+    // 机位区四周留白。SlotLayout.edgeMargin 与任务卡片左留白都取本值（单点定义）。
     property real  _slotMargin:    10
-    property real  _slotBoxW:      (rightPanel.width - _slotMargin * 2 - _slotGap) / _slotCols
-    property real  _slotBoxH:      _slotBoxW / 2
-    property int   _slotRows:      Math.max(1, Math.ceil(_slots.length / _slotCols))
-    property real  _slotGridH:     _slotRows * _slotBoxH + (_slotRows - 1) * _slotGap
-    property real  _slotAreaH:     Math.min(_slotGridH, Math.max(0, siteViewArea.height / 2))
+    // 机位图朝向：N = 上为北（缺省）/ E = 上为东。**只驱动本机位图的投影**，不改动别的任何东西。
+    //
+    // 落盘复用 QGC 既有的**通用键值接口** `QGroundControl.saveGlobalSetting / loadGlobalSetting`
+    //（Q_INVOKABLE，写进 .ini 的 `[QGCQml]` 组）——与 `PipView.qml` 的 `_pipExpandedSettingsKey`
+    // 同源：那是 QGC 里"界面偏好要落盘"的既有先例，**零 C++、零 CMake 改动**。
+    // 不必走 SettingsGroup（那要 json + cc/h + SettingsManager 注册 + 设置页条目），
+    // 而本项的**操作入口就在这条工具栏上**，再放一份到设置页只会多一个决定者。
+    //
+    // ‼️ 这个键是**整机（QSettings）级**的：不区分登录用户、不区分站点。换个人登录、或换场地，
+    //    读到的都是上一次在本机改过的值。用户原话「有人修改朝向，则下次登陆采用上次设置的值」
+    //    要的正是这个形状。哪天要按用户/站点各存一份，得把键名换成带 userId/siteId 的形式
+    //    ——那时 `QGroundControl` 这对接口就不够用了（它只吃一个扁平键名）。
+    readonly property string _slotOrientSettingsKey: "OpsViewSlotOrient"
+    property string _slotOrient:   "N"
+    // 缺省朝北 ⇒ `loadGlobalSetting` 的缺省值就取 "N"（键根本没写过时返回它）。
+    // ⚠️ **必须过一遍白名单**，不能把读到的串直接赋给 `_slotOrient`：手工改过 .ini、
+    //    或将来枚举扩展，都能塞进垃圾值。后果不是崩溃而是**静默**——`SlotLayout` 里所有
+    //    `orient === "E"` 判断会一律按北处理（fail-safe，画面仍画得出来），但两个切换按钮
+    //    **都不高亮**，界面进入"看起来一项都没选中"的状态，且不报任何错。所以非 "E" 一律回落 "N"。
+    function _loadSlotOrient() {
+        return QGroundControl.loadGlobalSetting(_slotOrientSettingsKey, "N") === "E" ? "E" : "N"
+    }
+    // 用 `Component.onCompleted` 赋值而**不是**写成属性绑定 `property string _slotOrient: _loadSlotOrient()`：
+    // 方法调用不注册 QML 绑定依赖（见本文件顶部 roles 那条同源教训），两者此刻等价，
+    // 但绑定一旦将来因任何原因被重估，就会把用户**本次会话内**改的朝向悄悄冲回文件里的旧值。
+    // 显式赋值把"只在启动时读一次"这件事写死。
+    Component.onCompleted: _slotOrient = _loadSlotOrient()
+    // 右边栏宽度：站点视图下按机位图**所需宽**取值（340 ~ 510 = 340×1.5），其余视图恒 340。
+    // 510 来自用户给的上限「宽度不足时右边栏可扩至 1.5 倍」。
+    readonly property real _rightPanelMinW: 340
+    readonly property real _rightPanelMaxW: _rightPanelMinW * 1.5
+    // 姿态仪/罗盘宽度**不随边栏加宽**（恒 340×0.8 = 272）：表盘放大没有信息量，
+    // 而且会连带吃掉机位区的可用高（仪表高 = (宽−12)/2，宽了高也高）。
+    readonly property real _instrBlockW:    _rightPanelMinW * 0.8
+    // 站点视图整块（任务列表之上、仪表区之下）的高度；其**一半**是机位图的可用高上限。
+    // ‼️ 必须由 rightPanel 与仪表区推出，**不能**直接读 siteViewArea.height —— 那会成环
+    //（可用高 → 比例系数 → 卡片高 → 机位簇自然高 → 机位区高 → 可用高），
+    // 而改造前的 _slotAreaH 正是那种写法，QML 只能靠"沿用上一轮的值"勉强收敛。
+    readonly property real _siteAreaH:      Math.max(0, rightPanel.height
+                                                     - instrumentsBlock.height
+                                                     - instrumentsBlock._vGap * 2)
+    readonly property real _slotAreaMaxH:   _siteAreaH / 2
+    // 机位卡片用的视图数据：在机位对象上补三个**呈现字段**
+    //（`uav_status` / `uav_status_label` / `slot_status_label`）。
+    // 补在这里而不是卡片里，是因为"停放无人机状态"要回退到 overview 的 uav_status
+    //（见 _uavStatusForSlot），而那个回退要读 _tasks —— SlotLayout 拿不到、也不该拿到。
+    // 枚举→中文的唯一来源仍是 _uavStatusLabel / _slotStatusLabel（卡片不许出现裸枚举）。
+    //
+    // ‼️ 源是 **`_slotsAll`（平面图那一档）**，不是 `_slots`：平面图必须画出维护/故障机位，
+    // 否则其余机位的投影相对方位整体错位（用户 2026-09-18 报障，见 SlotLayout.qml 文件头）。
+    readonly property var _slotsMapView: _decorateSlots(_slotsAll)
+    function _decorateSlots(src) {
+        if (!src || !src.length) return []
+        var out = []
+        for (var i = 0; i < src.length; i++) {
+            var s = src[i]
+            var c = {}
+            for (var k in s) c[k] = s[k]      // 整体浅拷贝：将来后端加字段不必回来补这里
+            c.uav_status = _uavStatusForSlot(s)
+            c.uav_status_label = _uavStatusLabel(c.uav_status)
+            c.slot_status_label = _slotStatusLabel(s.status)
+            out.push(c)
+        }
+        return out
+    }
+    // 机位图是否在场（SITE_ATC 且处于站点视图）——决定边栏要不要加宽、朝向按钮要不要出现
+    readonly property bool _showSlotLayout: _showSiteView && _isSiteATC
+    property real  _rightPanelW: _showSlotLayout
+                                 ? Math.min(_rightPanelMaxW,
+                                            Math.max(_rightPanelMinW, slotLayout.desiredPanelWidth))
+                                 : _rightPanelMinW
+    // 机位区高 = 机位簇自然高 + 底部留白，**再夹在 _slotAreaMaxH 之内**。
+    // ‼️ 这个 min 不能省：自然高**并不总**被 _slotAreaMaxH 夹住——求解器在"可读下限 lo 压过
+    // 纵向解 sH"时（如 6 机位排成南北一线，maxAreaHeight=304 实测自然高 454）会突破可用高，
+    // 此时若不夹，机位区会取 464px 把整块场地吃掉、上方任务列表只剩 145px。
+    // 夹住之后由 slotFlick 纵向滚动兜底（滚动本来就是这种场面的正解）。
+    // 同时这条 min 也把改造前那条 siteViewArea.height ↔ slotFlick 高度的绑定环去掉了。
+    readonly property real _slotAreaH: Math.min(_slotAreaMaxH, slotLayout.naturalHeight + _slotMargin)
     // 地图中心跟随：默认跟随首个任务；用户平移地图/点选 marker 后转手动。
     // 手动中心走属性而非直接赋值 opsMap.center —— 直接赋值会破坏 center 绑定，
     // 且 2s 轮询（_tasks 重建）会触发绑定重估把地图拽回首个任务（抢占用户视野）。
@@ -161,22 +240,35 @@ Item {
         })
     }
     function _fetchSlots() {
-        if (_isSiteATC && _mySiteId > 0) {
-            // 使用闸（2026-09-05）：仅已核准机位作降落/停靠点——过滤判据全程在**后端** ListSlots
-            // （2026-09-05 起缺省即只下发 VALIDATED 机位，旧构建不带参也一样被过滤；?only_validated=1
-            // 保留仅为对旧后端兼容的无害显式），OpsView 概览网格与"指定机位"弹窗因此不含未核准机位；
-            // 审批入口在 webui 站点与机位。本端不再重复实现列表过滤。
-            _get("/api/sites/" + _mySiteId + "/slots?only_validated=1", function(status, data) {
-                if (status === 200 && Array.isArray(data)) _slots = data
-                else console.warn("OpsView slots", status)   // 失败留痕，避免机位区空白且无人知晓
-            })
-        }
+        if (!_isSiteATC || _mySiteId <= 0) return
+        // 使用闸（2026-09-05）：仅**可用**机位作降落/停靠点——过滤判据全程在**后端** ListSlots
+        // （缺省档 = 已核准 ∧ status='FREE'，旧构建不带参也一样被过滤；?only_validated=1 保留
+        // 仅为对旧后端兼容的无害显式），「指定机位」弹窗因此不含未核准/维护/故障机位；
+        // 审批入口在 webui 站点与机位。本端不再重复实现列表过滤。
+        _get("/api/sites/" + _mySiteId + "/slots?only_validated=1", function(status, data) {
+            if (status === 200 && Array.isArray(data)) _slots = data
+            else console.warn("OpsView slots", status)   // 失败留痕，避免机位区空白且无人知晓
+        })
+    }
+    // 机位**平面图**那一档（2026-09-18）：`include_unusable=1` ⇒ 已核准、**不论**机位状态
+    //（维护/故障机位也要画出来，否则其余机位的相对方位会错——见 SlotLayout.qml 文件头）。
+    //
+    // ‼️ 与 `_fetchSlots` 是**两次请求**，不是"取一次再在前端 filter"：两个集合的判据都由后端定义
+    //（缺省档的语义就是后端给的"可用"），前端自己 filter 等于把使用闸在客户端重实现一遍——
+    // 那正是上面那条注释说的"本端不重复实现列表过滤"。多一个轮询请求，本站几十个机位，代价可忽略。
+    function _fetchSlotsAll() {
+        if (!_isSiteATC || _mySiteId <= 0) return
+        _get("/api/sites/" + _mySiteId + "/slots?include_unusable=1", function(status, data) {
+            if (status === 200 && Array.isArray(data)) _slotsAll = data
+            else console.warn("OpsView slots(all)", status)
+        })
     }
     function _poll() {
         if (_apiBase === "") return
         _fetchOverview()
         _fetchPending()
         _fetchSlots()
+        _fetchSlotsAll()      // 平面图那一档（含维护/故障机位）
     }
 
     //---- 交接动作 ----
@@ -421,6 +513,20 @@ Item {
         default: return s || "—"
         }
     }
+    // **机位**状态文案（≠ 上面的无人机状态；占用与否由 `current_uav_id` 派生，不是机位状态）。
+    // 取值域 = `table_slot.status`，后端白名单单点在 `handlers/site.go` 的 `validSlotStatus`
+    //（FREE / MAINTENANCE / FAULT）——三值三译名必须与 webui `src/utils/statusLabels.js` 的
+    // `SLOT_STATUS_LABELS` **逐字对齐**（那边是同一个界面的另一个端，措辞漂了就对不上）。
+    // 未知/空回退原样或 "—"：**fail-visible**——宁可让一个没跟上值域的机位显示原始枚举，
+    // 也不要静默显示成「空闲」（那是在撒谎，维护中的机位会看着和可用机位一模一样）。
+    function _slotStatusLabel(s) {
+        switch (s) {
+        case "FREE":        return "空闲"
+        case "MAINTENANCE": return "维护"
+        case "FAULT":       return "故障"
+        default: return s || "—"
+        }
+    }
     // 机位停放无人机状态：优先 slots 返回的 current_uav_status，否则用 overview 的 uav_status 兜底
     function _uavStatusForSlot(slot) {
         if (slot && slot.current_uav_status) return slot.current_uav_status
@@ -436,6 +542,8 @@ Item {
         if (isNaN(d.getTime())) return t.plan_takeoff_at
         return d.toLocaleTimeString(Qt.locale(), "HH:mm")
     }
+    // ⚠️ 只查**使用面** `_slots`（可用机位）：调用它的都是"能不能在这个机位起降/停靠"的判断，
+    // 平面图里那些维护/故障机位不该在这里被找到。
     function _slotById(id) {
         for (var i = 0; i < _slots.length; i++) if (_slots[i].id === id) return _slots[i]
         return null
@@ -477,8 +585,12 @@ Item {
         return null
     }
     function _selectSlot(slotId) {
+        // 平面图上画着维护/故障机位，但它们**不在使用面** `_slots` 里 ⇒ 点了不亮。
+        // 高亮一个不能起降的机位，等于告诉操作员"这台可以选"。
+        var s = _slotById(slotId)
+        if (!s) return
         _selectedSlotId = slotId
-        var t = _taskForSlot(_slotById(slotId))
+        var t = _taskForSlot(s)
         if (t) _selectedTaskId = t.task_id
     }
     // 起飞门控：任务已关联无人机且已停在指定起飞机位才允许起飞
@@ -578,7 +690,14 @@ Item {
             }
 
             // 出站/进站勾选（站点操作员；控制右侧列表过滤）
+            //
+            // ‼️ 本条 Row 的**每个**子项（含下面三组 Row）都要自己 `anchors.verticalCenter`：
+            // QML 的 `Row` 定位器**不改子项的 y** —— 不设就恒为 0 ⇒ 顶端对齐。而这里各组高度不同
+            //（勾选框 46px = indicator 34 + 样式内边距；按钮组 22px），不设就各贴各的顶，
+            // 看上去就是「机位 北 东」比「进站 / 出站」高了半个勾选框（2026-09-18 实测偏 **12px**，
+            // 用户报的就是这个）。加了锚点之后本 Row 的中线实测 23 == 勾选框中线 23。
             Row {
+                anchors.verticalCenter: parent.verticalCenter
                 spacing: 6
                 visible: _isSiteATC
                 CheckBox {
@@ -645,8 +764,49 @@ Item {
                 }
             }
 
+            // 机位图朝向：北（上为北）/ 东（上为东）。样式与"双身份切换"同一套（56×22、
+            // radius 3、选中 #2f6bd8、未选中描边 #9aa7bd），两个并排的切换组才不会看起来是两种控件。
+            // ⚠️ 两个按钮的文案**不是枚举**（"N"/"E" 只活在代码里），故不需要走 _uavStatusLabel 那类映射。
+            Row {
+                anchors.verticalCenter: parent.verticalCenter   // 见上：本 Row 比勾选框矮 24px
+                spacing: 4
+                // 只在机位图真的在场时出现：监控员视图里没有机位图，切了也没有东西会转
+                visible: _showSlotLayout
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    color: "#8fa1bd"; font.pixelSize: 11
+                    text: qsTr("机位")
+                }
+                Repeater {
+                    model: [qsTr("北"), qsTr("东")]
+                    Rectangle {
+                        width: 56; height: 22
+                        radius: 3
+                        color: (_slotOrient === (index === 0 ? "N" : "E")) ? "#2f6bd8" : "transparent"
+                        border.color: "#9aa7bd"; border.width: 1
+                        Text {
+                            anchors.centerIn: parent
+                            color: (_slotOrient === (index === 0 ? "N" : "E")) ? "#ffffff" : "#5c6b84"
+                            font.pixelSize: 11
+                            text: modelData
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            // 这是 `_slotOrient` 在全仓的**唯一写点**（含启动读取那条赋值）。
+                            // 改状态与落盘必须成对出现：只改状态 ⇒ 本次会话生效、重启回落；
+                            // 只落盘 ⇒ 界面当场不变。两句写在一起，别拆到别的信号里。
+                            onClicked: {
+                                _slotOrient = (index === 0 ? "N" : "E")
+                                QGroundControl.saveGlobalSetting(_slotOrientSettingsKey, _slotOrient)
+                            }
+                        }
+                    }
+                }
+            }
+
             // 双身份切换（仅 SITE_ATC+ROUTE_MONITOR 并存时）
             Row {
+                anchors.verticalCenter: parent.verticalCenter   // 同上：不加会被落在顶上（它原本与"机位"组同高，故一起偏）
                 spacing: 4
                 visible: _isDual
                 Repeater {
@@ -775,7 +935,9 @@ Item {
         Rectangle {
             id: rightPanel
             anchors { top: parent.top; topMargin: ScreenTools.toolbarHeight; bottom: parent.bottom; right: parent.right }
-            width: 340
+            // 宽度不再是常量：站点视图下随机位图所需宽在 340~510 之间伸缩（见 _rightPanelW）。
+            // 地图是 anchors.fill 铺满的，边栏变宽只是多盖住一点地图，不改变地图自身的尺寸。
+            width: _rightPanelW
             color: QGroundControl.globalPalette.windowTransparent
             opacity: 0.8
 
@@ -785,7 +947,8 @@ Item {
                 // 上（场地↔仪表）/下（仪表↔窗口底）各留仪表高度 1/20 的空隙
                 readonly property real _vGap: height / 20
                 anchors { horizontalCenter: parent.horizontalCenter; bottom: parent.bottom; bottomMargin: _vGap }
-                width: parent.width * 0.8
+                // ‼️ 不跟 parent.width：边栏加到 510 时表盘仍恒 272（见 _instrBlockW）
+                width: _instrBlockW
                 height: (instrumentsBlock.width - 12) / 2
 
                 QGCAttitudeWidget {
@@ -832,31 +995,44 @@ Item {
                             // 看上去是连成一片的一张卡（选中态那道亮蓝描边尤其明显）。
                             spacing: _taskCardGap
                         }
-                        // ── 下部：机位（两列、从底向上、内容超出可滚动）──
+                        // ── 下部：机位（按经纬度投影、贴底、装不下时可滚动）──
                         Flickable {
                             id: slotFlick
                             Layout.fillWidth: true
                             Layout.preferredHeight: _slotAreaH
                             Layout.maximumHeight: _slotAreaH
                             clip: true
-                            contentWidth: width
-                            contentHeight: Math.max(_slotGridH, height)
+                            // 横向：机位簇比可见宽更宽时（可读下限撑破了边栏）才真的能滚；
+                            // 纵向：同样只是在自然高被 _slotAreaMaxH 夹住时才滚。都是兜底，不是常态。
+                            contentWidth: Math.max(slotLayout.naturalWidth + _slotMargin * 2, width)
+                            contentHeight: Math.max(slotLayout.naturalHeight + _slotMargin, height)
                             boundsBehavior: Flickable.StopAtBounds
                             Column {
-                                // 顶部弹性空白：机位少时把方格推到最底部（从底向上排列）
-                                Item { width: 1; height: Math.max(0, slotFlick.height - _slotGridH) }
-                                Grid {
+                                // 顶部弹性空白：机位少时把机位簇推到最底部（用户要求"机位靠下显示"）
+                                Item {
+                                    width: 1
+                                    height: Math.max(0, slotFlick.height
+                                                        - slotLayout.naturalHeight - _slotMargin)
+                                }
+                                SlotLayout {
+                                    id: slotLayout
+                                    // ‼️ 宽度只由容器给，**不要**写成 max(naturalWidth, 容器宽)：
+                                    // naturalWidth 依赖 width（求解比例系数要用可用宽）⇒ 成环。
+                                    // 溢出交给外面 Flickable 的 contentWidth 表达。
                                     width: slotFlick.width
-                                    columns: _slotCols
-                                    columnSpacing: _slotGap
-                                    rowSpacing: _slotGap
-                                    leftPadding: _slotMargin
-                                    rightPadding: _slotMargin
-                                    bottomPadding: _slotMargin
-                                    Repeater {
-                                        model: _slots
-                                        delegate: slotBar
-                                    }
+                                    height: slotLayout.naturalHeight
+                                    edgeMargin: _slotMargin
+                                    // 机位间隔 = 任务列表两张卡之间的间隔（用户 2026-09-18：
+                                    // 「间隔参照任务列表中两个卡片的间隔」）。**单点定义**在
+                                    // `_taskCardGap`，这里只绑、不另写字面量。
+                                    fixedGap: _taskCardGap
+                                    orient: _slotOrient
+                                    slots: _slotsMapView
+                                    maxAreaHeight: _slotAreaMaxH
+                                    selectedSlotId: _selectedSlotId
+                                    panelMinWidth: _rightPanelMinW
+                                    panelMaxWidth: _rightPanelMaxW
+                                    onSlotClicked: function (slotId) { _selectSlot(slotId) }
                                 }
                             }
                         }
@@ -951,45 +1127,13 @@ Item {
         }
     }
 
-    //---- 任务项 delegate（右侧边栏复用）----
-    Component {
-        id: slotBar
-        Rectangle {
-            width: _slotBoxW
-            height: _slotBoxH
-            radius: 6
-            color: _selectedSlotId === modelData.id ? "#2f6bd8"
-                   : (modelData.current_uav_no ? "#3a4c6e" : "#1c2942")
-            border.width: _selectedSlotId === modelData.id ? 2 : 1
-            border.color: _selectedSlotId === modelData.id ? "#7fb3ff" : "#4a5f85"
-            Column {
-                anchors.fill: parent
-                anchors.margins: 5
-                spacing: 2
-                Text {
-                    width: parent.width
-                    color: "#9fb3d4"; font.pixelSize: 12
-                    elide: Text.ElideMiddle
-                    text: modelData.slot_code
-                }
-                Text {
-                    width: parent.width
-                    color: modelData.current_uav_no ? "#ffd27f" : "#5c6b84"
-                    font.pixelSize: 11
-                    elide: Text.ElideMiddle
-                    text: modelData.current_uav_no
-                          ? modelData.current_uav_no + " · " + _uavStatusLabel(_uavStatusForSlot(modelData))
-                          : qsTr("空")
-                }
-            }
-            // 点机位 → 选中该机位，并反向点亮停放其无人机的任务
-            MouseArea {
-                anchors.fill: parent
-                onClicked: _selectSlot(modelData.id)
-            }
-        }
-    }
+    // 机位卡片 delegate 已移入 SlotLayout.qml（按经纬度投影落位，卡片宽由几何求解给出）。
+    // 它需要的中文状态文案由 `_decorateSlots` 预先补进 `uav_status_label` / `slot_status_label`
+    //（源头是 `_slotsAll` —— 平面图那一档，含维护/故障机位）。
+    // ⚠️ 上方「指定机位」弹窗的 `Repeater` 读的是 **`_slots`（raw，仅可用机位）**，两者**不是**同一份数据，
+    // 也不是同一个档位——别看到两处都在画机位就顺手合并。
 
+    //---- 任务项 delegate（右侧边栏复用）----
     Component {
         id: taskDelegate
         Rectangle {

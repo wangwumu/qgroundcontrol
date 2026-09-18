@@ -12,5 +12,6 @@ qt_add_qml_module(OpsViewModule
     RESOURCE_PREFIX /qml
     QML_FILES
         OpsView.qml
+        SlotLayout.qml
     NO_PLUGIN
 )
