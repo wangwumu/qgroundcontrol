@@ -54,11 +54,22 @@ bool ReplayGuard::hasDevice(DeviceID deviceID) const
     return _upLastNonce.contains(deviceID);
 }
 
-bool ReplayGuard::peekLastNonce(DeviceID deviceID, uint64_t& outLast) const
+bool ReplayGuard::peekUpLastNonce(DeviceID deviceID, uint64_t& outLast) const
 {
     const QMutexLocker locker(&_mutex);
     const auto it = _upLastNonce.constFind(deviceID);
     if (it == _upLastNonce.constEnd()) {
+        return false;
+    }
+    outLast = it.value();
+    return true;
+}
+
+bool ReplayGuard::peekDownLastNonce(DeviceID deviceID, uint64_t& outLast) const
+{
+    const QMutexLocker locker(&_mutex);
+    const auto it = _downLastNonce.constFind(deviceID);
+    if (it == _downLastNonce.constEnd()) {
         return false;
     }
     outLast = it.value();

@@ -362,11 +362,40 @@ bool CryptoController::nextOutgoingCounter(uint64_t& outCounter)
     }
 
     uint64_t last = 0;
-    if (_replayGuard.peekLastNonce(_activeDeviceID, last)) {
+    if (_replayGuard.peekUpLastNonce(_activeDeviceID, last)) {
         // 取严格大于 last 的最小奇数
         outCounter = (last & 1u) ? (last + 2) : (last + 1);
+    } else if (_replayGuard.peekDownLastNonce(_activeDeviceID, last)) {
+        // QGC 重启恢复（规范 §3.2.4.2）：上行水位随进程丢失，改用下行水位推起点。
+        // Y = 已提交的下行 counter 最大值（两阶段调用保证，见 ReplayGuard.h），
+        // Y+1 即其奇数后继，也就是本档的起点。
+        // 不可取随机起点（§2.5 建链首帧规则）：约 50% 概率落回旧上行区间，且
+        // accept() 随即记下该值，此后每条 +2 仍低于旧水位 ⇒ 上行持续被 mavp2p
+        // 边缘判重丢弃，而 QGC 侧察觉不到（§2.5：按自身节奏发送、不确认）。
+        // 安全性依赖「下行 counter 恒领先上行」：DOWNLINK_INIT_OFFSET（=1001，**PX4
+        // 侧常量**，QGC 仓库不持有；见规范 §2.5/附录 A）给出 500 帧余量 ⇒ 只要
+        // N_up − N_down ≤ 500 就有 Y+1 > 重启前的上行水位。
+        // ⚠️ 这是**现状约束**而非未来风险：摇杆 MANUAL_CONTROL 现在就走本加密发送
+        // 路径（默认 25 Hz、上限 200 Hz）持续消耗余量；是否真被击穿取决于当时的
+        // 下行速率，本侧无法测定。完整论证见实现说明文档 §3.2.4.2。
+        // ⚠️ 范围守卫必须在算式**之前**（照抄 PX4 next_tx_counter）：last 越界时
+        // last+2 会回绕成小奇数，而下方 2^62 守卫判在回绕之后、根本拦不住。
+        if (last >= (1ull << 62)) {
+            qCWarning(CryptoControllerLog)
+                << "downlink counter out of range, refuse to send:" << last << "device" << _activeDeviceID;
+            return false;
+        }
+        // (last & 1u) 分支是防御：下行序列异常为奇数时不得产出偶数上行 counter。
+        outCounter = (last & 1u) ? (last + 2) : (last + 1);
     } else {
-        // 首帧：加密安全随机 62 位奇数起点（避免重启后从 1 重来导致 nonce 复用，规范 §2.5）
+        // 上行与下行水位皆空（本进程尚未提交过任何下行）⇒ 沿用建链首帧的随机起点，
+        // 避免重启后从 1 重来导致 nonce 复用（规范 §2.5）。§3.2.4.2 只禁止用确定性
+        // 或旧 counter，随机起点不违反。
+        // ⚠️ 这是一次性抉择：下方 accept() 随即写入上行水位，此后本进程内必命中第一
+        // 档，不会「待 PX4 恢复下行后按 Y+1 收敛」（resetReplay 无生产调用方）。
+        // 能走到这里只有两条路，且都安全：① 明文待命心跳触发 beginLinking —— 此时
+        // QGC 是建链发起方，§2.5 的随机起点正是正确规则，且该待命心跳已清掉 mavp2p
+        // 的水位；② 同一次 receiveBytes 内先提交下行、后建链（微秒级窗口）。
         outCounter = randomOddCounter();
     }
 
@@ -376,8 +405,13 @@ bool CryptoController::nextOutgoingCounter(uint64_t& outCounter)
         return false;
     }
 
-    // 原子预留：更新 lastNonce（outCounter 必 > last，accept 必成功）
-    (void) _replayGuard.accept(_activeDeviceID, outCounter);
+    // 原子预留：更新 lastNonce。上面各档产出的 outCounter 必 > last，故 accept 必成功；
+    // 仍检查返回值——失败意味着 nonce 将被复用，属不可逆的安全事故（规范 §2.5）。
+    if (!_replayGuard.accept(_activeDeviceID, outCounter)) {
+        qCCritical(CryptoControllerLog) << "counter reservation failed, refuse to send:" << outCounter << "device"
+                                        << _activeDeviceID;
+        return false;
+    }
     return true;
 }
 

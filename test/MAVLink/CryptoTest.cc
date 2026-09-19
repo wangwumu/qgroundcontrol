@@ -345,9 +345,9 @@ void CryptoTest::_testReplayGuard()
     QVERIFY(guard.accept(otherDevice, 1));
     QVERIFY(guard.accept(otherDevice, 2));
 
-    // peekLastNonce
+    // peekUpLastNonce
     uint64_t last = 0;
-    QVERIFY(guard.peekLastNonce(deviceID, last));
+    QVERIFY(guard.peekUpLastNonce(deviceID, last));
     QCOMPARE(last, static_cast<uint64_t>(101));
 
     // reset
@@ -457,15 +457,33 @@ void CryptoTest::_testReplayGuardUpDownSeparation()
     QVERIFY(!guard.accept(deviceID, 101)); // 上行重放仍拒绝
     QVERIFY(guard.accept(deviceID, 105));
 
-    // peekLastNonce 只读上行窗口（发送侧）
+    // peekUpLastNonce 只读上行窗口（发送侧）
     uint64_t last = 0;
-    QVERIFY(guard.peekLastNonce(deviceID, last));
+    QVERIFY(guard.peekUpLastNonce(deviceID, last));
     QCOMPARE(last, static_cast<uint64_t>(105)); // 若共用：读到 1000 → 失败
 
     // 反向：上行 accept 不得污染下行——下行重放仍拒绝、严格递增
     QVERIFY(!guard.isAcceptable(deviceID, 1000));
     QVERIFY(guard.isAcceptable(deviceID, 1001));
     guard.commit(deviceID, 1001);
+
+    // peekDownLastNonce 只读下行窗口（接收侧）——QGC 重启恢复取 Y 用（规范 §3.2.4.2）
+    uint64_t downLast = 0;
+    QVERIFY(guard.peekDownLastNonce(deviceID, downLast));
+    QCOMPARE(downLast, static_cast<uint64_t>(1001));
+
+    // 两个 peek 互不串读：上行窗口仍停在 105
+    QVERIFY(guard.peekUpLastNonce(deviceID, last));
+    QCOMPARE(last, static_cast<uint64_t>(105));
+
+    // 未登记设备：两个方向均返回 false（unset），且不得改写 outLast（哨兵值须原样保留）
+    const DeviceID freshDevice = 0x99AABBCCu;
+    uint64_t upSentinel = 0xDEADBEEFu;
+    uint64_t downSentinel = 0xFEEDFACEu;
+    QVERIFY(!guard.peekUpLastNonce(freshDevice, upSentinel));
+    QCOMPARE(upSentinel, static_cast<uint64_t>(0xDEADBEEFu));
+    QVERIFY(!guard.peekDownLastNonce(freshDevice, downSentinel));
+    QCOMPARE(downSentinel, static_cast<uint64_t>(0xFEEDFACEu));
 
     // reset 同时清 up 与 down
     guard.reset(deviceID);
@@ -713,6 +731,87 @@ void CryptoTest::_testNextOutgoingCounter()
     uint64_t c2 = 0;
     QVERIFY(crypto->nextOutgoingCounter(c2));
     QCOMPARE(c2, c1 + 2);
+
+    // 清理（单例 + 全局 lastNonce + key cache 均持久，避免污染同进程其他测试）
+    crypto->returnToStandby();
+    crypto->deviceKeyManager()->removeKey(deviceID);
+    crypto->resetReplay(deviceID);
+}
+
+void CryptoTest::_testNextOutgoingCounterRestartYPlusOne()
+{
+    // 规范 §3.2.4.2（QGC 重启恢复）：重启后本地上行水位随进程丢失，首条上行的
+    // 起点须取「重启后收到的下行 counter 最大值 Y」的奇数后继（Y+1）。
+    // 若此处仍按 §2.5 的建链首帧规则取随机起点，随机数有约 50% 概率低于 mavp2p
+    // 上残留的旧上行水位 ⇒ 上行被边缘判重静默丢弃；且 accept() 已记下该起点，
+    // 此后每条 +2 仍低于旧水位 ⇒ 持续阻塞（QGC 侧察觉不到，规范 §2.5）。
+    // 安全性由「下行 counter 恒领先上行」保证（DOWNLINK_INIT_OFFSET=1001 的
+    // 500 帧余量，见规范 §3.2.4.2 论证；该常量在 PX4 侧，QGC 仓库不持有）。
+    CryptoController* const crypto = CryptoController::instance();
+    const DeviceID deviceID = 0x0A0B0C0Du;  // bit24=0，满足签名位约束（规范 §1.4）
+
+    // 复位单例（Q_APPLICATION_STATIC 跨测试共享，需清历史状态）
+    crypto->returnToStandby();
+    crypto->resetReplay(deviceID);
+
+    crypto->deviceKeyManager()->cacheKey(deviceID, testKey());
+    crypto->beginLinking(deviceID);
+    QCOMPARE(crypto->state(), CryptoController::State::Active);
+
+    // 模拟重启后陆续收到 PX4 下行（偶数序列）：**上行窗口保持 unset**，只填下行。
+    // 走与生产路径相同的两阶段调用（先判定后提交），而非直接 commit。
+    const uint64_t y = 4020;  // 偶数
+    QVERIFY(crypto->isIncomingAcceptable(deviceID, y - 2));
+    crypto->commitIncoming(deviceID, y - 2);
+    QVERIFY(crypto->isIncomingAcceptable(deviceID, y));
+    crypto->commitIncoming(deviceID, y);
+
+    // 重启后首条上行 = Y+1（奇数），而不是随机起点
+    // （随机起点恰为 Y+1 的概率约 2^-61——取值空间是 [1, 2^62) 上的奇数，实践上不可能）
+    uint64_t c1 = 0;
+    QVERIFY(crypto->nextOutgoingCounter(c1));
+    QCOMPARE(c1, y + 1);
+
+    // 恢复只影响首条：此后回到常规 +2 节拍
+    uint64_t c2 = 0;
+    QVERIFY(crypto->nextOutgoingCounter(c2));
+    QCOMPARE(c2, y + 3);
+
+    // 清理（单例 + 全局 lastNonce + key cache 均持久，避免污染同进程其他测试）
+    crypto->returnToStandby();
+    crypto->deviceKeyManager()->removeKey(deviceID);
+    crypto->resetReplay(deviceID);
+}
+
+void CryptoTest::_testNextOutgoingCounterRejectsWrappedDownlink()
+{
+    // 防御：下行 counter 越界时第二档必须拒发。取 2^64-1（奇数）——此时算式
+    // last+2 会**回绕成 1**，而下方「≥ 2^62」守卫判在回绕之后、根本拦不住，
+    // 于是会以 counter=1 发出（nonce 复用，规范 §2.5 禁止）。
+    // 线上不可达（PX4 next_tx_counter 在 2^62 即拒发），此处直接构造该状态；
+    // 顺带覆盖 (last & 1u) 的奇数防御分支（对端违规发奇数下行）。
+    CryptoController* const crypto = CryptoController::instance();
+    const DeviceID deviceID = 0x0A0B0C0Eu;
+
+    crypto->returnToStandby();
+    crypto->resetReplay(deviceID);
+
+    crypto->deviceKeyManager()->cacheKey(deviceID, testKey());
+    crypto->beginLinking(deviceID);
+    QCOMPARE(crypto->state(), CryptoController::State::Active);
+
+    // 只填下行水位并置于越界值：首帧 unset 必通过判定，故可直接提交
+    const uint64_t wrapped = 0xFFFFFFFFFFFFFFFFull;
+    QVERIFY(crypto->isIncomingAcceptable(deviceID, wrapped));
+    crypto->commitIncoming(deviceID, wrapped);
+
+    // 第二档命中，但守卫须拒发（若守卫缺失，这里会返回 true 且 c == 1）。
+    // 拒发必须留下日志——strict mode 下这条日志是行为的一部分，须显式预期。
+    expectLogMessage("MAVLink.Crypto.CryptoController", QtWarningMsg,
+                     QRegularExpression("downlink counter out of range"));
+    uint64_t c = 0;
+    QVERIFY(!crypto->nextOutgoingCounter(c));
+    verifyExpectedLogMessage();
 
     // 清理（单例 + 全局 lastNonce + key cache 均持久，避免污染同进程其他测试）
     crypto->returnToStandby();

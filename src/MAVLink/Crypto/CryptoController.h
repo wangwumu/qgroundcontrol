@@ -4,12 +4,18 @@
 ///
 /// 职责：
 /// - 状态机：待命(Standby) → 建链中(Linking) → 正常(Active) → 回待命；
-/// - counter 管理：QGC 发送用**奇数**，建链首帧取加密安全随机 62 位奇数起点，此后取「严格大于该 deviceID 全局 lastNonce 的最小奇数」；
-/// - 防重放：按 deviceID 维护全局 lastNonce，`本次 > lastNonce` 才接受；
+/// - counter 管理：QGC 发送用**奇数**，起点按三档选取（见 `nextOutgoingCounter()`）——
+///   ① 本设备上行水位在 → 取其最小奇数后继；② 上行缺失但下行水位在（QGC 重启恢复，
+///   规范 §3.2.4.2）→ 取下行最大值 Y 的奇数后继 Y+1；③ 两者皆无 → 加密安全随机 62 位
+///   奇数（规范 §2.5）；
+/// - 防重放：按 deviceID + 方向（上行/下行）**分别**维护 lastNonce，`本次 > lastNonce` 才接受；
 /// - 密钥：经 DeviceKeyManager 获取，本控制器持有一个「活跃目标 deviceID + 密钥」。
 ///
 /// 本模块为**状态与 counter 管理核心**；收发 hook 由 LinkInterface/MAVLinkProtocol 接线调用。
-/// 线程安全：状态/映射由本类 `_mutex` 保护；lastNonce 由 ReplayGuard 内部锁保护（二者独立，避免嵌套加锁）。
+/// 线程安全：状态/映射由本类 `_mutex` 保护，lastNonce 由 ReplayGuard 内部锁保护。两者存在
+/// **嵌套**（本类持 `_mutex` 时调 `ReplayGuard::peek*` / `accept`），锁序单向
+/// （CryptoController → ReplayGuard）故无死锁；接收路径经 Qt::AutoConnection 排队，
+/// 在主线程串行执行。
 
 #include <QtCore/QHash>
 #include <QtCore/QList>
@@ -131,8 +137,13 @@ public:
     // -----------------------------------------------------------------------
 
     /// 取下一个本方向（QGC 奇数）发送 counter，并**原子预留**（更新 lastNonce）。
-    /// 仅 Active 状态可调用。
-    /// @return true=成功，outCounter 填充；false=非 Active 状态
+    /// 起点选取：上行水位在 → 严格大于它的最小奇数（运行期 +2 节拍）；上行水位缺失
+    /// 但下行水位在 → 下行最大值 Y 的奇数后继 Y+1（QGC 重启恢复，规范 §3.2.4.2）；
+    /// 两者都无 → 加密安全随机 62 位奇数（规范 §2.5 的建链首帧规则，同时也覆盖
+    /// 「本进程尚未提交过任何下行」的情形）。
+    /// 仅 Active 状态可调用。第二档在下行 counter 越界时拒发（守卫在算式之前）。
+    /// @return true=成功，outCounter 填充；false=非 Active 状态，或 counter 越界 /
+    ///         预留失败（均已记日志；调用方须丢弃该帧，不得复用 counter）
     bool nextOutgoingCounter(uint64_t& outCounter);
 
     /// 生成加密安全随机 62 位奇数 counter 起点（规范 §2.5：建链首帧用随机起点，

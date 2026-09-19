@@ -37,6 +37,8 @@ private slots:
     // counter 随机起点（规范 §2.5：62 位奇数，避免重启后 nonce 复用）
     void _testRandomOddCounter();
     void _testNextOutgoingCounter();         // nextOutgoingCounter 端到端：首帧随机、+2 递增、非 Active 拒绝
+    void _testNextOutgoingCounterRestartYPlusOne();  // 规范 §3.2.4.2：重启后取下行 Y 的奇数后继，非随机起点
+    void _testNextOutgoingCounterRejectsWrappedDownlink();  // 下行越界须拒发（守卫在算式之前）
 
     // VTOL 自定义消息（80000-80003）：字段排序 + CRC_EXTRA + 往返（纳入加密链路）
     void _testVtolMessages();
