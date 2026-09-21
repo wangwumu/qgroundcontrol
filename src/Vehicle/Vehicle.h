@@ -428,6 +428,13 @@ public:
     // Property accesors
     int id() const{ return _systemID; }
     int compId() const{ return _compID; }
+    /// 该载具的 MAVLink deviceID（加密链路设备标识）；0 = 未学到映射 / 未走加密链路。
+    /// OpsView 起飞门控用它把后端任务上的无人机（`task.device_id`）对应到本地载具 ——
+    /// 「**这架**飞机的明文心跳是否已送到 QGC」的判据。
+    /// 写成 Q_INVOKABLE 而非 Q_PROPERTY(CONSTANT)：deviceID 由 `CryptoController` 在**收到明文
+    /// 心跳时**才学到，若在构造期读一次并缓存，早于学习就会永久缓存 0（判据恒假 ⇒ 永远不能
+    /// 起飞）；每次现算则学习到位后自愈。
+    Q_INVOKABLE uint deviceID() const;
     MAV_AUTOPILOT firmwareType() const { return _firmwareType; }
     MAV_TYPE vehicleType() const { return _vehicleType; }
     QGCMAVLink::VehicleClass_t vehicleClass(void) const { return QGCMAVLink::vehicleClass(_vehicleType); }

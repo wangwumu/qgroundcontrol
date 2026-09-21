@@ -325,7 +325,7 @@ Item {
         var task = a.task
         if (a.kind === "takeoff") {
             _post("/api/tasks/" + task.task_id + "/takeoff", null, function(status) {
-                if (status === 200) _guidedTakeoff()
+                if (status === 200) _guidedTakeoff(task)
                 else console.warn("OpsView takeoff", status)
             })
         } else if (a.kind === "land") {
@@ -335,23 +335,37 @@ Item {
                 if (status !== 200) { console.warn("OpsView park", status); return }
                 // 停泊离线命令（路径 C：gcs_server 只落库，命令由 QGC 发）：
                 // MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN(246)，param1=4 autopilot 下电、param2=2 强制
-                // 经 activeVehicle 加密上行链路（LinkInterface）自动下发
-                var v = QGroundControl.multiVehicleManager.activeVehicle
+                // 经该机自己的加密上行链路（LinkInterface）下发——同样按 deviceID 取机，
+                // 而不是 activeVehicle（多机在连会把指令下到别的飞机上）。
+                var v = _vehicleForTask(task)
                 if (v) v.sendCommand(1, 246, false, 4, 2)
-                else console.warn("OpsView 停泊：无已连接飞行器，无法下发离线命令")
+                else console.warn("OpsView 停泊：该机未连接，无法下发离线命令")
             })
         }
         _pendingAction = null
     }
-    //---- 起飞/降落（MAVLink guided 指令，需已连接 activeVehicle）----
-    function _guidedTakeoff() {
-        var v = QGroundControl.multiVehicleManager.activeVehicle
-        if (!v) { console.warn("OpsView 起飞：无已连接飞行器"); return }
+    //---- 起飞/降落（MAVLink guided 指令）----
+    // 取**本任务指定的那架**载具，不用 `activeVehicle`：后者是"当前选中"的载具，
+    // 本站有两架同时在连时会**把指令发给另一架飞机**（原实现即如此）。
+    function _guidedTakeoff(task) {
+        var v = _vehicleForTask(task)
+        if (!v) {
+            // 原实现只 console.warn：后端已把任务落库成 TAKEOFF，本机却什么都没发、界面零反馈。
+            QGroundControl.showMessageDialog(opsView, qsTr("起飞指令未发出"),
+                qsTr("未找到该任务无人机（deviceID %1）的连接，起飞指令未下发，请检查现场链路。")
+                    .arg(task && task.device_id ? task.device_id : "—"))
+            return
+        }
         v.guidedModeTakeoff(20)
     }
-    function _guidedLand() {
-        var v = QGroundControl.multiVehicleManager.activeVehicle
-        if (!v) { console.warn("OpsView 降落：无已连接飞行器"); return }
+    function _guidedLand(task) {
+        var v = _vehicleForTask(task)
+        if (!v) {
+            QGroundControl.showMessageDialog(opsView, qsTr("降落指令未发出"),
+                qsTr("未找到该任务无人机（deviceID %1）的连接，降落指令未下发，请检查现场链路。")
+                    .arg(task && task.device_id ? task.device_id : "—"))
+            return
+        }
         v.guidedModeLand()
     }
 
@@ -593,12 +607,45 @@ Item {
         var t = _taskForSlot(s)
         if (t) _selectedTaskId = t.task_id
     }
-    // 起飞门控：任务已关联无人机且已停在指定起飞机位才允许起飞
+    // 取本任务**指定**的那架载具（按 deviceID 精确匹配），没有则 null。
+    // 判据用 deviceID 而非 uav_no：后者是人工编号、与链路无关，无从据此认领载具。
+    // 遍历 `multiVehicleManager.vehicles` 而不是反查 `CryptoController` 的 deviceID↔sysid 表：
+    // 那张表**只增不删**，载具断开后记录仍在 ⇒ 判据会"粘住"恒真；vehicles 在断开时移除，
+    // 遍历它天然自洽。
+    function _vehicleForTask(task) {
+        if (!task || !task.device_id) return null
+        var vs = QGroundControl.multiVehicleManager.vehicles
+        for (var i = 0; i < vs.count; i++) {
+            if (vs.get(i).deviceID() === task.device_id) return vs.get(i)
+        }
+        return null
+    }
+    // 该任务的无人机是否已连到 QGC。
+    function _uavOnline(task) { return _vehicleForTask(task) !== null }
+    // 起飞按钮置灰的原因：逐条对应 _canTakeoff 的判据、顺序也一致。
+    // 枚举一律转中文（界面不出现原始枚举是既定规则）。
+    function _takeoffBlockReason(task) {
+        if (!task) return ""
+        if (!task.uav_id) return qsTr("任务未指派无人机")
+        if (!task.uav_current_slot_id) return qsTr("无人机未停在任何机位，请先在停放页派位")
+        if (task.uav_status !== "READY_TO_TAKEOFF") return qsTr("无人机尚未通过航前检查，请在停放页确认航前检查通过")
+        if (!_uavOnline(task)) return qsTr("无人机尚未连接到本地面站，等待其心跳")
+        return ""
+    }
+    // 起飞门控：**已完成航前预检 + 已停在机位 + 该机已连到 QGC**。
+    // 2026-09-21 用户裁定（05 §6.0-D 由"建议"转正），与后端 `ops.Takeoff` 同一份判据：
+    //   · `uav_status` 必须 READY_TO_TAKEOFF —— 原实现**完全不读 uav_status**，于是
+    //     「只把飞机放进机位、状态还停在航前检查」按钮就亮了，正是用户报障的现象；
+    //   · 该机明文心跳须已送达 QGC —— 否则后端落了库、本机却发不出 MAVLink 指令
+    //     （见 _guidedTakeoff 的失败分支）。
+    // 同时**删去**「有 takeoff_slot_id 则须与当前机位一致」的比对：05 §3.3 已于 2026-09-13
+    // 令删除（该列是实际值快照、起飞时才写，拿它比对会造出"实际停 A、任务写 B ⇒ 拒绝起飞"的伪冲突）。
     function _canTakeoff(task) {
         if (!task || !_isOutbound(task)) return false
         if (task.status !== "SCHEDULED" && task.status !== "READY") return false
         if (!task.uav_id || !task.uav_current_slot_id) return false
-        if (task.takeoff_slot_id && task.uav_current_slot_id !== task.takeoff_slot_id) return false
+        if (task.uav_status !== "READY_TO_TAKEOFF") return false
+        if (!_uavOnline(task)) return false
         return true
     }
     // 发出降落指令（6.0-E，LANDING 唯一写路径）：机位空闲校验 → POST /tasks/:id/land（DB→LANDING）→ 引导降落。
@@ -610,7 +657,7 @@ Item {
             if (status === 200 && data && data.free === true) {
                 _post("/api/tasks/" + tid + "/land", null, function(landStatus, data) {
                     if (landStatus === 200) {
-                        _guidedLand()
+                        _guidedLand(task)
                         _poll()   // 任务→LANDING 后立即刷新列表（按钮转 指定机位/停泊）
                     } else {
                         // 透传服务端业务原因（如机位占用/状态已变），避免只显 "HTTP 409" 无法处置
@@ -1233,6 +1280,11 @@ Item {
                         enabled: _canTakeoff(modelData)
                         height: 24; padding: 0
                         text: qsTr("起飞")
+                        // 置灰时说明**差哪一条**：否则用户只看到灰按钮，不知道是要去停放页
+                        // 推「航前检查通过」，还是飞机压根还没连上本地面站——两种处置完全不同。
+                        ToolTip.visible: hovered && !enabled
+                        ToolTip.delay: 300
+                        ToolTip.text: _takeoffBlockReason(modelData)
                         onClicked: { _pendingAction = {kind:"takeoff", task:modelData}; actionConfirmDialog.open() }
                     }
                     Button {

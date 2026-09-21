@@ -25,6 +25,7 @@
 #include "AudioOutput.h"
 #include "AutoPilotPlugin.h"
 #include "ComponentInformationManager.h"
+#include "Crypto/CryptoController.h"   // Vehicle::deviceID()：按 sysid 反查设备标识（加密链路）
 #include "MAVLinkEventManager.h"
 #include "FirmwarePlugin.h"
 #include "FirmwarePluginManager.h"
@@ -1787,6 +1788,16 @@ QString Vehicle::vehicleTypeString() const
 QString Vehicle::vehicleClassInternalName() const
 {
     return QGCMAVLink::vehicleClassToInternalString(vehicleClass());
+}
+
+uint Vehicle::deviceID() const
+{
+    // 反查而非自行位运算：deviceID 的编码（incompat<<24|compat<<16|sysid<<8|compid）留在
+    // `MAVLinkCrypto` 单点，此处不复制一份，免得编码变动时静默失配。
+    MAVLinkCrypto::DeviceID deviceID = MAVLinkCrypto::kInvalidDeviceID;
+    MAVLinkCrypto::CryptoController::instance()->deviceIDForSystemID(
+        static_cast<uint8_t>(_systemID), deviceID);
+    return deviceID;
 }
 
 /// Returns the string to speak to identify the vehicle
