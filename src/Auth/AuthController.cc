@@ -299,6 +299,44 @@ void AuthController::_onLoginFinished(QNetworkReply* reply)
             break;
         }
     }
+
+    // ---- QGC 登录角色闸（2026-09-21 用户裁定）----
+    // QGC 只允许三种身份登入：站点操作员（SITE_ATC）、航线监控员（ROUTE_MONITOR）、
+    // 飞行安全监理（FLIGHT_SUPERVISOR）——《异常处置与降落端载体迁移-设计稿-20260913.md》§1 B13。
+    // 其余角色（场地管理员 SITE_MANAGER、系统管理员、运营制单/复核、观察者）**一律拒绝**：
+    // 清空本次已写入的会话字段并保持在**未登录**状态，不进入任何主界面。
+    // 改前无此闸：token 到手即置 _loggedIn=true，非三类角色会在 MainWindow.qml 的兜底分支落到
+    // showFlyView()——那是"把人放到别的界面"而非"拒绝"，于是场地管理员能以已登录状态进入地面站。
+    // ⚠️ 与后端 handlers/auth.go 的 qgc 白名单**两端同解**（后端同句文案、同三种角色）；此处是第二道，
+    //    防的是旧版后端/绕过前端闸的情形。**两处白名单必须同步修改**，只改一边会出现"能登进去但处处 403"
+    //    或"根本登不进去"。
+    // 位置约束（关键）：必须在 `_loggedIn = true` **之前**。若放到其后，就成了"先算登录成功、再回滚登出"，
+    //    而下方 DeviceKeyManager::cacheKey / CryptoController::addLinkedDevice 已执行——加密链路会带着
+    //    非授权账号取回的 deviceID 集合继续跑（80005 登记集合被污染）。
+    // 已知边界：DeviceKeyManager/PlanUploader 内**先前**会话注入的 token 不在此处理（既有失败分支同样不
+    //    处理）。当前 QGC 无登出路径，进程内"已登录再换账号登录"不可达；将来若加登出，需一并清理。
+    if (!_roles.contains(QStringLiteral("SITE_ATC"))
+        && !_roles.contains(QStringLiteral("ROUTE_MONITOR"))
+        && !_roles.contains(QStringLiteral("FLIGHT_SUPERVISOR"))) {
+        const bool wasLoggedIn = _loggedIn;
+        _token.clear();
+        _currentUser.clear();
+        _displayName.clear();
+        _userId = 0;
+        _roles.clear();
+        _siteId = 0;
+        _loggedIn = false;
+        if (wasLoggedIn) {
+            emit loggedInChanged();
+        }
+        const QString error = QStringLiteral("该账号无地面站操作权限（仅站点操作员、航线监控员、飞行安全监理可登录）");
+        _setError(error);
+        qCWarning(AuthControllerLog) << "login rejected: 非 QGC 三类身份，已保持未登录";
+        // _unlockInProgress 时本函数不会走到这里（解锁分支在更早处 return），故一律发 loginFailed。
+        emit loginFailed(error);
+        return;
+    }
+
     _loggedIn = true;
 
     // 会话 token 注入 DeviceKeyManager（衔接加密链路取密钥鉴权）

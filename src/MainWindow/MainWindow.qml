@@ -23,7 +23,13 @@ ApplicationWindow {
 
     Component.onCompleted: {
         // 登录成功后按操作岗位分流：
-        //   SITE_ATC / ROUTE_MONITOR → 监控主界面（OpsView）；其余角色 → 原飞行视图
+        //   SITE_ATC / ROUTE_MONITOR → 监控主界面（OpsView）
+        //   FLIGHT_SUPERVISOR        → 原飞行视图（专属视图尚未实现，2026-09-21 用户裁定暂不处理）
+        // ⚠️ 此处**不是**登录许可闸，只是**分流**：能走到这里的前提是 AuthController 已放行——
+        //    非「QGC 三类身份」的账号在 AuthController.cc 的「QGC 登录角色闸」处就已被拒绝，
+        //    且**不会**发出 loginSucceeded，本函数根本不会被调用。
+        //    所以下面的 else 分支实际只可能是 FLIGHT_SUPERVISOR；不要把它读成"其余角色也能进
+        //    飞行视图"，更不要在这里添加新的放行分支（放行口径只有 AuthController 那一处）。
         AuthController.loginSucceeded.connect(_onLoginSucceededForRole)
         // Start the sequence of first run prompt(s)
         firstRunPromptManager.nextPrompt()
