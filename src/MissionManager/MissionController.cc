@@ -4,6 +4,7 @@
 #include "VehicleSupports.h"
 #include "Crypto/CryptoController.h"
 #include "MissionManager.h"
+#include "AuthController.h"
 #include "FlightPathSegment.h"
 #include "FirmwarePlugin.h"
 #include "QGCApplication.h"
@@ -117,6 +118,17 @@ void MissionController::_newMissionItemsAvailableFromVehicle(bool removeAllReque
     // Plan view only reloads if:
     //  - Load was specifically requested
     //  - There is no current Plan
+    // 已登录后台系统：只放行「本次装载由显式请求发起」（_itemsRequested 由 loadFromVehicle /
+    // showPlanFromManagerVehicle 置位，含用户动作之后的同步），载具自行发起的自动装载不再装入。
+    // 判据挂在登录状态上而非具体视图，故 OpsView 及今后新增的视图一并适用。
+    // 未登录时不进入此分支，下面的原条件一字未改。
+    if (!_itemsRequested && AuthController::backendLoggedIn()) {
+        qCDebug(MissionControllerLog) << "_newMissionItemsAvailableFromVehicle: backend logged in, skipping auto plan load, count"
+                                      << _missionManager->missionItems().count();
+        _itemsRequested = false;
+        return;
+    }
+
     if (_flyView || removeAllRequested || _itemsRequested || isEmpty()) {
         // Fly Mode (accept if):
         //      - Always accepts new items from the vehicle so Fly view is kept up to date
@@ -1930,6 +1942,11 @@ bool MissionController::showPlanFromManagerVehicle (void)
         qCCritical(MissionControllerLog) << "MissionController::showPlanFromManagerVehicle called while offline";
         return true;    // stops further propagation of showPlanFromManagerVehicle due to error
     } else {
+        // 用户显式动作（PlanView.qml:830 按钮 → PlanMasterController::_showPlanFromManagerVehicle → 此处）。
+        // 必须在下面两个早返回**之前**置位：否则载具初始加载未完成时提前返回，_itemsRequested 停在
+        // false，等同步完成的信号到达时本文 :125 的登录闸会把它当成"载具自动装载"拦掉——按钮点了没反应。
+        // GeoFenceController::showPlanFromManagerVehicle 同形（其 :372），三处必须一致。
+        _itemsRequested = true;
         if (!_managerVehicle->initialPlanRequestComplete()) {
             // The vehicle hasn't completed initial load, we can just wait for newMissionItemsAvailable to be signalled automatically
             qCDebug(MissionControllerLog) << "showPlanFromManagerVehicle: !initialPlanRequestComplete, wait for signal";

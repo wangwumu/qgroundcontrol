@@ -1,5 +1,6 @@
 #include "GeoFenceController.h"
 #include "Vehicle.h"
+#include "AuthController.h"
 #include "ParameterManager.h"
 #include "GeoJsonHelper.h"
 #include "JsonParsing.h"
@@ -324,6 +325,13 @@ void GeoFenceController::_managerLoadComplete(void)
     // Plan view only reloads if:
     //  - Load was specifically requested
     //  - There is no current Plan
+    // 已登录后台系统：同 MissionController —— 显式请求照常，载具自行发起的自动装载不再装入。
+    if (!_itemsRequested && AuthController::backendLoggedIn()) {
+        qCDebug(GeoFenceControllerLog) << "_managerLoadComplete: backend logged in, skipping auto plan load";
+        _itemsRequested = false;
+        return;
+    }
+
     if (_flyView || _itemsRequested || isEmpty()) {
         _setReturnPointFromManager(_geoFenceManager->breachReturnPoint());
         _setFenceFromManager(_geoFenceManager->polygons(), _geoFenceManager->circles());

@@ -58,6 +58,11 @@ AuthController* AuthController::instance()
     return s_instance;
 }
 
+bool AuthController::backendLoggedIn()
+{
+    return s_instance && s_instance->_loggedIn;
+}
+
 void AuthController::setUnlockDialogOpen(bool open)
 {
     if (_unlockDialogOpen != open) {

@@ -168,6 +168,9 @@ private slots:
 private:
     void _commonInit(void);
     void _showPlanFromManagerVehicle(void);
+    /// 载具变化时自动装载其航线（QGC 缺省行为，未登录时保持）；
+    /// 已登录后台系统则跳过——不自动装入本地/载具航线。
+    void _autoLoadPlanFromManagerVehicle(void);
     void _setDirtyForSave(bool dirtyForSave);
     void _setDirtyForUpload(bool dirtyForUpload);
     void _setDirtyStates(bool dirtyForSave, bool dirtyForUpload);

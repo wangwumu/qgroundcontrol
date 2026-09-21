@@ -8,6 +8,7 @@
 #include "PlanMasterController.h"
 #include "RallyPointManager.h"
 #include "Vehicle.h"
+#include "AuthController.h"
 #include "QGCLoggingCategory.h"
 
 #include <QtCore/QJsonArray>
@@ -195,6 +196,13 @@ void RallyPointController::_managerLoadComplete(void)
     // Plan view only reloads if:
     //  - Load was specifically requested
     //  - There is no current Plan
+    // 已登录后台系统：同 MissionController —— 显式请求照常，载具自行发起的自动装载不再装入。
+    if (!_itemsRequested && AuthController::backendLoggedIn()) {
+        qCDebug(RallyPointControllerLog) << "_managerLoadComplete: backend logged in, skipping auto plan load";
+        _itemsRequested = false;
+        return;
+    }
+
     if (_flyView || _itemsRequested || isEmpty()) {
         _points.clearAndDeleteContents();
         QObjectList pointList;
@@ -294,6 +302,11 @@ bool RallyPointController::showPlanFromManagerVehicle (void)
         qCCritical(RallyPointControllerLog) << "RallyPointController::showPlanFromManagerVehicle called while offline";
         return true;    // stops further propagation of showPlanFromManagerVehicle due to error
     } else {
+        // 用户显式动作（PlanView.qml:830 按钮 → PlanMasterController::_showPlanFromManagerVehicle → 此处）。
+        // 必须在下面两个早返回**之前**置位：否则载具初始加载未完成时提前返回，_itemsRequested 停在
+        // false，等 _loadComplete 信号到达时本文 :200 的登录闸会把它当成"载具自动装载"拦掉——按钮点了没反应。
+        // GeoFenceController::showPlanFromManagerVehicle 同形（其 :372），三处必须一致。
+        _itemsRequested = true;
         if (!_managerVehicle->initialPlanRequestComplete()) {
             // The vehicle hasn't completed initial load, we can just wait for loadComplete to be signalled automatically
             qCDebug(RallyPointControllerLog) << "showPlanFromManagerVehicle: !initialPlanRequestComplete, wait for signal";

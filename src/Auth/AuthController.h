@@ -53,6 +53,11 @@ public:
     /// 全局单例访问点（QML 引擎首次访问本类型时构造并记录）。
     static AuthController* instance();
 
+    /// 后台已登录 ⇒ 计划 / 地理围栏 / 返航点的**自动**装载（非用户显式请求）应被闸住。
+    /// 判据挂在登录状态上而非具体视图，故 OpsView 及今后新增的视图一并适用。
+    /// 未创建单例时返回 false —— 宁可照常装载，也不误跳过（QGC 缺省页面行为不变）。
+    static bool backendLoggedIn();
+
     bool    loggedIn() const { return _loggedIn; }
     QString currentUser() const { return _currentUser; }
     QString     displayName() const { return _displayName; }

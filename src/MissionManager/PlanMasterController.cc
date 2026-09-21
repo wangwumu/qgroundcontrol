@@ -1,5 +1,6 @@
 #include "PlanMasterController.h"
 #include "AppMessages.h"
+#include "AuthController.h"
 #include "QGCCorePlugin.h"
 #include "MultiVehicleManager.h"
 #include "Vehicle.h"
@@ -151,7 +152,7 @@ void PlanMasterController::_activeVehicleChanged(Vehicle* activeVehicle)
         } else {
             // Fly view has changed to a new active vehicle, update to show correct mission
             qCDebug(PlanMasterControllerLog) << "_activeVehicleChanged: Fly View - New active vehicle, loading new plan from manager vehicle";
-            _showPlanFromManagerVehicle();
+            _autoLoadPlanFromManagerVehicle();
         }
     } else {
         // We are in the Plan view.
@@ -173,7 +174,7 @@ void PlanMasterController::_activeVehicleChanged(Vehicle* activeVehicle)
                 } else {
                     // We are transitioning from one active vehicle to another. Show the plan from the new vehicle.
                     qCDebug(PlanMasterControllerLog) << "_activeVehicleChanged: Plan View - Previous clean plan exists, new active vehicle, loading from new manager vehicle";
-                    _showPlanFromManagerVehicle();
+                    _autoLoadPlanFromManagerVehicle();
                 }
             }
         } else {
@@ -185,7 +186,7 @@ void PlanMasterController::_activeVehicleChanged(Vehicle* activeVehicle)
             } else {
                 // Just show the plan from the new vehicle
                 qCDebug(PlanMasterControllerLog) << "_activeVehicleChanged: Plan View - No previous plan, new active vehicle, loading from new manager vehicle";
-                _showPlanFromManagerVehicle();
+                _autoLoadPlanFromManagerVehicle();
             }
         }
     }
@@ -699,6 +700,19 @@ void PlanMasterController::sendPlanToVehicle(Vehicle* vehicle, const QString& fi
     controller->startStaticActiveVehicle(vehicle, true /* deleteWhenSendCompleted */);
     controller->loadFromFile(filename);
     controller->sendToVehicle();
+}
+
+void PlanMasterController::_autoLoadPlanFromManagerVehicle(void)
+{
+    // 已登录后台系统：不再自动从载具装入航线（QGC 缺省页面未登录时的行为一字不动）。
+    // 判据挂在登录状态上而非具体视图，故 OpsView 及今后新增的视图一并适用。
+    // 注意：用户显式动作（PlanView 弹窗「从载具载入新航线」→ showPlanFromManagerVehicle()）
+    // 不走此路径，仍可装载，避免按钮点了没反应。
+    if (AuthController::backendLoggedIn()) {
+        qCDebug(PlanMasterControllerLog) << "_autoLoadPlanFromManagerVehicle: backend logged in, skipping auto plan load";
+        return;
+    }
+    _showPlanFromManagerVehicle();
 }
 
 void PlanMasterController::_showPlanFromManagerVehicle(void)
