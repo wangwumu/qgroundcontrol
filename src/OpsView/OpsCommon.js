@@ -278,6 +278,23 @@ function abnormalColor(kind) {
     }
 }
 
+// 异常种类 → 中文短标签，用于置顶徽标（§4.1 中段第 1 节）。
+// ‼️ 与 `abnormalColor` 是**同组入参**（都吃 `abnormalKind()` 的返回值）：一处加枚举，
+//    另一处**必须同加**，否则会出现"有底色没字"或"有字没底色"的半截徽标。
+// ‼️ 返回的是**中文**不是枚举值——界面不出现裸枚举（`ui-no-raw-enum-labels`）。
+// ⚠️ 未知 kind 返回**空串**，调用方据此**整个徽标不画**，而不是画一个空方框。
+//    `abnormalKind` 已把未知 type 收成空串，正常路径到不了这里；留着 default 是
+//    **断路器**：万一枚举扩容而这里忘补，"没有徽标"（看得见）好过"编一个中文"
+//    （编错了没人会发现）。
+function abnormalLabel(kind) {
+    switch (kind) {
+    case "DIVERT":          return "备降"
+    case "RETURN":          return "回航"
+    case "FORCED_LANDING":  return "迫降"
+    default:                return ""
+    }
+}
+
 // 飞机 marker 的着色（§5.3，**入参是 device 不是 task**）。
 // 优先级：异常 > 按飞机状态。
 // ⚠️ 第 2 条**没有**复用 `statusColor`：那个函数的 switch 判的是**任务**状态

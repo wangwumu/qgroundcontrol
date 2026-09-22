@@ -128,22 +128,36 @@ ColumnLayout {
                 Row {
                     width: parent.width
                     spacing: 6
-                    // 异常航班 ⇒ 置顶标记。中段表头写着「航班列表 · 异常置顶」，**被置顶的那一行
+                    // 异常航班 ⇒ 置顶徽标。中段表头写着「航班列表 · 异常置顶」，**被置顶的那一行
                     // 必须自己说明它为什么在顶上**——否则表头在承诺一件界面没做的事。
                     // ‼️ 判据与置顶判据**同源**：`OpsCommon.middleSectionTasks` 用 `isAbnormal`
-                    //    挑出第 1 节，这里用同一个函数决定画不画 ⇒ 两者不可能漂移。
-                    // ‼️ 色走 §5.3 的三色单点定义（备降橙 / 回航黄 / 迫降红），**不是**常量红
-                    //    ——这样同一条航班在中段列表里的标记色与地图上它那架飞机的 marker
-                    //    颜色恒等（`deviceColor` 用的是同一对函数）。
-                    // ⚠️ 未知 type 时 `abnormalColor` 返回**空串**，按该函数头部的硬约束
-                    //    **不得兜底成红**（红是迫降语义，兜红会让普通告警看着像坠机）
-                    //    ⇒ 回退成与常规信息同一档的灰字：标记照旧出现，只是不着色。
-                    //    `||` 在这里是对的判据——空串是 falsy，不想要的是 `??`（空串不触发）。
-                    Text {
-                        visible: OpsCommon.isAbnormal(modelData)
-                        color: OpsCommon.abnormalColor(OpsCommon.abnormalKind(modelData)) || "#8fa1bd"
-                        font.pixelSize: 12; font.bold: true
-                        text: "⚠"
+                    //    挑出第 1 节，这里用同一族的 `abnormalKind` 决定写什么 ⇒ 不可能漂移。
+                    // ‼️ 文案与底色都走 §5.3 的**单点定义**（`abnormalLabel` / `abnormalColor`）
+                    //    ——这样同一条航班在中段列表里的徽标与地图上它那架飞机的 marker
+                    //    恒等色（`deviceColor` 用的是同一对函数）。
+                    // ⚠️ `visible` 判的是 **label 非空**，不是 `isAbnormal`：kind 未知时
+                    //    （`abnormalKind` 对未知 type 返回空串）画出来会是一个**没有字的空方框**。
+                    //    按 `abnormalColor` 头部的硬约束，未知值**不得兜底成红**（红是迫降语义，
+                    //    兜红会让普通告警看着像坠机）；此处连底色一起不画，最干净。
+                    // ⚠️ `anchors.verticalCenter` 要写：`Row` **不设子项 y**，不写就顶端对齐
+                    //    （见 `qml-row-does-not-set-child-y`）。同 Row 的状态点也是居中的，
+                    //    徽标跟着它对齐才不显得掉下去；两侧那几个 `Text` 没写是既有状态，别顺手统一。
+                    Rectangle {
+                        visible: OpsCommon.abnormalLabel(OpsCommon.abnormalKind(modelData)) !== ""
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: badgeText.implicitWidth + 6
+                        height: badgeText.implicitHeight + 2
+                        radius: 2
+                        color: OpsCommon.abnormalColor(OpsCommon.abnormalKind(modelData))
+                        Text {
+                            id: badgeText
+                            anchors.centerIn: parent
+                            // 底色是三色**实心**，字取卡片底色（深）才够对比：
+                            // 回航黄 #ffd54f 上写白字会明显发灰，写深色才清楚。
+                            color: "#16233c"
+                            font.pixelSize: 10; font.bold: true
+                            text: OpsCommon.abnormalLabel(OpsCommon.abnormalKind(modelData))
+                        }
                     }
                     Rectangle {
                         width: 8; height: 8; radius: 4
