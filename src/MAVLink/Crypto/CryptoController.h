@@ -118,12 +118,15 @@ public:
     ///
     /// ⚠️ **不要把它接到 2s 轮询上**——那会打乱 10s 保活周期。
     /// ⚠️ 集合没变时反复调用它最多多花几帧，不改集合、不改变行为方向。
-    /// ⚠️ 登记的闸一律在**调用方**：本函数自带 `registrationEnabled()` 门，而
-    ///    `_sendRegistration()` 与 `_sendRegistrationFrame()` **两个都没有**
-    ///    （前者零 `return`、只有取批 + 发帧；后者只管计数 + 组帧 + 发。都假定调用方已把好关）。
-    ///    新增调用点时必须**自己带门判断**；**或**在注释里明写"有意不设门"并给出依据
-    ///    （定向重发 `reRegisterDevice()` 即后者，见其声明处：设计文档 §3.6.3 场景表第 5 行
-    ///    「`_sendRegistration` 因故停摆 ⇒ 全部重发」要求它在登记关闭时照常兜底）。
+    /// ⚠️ 闸的落点分两类：
+    ///    ① **C++ 内部调用**：闸一律在**调用方**——本函数自带 `registrationEnabled()` 门，
+    ///       而 `_sendRegistration()` 与 `_sendRegistrationFrame()` **两个都没有**
+    ///       （前者零 `return`、只有取批 + 发帧；后者只管计数 + 组帧 + 发。都假定调用方已把好关）。
+    ///       新增 C++ 调用点时必须自己带门判断。
+    ///    ② **QML 可达的入口（`Q_INVOKABLE`）必须自带门**：`registrationEnabled()`
+    ///       **不是** `Q_INVOKABLE` ⇒ QML 物理上查不到闸的状态，"闸在调用方"对它不成立。
+    ///       `setMonitorDevices()`（闸在其触发的 C++ 内部调用上）、`reRegisterDevice()`
+    ///       （自带门，见其声明处）都属此类。
     Q_INVOKABLE void requestAcceleratedRegistration();
 
     /// 对单个 deviceID 立即发一个**只含它**的 80005 报文（§3.6.2 的"定向加速重发"）。
@@ -137,12 +140,21 @@ public:
     ///    任何异常。代价是幂等的：单架报文的 MAVLink 帧约 24 字节
     ///    ⇒ **误判的代价是一个 24 字节的帧**。
     ///
-    /// ‼️ **有意不设 `registrationEnabled()` 门**——设计文档
-    ///    （`航线监控员主界面设计-20260922.md` §3.6.3 场景表第 5 行）：
-    ///    「`_sendRegistration` 因故停摆（定时器被停等）⇒ 兜底：全部飞机超时 ⇒ 全部重发」。
-    ///    ⇒ 本函数是**周期轮转停摆时的兜底通道**，登记关闭时必须照常工作。
-    ///    （对照：`_sendRegistration()` / `_sendRegistrationFrame()` 也都没有门——闸一律在调用方；
-    ///    见 `requestAcceleratedRegistration()` 的注释。）
+    /// ‼️ **自带 `registrationEnabled()` 门**（先校验参数、再校验状态 ⇒ 非法 deviceID 的
+    ///    告警在关门时照常打）。门必须落在**被调用方**：本函数是 `Q_INVOKABLE`，而
+    ///    `registrationEnabled()` **不是** ⇒ QML 调用点（`RomView.qml` 的 2s 节拍）物理上
+    ///    查不到闸的状态，"闸在调用方"这条原则对它根本不成立。
+    ///    缺门的后果（P5 终审 I-1）：crypto 关闭 ⇒ `_registrationEnabled` 恒 false、周期定时器
+    ///    也停着 ⇒ 本函数成为 80005 的**唯一**发送方，而明文路径上没有 `noteDeviceFrame` 埋点
+    ///    ⇒ `msSinceLastFrame()` 恒 -1 ⇒ QML 判据恒真 ⇒ 每 2s 对清单里每架发一次，
+    ///    永不停止、无退避、无日志。
+    /// ⚠️ 设门**不削兜底**：设计文档（`航线监控员主界面设计-20260922.md` §3.6.3 场景表第 5 行）
+    ///    要的是「`_sendRegistration` 因故停摆 ⇒ 全部飞机超时 ⇒ 全部重发」，而轮转停摆在生产
+    ///    代码里的唯一成因就是 `setRegistrationEnabled(false)`（它停掉周期定时器）——那恰恰是
+    ///    "用户要求不发"，不是"意外停摆"。登记**开着**而轮转意外没发时门是开的，
+    ///    超时检查照常兜底：这正是要保留的语义。
+    ///    （对照：`_sendRegistration()` / `_sendRegistrationFrame()` 仍然都没有门——它们只被
+    ///    C++ 内部调用，闸在调用方；见 `requestAcceleratedRegistration()` 的注释。）
     Q_INVOKABLE void reRegisterDevice(quint32 deviceID);
 
     /// ---- 仅供单测（生产代码不得调用）----

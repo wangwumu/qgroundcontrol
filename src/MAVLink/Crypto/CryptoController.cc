@@ -178,13 +178,14 @@ int CryptoController::monitorDeviceCount() const
 void CryptoController::requestAcceleratedRegistration()
 {
     if (!registrationEnabled()) {
-        // ‼️ 登记的闸一律在**调用方**：本函数自带这道门，而 `_sendRegistration()` 与
-        //    `_sendRegistrationFrame()` **两个都没有**（前者零 `return`——只有取批 +
-        //    发帧；后者只管计数 + 组帧 + 发。都假定调用方已把好关）。登记关着时不发帧靠的是
-        //    `setRegistrationEnabled(false)` 停掉周期定时器，**不是**它们的自检。
-        //    新增调用点时必须自己带门判断，**或**明写"有意不设门"并给出依据
-        //    （定向重发 `reRegisterDevice()` 即后者，见其声明处：设计文档 §3.6.3 场景表第 5 行
-        //    「`_sendRegistration` 因故停摆 ⇒ 全部重发」要求它在登记关闭时照常兜底）。
+        // ‼️ 闸的落点分两类：
+        //    ① **C++ 内部调用**：闸一律在**调用方**——本函数自带这道门，而 `_sendRegistration()`
+        //       与 `_sendRegistrationFrame()` **两个都没有**（前者零 `return`——只有取批 +
+        //       发帧；后者只管计数 + 组帧 + 发。都假定调用方已把好关）。登记关着时不发帧靠的是
+        //       `setRegistrationEnabled(false)` 停掉周期定时器，**不是**它们的自检。
+        //    ② **QML 可达的入口（`Q_INVOKABLE`）必须自带门**：QML 查不到闸的状态
+        //       （`registrationEnabled()` 不是 Q_INVOKABLE）⇒ "闸在调用方"对它根本不成立。
+        //       `reRegisterDevice()` 即此类，见其实现与声明处的注释。
         return;
     }
 
@@ -233,11 +234,23 @@ void CryptoController::reRegisterDevice(quint32 deviceID)
         qCWarning(CryptoControllerLog) << "reRegisterDevice: 非法 deviceID，忽略" << deviceID;
         return;
     }
+    // ‼️ **登记闸设在这里**（先校验参数、再校验状态：非法 deviceID 的告警在关门时照常打）。
+    //    门必须落在**被调用方**：`registrationEnabled()` **不是** Q_INVOKABLE，而本函数**是**
+    //    ⇒ QML 调用点（RomView.qml 的 2s 节拍）物理上查不到闸的状态，无法自己把门。
+    //    缺门的后果（P5 终审 I-1）：crypto 关闭 ⇒ `_registrationEnabled` 恒 false、
+    //    周期定时器也停着 ⇒ 本函数成为 80005 的**唯一**发送方，且 `msSinceLastFrame()` 在
+    //    明文路径上没有埋点恒返回 -1 ⇒ QML 判据恒真 ⇒ 每 2s 对清单里每架发一次，
+    //    永不停止、无退避、无日志。
+    // ⚠️ 设门**不削兜底**：设计文档 §3.6.3 场景表第 5 行要的是"周期轮转因故停摆时靠定向重发
+    //    兜底"，而轮转停摆在生产代码里的唯一成因就是 `setRegistrationEnabled(false)`
+    //    （它停掉定时器）——恰恰是"用户要求不发"的情形，不是"意外停摆"。登记**开着**而
+    //    轮转意外没发时门是开的，超时检查照常兜底：这正是要保留的语义。
+    if (!registrationEnabled()) {
+        return;
+    }
     // 单发一批（只含这一个），复用 _sendRegistrationFrame 的组帧与发送逻辑。
     // ‼️ 这里**不碰** _monitorDevices、不碰 _regCursor —— 重发是幂等刷新，
     //    任何集合改动都会把"超时自愈"变成"超时自我放逐"（§3.6.2）。
-    // ‼️ **有意不设 `registrationEnabled()` 门**（§3.6.3 场景表第 5 行：周期轮转停摆时
-    //    靠定向重发兜底）——详见头文件声明处的注释。
     _sendRegistrationFrame(QList<DeviceID>{ static_cast<DeviceID>(deviceID) });
 }
 
