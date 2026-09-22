@@ -12,6 +12,7 @@
 .vs/
 .settings/
 .codex/
+.superpowers/
 
 # VS Code - track .default files, ignore personal overrides
 .vscode/*
