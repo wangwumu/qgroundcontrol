@@ -118,10 +118,12 @@ public:
     ///
     /// ⚠️ **不要把它接到 2s 轮询上**——那会打乱 10s 保活周期。
     /// ⚠️ 集合没变时反复调用它最多多花几帧，不改集合、不改变行为方向。
-    /// ⚠️ 登记的闸在**调用方**：本函数自带 `registrationEnabled()` 门，而
-    ///    `_sendRegistration()` **没有**（它假定调用方已把好关）。要给
-    ///    `_sendRegistration()` 加新调用点（如定向重发）时，必须自己确认登记已启用——
-    ///    否则会在登记关闭状态下照发登记帧。
+    /// ⚠️ 登记的闸一律在**调用方**：本函数自带 `registrationEnabled()` 门，而
+    ///    `_sendRegistration()` 与 `_sendRegistrationFrame()` **两个都没有**
+    ///    （前者零 `return`、只有计数 + 取批 + 发帧；后者只管组帧 + 发。都假定调用方已把好关）。
+    ///    新增调用点时必须**自己带门判断**；**或**在注释里明写"有意不设门"并给出依据
+    ///    （定向重发 `reRegisterDevice` 即后者：设计文档 §3.6.3 场景表第 5 行
+    ///    「`_sendRegistration` 因故停摆 ⇒ 全部重发」要求它在登记关闭时照常兜底）。
     Q_INVOKABLE void requestAcceleratedRegistration();
 
     /// ---- 仅供单测（生产代码不得调用）----

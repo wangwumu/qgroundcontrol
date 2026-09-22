@@ -178,15 +178,18 @@ int CryptoController::monitorDeviceCount() const
 void CryptoController::requestAcceleratedRegistration()
 {
     if (!registrationEnabled()) {
-        // ‼️ 登记的闸在**调用方**：本函数自带这道门，而 `_sendRegistration()` **没有**
-        //    （它零 `return`——只有计数 + 取批 + 发帧，假定调用方已把好关）。
-        //    登记关着时不发帧靠的是 `setRegistrationEnabled(false)` 停掉周期定时器，
-        //    **不是** `_sendRegistration()` 的自检。往 `_sendRegistration()` 加新调用点
-        //    （如定向重发）前必须自己确认登记已启用，否则会在关闭状态下照发。
+        // ‼️ 登记的闸一律在**调用方**：本函数自带这道门，而 `_sendRegistration()` 与
+        //    `_sendRegistrationFrame()` **两个都没有**（前者零 `return`——只有计数 + 取批 +
+        //    发帧；后者只管组帧 + 发。都假定调用方已把好关）。登记关着时不发帧靠的是
+        //    `setRegistrationEnabled(false)` 停掉周期定时器，**不是**它们的自检。
+        //    新增调用点时必须自己带门判断，**或**明写"有意不设门"并给出依据
+        //    （定向重发 `reRegisterDevice` 即后者：设计文档 §3.6.3 场景表第 5 行
+        //    「`_sendRegistration` 因故停摆 ⇒ 全部重发」要求它在登记关闭时照常兜底）。
         return;
     }
 
-    int n = 0;
+    int n = 0;        // 本轮要发的**总量**（含追加的 active）
+    int listSize = 0; // 清单本身的条数（不含追加）——仅供容量告警把两个量都打出来
     {
         const QMutexLocker locker(&_mutex);
         // ‼️ 口径必须与 `_sendRegistration()` 取列表的那几行**一致**：那里在
@@ -196,7 +199,8 @@ void CryptoController::requestAcceleratedRegistration()
         //    ⇒ 它这一轮永远取不到、要等下一个 10s 周期——而那架正是用户刚选定、
         //    正在建链的目标。改完 n = 这一轮真正要发的总量。
         const QList<DeviceID>& devices = _monitorDevices.isEmpty() ? _linkedDevices : _monitorDevices;
-        n = devices.size();
+        listSize = devices.size();
+        n = listSize;
         if (_activeDeviceID != kInvalidDeviceID && !devices.contains(_activeDeviceID)) {
             n++;
         }
@@ -208,8 +212,11 @@ void CryptoController::requestAcceleratedRegistration()
         // 容量天花板（§3.4）：越过 n ≤ 80 时稳态本来就保证不了 TTL，
         // 加速发送再多也只是把这一轮塞满。**截断的是批数，不是集合**——
         // 集合永远不动（§3.6.2）。
-        qCWarning(CryptoControllerLog) << "监控清单超过容量天花板（n ≤ 80），加速发送已截断"
-                                       << n << "架 / 需" << batches << "批";
+        // ‼️ 两个量都要打：触发判据用的是 `n`（本轮总量，含追加的 active），
+        //    而 `_monitorDevices` 的实际条数是 `listSize`。只打一个会让排障者
+        //    去找一个不存在的清单（清单恰 80 条 + active 不在清单 ⇒ n=81 触发告警）。
+        qCWarning(CryptoControllerLog) << "登记总量超过容量天花板（n ≤ 80），加速发送已截断："
+                                       << "监控清单" << listSize << "架 / 本轮" << n << "架 / 需" << batches << "批";
     }
 
     // ⚠️ 用 QTimer::singleShot 串，**不要**用 QThread::msleep 或忙等——那会卡 GUI 线程（§3.4）
