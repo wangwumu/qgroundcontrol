@@ -222,9 +222,9 @@ void CryptoController::_sendRegistration()
             devices.append(_activeDeviceID);
         }
         // §3.3：分批轮转。n ≤ 16 时退化为"一批全取、游标恒 0"，与改动前一致。
-        // ‼️ batch 仍须是 MAX_QGC_LINKED_PX4（@pre）。但传更大值**不会越界**——下游 qMin 是真实
-        //    兜底，deviceCount 恒 ≤ 16、最大写索引 63 < 64。真实后果是**覆盖性缺口**：游标按 batch
-        //    推进而 payload 只装前 16 个 ⇒ 每轮丢掉本轮取出的、超出 16 个的那部分（整批 = batch-16，尾批更少）。
+        // ‼️ batch 仍须是 MAX_QGC_LINKED_PX4（@pre）。但传更大值**不会越界**——下游 qMin 是真实兜底，
+        //    deviceCount 恒 ≤ 16、最大写索引 63 < 64。真实后果是**覆盖性缺口**：游标按本轮取出量推进（尾批小于 batch）
+        //    而 payload 只装前 16 个 ⇒ 每轮丢掉本轮取出的、超出 16 个的那部分（整批 = batch-16，尾批更少）。
         batch = nextRegistrationBatch(devices, MAX_QGC_LINKED_PX4, _regCursor);
     }
 
