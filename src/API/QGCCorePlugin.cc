@@ -9,6 +9,7 @@
 #include "InstrumentValueData.h"
 #include "JoystickManager.h"
 #include "MissionManager/PlanUploader.h"
+#include "Crypto/CryptoController.h"
 #include "QGCLoggingCategory.h"
 #include "QGCOptions.h"
 #include "QmlComponentInfo.h"
@@ -287,6 +288,13 @@ QQmlApplicationEngine *QGCCorePlugin::createQmlApplicationEngine(QObject *parent
     qmlEngine->rootContext()->setContextProperty(QStringLiteral("joystickManager"), JoystickManager::instance());
     // 航线上传后台（PlanUploader）：C++ 先注入 serverUrl/token，QML 经此属性访问同一实例
     qmlEngine->rootContext()->setContextProperty(QStringLiteral("planUploader"), PlanUploader::instance());
+    // 80005 登记链路的 QML 接口（设计文档 §3.5.3）：RomView 在每次成功轮询后
+    // 推监控清单与超时阈值，并在每 2s 的轮询节拍上做超时定向重发。
+    // ⚠️ 用 setContextProperty 而非 QML_SINGLETON：CryptoController 不在任何
+    //    qt_add_qml_module 里，加 QML_SINGLETON 要动 QML 模块结构，与本设计无关。
+    //    惯例同紧邻的 joystickManager / planUploader。
+    qmlEngine->rootContext()->setContextProperty(QStringLiteral("cryptoController"),
+                                                 MAVLinkCrypto::CryptoController::instance());
     return qmlEngine;
 }
 
