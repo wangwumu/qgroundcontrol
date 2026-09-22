@@ -14,7 +14,8 @@ import QGroundControl.Controls
 ///   1. `overviewView: "route"` —— 数据源参数，后端按**负责航线**过滤 IN_FLIGHT；
 ///   2. 右栏只放**任务列表**，没有机位平面图（监控员不调度机位）。
 ///
-/// ‼️ 本视图**不连** `polled()`。机位是站点专属数据，监控员拉它没有消费者，白花一次请求。
+/// ‼️ 本视图连 `polled()`，但**只为接引链路**（§3.5.3/§3.6）：拉 ③ 端点推监控清单、
+///    做每 2s 的超时定向重发。机位仍**不拉**——那是站点专属数据，监控员拉它没有消费者。
 ///    这正是骨架把 `polled()` 做成信号、而不是把机位一并塞进 `_poll()` 的原因。
 ///
 /// ‼️ 本视图**不填** `commandBarExtras`。出站/进站（本站语义）与机位朝向（无机位图可转）
@@ -43,6 +44,51 @@ OpsShell {
     // 读 roles 属性（NOTIFY rolesChanged）而非 hasRole() 方法：方法调用不注册 QML 绑定依赖，
     // 登录后才填充的 roles 不会触发重估 → 视图永不显示。indexOf 读属性值，登录后绑定自动更新。
     readonly property bool _isRouteMon: AuthController.roles.indexOf("ROUTE_MONITOR") >= 0
+
+    //=========================================================================
+    // 接引清单与超时（设计文档 §3.5.3 / §3.6）
+    //=========================================================================
+    // 上次**成功**推送的清单与阈值。超时检查用它遍历；请求失败时**保留不动**（§3.5.4）。
+    property var _monitorIds: []
+    property int _frameTimeoutMs: 3000   // = CryptoController::DEFAULT_FRAME_TIMEOUT_MS
+
+    /// 每次轮询拉一次 ③ 端点；**只有成功**才把清单与阈值推给 C++。
+    /// ‼️ 失败时什么都不做——把"请求失败"当成"没有需要监控的飞机"会让登记集合
+    ///    清空，全部飞机在 60s TTL 后集体掉线，而失败原因可能只是一次网络抖动（§3.5.4）。
+    function _fetchMonitorDevices() {
+        _get("/api/ops/route-tasks", function(status, data) {
+            if (status !== 200 || !data || !Array.isArray(data.devices)) {
+                // 失败 / 老后端 / 端点尚未部署（P1 未落地时走这一支）：
+                // 保留上一次的清单，不推送、不清空
+                return
+            }
+            var ids = data.devices.map(function(d) { return d.device_id })
+            _monitorIds = ids
+            _frameTimeoutMs = (typeof data.frame_timeout_ms === "number" && data.frame_timeout_ms > 0)
+                              ? data.frame_timeout_ms
+                              : 3000
+            // ⚠️ 清单与阈值**同一次**传入：两个 setter 会造出"新阈值配旧清单"的中间态（§3.6.4）
+            cryptoController.setMonitorDevices(ids, _frameTimeoutMs)
+        })
+    }
+
+    /// 每 2s 的超时检查（与轮询同相，§3.6.2）。**只重发，绝不改清单。**
+    /// ⚠️ `since < 0` 表示"从未收到过帧"，同样判超时——那正是**接引失败**的形状，
+    ///    也恰恰是本机制最该自愈的场景（设计文档 §3.6.3 的场景表第 2 行）。
+    function _checkFrameTimeouts() {
+        for (var i = 0; i < _monitorIds.length; i++) {
+            var id = _monitorIds[i]
+            var since = cryptoController.msSinceLastFrame(id)
+            if (since < 0 || since > _frameTimeoutMs) {
+                cryptoController.reRegisterDevice(id)
+            }
+        }
+    }
+
+    onPolled: {
+        _fetchMonitorDevices()
+        _checkFrameTimeouts()
+    }
 
     //=========================================================================
     // 注入槽 ②：右栏中段 —— 任务列表（监控员视图的右栏**只有**这一块）
