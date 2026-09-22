@@ -208,6 +208,9 @@ void MAVLinkProtocol::_receiveEncryptedBytes(LinkInterface* link, const SharedLi
                 0, deviceID, false, reinterpret_cast<const char*>(frameData), frame.size(), nullptr, 0, true);
             MAVLinkCrypto::CryptoController::instance()->learnDeviceSystemMapping(
                 deviceID, MAVLinkCrypto::systemID(deviceID));
+            // 收帧时间戳（§3.6.1）：本分支覆盖「未建链」阶段。
+            // ⚠️ 两处收帧点必须都记——只记心跳会让判据在接引成功那一刻起永久失效。
+            MAVLinkCrypto::CryptoController::instance()->noteDeviceFrame(deviceID);
 
             // 自动建链（C2 修正）：待命心跳声明 PX4 在线，且本地已缓存该 deviceID 的密钥 → 自动建链。
             // 否则 QGC 初始连接状态机发出的 COMMAND_LONG 等命令在 Standby 下全被 LinkInterface 丢弃，
@@ -259,6 +262,10 @@ void MAVLinkProtocol::_processEncryptedFrame(LinkInterface* link, const SharedLi
     // 明文帧头即可重组，无需密钥；放在取密钥前可打破全新启动的死锁
     //（否则无密钥→无法解密→无法学习映射→beginLinkingForSystemID 无从触发）。
     crypto->learnDeviceSystemMapping(deviceID, MAVLinkCrypto::systemID(deviceID));
+    // 收帧时间戳（§3.6.1）：本分支覆盖「已建链」阶段——建链后 PX4 停发明文心跳、
+    // 改发加密遥测，只记心跳分支的实现在这里会漏掉全部在飞飞机。
+    // ⚠️ 放在防重放检查**之前**是有意的：重放帧、重复帧同样是"mavp2p 在转给我"的证据。
+    crypto->noteDeviceFrame(deviceID);
 
     // 防重放「判定」（规范 §2.6 第 3 步：仅判定，不更新 lastNonce，
     // 更新须待解密 + tag 认证通过后，见下方 commitIncoming）。
