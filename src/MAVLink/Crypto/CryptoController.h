@@ -175,6 +175,15 @@ public:
     /// 区分不了 `{a}` 与 `{b}`。供测试断言清单本身。
     QList<DeviceID> monitorDevicesForTest() const;
 
+    /// 最近一次进入 `_sendRegistrationFrame()` 时**实际装入帧**的 deviceID 序列
+    /// （已按 `MAX_QGC_LINKED_PX4` 截断，口径与 `deviceBytes` 循环一致）。
+    /// `registrationSendCountForTest()` 只数"发了几帧"，区分不了"帧里装的是 a 还是 b"
+    /// —— 定向重发的判据必须落在**内容**上：一个"发了一帧、但帧里装的是别人"的实现，
+    /// 能同时骗过计数与集合两格。
+    /// ⚠️ 组帧失败（`packLen == 0`）早退前就已记录：口径是"这一帧打算装什么"，
+    ///    与 `registrationSendCountForTest()` 一致（它也把失败那一次计进去）。
+    QList<DeviceID> lastRegistrationPayloadForTest() const;
+
     /// 从 `devices` 的 `cursor` 位置起取至多 `batch` 个（环形回绕），
     /// 并把 `cursor` 就地推进到**下一批的起点**（§3.3）。
     ///
@@ -364,6 +373,8 @@ private:
     /// 分批发送的游标（§3.3），跨两次 `_sendRegistration()` 保持。
     int _regCursor = 0;
     int _registrationSendCount = 0; ///< 单测用的发送计数，见 registrationSendCountForTest()
+    /// 单测用的"上一帧装了什么"，见 lastRegistrationPayloadForTest()。
+    QList<DeviceID> _lastRegistrationPayload;
     QTimer* _linkLossTimer = nullptr; ///< PX4 失联检测定时器
     DeviceID _linkLossDevice = kInvalidDeviceID; ///< 正在监测失联的活跃 deviceID
     mutable QMutex _mutex;

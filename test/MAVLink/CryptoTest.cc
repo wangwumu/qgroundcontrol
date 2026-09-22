@@ -1553,19 +1553,32 @@ void CryptoTest::_testSetMonitorDevices()
     // 非法条目必须跳过并留下日志，不能默默变成 0：
     // 一条 device_id=0 的登记会在 mavp2p 里建出无意义的 pair，且没有任何一处会报错（§3.5.2）
     //
-    // ‼️ withBad 里是**两种**非法形态（"not-a-number" 转不成 uint、0u == kInvalidDeviceID），
-    //    各产生一条 qCWarning ⇒ 必须配 **2** 次 expect + verify。
+    // ‼️ withBad 里是**三种**非法形态（"not-a-number" 转不成 uint、0u == kInvalidDeviceID、
+    //    bit24 置位的**非零**值 ⇒ hasValidSignatureBit 为假），各产生一条 qCWarning
+    //    ⇒ 必须配 **3** 次 expect + verify。
     //    strict mode（UnitTest::cleanup 的 "Unexpected log messages"）会把未消费的日志
     //    判为失败，而 verifyExpectedLogMessage 只消费**一条**。
+    // ⚠️ 第三种与前两种走的是**不同的**短路项：它非 0 ⇒ 不会被 `id == kInvalidDeviceID`
+    //    拦下，只能靠 `!hasValidSignatureBit(...)` 拦住。删掉该项的变异体会让它悄悄混进
+    //    清单，变成一条高字节带签名的登记（mavp2p 侧误判签名）。
+    const DeviceID badSig = makeDeviceID(0x01, 0, 0x31, 0x09);   // incompatFlag bit0 = 1 ⇒ bit24 置位
+    QVERIFY(!hasValidSignatureBit(badSig));
+    QVERIFY(badSig != kInvalidDeviceID);   // 与 0u 那一条是不同的短路项，不是重复
     expectLogMessage("MAVLink.Crypto.CryptoController", QtWarningMsg,
                      QRegularExpression("setMonitorDevices"));
     expectLogMessage("MAVLink.Crypto.CryptoController", QtWarningMsg,
                      QRegularExpression("setMonitorDevices"));
-    const QVariantList withBad{ static_cast<uint>(a), QStringLiteral("not-a-number"), 0u };
+    expectLogMessage("MAVLink.Crypto.CryptoController", QtWarningMsg,
+                     QRegularExpression("setMonitorDevices"));
+    const QVariantList withBad{ static_cast<uint>(a), QStringLiteral("not-a-number"), 0u,
+                                static_cast<uint>(badSig) };
     crypto->setMonitorDevices(withBad, 5000);
     verifyExpectedLogMessage();
     verifyExpectedLogMessage();
+    verifyExpectedLogMessage();
     QCOMPARE(crypto->monitorDeviceCount(), 1);   // 只剩 a
+    // ‼️ 条数区分不了"剩下的那个是不是 a" ⇒ 补内容断言（同下面那条的理由）。
+    QCOMPARE(crypto->monitorDevicesForTest(), QList<DeviceID>{ a });
 
     // 阈值 ≤ 0 或非法 ⇒ 回落默认，且**不清空清单**（§3.5.4：失败只降灵敏度、不改变方向）
     crypto->setMonitorDevices(QVariantList{ static_cast<uint>(b) }, -1);
@@ -1677,6 +1690,44 @@ void CryptoTest::_testRequestAcceleratedRegistration()
     crypto->setMonitorDevices(QVariantList(), 3000);
     QCOMPARE(crypto->monitorDeviceCount(), 0);
 
+    // ---- ⑥ `n` 必须把「有效且不在清单里」的 `_activeDeviceID` 算进去 ----
+    // 构造：清单条数恰为 MAX_QGC_LINKED_PX4(16) 的**整数倍**，且 active 不在清单里。
+    //   n = 16（清单）+ 1（`_sendRegistration()` 会追加到末尾）= 17 ⇒ ceil(17/16) = **2** 批；
+    //   漏算这一个 ⇒ n = 16 ⇒ 1 批 ⇒ 追加在末尾的 active 这一轮**取不到**，
+    //   要等下一个 10s 周期——而那架正是用户刚选定、正在建链的目标。
+    // ⚠️ 必须**恰好**是 16 的整数倍：清单 15 条时漏算也是 1 批、算上也是 1 批 ⇒ 本格假绿。
+    //    这也解释了为什么单靠下面那些用例测不出：它们的清单条数都不是 16 的整数倍。
+    crypto->returnToStandby();
+    const DeviceID active = makeDeviceID(0, 0, 0x71, 0x01);
+    crypto->deviceKeyManager()->cacheKey(active, testKey());
+    crypto->beginLinking(active);   // 密钥已缓存 ⇒ 同步进 Active
+    QCOMPARE(crypto->state(), CryptoController::State::Active);
+    QCOMPARE(crypto->activeDeviceID(), active);
+
+    crypto->setRegistrationEnabled(true, 3600000);   // 开启自身立即发一帧 ⇒ 用增量断言
+    const int s6 = crypto->registrationSendCountForTest();
+
+    QVariantList sixteen;
+    for (int i = 0; i < 16; i++) {
+        sixteen.append(static_cast<uint>(makeDeviceID(0, 0, 0x71, static_cast<uint8_t>(i + 0x10))));
+    }
+    crypto->setMonitorDevices(sixteen, 3000);
+    // ‼️ 追加只发生在**发送侧**：清单本身仍是 16 条，active 绝不进清单（§3.6.2 的同一约束）。
+    QCOMPARE(crypto->monitorDeviceCount(), 16);
+    // 两批落在 t = 0/200ms。漏算 active ⇒ 只发 1 批 ⇒ 本格红（QTRY 等到超时）。
+    QTRY_COMPARE_WITH_TIMEOUT(crypto->registrationSendCountForTest(), s6 + 2, TestTimeout::shortMs());
+    // 再等满一个窗口（兜住反方向：别处若多排一批，本格红）。
+    (void) QTest::qWaitFor([] { return false; }, TestTimeout::shortMs());
+    QCOMPARE(crypto->registrationSendCountForTest(), s6 + 2);
+
+    // 复位（单例跨用例共享）：active 必须清掉，否则 `_sendRegistration()` 会在**每个**
+    // 后续用例里多追加一个 id、污染它们的批次判据。顺序同下：先关登记、再清清单。
+    crypto->setRegistrationEnabled(false);
+    crypto->setMonitorDevices(QVariantList(), 3000);
+    crypto->returnToStandby();
+    crypto->deviceKeyManager()->removeKey(active);
+    QCOMPARE(crypto->activeDeviceID(), kInvalidDeviceID);
+
     // 排空：CryptoController 是**单例**，burst 用一次性定时器串，
     // kRegistrationBurstIntervalMs(200) × capped(≤5) ⇒ 最晚一批在 800ms 后才投递。
     // 不等它们落地就会跑进**下一个测试函数**、污染其 sendCount 基线。
@@ -1761,6 +1812,11 @@ void CryptoTest::_testReRegisterDevice()
     QCOMPARE(crypto->registrationSendCountForTest(), s0 + 1);   // ‼️ 真的发了（一帧，且只一帧）
     QCOMPARE(crypto->monitorDeviceCount(), 2);                   // ‼️ 且集合没动
     QCOMPARE(crypto->monitorDevicesForTest(), (QList<DeviceID>{ a, b }));
+    // ‼️ 第三格：帧里装的必须**就是 a 自己**。
+    //    只有计数 + 集合两格时，"发了一帧、但帧里装的是别人"的实现能同时骗过它们
+    //    （计数 +1、集合不动，两格全绿）——而它的实际后果是"超时的那架永远收不到定向刷新"，
+    //    正是本设计要防的静默失效。
+    QCOMPARE(crypto->lastRegistrationPayloadForTest(), QList<DeviceID>{ a });
 
     // 集合里的另一个也必须原样在
     const int s1 = crypto->registrationSendCountForTest();
@@ -1768,6 +1824,8 @@ void CryptoTest::_testReRegisterDevice()
     QCOMPARE(crypto->registrationSendCountForTest(), s1 + 1);
     QCOMPARE(crypto->monitorDeviceCount(), 2);
     QCOMPARE(crypto->monitorDevicesForTest(), (QList<DeviceID>{ a, b }));
+    // 换一个 id ⇒ payload 必须跟着换（上面那格若被"恒发清单头一个"的实现蒙混，这格抓住它）
+    QCOMPARE(crypto->lastRegistrationPayloadForTest(), QList<DeviceID>{ b });
 
     // 不在清单里的 deviceID 也可以重发（幂等刷新，mavp2p 只刷 lastSeen）
     const DeviceID outsider = makeDeviceID(0, 0, 0x61, 0x09);
@@ -1775,6 +1833,26 @@ void CryptoTest::_testReRegisterDevice()
     crypto->reRegisterDevice(outsider);
     QCOMPARE(crypto->registrationSendCountForTest(), s2 + 1);
     QCOMPARE(crypto->monitorDeviceCount(), 2);   // ‼️ 不得被"顺手加进清单"
+    QCOMPARE(crypto->monitorDevicesForTest(), (QList<DeviceID>{ a, b }));
+    // ‼️ 且帧里装的是 outsider，**不是**清单里的任何一个——'发了，但发的是清单首项'
+    //    这类实现对集合两格全绿，却完全没有实现"定向"二字。
+    QCOMPARE(crypto->lastRegistrationPayloadForTest(), QList<DeviceID>{ outsider });
+
+    // ---- ③ 签名位非法的**非零** id ⇒ 告警照打、且一帧都不发 ----
+    // ‼️ 非零 ⇒ 不会被 `deviceID == kInvalidDeviceID` 拦下，只能靠 `!hasValidSignatureBit(...)`。
+    //    刻意放在**开门**段（①段的 `reRegisterDevice(0)` 在关门段）：关门段里门会把
+    //    "签名位检查被删掉"一并吞掉（删了也照样一帧不发）⇒ 那一格只验得动"告警打没打"；
+    //    门开着时两件事才同时可判别：告警照打 **且** 计数纹丝不动。
+    const DeviceID badSig = makeDeviceID(0x01, 0, 0x61, 0x0A);
+    QVERIFY(!hasValidSignatureBit(badSig));
+    QVERIFY(badSig != kInvalidDeviceID);
+    const int s4 = crypto->registrationSendCountForTest();
+    expectLogMessage("MAVLink.Crypto.CryptoController", QtWarningMsg,
+                     QRegularExpression("reRegisterDevice"));
+    crypto->reRegisterDevice(badSig);
+    verifyExpectedLogMessage();
+    QCOMPARE(crypto->registrationSendCountForTest(), s4);   // ‼️ 非法 ⇒ 一帧都不发
+    QCOMPARE(crypto->monitorDeviceCount(), 2);
     QCOMPARE(crypto->monitorDevicesForTest(), (QList<DeviceID>{ a, b }));
 
     // 复位（单例跨用例共享，且下一个用例假定"无清单 + 登记关着"）。

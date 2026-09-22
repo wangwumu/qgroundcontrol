@@ -266,6 +266,12 @@ QList<DeviceID> CryptoController::monitorDevicesForTest() const
     return _monitorDevices;
 }
 
+QList<DeviceID> CryptoController::lastRegistrationPayloadForTest() const
+{
+    const QMutexLocker locker(&_mutex);
+    return _lastRegistrationPayload;
+}
+
 QList<DeviceID> CryptoController::nextRegistrationBatch(const QList<DeviceID>& devices, int batch, int& cursor)
 {
     const int n = devices.size();
@@ -338,6 +344,13 @@ void CryptoController::_sendRegistrationFrame(const QList<DeviceID>& ids)
     // 帧头 deviceID 用 GCS 段固定值（文档 §1.3 QGC_REGISTRATION_DEVICE_ID_DEFAULT），
     // 由 pack 函数拆入帧头 4 字节（方案 B）。payload 填关联 PX4 deviceID 集合。
     const int deviceCount = qMin(ids.size(), static_cast<int>(MAX_QGC_LINKED_PX4));
+
+    // 单测用：记下**这一帧真正装进去的** id（截断之后），口径与下面的 `deviceBytes` 循环一致。
+    // ‼️ 记的是 `deviceCount` 而非调用方传进来的整个 `ids`——否则断言会对着"打算装的"而非"装了的"。
+    {
+        const QMutexLocker locker(&_mutex);
+        _lastRegistrationPayload = ids.mid(0, deviceCount);
+    }
 
     // ⚠️ 定长数组，不是 VLA：`uint8_t deviceBytes[count * 4]` 是 GCC 扩展、
     //    不是标准 C++，MSVC 直接编译失败，本仓是多平台构建（§3.3 关键点 1）。
