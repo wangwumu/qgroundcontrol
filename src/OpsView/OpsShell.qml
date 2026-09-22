@@ -131,32 +131,28 @@ Item {
     //    为对抗这个**而存在的。不记录依赖的是 **C++ 的 `Q_INVOKABLE`**，不是 QML/JS 函数。
     //    （本条同时解释了 `routeRowsDimmed()/routeRowsLit()` 写在 `model:` 里为什么有效。）
     readonly property var _routeRows: {
-        var agg = {}
-        for (var i = 0; i < _routeOrder.length; i++) agg[String(_routeOrder[i])] = { uavs: {}, abnormal: false, tasks: [] }
-        for (var j = 0; j < _routeTasks.length; j++) {
-            var t = _routeTasks[j]
-            var a = agg[String(t.route_id)]
-            if (a === undefined) continue          // ③ 里出现了不在名册里的航线：不新增行
-            a.tasks.push(t)
-            var uid = Number(t.uav_id)
-            if (uid > 0) a.uavs[String(uid)] = true   // 按**飞机**去重，不是一个任务算一架
-            if (OpsCommon.isAbnormal(t)) a.abnormal = true
-        }
+        // ‼️ 分组与计数**住 `OpsCommon` 纯函数**，本文件不再内联实现一遍。
+        //    理由有二：纯函数才是 QML 测试基础设施够得着的（写在骨架里只能靠肉眼比对）；
+        //    且这两段判据原先在本文件与 `OpsCommon` 里**各有一份定义**，会各演化各的。
+        // ‼️ `groupTasksByRoute` 按 `_routeOrder` 建键 ⇒ 无航班的航线拿到的是**空数组
+        //    而不是缺键**（缺键会让"这条航线没有航班"与"这条航线的数据还没回来"
+        //    在界面上长得一样）。③ 里出现不在名册里的航线时两边都跳过、不新增行。
+        var grouped = OpsCommon.groupTasksByRoute(_routeTasks, _routeOrder)
         var out = []
         for (var k = 0; k < _routeOrder.length; k++) {
             var id = _routeOrder[k]
             var r = _routeCache[String(id)]
             if (!r) continue
-            var g = agg[String(id)]
+            var g = grouped[String(id)]
             out.push({
                 route_id:     r.route_id,
                 route_code:   r.route_code,
                 route_name:   r.route_name,
                 route_type:   r.route_type,
                 waypoints:    Array.isArray(r.waypoints) ? r.waypoints : [],
-                active_count: Object.keys(g.uavs).length,
-                has_abnormal: g.abnormal,
-                tasks:        g.tasks
+                active_count: OpsCommon.activeUavCount(g),
+                has_abnormal: g.some(OpsCommon.isAbnormal),
+                tasks:        g
             })
         }
         return out
