@@ -105,6 +105,18 @@ ColumnLayout {
             // 点整项选中任务（视图侧收到 taskSelected 后自行决定是否同步点亮机位）
             MouseArea {
                 anchors.fill: parent
+                // ‼️ 命中区上下各外扩 `cardGap/2`，把 `ListView.spacing` 的缝**盖满**：
+                //    相邻两张卡各分一半（上半→上面那张，下半→下面那张），**无缝、不重叠**。
+                //    动机：`Flickable` 在内容溢出时会抢走按下，落在缝上的点击**谁都收不到**；
+                //    而溢出时视口已被卡片铺满，那几 px 的缝是右栏**唯一**的落点（2026-09-23 实测）。
+                // ✅ 修法已探针验证（`qmltestrunner` + offscreen，含阴性对照）：
+                //    · 未扩时缝中点命中 **0** 次（死区），扩后恰好命中 **1** 张卡；
+                //    · 缝上半→上一张、下半→下一张，归属正确；
+                //    · **拖动零退化**——四格位移（卡片中心/缝 × 未扩/扩后）全等，
+                //      因为 `Flickable` 是在 **move** 阶段偷走事件，与 MouseArea 无关。
+                // ⚠️ 视觉零变化：MouseArea 不渲染，改动只落在事件几何上。
+                anchors.topMargin:    -panel.cardGap / 2
+                anchors.bottomMargin: -panel.cardGap / 2
                 onClicked: panel.taskSelected(modelData)
             }
 

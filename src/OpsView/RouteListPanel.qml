@@ -87,6 +87,12 @@ ColumnLayout {
             // 点整行 ⇒ 选中该航线（再点一次是取消，由骨架的 `selectRoute` toggle）
             MouseArea {
                 anchors.fill: parent
+                // ‼️ 命中区上下各外扩 `cardGap/2` 盖住 `ListView.spacing` 的缝，与
+                //    `TaskListPanel` 的委托**逐字同解**（含验证结论）。理由与判别力的完整
+                //    说明写在那边的 MouseArea 上，此处不重复——两处必须一起改，
+                //    只改一处会让右栏上下两段对"缝"的响应不一致。
+                anchors.topMargin:    -panel.cardGap / 2
+                anchors.bottomMargin: -panel.cardGap / 2
                 onClicked: panel.routeSelected(modelData.route_id)
             }
 
