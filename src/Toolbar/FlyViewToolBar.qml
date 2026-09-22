@@ -10,6 +10,11 @@ import QGroundControl.FlyView
 Item {
     required property var guidedValueSlider
 
+    /// 右侧载具遥测指示器区（电池/卫星/RSSI 等）的实际占宽。宿主视图可据此把自绘
+    /// 控件让开这块区域——OpsView/RomView 的命令条扩展区就是这么避让的（见 OpsShell.qml）。
+    /// 随指示器显隐动态变化：无载具时仅剩两侧边距，建链后为整排图标宽。
+    readonly property real indicatorsWidth: flyViewIndicators.width
+
     id:     control
     width:  parent.width
     height: ScreenTools.toolbarHeight

@@ -22,9 +22,10 @@ ApplicationWindow {
     flags:      Qt.Window | (ScreenTools.isAndroid ? Qt.ExpandedClientAreaHint | Qt.NoTitleBarBackgroundHint : 0)
 
     Component.onCompleted: {
-        // 登录成功后按操作岗位分流：
-        //   SITE_ATC / ROUTE_MONITOR → 监控主界面（OpsView）
-        //   FLIGHT_SUPERVISOR        → 原飞行视图（专属视图尚未实现，2026-09-21 用户裁定暂不处理）
+        // 登录成功后按操作岗位分流（单身份，见 _onLoginSucceededForRole）：
+        //   SITE_ATC          → 站点操作员监控主界面（OpsView）
+        //   ROUTE_MONITOR     → 航线监控员监控主界面（RomView）
+        //   FLIGHT_SUPERVISOR → 原飞行视图（专属视图尚未实现，2026-09-21 用户裁定暂不处理）
         // ⚠️ 此处**不是**登录许可闸，只是**分流**：能走到这里的前提是 AuthController 已放行——
         //    非「QGC 三类身份」的账号在 AuthController.cc 的「QGC 登录角色闸」处就已被拒绝，
         //    且**不会**发出 loginSucceeded，本函数根本不会被调用。
@@ -35,9 +36,21 @@ ApplicationWindow {
         firstRunPromptManager.nextPrompt()
     }
 
+    /// **本函数是全仓唯一的视图分流判据。**
+    ///
+    /// 用户 2026-09-21 裁定「这两个身份不允许重叠，不存在双身份」（真库实测 ATC+RM 双身份 0 人，
+    /// webui 建用户时已做两级角色互斥），故这里是**单身份**分流：两个身份各是一个独立视图，
+    /// 不再像旧版那样把两者合起来判、再由视图内那组「站点／监控员」按钮切换。
+    /// 那两个视图内部都不认识另一个身份——判据副本越少，漂移的机会越少。
+    ///
+    /// ⚠️ 判据用 `hasRole()`（方法）而非 `roles.indexOf()`（属性）：只有**绑定**才需要"读属性"
+    ///    来注册依赖（见 OpsView/RomView 里 `_isSiteATC` 的注释）；本函数是信号回调里的一次性
+    ///    判断，不参与绑定重估，方法调用没有那个坑。
     function _onLoginSucceededForRole() {
-        if (AuthController.hasRole("SITE_ATC") || AuthController.hasRole("ROUTE_MONITOR")) {
+        if (AuthController.hasRole("SITE_ATC")) {
             showOpsView()
+        } else if (AuthController.hasRole("ROUTE_MONITOR")) {
+            showRomView()
         } else {
             showFlyView()
         }
@@ -147,6 +160,7 @@ ApplicationWindow {
         flyView.visible = false
         planView.visible = true
         opsView.visible = false
+        romView.visible = false
         toolDrawer.visible = false
     }
 
@@ -154,6 +168,7 @@ ApplicationWindow {
         flyView.visible = true
         planView.visible = false
         opsView.visible = false
+        romView.visible = false
         toolDrawer.visible = false
     }
 
@@ -161,11 +176,27 @@ ApplicationWindow {
         flyView.visible = false
         planView.visible = false
         opsView.visible = true
+        romView.visible = false
         toolDrawer.visible = false
     }
 
     function hideOpsView() {
         opsView.visible = false
+    }
+
+    /// 航线监控员视图。与 showOpsView 逐行对称——两个身份互斥，任一时刻至多一个可见。
+    /// 不在 showOpsView 里"顺手"写 romView 的显示条件：分流只发生在 _onLoginSucceededForRole，
+    /// 这里只负责显隐。
+    function showRomView() {
+        flyView.visible = false
+        planView.visible = false
+        opsView.visible = false
+        romView.visible = true
+        toolDrawer.visible = false
+    }
+
+    function hideRomView() {
+        romView.visible = false
     }
 
     function showTool(toolTitle, toolSource, toolIcon) {
@@ -352,6 +383,15 @@ ApplicationWindow {
     OpsView {
         id:             opsView
         objectName:     "mainView_ops"
+        anchors.fill:   parent
+        visible:        false
+    }
+
+    // 航线监控员视图，与 OpsView 并列。两者共用 `OpsShell.qml`（地图/命令条/右栏容器/
+    // 底部状态栏/仪器/轮询/HTTP/交接弹框），差异只在数据源参数与右栏内容。
+    RomView {
+        id:             romView
+        objectName:     "mainView_rom"
         anchors.fill:   parent
         visible:        false
     }

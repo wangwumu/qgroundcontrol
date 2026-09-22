@@ -1,21 +1,37 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
-import QtQuick.Window
-import QtLocation
-import QtPositioning
 
 import QGroundControl
 import QGroundControl.Controls
-import QGroundControl.FlightMap
-import QGroundControl.Toolbar
 
-/// @brief 飞行监控主界面（站点操作员 SITE_ATC / 航线监控员 ROUTE_MONITOR）
+import "OpsCommon.js" as OpsCommon
+
+/// @brief 飞行监控主界面 —— **站点操作员（SITE_ATC）视图**
 /// 设计见 docs/qgc/飞行监控主界面设计.md。
-/// 网络层用 QML XMLHttpRequest + AuthController 会话 token（Bearer），
-/// 替代文档 §9 建议的 C++ OpsViewController（功能等价、减少 C++ 层改动）。
-Item {
+///
+/// 骨架/数据源/轮询/命令条/地图/底部状态栏/姿态仪/交接弹框全在 `OpsShell.qml`；
+/// 本文件只写**站点专属**的那部分：机位平面图、出站/进站过滤、起飞/降落/停泊三个飞控动作
+/// 及其红绿确认，并用两个注入槽挂进骨架。
+///
+/// ‼️ 职责边界的判据是"**换个视图还要不要**"：机位、飞控动作、出站/进站只要站点视图要，
+///    就留在本文件。放进骨架会让航线监控员也拿到"能不能起飞"这类判据，而它没有机位上下文
+///    ——那正是两个视图各长一份判据副本、然后静默漂移的起点。
+OpsShell {
     id: opsView
+
+    //-------------------------------------------------------------------------
+    // 骨架输入
+    //-------------------------------------------------------------------------
+    // 数据源参数（吃进 GET /api/ops/overview?view=）。本视图**只**服务站点操作员。
+    // 用户 2026-09-21 裁定两个身份不允许重叠、不存在双身份 ⇒ 监控员不走这里，它是并列的
+    // `RomView.qml`；分流判据只有一处，在 `MainWindow._onLoginSucceededForRole()`。
+    overviewView: "site"
+    // 右栏宽度：按机位图**所需宽**取值（340 ~ 510 = 340×1.5）。510 来自用户给的上限
+    //「宽度不足时右边栏可扩至 1.5 倍」。机位图所需宽由 `_slotDesiredPanelWidth` 回送。
+    rightPanelWidth: _isSiteATC
+                     ? Math.min(_rightPanelMaxW, Math.max(_rightPanelMinW, _slotDesiredPanelWidth))
+                     : _rightPanelMinW
 
     //-------------------------------------------------------------------------
     // 会话与身份
@@ -23,20 +39,10 @@ Item {
     // 读 roles 属性（NOTIFY rolesChanged）而非 hasRole() 方法：方法调用不注册 QML 绑定依赖，
     // 登录后才填充的 roles 不会触发重估 → 视图永不显示。indexOf 读属性值，登录后绑定自动更新。
     readonly property bool  _isSiteATC:      AuthController.roles.indexOf("SITE_ATC") >= 0
-    readonly property bool  _isRouteMon:     AuthController.roles.indexOf("ROUTE_MONITOR") >= 0
-    readonly property bool  _isDual:         _isSiteATC && _isRouteMon   // 双身份并存：可切换子视图
-    property bool           _showSiteView:   true                        // true=站点视图 false=监控员视图
-    readonly property string _apiBase:       AuthController.serverUrl()
-
-    // 供复用组件（FlyViewToolBar 内部 guidedActionMessageDisplay）解析的上下文值，
-    // 与 FlyView 定义保持一致；缺省则其内部 _margins 绑定运行时 ReferenceError。
-    readonly property real  _margins:       ScreenTools.defaultFontPixelWidth / 2
 
     //-------------------------------------------------------------------------
-    // 数据（轮询刷新；JS 数组整体重建以触发 Repeater 更新）
+    // 站点数据（骨架只拉两视图共用的任务/交接；机位是站点专属，挂轮询信号自己拉）
     //-------------------------------------------------------------------------
-    property var  _tasks:          []      // /ops/overview 任务数组（已按角色过滤）
-    property var  _pending:        []      // /handovers/pending 待确认交接数组
     // ‼️ 两个机位集合**刻意分开**，别合并（2026-09-18）：
     //   `_slots`    = 缺省档「**可用**机位」（已核准 ∧ status='FREE'）——**使用面**的唯一来源：
     //                 「指定机位」弹窗的按钮、`_slotById`、`_slotForTask`。维护/故障机位必须不在其中，
@@ -45,41 +51,25 @@ Item {
     // 两档由**后端** `site.go ListSlots` 的参数分流（QGC 侧不做任何过滤，判据全程在后端）。
     property var  _slots:          []      // 本站可用机位（site_id=_mySiteId）
     property var  _slotsAll:       []      // 本站已核准机位（含维护/故障；仅平面图用）
-    property var  _handoverById:   ({})    // task_id -> pending handover
-    property var  _seenHandovers:  []      // 已提示过的 handover id（防重复弹框）
-    property var  _selectedTaskId: -1
-    property var  _confirmHandover: null   // 交接弹框当前对象
     property var  _assignSlotTask: null    // 机位选择弹框当前任务
     property var  _pendingAction:  null    // 红绿确认动作：{kind:"takeoff"|"land"|"park", task}
     property bool  _outbound:      true    // 站点视图勾选：出站
     property bool  _inbound:       true    // 站点视图勾选：进站
-    property int   _now:           Date.now()
-    // 右边栏重构：选中机位 / 降落拦截原因 / 本站站点 id
+    // 右边栏重构：选中机位 / 降落拦截原因
     // 本站站点 id 来自登录响应 role_sites 单值（AuthController.siteId，仅内存），不再从任务反推。
     property var   _selectedSlotId:   -1
     property string _landBlockReason: ""
     property string _assignSlotError: ""      // 指定机位失败原因（slotDialog 展示，成功/重开时清空）
-    property string _handoverActionError: ""  // 交接确认/拒绝/撤回失败提示（handoverDialog 保留可重试）
-    property var   _mySiteId:       AuthController.siteId
-    // 任务卡片之间的竖直间距。**单点定义**：站点视图与监控员视图是两个 ListView，
-    // 但用的是同一个 taskDelegate、看起来必须是同一种卡，间距就得是**同一个值**——
-    // 两处各写一个字面量就是两个"决定者"，改一处忘一处会得到两种疏密
-    //（数值上恰好等于 _slotGap 纯属巧合，别拿它代用：机位间距是另一件事）。
-    property real  _taskCardGap:   6
-    // 任务卡片**左**侧留白：与机位图的左空隙**对齐**（2026-09-17 用户要求"参照机位左侧的空位"；
-    // 机位图侧由 SlotLayout.edgeMargin 承担，两者同源）。
-    // 直接引用 _slotMargin 而不是另抄一个 10 —— 用户要的就是"和机位左空隙一样"，
-    // 所以将来调机位留白时卡片应当跟着对齐，而不是各调各的。
-    property real  _taskCardMargin: _slotMargin
-    // 任务卡片**右**侧留白：就是原代码 `width: ListView.view.width - 20` 里那个 20。
-    // ‼️ 加左空位**不得吃掉它**（用户明确要求"不能挤到右侧的滚动条"）⇒ 左空位是从卡片**宽度**里
-    // 减出来的，不是把卡片整体右移；右边缘位置因此一个像素都不变。
-    // ⚠️ 实测本文件**没有任何 ScrollBar**（`ScrollBar` 在 OpsView.qml 零命中；QGC 用 Qt `Basic`
-    // 风格，该风格也不会给 ListView 自动附加滚动条），所以这 20 到底是给谁留的无法从代码确认
-    // ——按"来历不明的右侧留白"对待，只保持原值、不替它编一个用途。
-    property real  _taskCardRightGap: 20
-    // 机位区四周留白。SlotLayout.edgeMargin 与任务卡片左留白都取本值（单点定义）。
-    property real  _slotMargin:    10
+
+    //-------------------------------------------------------------------------
+    // 布局常量（站点专属部分）
+    //-------------------------------------------------------------------------
+    // 机位区四周留白。与任务卡片左留白**同源**：2026-09-17 用户要求卡片左留白"参照机位左侧的
+    // 空位"，2026-09-18 又要求"机位间隔参照任务列表中两个卡片的间隔"——两者要的其实是同一个数。
+    // ‼️ 该数的**单点定义现在在骨架**（`OpsShell._taskCardMargin`，10），不再是本文件：监控员
+    // 视图也要用它，而监控员没有机位，定义留在这里拆出去的那个视图就够不着了（2026-09-21 拆
+    // RomView 时暴露）。方向仍是"任务卡是源、机位是派生"。
+    property real  _slotMargin:    _taskCardMargin
     // 机位图朝向：N = 上为北（缺省）/ E = 上为东。**只驱动本机位图的投影**，不改动别的任何东西。
     //
     // 落盘复用 QGC 既有的**通用键值接口** `QGroundControl.saveGlobalSetting / loadGlobalSetting`
@@ -107,26 +97,20 @@ Item {
     // 但绑定一旦将来因任何原因被重估，就会把用户**本次会话内**改的朝向悄悄冲回文件里的旧值。
     // 显式赋值把"只在启动时读一次"这件事写死。
     Component.onCompleted: _slotOrient = _loadSlotOrient()
-    // 右边栏宽度：站点视图下按机位图**所需宽**取值（340 ~ 510 = 340×1.5），其余视图恒 340。
-    // 510 来自用户给的上限「宽度不足时右边栏可扩至 1.5 倍」。
-    readonly property real _rightPanelMinW: 340
-    readonly property real _rightPanelMaxW: _rightPanelMinW * 1.5
-    // 姿态仪/罗盘宽度**不随边栏加宽**（恒 340×0.8 = 272）：表盘放大没有信息量，
-    // 而且会连带吃掉机位区的可用高（仪表高 = (宽−12)/2，宽了高也高）。
-    readonly property real _instrBlockW:    _rightPanelMinW * 0.8
     // 站点视图整块（任务列表之上、仪表区之下）的高度；其**一半**是机位图的可用高上限。
     // ‼️ 必须由 rightPanel 与仪表区推出，**不能**直接读 siteViewArea.height —— 那会成环
     //（可用高 → 比例系数 → 卡片高 → 机位簇自然高 → 机位区高 → 可用高），
     // 而改造前的 _slotAreaH 正是那种写法，QML 只能靠"沿用上一轮的值"勉强收敛。
-    readonly property real _siteAreaH:      Math.max(0, rightPanel.height
-                                                     - instrumentsBlock.height
-                                                     - instrumentsBlock._vGap * 2)
+    // 三个被减数由骨架转发（`rightPanel`/`instrumentsBlock` 是骨架的内部 id，本文件看不到）。
+    readonly property real _siteAreaH:      Math.max(0, rightPanelHeight
+                                                     - instrumentsHeight
+                                                     - instrumentsVGap * 2)
     readonly property real _slotAreaMaxH:   _siteAreaH / 2
     // 机位卡片用的视图数据：在机位对象上补三个**呈现字段**
     //（`uav_status` / `uav_status_label` / `slot_status_label`）。
     // 补在这里而不是卡片里，是因为"停放无人机状态"要回退到 overview 的 uav_status
     //（见 _uavStatusForSlot），而那个回退要读 _tasks —— SlotLayout 拿不到、也不该拿到。
-    // 枚举→中文的唯一来源仍是 _uavStatusLabel / _slotStatusLabel（卡片不许出现裸枚举）。
+    // 枚举→中文的唯一来源仍是 OpsCommon.uavStatusLabel / _slotStatusLabel（卡片不许出现裸枚举）。
     //
     // ‼️ 源是 **`_slotsAll`（平面图那一档）**，不是 `_slots`：平面图必须画出维护/故障机位，
     // 否则其余机位的投影相对方位整体错位（用户 2026-09-18 报障，见 SlotLayout.qml 文件头）。
@@ -139,106 +123,34 @@ Item {
             var c = {}
             for (var k in s) c[k] = s[k]      // 整体浅拷贝：将来后端加字段不必回来补这里
             c.uav_status = _uavStatusForSlot(s)
-            c.uav_status_label = _uavStatusLabel(c.uav_status)
+            c.uav_status_label = OpsCommon.uavStatusLabel(c.uav_status)
             c.slot_status_label = _slotStatusLabel(s.status)
             out.push(c)
         }
         return out
     }
-    // 机位图是否在场（SITE_ATC 且处于站点视图）——决定边栏要不要加宽、朝向按钮要不要出现
-    readonly property bool _showSlotLayout: _showSiteView && _isSiteATC
-    property real  _rightPanelW: _showSlotLayout
-                                 ? Math.min(_rightPanelMaxW,
-                                            Math.max(_rightPanelMinW, slotLayout.desiredPanelWidth))
-                                 : _rightPanelMinW
-    // 机位区高 = 机位簇自然高 + 底部留白，**再夹在 _slotAreaMaxH 之内**。
-    // ‼️ 这个 min 不能省：自然高**并不总**被 _slotAreaMaxH 夹住——求解器在"可读下限 lo 压过
-    // 纵向解 sH"时（如 6 机位排成南北一线，maxAreaHeight=304 实测自然高 454）会突破可用高，
-    // 此时若不夹，机位区会取 464px 把整块场地吃掉、上方任务列表只剩 145px。
-    // 夹住之后由 slotFlick 纵向滚动兜底（滚动本来就是这种场面的正解）。
-    // 同时这条 min 也把改造前那条 siteViewArea.height ↔ slotFlick 高度的绑定环去掉了。
-    readonly property real _slotAreaH: Math.min(_slotAreaMaxH, slotLayout.naturalHeight + _slotMargin)
-    // 地图中心跟随：默认跟随首个任务；用户平移地图/点选 marker 后转手动。
-    // 手动中心走属性而非直接赋值 opsMap.center —— 直接赋值会破坏 center 绑定，
-    // 且 2s 轮询（_tasks 重建）会触发绑定重估把地图拽回首个任务（抢占用户视野）。
-    property bool  _mapFollowFirst:  true
-    property var   _mapManualCenter: null
-    // 喂给原版姿态仪/罗盘组件的 mock vehicle：云平台遥测（/ops/overview.latest）需转成
-    // QGC Fact 形（`{rawValue}`），组件 vehicle 为 null 时会显示 0/"OFF"；null 时才不崩，
-    // 故提供完整 Fact 契约对象，随一次轮询重建触发组件内部绑定重估。
-    property var   _mockVehicle:    null
-
-    // 超时/剩余秒阈值（与后端 OPS_HANDOVER_TIMEOUT 联动；显示用）
-    readonly property int _handoverTimeoutSec: 30
-    // 实时遥测判定窗口（6.0-C 失联放行判据）：latest.timestamp 距 _now ≤15s 视为在线
-    readonly property int _liveTelemetryWindowMs: 15000
+    // 机位图是否在场。原先还要 `&& _showSiteView`（双身份可切到监控员子视图，那时机位图不在场）；
+    // 拆出 RomView 后本视图只剩站点一种形态，判据收敛为 `_isSiteATC` 一个条件。
+    // 「机位图在场」直接决定边栏要不要加宽、朝向按钮要不要出现。
+    readonly property bool _showSlotLayout: _isSiteATC
+    // 机位图**所需的右边栏宽**，由右栏内容组件内的 `Binding` 回送（见下方 rightPanelContent）。
+    // ‼️ 不能在骨架里直接读 `slotLayout.desiredPanelWidth`：`slotLayout` 声明在注入的
+    //    `Component` 里，骨架展开它之前那个 id 根本不存在 ⇒ 第一次求值拿到 null、
+    //    此后**没有任何 NOTIFY 会让它重估**，边栏宽就被永久钉死在 340。
+    //    回送到一个普通属性上，依赖就落在"属性变化"这件有信号的事上。
+    property real _slotDesiredPanelWidth: _rightPanelMinW
 
     //-------------------------------------------------------------------------
-    // 轮询：2s 数据 + 1s 时钟（驱动剩余秒/超时红闪）
+    // 轮询：骨架每轮拉完任务/交接后发 polled()，机位在这里自己接
     //-------------------------------------------------------------------------
-    Timer {
-        interval: 2000; repeat: true
-        // 门控：仅 OpsView 可见（MainWindow.showOpsView/hideOpsView 切换）且已登录时轮询，
-        // 避免切走视图/登出后仍在后台拉接口。
-        running: opsView.visible && AuthController.loggedIn
-        onTriggered: _poll()
+    // 顺序与拆分前一致（overview → pending → slots）。
+    onPolled: {
+        _fetchSlots()
+        _fetchSlotsAll()
     }
-    Timer {
-        interval: 1000; repeat: true
-        running: opsView.visible && AuthController.loggedIn
-        onTriggered: _now = Date.now()
-    }
+    // 选中任务（地图 marker 或列表点击都由骨架发）→ 找到停放其无人机的机位，点亮之
+    onTaskSelected: function(task) { _syncSlotForSelection(task) }
 
-    //-------------------------------------------------------------------------
-    // 网络层：XHR + Bearer（仿 PlanUploader 的 Bearer 鉴权方式）
-    //-------------------------------------------------------------------------
-    function _send(method, path, body, onDone) {
-        if (_apiBase === "") {
-            console.warn("OpsView: gcs_server 地址未配置")
-            return
-        }
-        var xhr = new XMLHttpRequest()
-        xhr.open(method, _apiBase + path)
-        xhr.setRequestHeader("Content-Type", "application/json")
-        xhr.setRequestHeader("Authorization", "Bearer " + AuthController.authToken())
-        xhr.onreadystatechange = function() {
-            if (xhr.readyState === XMLHttpRequest.DONE) {
-                var data = null
-                if (xhr.responseText && xhr.responseText.length) {
-                    try { data = JSON.parse(xhr.responseText) } catch (e) { console.warn("OpsView 响应非 JSON:", xhr.responseText) }
-                }
-                onDone(xhr.status, data)
-            }
-        }
-        xhr.send(body ? JSON.stringify(body) : null)
-    }
-    function _get(path, onDone) { _send("GET", path, null, onDone) }
-    function _post(path, body, onDone) { _send("POST", path, body, onDone) }
-
-    //---- 接口封装 ----
-    function _currentView() {
-        // Overview 按视图过滤：双身份并存时随当前子视图切换，单身份固定
-        if (_showSiteView && _isSiteATC) return "site"
-        return "route"
-    }
-    function _fetchOverview() {
-        _get("/api/ops/overview?view=" + _currentView(), function(status, data) {
-            if (status !== 200 || !Array.isArray(data)) { console.warn("OpsView overview", status); return }
-            _tasks = data
-            _updateMockVehicle()
-            // 本站站点 id 由 AuthController.siteId（登录 role_sites 单值）提供，不再从任务 data[i].site_id 反推。
-        })
-    }
-    function _fetchPending() {
-        _get("/api/handovers/pending", function(status, data) {
-            if (status !== 200 || !Array.isArray(data)) { console.warn("OpsView pending", status); return }
-            _pending = data
-            var map = {}
-            for (var i = 0; i < data.length; i++) map[data[i].task_id] = data[i]
-            _handoverById = map
-            _notifyNewPending(data)
-        })
-    }
     function _fetchSlots() {
         if (!_isSiteATC || _mySiteId <= 0) return
         // 使用闸（2026-09-05）：仅**可用**机位作降落/停靠点——过滤判据全程在**后端** ListSlots
@@ -263,50 +175,10 @@ Item {
             else console.warn("OpsView slots(all)", status)
         })
     }
-    function _poll() {
-        if (_apiBase === "") return
-        _fetchOverview()
-        _fetchPending()
-        _fetchSlots()
-        _fetchSlotsAll()      // 平面图那一档（含维护/故障机位）
-    }
 
-    //---- 交接动作 ----
-    // 动作统一成功即 _poll()（乐观刷新按钮态/landing_accepted，防 2s 轮询窗内重复点按 409 噪音）。
-    // 弹框类动作带 onDone(success)：失败返回 false → 调用方保留弹框供重试（防瞬时失败后无入口再确认）。
-    // 404 视为"已被他端处理"＝成功（幂等收口）。
-    function _proposeHandover(taskId, phaseTo) {
-        _post("/api/tasks/" + taskId + "/handover", { phase_to: phaseTo },
-              function(status) {
-                  if (status === 200) _poll()
-                  else console.warn("OpsView propose", status)
-              })
-    }
-    function _acceptHandover(handoverId, onDone) {
-        _post("/api/handovers/" + handoverId + "/accept", null,
-              function(status) {
-                  if (status === 200) _poll()
-                  else console.warn("OpsView accept", status)
-                  if (onDone) onDone(status === 200 || status === 404)
-              })
-    }
-    function _rejectHandover(handoverId, onDone) {
-        _post("/api/handovers/" + handoverId + "/reject", { reason: "" },
-              function(status) {
-                  if (status === 200) _poll()
-                  else console.warn("OpsView reject", status)
-                  if (onDone) onDone(status === 200 || status === 404)
-              })
-    }
-    function _cancelHandover(handoverId, onDone) {
-        _post("/api/handovers/" + handoverId + "/cancel", null,
-              function(status) {
-                  if (status === 200) _poll()
-                  else console.warn("OpsView cancel", status)
-                  if (onDone) onDone(status === 200 || status === 404)
-              })
-    }
-    //---- 机位 / 落地 ----
+    //-------------------------------------------------------------------------
+    // 站点飞控动作（机位 / 起飞 / 降落 / 停泊）
+    //-------------------------------------------------------------------------
     function _assignSlot(taskId, slotId, onDone) {
         _post("/api/tasks/" + taskId + "/assign-slot", { slot_id: slotId },
               function(status, data) {
@@ -368,166 +240,38 @@ Item {
         }
         v.guidedModeLand()
     }
+    // 发出降落指令（6.0-E，LANDING 唯一写路径）：机位空闲校验 → POST /tasks/:id/land（DB→LANDING）→ 引导降落。
+    function _execLand(task) {
+        if (!task) return
+        if (!task.landing_slot_id) { console.warn("OpsView 发出降落指令：未指定降落机位"); return }
+        var tid = task.task_id
+        _get("/api/tasks/" + tid + "/landing-slot-check", function(status, data) {
+            if (status === 200 && data && data.free === true) {
+                _post("/api/tasks/" + tid + "/land", null, function(landStatus, data) {
+                    if (landStatus === 200) {
+                        _guidedLand(task)
+                        _poll()   // 任务→LANDING 后立即刷新列表（按钮转 指定机位/停泊）
+                    } else {
+                        // 透传服务端业务原因（如机位占用/状态已变），避免只显 "HTTP 409" 无法处置
+                        _landBlockReason = qsTr("降落指令下发失败：") +
+                            ((data && (data.error || data.reason)) || ("HTTP " + landStatus))
+                        landBlockDialog.open()
+                        console.warn("OpsView 发出降落指令失败:", landStatus, JSON.stringify(data))
+                    }
+                })
+            } else {
+                _landBlockReason = qsTr("降落校验未通过：") +
+                    ((data && (data.reason || data.error)) || ("HTTP " + status))
+                landBlockDialog.open()
+                console.warn("OpsView 发出降落指令被阻止:", status, JSON.stringify(data))
+            }
+        })
+    }
 
     //-------------------------------------------------------------------------
-    // 派生/过滤
+    // 派生/过滤（站点专属：机位、流向）
     //-------------------------------------------------------------------------
-    function _handoverFor(task) { return task ? _handoverById[task.task_id] : undefined }
-    // 交接派生：某任务是否存在 PENDING phase_to 交接（_handoverById 仅含 pending）；landing_accepted=
-    // 已签入(LANDING)（存在 ACCEPTED phase_to=LANDING 交接；accept 仅管理交接，DB 状态不变，§6.0-E/F）。
-    function _pendingPhase(task, phase) {
-        var h = _handoverFor(task)
-        return !!(h && h.phase_to === phase)
-    }
-    function _landingAccepted(task) { return !!(task && task.landing_accepted) }
-    // 本地报文判定（仅显示/门控，不落库；2026-09-02 触发语义）：
-    // vtol_state=FW(4)=巡航；landed 取 bit0（起降位掩码 bit0=ON_GROUND）；遥测新鲜=latest.timestamp 在窗口内。
-    function _isCruising(task) {
-        var l = task ? task.latest : null
-        return !!(l && Number(l.vtol_state) === 4)
-    }
-    function _isLandedOnGround(task) {
-        var l = task ? task.latest : null
-        return !!(l && (Number(l.landed) & 1) !== 0)
-    }
-    function _hasLiveTelemetry(task) {
-        var l = task ? task.latest : null
-        if (!l || !l.timestamp) return false
-        var ts = Date.parse(l.timestamp)
-        if (isNaN(ts)) return false
-        var age = _now - ts
-        return age <= _liveTelemetryWindowMs && age >= -5000   // 容忍服务器时钟超前 ≤5s
-    }
-    // 出场=本站=起飞点且尚未完成切出：SCHEDULED/READY/TAKEOFF，以及落库 IN_FLIGHT 后 PENDING(ROUTE)
-    // 交接待监控员确认的重叠期（§6.0-F：签出=责任里程碑；确认接管后退出出场）。
-    function _isOutbound(t) {
-        if (t.takeoff_site_id === undefined || t.takeoff_site_id === null) return false
-        if (Number(t.takeoff_site_id) !== Number(_mySiteId)) return false
-        if (t.status === "SCHEDULED" || t.status === "READY" || t.status === "TAKEOFF") return true
-        return t.status === "IN_FLIGHT" && _pendingPhase(t, "ROUTE")
-    }
-    // 入场=本站=降落点：PENDING(LANDING) 待确认 / landing_accepted 已签入待发降落指令 / LANDING 已发降落指令。
-    function _isInbound(t) {
-        return t.landing_site_id !== undefined && t.landing_site_id !== null &&
-               Number(t.landing_site_id) === Number(_mySiteId) &&
-               (t.status === "LANDING" || _pendingPhase(t, "LANDING") || _landingAccepted(t))
-    }
-    function _siteTasks() {
-        var out = []
-        for (var i = 0; i < _tasks.length; i++) {
-            var t = _tasks[i]
-            if (_outbound && _isOutbound(t)) out.push(t)
-            else if (_inbound && _isInbound(t)) out.push(t)
-        }
-        return out
-    }
-    function _routeTasks() { return _tasks }   // overview 已按负责航线过滤 IN_FLIGHT
-    function _taskNo(task) { return task ? (task.uav_no ? task.uav_no : task.task_no) : "—" }
-    function _statusLabel(s) {
-        switch (s) {
-        case "SCHEDULED": return "待起飞"; case "READY": return "就绪"; case "TAKEOFF": return "起飞中"
-        case "IN_FLIGHT": return "航线中"; case "LANDING": return "降落中"; case "COMPLETED": return "已完成"
-        case "ABORT": return "中止"; case "FAILED": return "异常"; default: return s
-        }
-    }
-    // 状态文字 = task.status + 本地报文判定叠加（仅显示不落库，2026-09-02 触发语义）：
-    // task TAKEOFF 且 vtol_state=FW(4) → "飞行中"；task LANDING 且 landed bit0(ON_GROUND) → "已落地"。
-    function _displayStatus(task) {
-        if (!task) return "—"
-        var l = task.latest
-        if (task.status === "TAKEOFF" && l && Number(l.vtol_state) === 4) return qsTr("飞行中")
-        if (task.status === "LANDING" && l && (Number(l.landed) & 1) !== 0) return qsTr("已落地")
-        // IN_FLIGHT 阶段文案，与按钮重键一致（§6.0-E/F）：待监控员接管 / 待接收降落 / 已签入待发降落指令
-        if (task.status === "IN_FLIGHT") {
-            if (_pendingPhase(task, "ROUTE")) return qsTr("待接管")
-            if (_pendingPhase(task, "LANDING")) return qsTr("待降落")
-            if (_landingAccepted(task)) return qsTr("待发降落")
-        }
-        return _statusLabel(task.status)
-    }
-    function _phaseToLabel(p) { return p === "ROUTE" ? "航线监控" : p === "LANDING" ? "降落指挥" : p }
-    // 判定函数一律返回**真 bool**（`!!` 不可省）：返回 undefined 会让调用点的 `A && B`
-    // 短路求值成 undefined，而 QML 把 undefined 当成「这个绑定没有值」，属性退回**默认值**——
-    // `visible`/`enabled` 的默认值都是 true，于是无交接的任务反而长出「撤回交接」按钮（见 :1110）。
-    function _isMine(handover) { return !!(handover && handover.proposed_by === AuthController.userId) }
-    // deadline_at 由后端以 UTC 裸串落库/返回（time.Now().UTC().Format("2006-01-02 15:04:05")，无 T/时区标记）；
-    // ECMAScript 对无时区串按本地时区解析（中国 CST=UTC+8 → 会提前 8h 判"超时"）。此处补 'T' 与 'Z' 使其按 UTC
-    // 解析，与后端 datetime('now') 比较口径及遥测 timestamp（RFC3339 带 Z）一致；已是 ISO+时区则原样放行。
-    function _deadlineMs(handover) {
-        var s = handover ? handover.deadline_at : ""
-        if (!s) return NaN
-        if (s.indexOf("T") < 0) s = s.replace(" ", "T")
-        if (s.indexOf("Z") < 0 && !/[+-]\d{2}:\d{2}$/.test(s) && !/[+-]\d{4}$/.test(s)) s += "Z"
-        return Date.parse(s)
-    }
-    function _remainingSec(handover) {
-        if (!handover || !handover.deadline_at) return ""
-        var deadline = _deadlineMs(handover)
-        if (isNaN(deadline)) return ""
-        var sec = Math.ceil((deadline - _now) / 1000)
-        return sec > 0 ? sec + "s" : "超时"
-    }
-    function _isTimeout(handover) {
-        if (!handover || !handover.deadline_at) return false
-        var deadline = _deadlineMs(handover)
-        return !isNaN(deadline) && _now > deadline
-    }
-    function _notifyNewPending(list) {
-        for (var i = 0; i < list.length; i++) {
-            var h = list[i]
-            if (_seenHandovers.indexOf(h.handover_id) >= 0) continue
-            _seenHandovers.push(h.handover_id)
-            if (_seenHandovers.length > 200) _seenHandovers.shift()   // 防长会话无界增长（缓慢内存泄漏）
-            _handoverActionError = ""
-            _confirmHandover = h
-            handoverDialog.open()
-        }
-    }
-    // 地图中心：首个有效任务坐标，否则全局设置位置兜底
-    function _firstTaskCoord() {
-        for (var i = 0; i < _tasks.length; i++) {
-            var t = _tasks[i]
-            if (t.latest && t.latest.lat) return QtPositioning.coordinate(t.latest.lat, t.latest.lon)
-            if (t.waypoints && t.waypoints.length) return QtPositioning.coordinate(t.waypoints[0].lat, t.waypoints[0].lon)
-        }
-        return null
-    }
-    function _statusColor(t) {
-        var s = t ? t.status : ""
-        if (_isTimeout(_handoverFor(t))) return "#ff3b3b"
-        var l = t ? t.latest : null
-        // 已落地（本地报文 landed bit0，显示态）→ 绿；飞行中叠加态沿用黄色
-        if (s === "LANDING" && l && (Number(l.landed) & 1) !== 0) return "#2ecc71"
-        switch (s) {
-        case "TAKEOFF": case "IN_FLIGHT": case "LANDING": return "#ffc107"
-        case "COMPLETED": return "#2ecc71"
-        case "ABORT": case "FAILED": return "#ff3b3b"
-        default: return "#3b9cff"
-        }
-    }
-    // 任务性质：本站相对航线的角色（起飞点→出场，降落点→入场）
-    function _taskNature(t) {
-        if (!t) return "—"
-        if (t.takeoff_site_id !== undefined && Number(t.takeoff_site_id) === Number(_mySiteId)) return qsTr("出场")
-        if (t.landing_site_id !== undefined && Number(t.landing_site_id) === Number(_mySiteId)) return qsTr("入场")
-        return "—"
-    }
-    // 航线性质：固定/临时。暂假定固定；后端 overview 已带 route_type（协议保留状态位），空回退"固定"。
-    function _routeNature(t) {
-        var rt = t ? t.route_type : ""
-        if (/temporary|temp/i.test(rt)) return qsTr("临时")
-        return qsTr("固定")
-    }
-    // 机位状态文案；未知/空回退原样或 "—"（表字段可扩展）
-    function _uavStatusLabel(s) {
-        switch (s) {
-        case "PARKED": return "已停放"; case "PREFLIGHT": return "准备中"; case "READY_TO_TAKEOFF": return "待飞"; case "TAKEOFF": return "起飞中"; case "IN_FLIGHT": return "飞行中"
-        case "RETURNING": return "返航中"; case "DIVERTED": return "备降"; case "EMERGENCY_LANDING": return "迫降"; case "LANDING": return "降落中"; case "LANDED": return "已落地"
-        case "PARKED_YARD": return "停放场"
-        default: return s || "—"
-        }
-    }
-    // **机位**状态文案（≠ 上面的无人机状态；占用与否由 `current_uav_id` 派生，不是机位状态）。
+    // **机位**状态文案（≠ 无人机状态；占用与否由 `current_uav_id` 派生，不是机位状态）。
     // 取值域 = `table_slot.status`，后端白名单单点在 `handlers/site.go` 的 `validSlotStatus`
     //（FREE / MAINTENANCE / FAULT）——三值三译名必须与 webui `src/utils/statusLabels.js` 的
     // `SLOT_STATUS_LABELS` **逐字对齐**（那边是同一个界面的另一个端，措辞漂了就对不上）。
@@ -549,12 +293,6 @@ Item {
                 if (_tasks[i].uav_id === slot.current_uav_id) return _tasks[i].uav_status || ""
         }
         return ""
-    }
-    function _formatPlanTakeoff(t) {
-        if (!t || !t.plan_takeoff_at) return "—"
-        var d = new Date(t.plan_takeoff_at)
-        if (isNaN(d.getTime())) return t.plan_takeoff_at
-        return d.toLocaleTimeString(Qt.locale(), "HH:mm")
     }
     // ⚠️ 只查**使用面** `_slots`（可用机位）：调用它的都是"能不能在这个机位起降/停靠"的判断，
     // 平面图里那些维护/故障机位不该在这里被找到。
@@ -641,100 +379,21 @@ Item {
     // 同时**删去**「有 takeoff_slot_id 则须与当前机位一致」的比对：05 §3.3 已于 2026-09-13
     // 令删除（该列是实际值快照、起飞时才写，拿它比对会造出"实际停 A、任务写 B ⇒ 拒绝起飞"的伪冲突）。
     function _canTakeoff(task) {
-        if (!task || !_isOutbound(task)) return false
+        if (!task || !OpsCommon.isOutbound(task, _mySiteId, _handoverById)) return false
         if (task.status !== "SCHEDULED" && task.status !== "READY") return false
         if (!task.uav_id || !task.uav_current_slot_id) return false
         if (task.uav_status !== "READY_TO_TAKEOFF") return false
         if (!_uavOnline(task)) return false
         return true
     }
-    // 发出降落指令（6.0-E，LANDING 唯一写路径）：机位空闲校验 → POST /tasks/:id/land（DB→LANDING）→ 引导降落。
-    function _execLand(task) {
-        if (!task) return
-        if (!task.landing_slot_id) { console.warn("OpsView 发出降落指令：未指定降落机位"); return }
-        var tid = task.task_id
-        _get("/api/tasks/" + tid + "/landing-slot-check", function(status, data) {
-            if (status === 200 && data && data.free === true) {
-                _post("/api/tasks/" + tid + "/land", null, function(landStatus, data) {
-                    if (landStatus === 200) {
-                        _guidedLand(task)
-                        _poll()   // 任务→LANDING 后立即刷新列表（按钮转 指定机位/停泊）
-                    } else {
-                        // 透传服务端业务原因（如机位占用/状态已变），避免只显 "HTTP 409" 无法处置
-                        _landBlockReason = qsTr("降落指令下发失败：") +
-                            ((data && (data.error || data.reason)) || ("HTTP " + landStatus))
-                        landBlockDialog.open()
-                        console.warn("OpsView 发出降落指令失败:", landStatus, JSON.stringify(data))
-                    }
-                })
-            } else {
-                _landBlockReason = qsTr("降落校验未通过：") +
-                    ((data && (data.reason || data.error)) || ("HTTP " + status))
-                landBlockDialog.open()
-                console.warn("OpsView 发出降落指令被阻止:", status, JSON.stringify(data))
-            }
-        })
-    }
 
-    //-------------------------------------------------------------------------
-    // 顶部命令条：原样复用原主界面（FlyView）的 FlyViewToolBar —— Q 标（☰）打开完整
-    // 工具菜单（mainWindow.showToolSelectDialog），含主状态/飞行模式/遥测指示器等原始
-    // 部件。自定义工具（操作员名/出站进站/双身份切换/锁屏/全屏）叠加在命令条中间空白区，
-    // 不再单开右侧栏（原版中间区无 GuidedActionConfirm 时为空，可安全叠放）。
-    //-------------------------------------------------------------------------
-    Item {
-        id: commandBarWrap
-        anchors { top: parent.top; left: parent.left; right: parent.right }
-        height: ScreenTools.toolbarHeight
-        opacity: 0.8
-        z: 100
-
-        FlyViewToolBar {
-            id:                 commandBar
-            anchors.fill:       parent
-            // OpsView 无引导动作滑杆；GuidedActionConfirm 仅在有引导动作时才显示，置 null 安全
-            guidedValueSlider:  null
-        }
-
-        // 自定义工具——靠右停放（操作员名 + 出站/进站勾选 + 双身份切换），
-        // 锚到最右侧全屏/锁屏按钮组的左边。外层加深色圆角底条，
-        // 保证白色文字/白色对勾在命令条浅底上清晰可见。
-        Rectangle {
-            id: extrasBar
-            anchors { right: commandBarWindowButtons.left; rightMargin: 12; verticalCenter: parent.verticalCenter }
-            height: ScreenTools.defaultFontPixelHeight * 3
-            width: commandBarExtras.width + 24
-            radius: 6
-            color: "transparent"
-
-            Row {
-                id: commandBarExtras
-                anchors.left: parent.left; anchors.leftMargin: 12
-                anchors.verticalCenter: parent.verticalCenter
-                spacing: 18
-                visible: AuthController.loggedIn
-
-                // 当前日期时间（中国习惯 yyyy年MM月dd日 hh:mm:ss），每秒刷新
-                property date nowTime: new Date()
-                Timer {
-                    interval: 1000; repeat: true; running: AuthController.loggedIn
-                    onTriggered: commandBarExtras.nowTime = new Date()
-                }
-
-            Text {
-                anchors.verticalCenter: parent.verticalCenter
-                color: "#e6edf7"
-                font.pixelSize: 13; font.bold: true
-                text: qsTr("操作员：") + (AuthController.displayName !== "" ? AuthController.displayName : AuthController.currentUser)
-            }
-
-            // 当前年月日时分秒（操作员与出站之间）
-            Text {
-                anchors.verticalCenter: parent.verticalCenter
-                color: "#e6edf7"
-                font.pixelSize: 13; font.bold: true
-                text: Qt.formatDateTime(commandBarExtras.nowTime, "yyyy年MM月dd日 hh:mm:ss")
-            }
+    //=========================================================================
+    // 注入槽 ①：命令条中段扩展区（骨架把它塞进命令条那行 Row 的末尾）
+    //=========================================================================
+    commandBarExtras: Component {
+        // 根项是 `Row`：外层 Row 的 `spacing: 18` 同时作用于"时间↔本扩展区"与下面三组之间。
+        Row {
+            spacing: 18
 
             // 出站/进站勾选（站点操作员；控制右侧列表过滤）
             //
@@ -746,13 +405,13 @@ Item {
             Row {
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: 6
-                visible: _isSiteATC
+                visible: opsView._isSiteATC
                 CheckBox {
                     id: outboundCheck
                     anchors.verticalCenter: parent.verticalCenter
                     text: qsTr("出站")
-                    checked: _outbound
-                    onToggled: _outbound = checked
+                    checked: opsView._outbound
+                    onToggled: opsView._outbound = checked
                     // 文字用 QGCCheckBox 的 textColor 不生效（palette.text 无效），
                     // 直接覆盖 contentItem 为白色 Text（兼容 Qt/QGC 两种 CheckBox）
                     contentItem: Text {
@@ -783,8 +442,8 @@ Item {
                     id: inboundCheck
                     anchors.verticalCenter: parent.verticalCenter
                     text: qsTr("进站")
-                    checked: _inbound
-                    onToggled: _inbound = checked
+                    checked: opsView._inbound
+                    onToggled: opsView._inbound = checked
                     // 文字用 QGCCheckBox 的 textColor 不生效（palette.text 无效），
                     // 直接覆盖 contentItem 为白色 Text（兼容 Qt/QGC 两种 CheckBox）
                     contentItem: Text {
@@ -813,12 +472,12 @@ Item {
 
             // 机位图朝向：北（上为北）/ 东（上为东）。样式与"双身份切换"同一套（56×22、
             // radius 3、选中 #2f6bd8、未选中描边 #9aa7bd），两个并排的切换组才不会看起来是两种控件。
-            // ⚠️ 两个按钮的文案**不是枚举**（"N"/"E" 只活在代码里），故不需要走 _uavStatusLabel 那类映射。
+            // ⚠️ 两个按钮的文案**不是枚举**（"N"/"E" 只活在代码里），故不需要走 uavStatusLabel 那类映射。
             Row {
                 anchors.verticalCenter: parent.verticalCenter   // 见上：本 Row 比勾选框矮 24px
                 spacing: 4
                 // 只在机位图真的在场时出现：监控员视图里没有机位图，切了也没有东西会转
-                visible: _showSlotLayout
+                visible: opsView._showSlotLayout
                 Text {
                     anchors.verticalCenter: parent.verticalCenter
                     color: "#8fa1bd"; font.pixelSize: 11
@@ -829,11 +488,15 @@ Item {
                     Rectangle {
                         width: 56; height: 22
                         radius: 3
-                        color: (_slotOrient === (index === 0 ? "N" : "E")) ? "#2f6bd8" : "transparent"
+                        color: (opsView._slotOrient === (index === 0 ? "N" : "E")) ? "#2f6bd8" : "transparent"
                         border.color: "#9aa7bd"; border.width: 1
                         Text {
                             anchors.centerIn: parent
-                            color: (_slotOrient === (index === 0 ? "N" : "E")) ? "#ffffff" : "#5c6b84"
+                            // 选中/未选中**都是白字**（用户 2026-09-21 裁定：「图标东在没有选中的情况下，
+                            // 也显示白色，不然看不到字」）。原先未选中用 #5c6b84，压在本命令条那层透明
+                            // 背景（直接透出地图）上实测只有 **1.72:1**，肉眼只剩一个空框。
+                            // 状态差异改由**底色**（选中 #2f6bd8）与**框线**表达，文字不再承担状态编码。
+                            color: "#ffffff"
                             font.pixelSize: 11
                             text: modelData
                         }
@@ -843,513 +506,133 @@ Item {
                             // 改状态与落盘必须成对出现：只改状态 ⇒ 本次会话生效、重启回落；
                             // 只落盘 ⇒ 界面当场不变。两句写在一起，别拆到别的信号里。
                             onClicked: {
-                                _slotOrient = (index === 0 ? "N" : "E")
-                                QGroundControl.saveGlobalSetting(_slotOrientSettingsKey, _slotOrient)
+                                opsView._slotOrient = (index === 0 ? "N" : "E")
+                                QGroundControl.saveGlobalSetting(opsView._slotOrientSettingsKey, opsView._slotOrient)
                             }
                         }
                     }
                 }
             }
 
-            // 双身份切换（仅 SITE_ATC+ROUTE_MONITOR 并存时）
-            Row {
-                anchors.verticalCenter: parent.verticalCenter   // 同上：不加会被落在顶上（它原本与"机位"组同高，故一起偏）
-                spacing: 4
-                visible: _isDual
-                Repeater {
-                    model: [qsTr("站点"), qsTr("监控员")]
-                    Rectangle {
-                        width: 56; height: 22
-                        radius: 3
-                        color: (_showSiteView === (index === 0)) ? "#2f6bd8" : "transparent"
-                        border.color: "#9aa7bd"; border.width: 1
-                        Text {
-                            anchors.centerIn: parent
-                            color: (_showSiteView === (index === 0)) ? "#ffffff" : "#5c6b84"
-                            font.pixelSize: 11
-                            text: modelData
-                        }
-                        MouseArea {
-                            anchors.fill: parent
-                            onClicked: _showSiteView = (index === 0)
-                        }
-                    }
-                }
-            }
-
-        }
-        }
-
-        // 窗口控制（全屏/锁屏）靠屏幕右侧——与 Q 图标同组件（QGCToolBarButton logo:true）
-        // 同尺寸契约（icon 高 = defaultFontPixelHeight*2，按钮高 = 3×行高），透明背景 SVG 徽标。
-        Row {
-            id: commandBarWindowButtons
-            anchors { right: parent.right; rightMargin: 6; verticalCenter: parent.verticalCenter }
-            spacing: 4
-            visible: AuthController.loggedIn
-
-            QGCToolBarButton {
-                anchors.verticalCenter: parent.verticalCenter
-                icon.source:  "/res/OpsFullScreen.svg"
-                logo:         true
-                onClicked: {
-                    if (mainWindow.visibility === Window.FullScreen) mainWindow.showNormal()
-                    else mainWindow.showFullScreen()
-                }
-            }
-            QGCToolBarButton {
-                anchors.verticalCenter: parent.verticalCenter
-                icon.source:  "/res/OpsLockScreen.svg"
-                logo:         true
-                onClicked:    AuthController.lockScreen()
-            }
+            // 双身份切换控件（「站点／监控员」那组）**已删除**（2026-09-21）：
+            // 用户裁定两个身份不允许重叠、不存在双身份，webui 建用户时已做两级角色互斥，
+            // 故这组按钮永远不可见。视图分流改由 `MainWindow._onLoginSucceededForRole()` 承担，
+            // 监控员是并列的 `RomView.qml`。此处不再保留——留着就是一份会漂移的死判据。
         }
     }
 
-    //-------------------------------------------------------------------------
-    // 主体：左侧地图+仪表（flex:1） / 右侧边栏（~340px）
-    //-------------------------------------------------------------------------
-    Item {
-        id: body
-        anchors.fill: parent
-
-        //---- 左侧：地图 ----
-        FlightMap {
-            id: opsMap
+    //=========================================================================
+    // 注入槽 ②：右栏中段（顶部=右栏顶、底部=姿态仪之上、左右=右栏两侧）
+    //=========================================================================
+    rightPanelContent: Component {
+        ColumnLayout {
             anchors.fill: parent
-            allowGCSLocationCenter:     false
-            allowVehicleLocationCenter: false
-            planView:                   false
-            zoomLevel:                  _tasks.length ? 14 : QGroundControl.flightMapInitialZoom
-            center:                     _mapFollowFirst && _firstTaskCoord() !== null
-                                        ? _firstTaskCoord()
-                                        : (_mapManualCenter !== null
-                                           ? _mapManualCenter
-                                           : (QGroundControl.flightMapPosition.isValid
-                                              ? QGroundControl.flightMapPosition
-                                              : QtPositioning.coordinate(31.2, 121.5)))
-            // 用户平移地图：先冻结当前中心（此时仍=跟随值，无跳变）再退出跟随，
-            // 顺序不可颠倒（先退跟随会回落到 GCS 位置兜底，画面跳变）。
-            onMapPanStart: { _mapManualCenter = opsMap.center; _mapFollowFirst = false }
-            onMapPanStop:  { _mapManualCenter = opsMap.center }
+            spacing: 0
 
-            // 航路（全部任务 waypoints 连线）
-            Repeater {
-                model: _tasks
-                delegate: MapPolyline {
-                    line.width: 2
-                    line.color: "#00bfff"
-                    path: modelData.waypoints ? modelData.waypoints.map(
-                              function(wp) { return QtPositioning.coordinate(wp.lat, wp.lon) }) : []
-                }
-            }
-
-            // 无人机 marker
-            Repeater {
-                model: _tasks
-                delegate: MapQuickItem {
-                    visible: modelData.latest && modelData.latest.lat ? true : false
-                    coordinate: modelData.latest && modelData.latest.lat
-                                ? QtPositioning.coordinate(modelData.latest.lat, modelData.latest.lon)
-                                : QtPositioning.coordinate(0, 0)
-                    anchorPoint: Qt.point(12, 12)
-                    sourceItem: Rectangle {
-                        width: 24; height: 24; radius: 12
-                        color: _statusColor(modelData)
-                        border.color: "#ffffff"; border.width: 2
-                        Text {
-                            anchors.centerIn: parent
-                            color: "#ffffff"; font.pixelSize: 10; font.bold: true
-                            text: String(index + 1)
-                        }
-                        MouseArea {
-                            anchors.fill: parent
-                            onClicked: {
-                                _selectedTaskId = modelData.task_id
-                                _syncSlotForSelection(modelData)
-                                // 走属性更新中心（而非直接赋值 opsMap.center）：保留绑定，
-                                // 防止后续轮询/再次点击时中心被不期望地覆盖或绑定失效
-                                _mapFollowFirst = false
-                                _mapManualCenter = QtPositioning.coordinate(modelData.latest.lat, modelData.latest.lon)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        //---- 右侧边栏 ----
-        Rectangle {
-            id: rightPanel
-            anchors { top: parent.top; topMargin: ScreenTools.toolbarHeight; bottom: parent.bottom; right: parent.right }
-            // 宽度不再是常量：站点视图下随机位图所需宽在 340~510 之间伸缩（见 _rightPanelW）。
-            // 地图是 anchors.fill 铺满的，边栏变宽只是多盖住一点地图，不改变地图自身的尺寸。
-            width: _rightPanelW
-            color: QGroundControl.globalPalette.windowTransparent
-            opacity: 0.8
-
-            // 姿态仪 + 罗盘：右边栏最下方，宽度自适应右边栏宽度，高度随宽等比缩放。
+            // 站点视图（SITE_ATC）：上部任务列表 + 下部两列机位（从底向上，高≤本区一半）
             Item {
-                id: instrumentsBlock
-                // 上（场地↔仪表）/下（仪表↔窗口底）各留仪表高度 1/20 的空隙
-                readonly property real _vGap: height / 20
-                anchors { horizontalCenter: parent.horizontalCenter; bottom: parent.bottom; bottomMargin: _vGap }
-                // ‼️ 不跟 parent.width：边栏加到 510 时表盘仍恒 272（见 _instrBlockW）
-                width: _instrBlockW
-                height: (instrumentsBlock.width - 12) / 2
+                id: siteViewArea
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                visible: opsView._isSiteATC
+                clip: true
 
-                QGCAttitudeWidget {
-                    id: attitudeWidget
-                    anchors.left: parent.left
-                    anchors.verticalCenter: parent.verticalCenter
-                    size: (instrumentsBlock.width - 12) / 2
-                    vehicle: _mockVehicle
+                // 机位图**所需右边栏宽**回送给视图（右栏宽由骨架持有，而 `slotLayout` 只活在本
+                // 组件里）。见 `_slotDesiredPanelWidth` 的注释：跨出去直接读会在展开前拿到一次
+                // null 且永不重估。Binding 非可视化对象，不参与下面的布局。
+                Binding {
+                    target: opsView
+                    property: "_slotDesiredPanelWidth"
+                    value: slotLayout.desiredPanelWidth
                 }
-                QGCCompassWidget {
-                    id: compassWidget
-                    anchors.left: attitudeWidget.right
-                    anchors.leftMargin: 12
-                    anchors.verticalCenter: parent.verticalCenter
-                    size: (instrumentsBlock.width - 12) / 2
-                    vehicle: _mockVehicle
-                }
-            }
 
-            ColumnLayout {
-                anchors { top: parent.top; bottom: instrumentsBlock.top; bottomMargin: instrumentsBlock._vGap; left: parent.left; right: parent.right }
-                spacing: 0
-
-                // 站点视图（SITE_ATC）：上部任务列表 + 下部两列机位（从底向上，高≤本区一半）
-                Item {
-                    id: siteViewArea
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    visible: _showSiteView && _isSiteATC
-                    clip: true
-                    ColumnLayout {
-                        anchors.fill: parent
-                        spacing: 0
-                        // ── 上部：任务列表（吃掉机位之外的剩余高度）──
-                        ListView {
-                            Layout.fillWidth: true
-                            Layout.fillHeight: true
-                            clip: true
-                            model: _siteTasks()
-                            delegate: taskDelegate
-                            // 左空位（委托宽度里已为它预留，见 taskDelegate）
-                            leftMargin: _taskCardMargin
-                            // 卡片间距：不留缝时相邻两张卡各自 1px 的描边直接贴合，
-                            // 看上去是连成一片的一张卡（选中态那道亮蓝描边尤其明显）。
-                            spacing: _taskCardGap
-                        }
-                        // ── 下部：机位（按经纬度投影、贴底、装不下时可滚动）──
-                        Flickable {
-                            id: slotFlick
-                            Layout.fillWidth: true
-                            Layout.preferredHeight: _slotAreaH
-                            Layout.maximumHeight: _slotAreaH
-                            clip: true
-                            // 横向：机位簇比可见宽更宽时（可读下限撑破了边栏）才真的能滚；
-                            // 纵向：同样只是在自然高被 _slotAreaMaxH 夹住时才滚。都是兜底，不是常态。
-                            contentWidth: Math.max(slotLayout.naturalWidth + _slotMargin * 2, width)
-                            contentHeight: Math.max(slotLayout.naturalHeight + _slotMargin, height)
-                            boundsBehavior: Flickable.StopAtBounds
-                            Column {
-                                // 顶部弹性空白：机位少时把机位簇推到最底部（用户要求"机位靠下显示"）
-                                Item {
-                                    width: 1
-                                    height: Math.max(0, slotFlick.height
-                                                        - slotLayout.naturalHeight - _slotMargin)
-                                }
-                                SlotLayout {
-                                    id: slotLayout
-                                    // ‼️ 宽度只由容器给，**不要**写成 max(naturalWidth, 容器宽)：
-                                    // naturalWidth 依赖 width（求解比例系数要用可用宽）⇒ 成环。
-                                    // 溢出交给外面 Flickable 的 contentWidth 表达。
-                                    width: slotFlick.width
-                                    height: slotLayout.naturalHeight
-                                    edgeMargin: _slotMargin
-                                    // 机位间隔 = 任务列表两张卡之间的间隔（用户 2026-09-18：
-                                    // 「间隔参照任务列表中两个卡片的间隔」）。**单点定义**在
-                                    // `_taskCardGap`，这里只绑、不另写字面量。
-                                    fixedGap: _taskCardGap
-                                    orient: _slotOrient
-                                    slots: _slotsMapView
-                                    maxAreaHeight: _slotAreaMaxH
-                                    selectedSlotId: _selectedSlotId
-                                    panelMinWidth: _rightPanelMinW
-                                    panelMaxWidth: _rightPanelMaxW
-                                    onSlotClicked: function (slotId) { _selectSlot(slotId) }
-                                }
+                ColumnLayout {
+                    anchors.fill: parent
+                    spacing: 0
+                    // ── 上部：任务列表（吃掉机位之外的剩余高度）──
+                    TaskListPanel {
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        tasks: OpsCommon.siteTasks(opsView._tasks, opsView._outbound, opsView._inbound,
+                                                   opsView._mySiteId, opsView._handoverById)
+                        handoverById: opsView._handoverById
+                        nowMs: opsView._now
+                        mySiteId: opsView._mySiteId
+                        selectedTaskId: opsView._selectedTaskId
+                        showSiteActions: opsView._isSiteATC
+                        isRouteMonitor: false
+                        cardMargin: opsView._taskCardMargin
+                        cardRightGap: opsView._taskCardRightGap
+                        cardGap: opsView._taskCardGap
+                        liveTelemetryWindowMs: opsView._liveTelemetryWindowMs
+                        canTakeoffFn: opsView._canTakeoff
+                        takeoffBlockReasonFn: opsView._takeoffBlockReason
+                        // 点整项：选中任务 + 同步点亮对应机位（骨架负责写 _selectedTaskId）
+                        onTaskSelected: function(task) { opsView.selectTask(task) }
+                        onTakeoffRequested: function(task) { opsView._pendingAction = {kind:"takeoff", task:task}; actionConfirmDialog.open() }
+                        onLandRequested: function(task) { opsView._pendingAction = {kind:"land", task:task}; actionConfirmDialog.open() }
+                        onParkRequested: function(task) { opsView._pendingAction = {kind:"park", task:task}; actionConfirmDialog.open() }
+                        onAssignSlotRequested: function(task) { opsView._assignSlotError = ""; opsView._assignSlotTask = task; slotDialog.open() }
+                        onHandoverProposed: function(taskId, phase) { opsView._proposeHandover(taskId, phase) }
+                        onHandoverCancelRequested: function(handoverId) { opsView._cancelHandover(handoverId) }
+                    }
+                    // ── 下部：机位（按经纬度投影、贴底、装不下时可滚动）──
+                    Flickable {
+                        id: slotFlick
+                        Layout.fillWidth: true
+                        // = min(可用高上限, 机位簇自然高 + 底部留白)。原本是视图上的 `_slotAreaH`，
+                        // 因 `slotLayout` 只活在本组件内（见上）而就地展开——`_slotAreaMaxH` 仍来自
+                        // 骨架转发的 rightPanel/instrumentsBlock 尺寸，故那条"不许读 siteViewArea.height"
+                        // 的防成环纪律原样保留。这个 min 也不能省：自然高**并不总**被 _slotAreaMaxH 夹住
+                        //（求解器在"可读下限 lo 压过纵向解 sH"时会突破可用高，如 6 机位排成南北一线，
+                        // maxAreaHeight=304 实测自然高 454），此时若不夹，机位区会取 464px 把整块场地吃掉、
+                        // 上方任务列表只剩 145px。夹住之后由本 Flickable 纵向滚动兜底（滚动本来就是正解）。
+                        readonly property real _areaH: Math.min(opsView._slotAreaMaxH,
+                                                                slotLayout.naturalHeight + opsView._slotMargin)
+                        Layout.preferredHeight: slotFlick._areaH
+                        Layout.maximumHeight: slotFlick._areaH
+                        clip: true
+                        // 横向：机位簇比可见宽更宽时（可读下限撑破了边栏）才真的能滚；
+                        // 纵向：同样只是在自然高被 _slotAreaMaxH 夹住时才滚。都是兜底，不是常态。
+                        contentWidth: Math.max(slotLayout.naturalWidth + opsView._slotMargin * 2, width)
+                        contentHeight: Math.max(slotLayout.naturalHeight + opsView._slotMargin, height)
+                        boundsBehavior: Flickable.StopAtBounds
+                        Column {
+                            // 顶部弹性空白：机位少时把机位簇推到最底部（用户要求"机位靠下显示"）
+                            Item {
+                                width: 1
+                                height: Math.max(0, slotFlick.height
+                                                    - slotLayout.naturalHeight - opsView._slotMargin)
+                            }
+                            SlotLayout {
+                                id: slotLayout
+                                // ‼️ 宽度只由容器给，**不要**写成 max(naturalWidth, 容器宽)：
+                                // naturalWidth 依赖 width（求解比例系数要用可用宽）⇒ 成环。
+                                // 溢出交给外面 Flickable 的 contentWidth 表达。
+                                width: slotFlick.width
+                                height: slotLayout.naturalHeight
+                                edgeMargin: opsView._slotMargin
+                                // 机位间隔 = 任务列表两张卡之间的间隔（用户 2026-09-18：
+                                // 「间隔参照任务列表中两个卡片的间隔」）。**单点定义**在
+                                // `OpsCommon.taskCardGap`，这里只绑、不另写字面量。
+                                fixedGap: opsView._taskCardGap
+                                orient: opsView._slotOrient
+                                slots: opsView._slotsMapView
+                                maxAreaHeight: opsView._slotAreaMaxH
+                                selectedSlotId: opsView._selectedSlotId
+                                panelMinWidth: opsView._rightPanelMinW
+                                panelMaxWidth: opsView._rightPanelMaxW
+                                onSlotClicked: function (slotId) { opsView._selectSlot(slotId) }
                             }
                         }
                     }
                 }
-
-                // 监控员视图（ROUTE_MONITOR）
-                Item {
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    visible: (!_showSiteView || !_isSiteATC) && _isRouteMon
-                    clip: true
-                    ColumnLayout {
-                        anchors.fill: parent
-                        spacing: 0
-                        Text {
-                            Layout.fillWidth: true
-                            Layout.leftMargin: 12; Layout.topMargin: 10
-                            color: "#8fa1bd"; font.pixelSize: 12; font.bold: true
-                            text: qsTr("负责航线 · 执行中")
-                        }
-                        ListView {
-                            Layout.fillWidth: true
-                            Layout.fillHeight: true
-                            // 横向留白一律交给委托（_taskCardMargin / _taskCardRightGap）单点决定：
-                            // 这里原本另有 Layout.leftMargin/rightMargin = 8，与委托的 x 叠加后
-                            // 同一张卡在两个视图里会得到两种左空位（8+10 vs 10）——两个"决定者"。
-                            Layout.topMargin: 4
-                            clip: true
-                            model: _routeTasks()
-                            delegate: taskDelegate
-                            // 与站点视图同一个 delegate，间距与左空位都取同一份值
-                            leftMargin: _taskCardMargin
-                            spacing: _taskCardGap
-                        }
-                    }
-                }
-            }
-        }
-
-        //---- 底部状态栏（占满左区宽，高度+50%，内容居中，字号按任务栏登录用户名）----
-        Rectangle {
-            id: instrumentPanel
-            anchors { left: parent.left; right: rightPanel.left; bottom: parent.bottom }
-            height: 48
-            color: QGroundControl.globalPalette.windowTransparent
-            z: 5
-
-            // 选中任务 —— 靠左
-            Text {
-                anchors.left: parent.left; anchors.leftMargin: 16
-                anchors.verticalCenter: parent.verticalCenter
-                color: "#e6edf7"; font.pixelSize: 13; font.bold: true
-                text: qsTr("选中任务：") + _taskNo(_selectedTask())
             }
 
-            // 参数排：标题：数值横向一行 —— 靠右
-            Row {
-                id: telemetryRow
-                anchors.right: parent.right; anchors.rightMargin: 16
-                anchors.verticalCenter: parent.verticalCenter
-                spacing: 18
-                Repeater {
-                    model: [["alt", qsTr("高度")], ["speed", qsTr("水平速度")], ["airspeed", qsTr("空速")],
-                            ["climb", qsTr("爬升")], ["battery", qsTr("电量")], ["heading", qsTr("航向")],
-                            ["status", qsTr("状态")]]
-                    delegate: Text {
-                        textFormat: Text.RichText
-                        font.pixelSize: 13; font.bold: true
-                        color: "#e6edf7"
-                        text: "<span style='color:#8fa1bd;'>%1：</span>%2".arg(modelData[1]).arg(_instrumentValue(modelData[0]))
-                    }
-                }
-            }
-        }
-    }
-
-    // 仪表取值（云平台遥测 latest；无数据返回 "—"）
-    function _instrumentValue(key) {
-        var t = _selectedTask()
-        if (!t || !t.latest) return "—"
-        var l = t.latest
-        switch (key) {
-        case "alt": return (l.alt_rel || 0).toFixed(0) + " m"
-        case "speed": return (l.ground_speed || 0).toFixed(1) + " m/s"
-        case "airspeed": return (l.air_speed || 0).toFixed(1) + " m/s"
-        case "climb": return (l.climb_rate || 0).toFixed(1) + " m/s"
-        case "battery": return (l.battery_pct || 0).toFixed(0) + "%"
-        case "heading": return (l.heading || 0).toFixed(0) + "°"
-        case "status": return _displayStatus(t)
-        default: return "—"
-        }
-    }
-
-    // 机位卡片 delegate 已移入 SlotLayout.qml（按经纬度投影落位，卡片宽由几何求解给出）。
-    // 它需要的中文状态文案由 `_decorateSlots` 预先补进 `uav_status_label` / `slot_status_label`
-    //（源头是 `_slotsAll` —— 平面图那一档，含维护/故障机位）。
-    // ⚠️ 上方「指定机位」弹窗的 `Repeater` 读的是 **`_slots`（raw，仅可用机位）**，两者**不是**同一份数据，
-    // 也不是同一个档位——别看到两处都在画机位就顺手合并。
-
-    //---- 任务项 delegate（右侧边栏复用）----
-    Component {
-        id: taskDelegate
-        Rectangle {
-            // 宽度为左空位**预留**（右边缘因此纹丝不动，右侧留白仍是完整的 _taskCardRightGap）。
-            // ‼️ 左空位**绝不能**靠本委托写 `x:` 来让位——纵向 ListView 会把委托的 x 压回 **0**
-            //（QT_QPA_PLATFORM=offscreen 实测：布局跑完后三张卡的 x 全是 0）。那样宽度是少了、
-            //   位置却没动 ⇒ **空位全长在右边**，正好与要求相反。让位只能靠 ListView 的 leftMargin
-            //（同样实测：`leftMargin: 10` 下 item 映射到根的 x = 10、右留白仍为 20），
-            //   见两个 ListView 上的 `leftMargin: _taskCardMargin`。
-            width: ListView.view.width - _taskCardRightGap - _taskCardMargin
-            height: taskBody.height + 12
-            radius: 4
-            color: "#16233c"
-            border.width: 1
-            border.color: _isTimeout(_handoverFor(modelData)) ? "#ff3b3b"
-                          : (_selectedTaskId === modelData.task_id ? "#2f6bd8" : "#2a3a55")
-
-            // 点整项选中任务（并同步点亮对应机位）
-            MouseArea {
-                anchors.fill: parent
-                onClicked: { _selectedTaskId = modelData.task_id; _syncSlotForSelection(modelData) }
-            }
-
-            Column {
-                id: taskBody
-                anchors { left: parent.left; right: parent.right; top: parent.top }
-                anchors.margins: 8
-                spacing: 5
-                Row {
-                    width: parent.width
-                    spacing: 6
-                    Rectangle {
-                        width: 8; height: 8; radius: 4
-                        anchors.verticalCenter: parent.verticalCenter
-                        color: _statusColor(modelData)
-                    }
-                    Text {
-                        color: _statusColor(modelData); font.pixelSize: 12; font.bold: true
-                        text: _displayStatus(modelData)
-                    }
-                    Text {
-                        color: "#8fa1bd"; font.pixelSize: 11
-                        text: qsTr("性质：") + _taskNature(modelData)
-                    }
-                }
-                Text {
-                    width: parent.width
-                    color: "#e6edf7"; font.pixelSize: 12
-                    elide: Text.ElideMiddle
-                    text: modelData.route_name ? qsTr("航线：") + modelData.route_name : qsTr("航线：—")
-                }
-                Row {
-                    width: parent.width
-                    spacing: 8
-                    // 未指派无人机的任务**整行不可见**（2026-09-17 用户裁定），过滤落在服务端：
-                    // `handlers/ops.go` Overview 的**共享 WHERE** 里有 `COALESCE(t.uav_id,0) <> 0`，
-                    // 所以本视图正常**只会拿到已派机的任务**，下面 `uav_id` 为假的那一支走不到。
-                    // 保留另一支是**断路器**，不是"这类任务会显示"：万一后端过滤被改回去/绕过，
-                    // 界面会明说「未指派无人机」，而不是回落显示 task_no 把任务号伪装成航班号
-                    //——那正是本视图改前的老行为，也正是用户报障时看到的那一条。
-                    // ‼️ 判据用 uav_id（后端 `COALESCE(t.uav_id,0)`，0=未指派），**不用 uav_no 空串**
-                    //——与 _canTakeoff(:469)/_slotForTask(:444) 同解，全视图对「有没有派机」只有一份判据。
-                    Text {
-                        color: modelData.uav_id ? "#9fb3d4" : "#ffc107"
-                        font.pixelSize: 11
-                        text: modelData.uav_id
-                              ? qsTr("航班：") + (modelData.uav_no ? modelData.uav_no : "—")
-                              : qsTr("航班：未指派无人机（%1）").arg(modelData.task_no ? modelData.task_no : "—")
-                    }
-                    Text {
-                        color: "#9fb3d4"; font.pixelSize: 11
-                        text: qsTr("起飞：") + _formatPlanTakeoff(modelData)
-                    }
-                    Text {
-                        color: "#9fb3d4"; font.pixelSize: 11
-                        text: qsTr("航线性质：") + _routeNature(modelData)
-                    }
-                }
-                // 交接状态徽标
-                Text {
-                    width: parent.width
-                    visible: _handoverFor(modelData) ? true : false
-                    color: _isTimeout(_handoverFor(modelData)) ? "#ff3b3b" : "#ffc107"
-                    font.pixelSize: 11
-                    text: _handoverFor(modelData) ? (qsTr("待") + _phaseToLabel(_handoverFor(modelData).phase_to) +
-                          qsTr("确认 · ") + (_isMine(_handoverFor(modelData)) ? qsTr("我提出") : (modelData.proposed_by_name ? modelData.proposed_by_name : "")) +
-                          qsTr(" · ") + _remainingSec(_handoverFor(modelData))) : ""
-                }
-                // 操作按钮行
-                Row {
-                    width: parent.width
-                    spacing: 6
-                    // ── 站点视图：出站 ──
-                    Button {
-                        visible: _showSiteView && _isSiteATC && _isOutbound(modelData)
-                                 && (modelData.status === "SCHEDULED" || modelData.status === "READY")
-                        enabled: _canTakeoff(modelData)
-                        height: 24; padding: 0
-                        text: qsTr("起飞")
-                        // 置灰时说明**差哪一条**：否则用户只看到灰按钮，不知道是要去停放页
-                        // 推「航前检查通过」，还是飞机压根还没连上本地面站——两种处置完全不同。
-                        ToolTip.visible: hovered && !enabled
-                        ToolTip.delay: 300
-                        ToolTip.text: _takeoffBlockReason(modelData)
-                        onClicked: { _pendingAction = {kind:"takeoff", task:modelData}; actionConfirmDialog.open() }
-                    }
-                    Button {
-                        // 6.0-A 申请切出（签出）：起飞经航迹确认后发起 ROUTE 交接；仅巡航(FW)且有实时遥测可切出，
-                        // 无遥测置灰（6.0-C 失联不签发；DB 在 Propose ROUTE 时落 IN_FLIGHT=责任里程碑）。
-                        visible: _showSiteView && _isSiteATC && modelData.status === "TAKEOFF"
-                                 && !_pendingPhase(modelData, "ROUTE")
-                        enabled: _isCruising(modelData) && _hasLiveTelemetry(modelData)
-                        height: 24; padding: 0
-                        text: qsTr("申请切出")
-                        onClicked: _proposeHandover(modelData.task_id, "ROUTE")
-                    }
-                    // ── 站点视图：进站（accept 交接走 handoverDialog，此处无行内确认按钮）──
-                    Button {
-                        // 6.0-E 发出降落指令：仅已签入(LANDING)（landing_accepted）且 DB 仍 IN_FLIGHT 时出现；
-                        // 点按→红绿确认→机位校验→POST /tasks/:id/land（LANDING 唯一写路径）→引导降落。
-                        visible: _showSiteView && _isSiteATC && _isInbound(modelData)
-                                 && modelData.status === "IN_FLIGHT" && _landingAccepted(modelData)
-                        enabled: modelData.landing_slot_id ? true : false
-                        height: 24; padding: 0
-                        text: qsTr("发出降落指令")
-                        onClicked: { _pendingAction = {kind:"land", task:modelData}; actionConfirmDialog.open() }
-                    }
-                    Button {
-                        // 指定机位：签入(LANDING)后可预占（后端 AssignSlot 门控 IN_FLIGHT+ACCEPTED LANDING 或 LANDING）
-                        visible: _showSiteView && _isSiteATC && _isInbound(modelData)
-                                 && (modelData.status === "LANDING" ||
-                                     (modelData.status === "IN_FLIGHT" && _landingAccepted(modelData)))
-                        height: 24; padding: 0
-                        text: qsTr("指定机位")
-                        onClicked: { _assignSlotError = ""; _assignSlotTask = modelData; slotDialog.open() }
-                    }
-                    Button {
-                        // 6.0-B 停泊门控：已落地(landed bit0) 可停泊；有实时遥测未落地→置灰"停泊（待落地）"；
-                        // 失联/无遥测→放行"停泊（无遥测）"；均不隐藏，供人工收尾
-                        visible: _showSiteView && _isSiteATC && modelData.status === "LANDING"
-                        enabled: _isLandedOnGround(modelData) || !_hasLiveTelemetry(modelData)
-                        height: 24; padding: 0
-                        text: _isLandedOnGround(modelData) ? qsTr("停泊")
-                              : (_hasLiveTelemetry(modelData) ? qsTr("停泊（待落地）") : qsTr("停泊（无遥测）"))
-                        onClicked: { _pendingAction = {kind:"park", task:modelData}; actionConfirmDialog.open() }
-                    }
-                    // ── 监控员视图 ──
-                    Button {
-                        // 仅无 PENDING(LANDING) 交接时可发起（防重复 409；已有交接可走"撤回交接"）
-                        visible: (!_showSiteView || !_isSiteATC) && _isRouteMon
-                                 && modelData.status === "IN_FLIGHT" && !_pendingPhase(modelData, "LANDING")
-                        height: 24; padding: 0
-                        text: qsTr("移交降落指挥")
-                        onClicked: _proposeHandover(modelData.task_id, "LANDING")
-                    }
-                    // 撤回/拒绝（提出方或接收方在交接弹框内处理；此处提供撤回）
-                    Button {
-                        // ‼️ 必须是三元式而不是 `_handoverFor(modelData) && _isMine(...)`：
-                        // 无交接时 `_handoverFor` 返回 undefined，`&&` 直接在**左操作数**上短路，
-                        // 整个表达式求值为 undefined（不是 false）；QML 视其为「绑定无值」，
-                        // visible 遂退回 Item 默认值 **true** ⇒ 每一张卡片都显示「撤回交接」。
-                        // 同 :725/:1039 的写法。判据仍与徽标同源，只有「求值成真 bool」这一条不同。
-                        visible: _handoverFor(modelData) ? _isMine(_handoverFor(modelData)) : false
-                        height: 24; padding: 0
-                        text: qsTr("撤回交接")
-                        onClicked: _cancelHandover(_handoverFor(modelData).handover_id)
-                    }
-                }
-            }
+            // 监控员的任务列表**已移出本文件**（2026-09-21）：它现在是并列的 `RomView.qml`。
+            // 原先这里是 `visible: (!_showSiteView || !_isSiteATC) && _isRouteMon` 的第二个分支，
+            // 靠命令条上那组「站点／监控员」切换显示。用户裁定不存在双身份后，这两个身份是两个
+            // 独立视图、由登录身份直接决定，本视图内不再有任何"另一个视图"的判据。
         }
     }
 
@@ -1376,72 +659,7 @@ Item {
                 Layout.fillWidth: true
                 color: "#ffc107"; font.pixelSize: 12
                 wrapMode: Text.Wrap
-                text: _landBlockReason
-            }
-        }
-    }
-
-    //-------------------------------------------------------------------------
-    // 交接确认弹框（pending 到达自动弹出）
-    //-------------------------------------------------------------------------
-    Dialog {
-        id: handoverDialog
-        parent: opsView
-        width: 400
-        modal: true
-        title: qsTr("交接确认")
-
-        ColumnLayout {
-            width: parent.width
-            spacing: 8
-            Text {
-                Layout.fillWidth: true
-                color: "#e6edf7"; font.pixelSize: 13
-                wrapMode: Text.Wrap
-                text: _confirmHandover
-                    ? qsTr("%1 · %2 请求把任务「%3」移交 %4")
-                        .arg(_confirmHandover.uav_no || _confirmHandover.task_no)
-                        .arg(_confirmHandover.proposed_by_name || _confirmHandover.proposed_by)
-                        .arg(_confirmHandover.task_no)
-                        .arg(_phaseToLabel(_confirmHandover.phase_to))
-                    : ""
-            }
-            Text {
-                Layout.fillWidth: true
-                color: _confirmHandover && _isTimeout(_confirmHandover) ? "#ff3b3b" : "#ffc107"
-                font.pixelSize: 12
-                text: _confirmHandover ? qsTr("剩余 ") + _remainingSec(_confirmHandover) : ""
-            }
-            // 操作失败提示：瞬时网络失败时保留弹框供重试（配合 _seenHandovers 去重，关框即无再确认入口）
-            Text {
-                Layout.fillWidth: true
-                color: "#ff6b6b"; font.pixelSize: 12
-                wrapMode: Text.Wrap
-                visible: _handoverActionError !== ""
-                text: _handoverActionError
-            }
-            RowLayout {
-                Layout.fillWidth: true
-                spacing: 8
-                Item { Layout.fillWidth: true }
-                Button {
-                    text: qsTr("拒绝")
-                    onClicked: _rejectHandover(_confirmHandover.handover_id, function(ok) {
-                        if (ok) handoverDialog.close()
-                        else _handoverActionError = qsTr("操作未送达服务端，请重试；仍失败请通知提出方撤回重提")
-                    })
-                }
-                Button {
-                    text: _confirmHandover && _isMine(_confirmHandover) ? qsTr("撤回") : qsTr("确认接管")
-                    onClicked: {
-                        var mine = _confirmHandover && _isMine(_confirmHandover)
-                        var act = mine ? _cancelHandover : _acceptHandover
-                        act(_confirmHandover.handover_id, function(ok) {
-                            if (ok) handoverDialog.close()
-                            else _handoverActionError = qsTr("操作未送达服务端，请重试；仍失败请通知对方人工处理")
-                        })
-                    }
-                }
+                text: opsView._landBlockReason
             }
         }
     }
@@ -1462,28 +680,28 @@ Item {
             Text {
                 Layout.fillWidth: true
                 color: "#e6edf7"; font.pixelSize: 12
-                text: _assignSlotTask ? qsTr("任务 %1 指定降落机位：").arg(_taskNo(_assignSlotTask)) : ""
+                text: opsView._assignSlotTask ? qsTr("任务 %1 指定降落机位：").arg(OpsCommon.taskNo(opsView._assignSlotTask)) : ""
             }
             // 指派失败原因（保留弹框可换机位重试）
             Text {
                 Layout.fillWidth: true
                 color: "#ff6b6b"; font.pixelSize: 12
                 wrapMode: Text.Wrap
-                visible: _assignSlotError !== ""
-                text: _assignSlotError
+                visible: opsView._assignSlotError !== ""
+                text: opsView._assignSlotError
             }
             Flow {
                 Layout.fillWidth: true
                 spacing: 6
                 Repeater {
-                    model: _slots
+                    model: opsView._slots
                     delegate: Button {
                         width: 96; height: 32
-                        text: modelData.slot_code + _slotAssignHint(modelData)
-                        enabled: _slotAssignable(modelData)
+                        text: modelData.slot_code + opsView._slotAssignHint(modelData)
+                        enabled: opsView._slotAssignable(modelData)
                         onClicked: {
-                            if (_assignSlotTask) _assignSlot(_assignSlotTask.task_id, modelData.id, function(ok) {
-                                if (ok) { slotDialog.close(); _assignSlotTask = null }
+                            if (opsView._assignSlotTask) opsView._assignSlot(opsView._assignSlotTask.task_id, modelData.id, function(ok) {
+                                if (ok) { slotDialog.close(); opsView._assignSlotTask = null }
                             })
                         }
                     }
@@ -1501,9 +719,9 @@ Item {
         parent: opsView
         width: 460
         modal: true
-        title: _pendingAction
-               ? (_pendingAction.kind === "takeoff" ? qsTr("起飞确认")
-                  : _pendingAction.kind === "land"    ? qsTr("降落确认")
+        title: opsView._pendingAction
+               ? (opsView._pendingAction.kind === "takeoff" ? qsTr("起飞确认")
+                  : opsView._pendingAction.kind === "land"    ? qsTr("降落确认")
                   : qsTr("停泊确认"))
                : qsTr("飞行控制确认")
 
@@ -1515,13 +733,13 @@ Item {
                 color: "#ffc107"; font.pixelSize: 13
                 wrapMode: Text.Wrap
                 text: {
-                    if (!_pendingAction || !_pendingAction.task) return ""
-                    var t = _pendingAction.task
-                    var hint = _pendingAction.kind === "takeoff" ? qsTr("将确认起飞并控制无人机升空")
-                             : _pendingAction.kind === "land"    ? qsTr("将发出降落指令：任务进入降落(LANDING)，引导无人机在本场着陆")
+                    if (!opsView._pendingAction || !opsView._pendingAction.task) return ""
+                    var t = opsView._pendingAction.task
+                    var hint = opsView._pendingAction.kind === "takeoff" ? qsTr("将确认起飞并控制无人机升空")
+                             : opsView._pendingAction.kind === "land"    ? qsTr("将发出降落指令：任务进入降落(LANDING)，引导无人机在本场着陆")
                              : qsTr("将终结本任务并对无人机下电停泊（不可撤销）")
                     return qsTr("%1\n任务「%2」 · 无人机 %3")
-                        .arg(hint).arg(_taskNo(t)).arg(t.uav_no ? t.uav_no : "—")
+                        .arg(hint).arg(OpsCommon.taskNo(t)).arg(t.uav_no ? t.uav_no : "—")
                 }
             }
             RowLayout {
@@ -1534,7 +752,7 @@ Item {
                     background: Rectangle { color: "#d63031"; radius: 3; implicitHeight: 40; implicitWidth: 132 }
                     contentItem: Text { text: parent.text; color: "#ffffff"; font.pixelSize: 15; font.bold: true
                                         horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
-                    onClicked: { actionConfirmDialog.close(); _execPendingAction() }
+                    onClicked: { actionConfirmDialog.close(); opsView._execPendingAction() }
                 }
                 // 绿 = 取消（安全退出）
                 Button {
@@ -1546,35 +764,5 @@ Item {
                 }
             }
         }
-    }
-
-    function _selectedTask() {
-        for (var i = 0; i < _tasks.length; i++) {
-            if (_tasks[i].task_id === _selectedTaskId) return _tasks[i]
-        }
-        return _tasks.length ? _tasks[0] : null
-    }
-
-    // 构造 QGC Fact 形对象（`{ rawValue }`）—— 供原版姿态仪/罗盘组件消费。
-    function _fact(v) { return { rawValue: (v === undefined || v === null) ? 0 : v } }
-    // 按选中任务最新遥测重建 mock vehicle（每次轮询调用；新建对象 → vehicle 属性变化 →
-    // 组件内部 `vehicle.xxx.rawValue` 绑定重估 → 仪表刷新）。headingToHome/headingToNextWP
-    // 云平台无此数据，补 0 兜底以免罗盘 property 立即评估时报 undefined 错误。
-    function _buildMockVehicle(t) {
-        var l = t ? t.latest : null
-        if (!l) return null
-        return {
-            armed: true,
-            roll:      _fact(l.roll),
-            pitch:     _fact(l.pitch),
-            heading:   _fact(l.heading),
-            groundSpeed: _fact(l.ground_speed),
-            headingToHome:  _fact(0),
-            headingToNextWP: _fact(0),
-            gps: { courseOverGround: _fact(l.heading) }
-        }
-    }
-    function _updateMockVehicle() {
-        _mockVehicle = _buildMockVehicle(_selectedTask())
     }
 }
