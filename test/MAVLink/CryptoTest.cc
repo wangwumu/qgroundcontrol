@@ -1703,10 +1703,14 @@ void CryptoTest::_testReRegisterDevice()
     //    `s0 + 1` 精确计数断言。而 requestAcceleratedRegistration() **自带
     //    `registrationEnabled()` 门**：登记关着 ⇒ 集合变化触发的加速被挡掉 ⇒ 计数干净；
     //    而 reRegisterDevice **有意无门** ⇒ 照发 ⇒ 计数精确 +1。
-    //    这一格把上述前提**显式断言**出来：前提若不成立，失败信息直接指向原因，
-    //    而不是表现为下面某格莫名其妙的 off-by-N。
-    QVERIFY2(!crypto->registrationEnabled(),
-             "定向重发用例用精确计数断言 ⇒ 必须确保登记关着（否则 burst 会污染计数）");
+    //    ⚠️ 前提用**构造**（下面这行）而不是断言：断言会依赖"本用例在类内声明顺序上跑在谁之后"，
+    //    构造则与顺序无关（本用例若被单独跑，单例也保证登记是关的）。
+    //    安全性（读自 setRegistrationEnabled 实现）：`enabled == false` 分支**只**做
+    //    `_registrationTimer->stop()` + 一条 `registration disabled`（Debug 级），
+    //    **不发帧**（发帧只在 `enabled == true` 分支）⇒ `_registrationSendCount` 一点不动。
+    //    ⚠️ 它**没有**"已关就短路"：登记本来已关时也照样打那一条 Debug 日志（恒 1 条）；
+    //    该日志已被上面的 ignoreLogMessage（正则含尾随空格，"registration disabled" 能匹配）覆盖。
+    crypto->setRegistrationEnabled(false);
 
     const DeviceID a = makeDeviceID(0, 0, 0x61, 0x01);
     const DeviceID b = makeDeviceID(0, 0, 0x61, 0x02);
