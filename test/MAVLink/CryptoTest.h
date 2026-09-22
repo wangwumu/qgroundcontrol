@@ -65,4 +65,7 @@ private slots:
 
     // 监控清单与超时阈值（§3.5.3/§3.6.4）：一次调用两个实参、非法 id 跳过、空清单回退
     void _testSetMonitorDevices();
+
+    // 加速首轮（§3.4）：集合变化触发连续发送、集合不变不触发、容量天花板截断
+    void _testRequestAcceleratedRegistration();
 };

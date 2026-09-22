@@ -156,10 +156,11 @@ void CryptoController::setMonitorDevices(const QVariantList& deviceIds, int fram
         }
     }
 
-    // ‼️ 集合变化时的"立即跑一轮加速发送"（§3.4）在 Task 5 接在这里：
-    //    `if (changed) { requestAcceleratedRegistration(); }`
-    //    本任务刻意**不加空实现占位**——空实现会让 Task 5 的用例假绿
-    //    （调用确实发生了，但没有任何可观测效果）。`changed` 保留在作用域里供其使用。
+    // ‼️ 判据是"集合内容变了"。2s 轮询会反复调用本函数，若每次都加速，
+    //    10s 保活周期会被打乱（§3.4）。
+    if (changed) {
+        requestAcceleratedRegistration();
+    }
 }
 
 int CryptoController::frameTimeoutMs() const
@@ -172,6 +173,48 @@ int CryptoController::monitorDeviceCount() const
 {
     const QMutexLocker locker(&_mutex);
     return _monitorDevices.size();
+}
+
+void CryptoController::requestAcceleratedRegistration()
+{
+    if (!registrationEnabled()) {
+        return;  // 未启用登记时不加速（与 _sendRegistration 的门一致）
+    }
+
+    int n = 0;
+    {
+        const QMutexLocker locker(&_mutex);
+        n = _monitorDevices.isEmpty() ? _linkedDevices.size() : _monitorDevices.size();
+    }
+
+    const int batches = (n <= 0) ? 1 : ((n + MAX_QGC_LINKED_PX4 - 1) / MAX_QGC_LINKED_PX4);
+    const int capped = qMin(batches, kMaxRegistrationBatches);
+    if (capped < batches) {
+        // 容量天花板（§3.4）：越过 n ≤ 80 时稳态本来就保证不了 TTL，
+        // 加速发送再多也只是把这一轮塞满。**截断的是批数，不是集合**——
+        // 集合永远不动（§3.6.2）。
+        qCWarning(CryptoControllerLog) << "监控清单超过容量天花板（n ≤ 80），加速发送已截断"
+                                       << n << "架 / 需" << batches << "批";
+    }
+
+    // ⚠️ 用 QTimer::singleShot 串，**不要**用 QThread::msleep 或忙等——那会卡 GUI 线程（§3.4）
+    for (int i = 0; i < capped; i++) {
+        QTimer::singleShot(i * kRegistrationBurstIntervalMs, this, [this]() {
+            _sendRegistration();
+        });
+    }
+}
+
+int CryptoController::registrationSendCountForTest() const
+{
+    const QMutexLocker locker(&_mutex);
+    return _registrationSendCount;
+}
+
+QList<DeviceID> CryptoController::monitorDevicesForTest() const
+{
+    const QMutexLocker locker(&_mutex);
+    return _monitorDevices;
 }
 
 QList<DeviceID> CryptoController::nextRegistrationBatch(const QList<DeviceID>& devices, int batch, int& cursor)
@@ -212,6 +255,11 @@ void CryptoController::addLinkedDevice(DeviceID deviceID)
 
 void CryptoController::_sendRegistration()
 {
+    {
+        // ‼️ 计数必须在任何 return 之前 —— 它数的是"函数被进入了几次"。
+        const QMutexLocker locker(&_mutex);
+        _registrationSendCount++;
+    }
     QList<DeviceID> batch;
     {
         const QMutexLocker locker(&_mutex);

@@ -380,6 +380,13 @@ void AuthController::_onLoginFinished(QNetworkReply* reply)
                               << "(site-scoped: deviceID set independent of user, same for any login; "
                                  "linked set used as 80005 registration payload)";
 
+    // 80005 登记集合刚被填充 ⇒ 立即跑一轮加速，让全平台设备在秒级内接上，
+    // 而不是等 batches × 10s 的游标周期（设计文档 §3.4）。复用上面已取的 `crypto`，
+    // 不新起 CryptoController::instance() 调用点。
+    // ⚠️ 排在 emit loginSucceeded() 之前：那块信号已经接了一堆消费者
+    //    （计划控制器的自动装载等），把登记加速排在它们后面没有意义。
+    crypto->requestAcceleratedRegistration();
+
     emit loggedInChanged();
     emit currentUserChanged();
     emit displayNameChanged();

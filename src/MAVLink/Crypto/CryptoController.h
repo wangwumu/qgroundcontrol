@@ -106,6 +106,29 @@ public:
     /// 供测试与诊断读——`_monitorDevices` 本身是 private。
     int monitorDeviceCount() const;
 
+    /// 立即跑一轮加速登记（§3.4）：连续 `ceil(n/16)` 次发送（批数封顶见
+    /// `kMaxRegistrationBatches`）、批间隔 `kRegistrationBurstIntervalMs`，
+    /// 让新集合在**秒级**内全部接上，而不是等 `batches × 10s` 的游标周期。
+    ///
+    /// 触发点两处：① `setMonitorDevices` 检测到集合变化；② 登录成功后
+    /// `AuthController` 通知（`_linkedDevices` 刚被填充）。
+    ///
+    /// ⚠️ **不要把它接到 2s 轮询上**——那会打乱 10s 保活周期。
+    /// ⚠️ 集合没变时反复调用它最多多花几帧，不改集合、不改变行为方向。
+    /// ⚠️ 与 `_sendRegistration` 共用同一道 `registrationEnabled()` 门：
+    ///    登记关着时直接返回，否则会出现"登记关着却在发登记帧"。
+    Q_INVOKABLE void requestAcceleratedRegistration();
+
+    /// ---- 仅供单测（生产代码不得调用）----
+    /// `_sendRegistration()` 被调用过的累计次数。单测里没有 UDP link，
+    /// 发送本身观察不到，只能数"函数进去过几次"。
+    /// ‼️ 不要用 `_regCursor` 代替：n ≤ 16 时它恒 0，n > 16 时跑满一个周期它会回绕到 0。
+    int registrationSendCountForTest() const;
+
+    /// 当前监控清单的**内容**副本。`monitorDeviceCount()` 只给条数，
+    /// 区分不了 `{a}` 与 `{b}`。供测试断言清单本身。
+    QList<DeviceID> monitorDevicesForTest() const;
+
     /// 从 `devices` 的 `cursor` 位置起取至多 `batch` 个（环形回绕），
     /// 并把 `cursor` 就地推进到**下一批的起点**（§3.3）。
     ///
@@ -254,6 +277,11 @@ signals:
     void px4LinkLost(DeviceID deviceID);
 
 private:
+    /// 加速发送的批间隔（§3.4：批间隔 ~200ms，用一次性定时器串，不阻塞主线程）。
+    static constexpr int kRegistrationBurstIntervalMs = 200;
+    /// 加速发送的批数上限，与 §3.4 的容量约束同源（batches ≤ 5 ⇔ n ≤ 80）。
+    static constexpr int kMaxRegistrationBatches = 5;
+
     void _onKeyFetched(DeviceID deviceID);
     void _onFetchFailed(DeviceID deviceID, const QString& error);
     void _sendRegistration(); ///< 发送 80005 登记/保活心跳（周期触发）
@@ -289,6 +317,7 @@ private:
     int _frameTimeoutMs = DEFAULT_FRAME_TIMEOUT_MS;
     /// 分批发送的游标（§3.3），跨两次 `_sendRegistration()` 保持。
     int _regCursor = 0;
+    int _registrationSendCount = 0; ///< 单测用的发送计数，见 registrationSendCountForTest()
     QTimer* _linkLossTimer = nullptr; ///< PX4 失联检测定时器
     DeviceID _linkLossDevice = kInvalidDeviceID; ///< 正在监测失联的活跃 deviceID
     mutable QMutex _mutex;
