@@ -62,4 +62,7 @@ private slots:
 
     // 80005 分批（§3.3/§3.4）：切批 + 环形轮转 + 覆盖性
     void _testNextRegistrationBatch();
+
+    // 监控清单与超时阈值（§3.5.3/§3.6.4）：一次调用两个实参、非法 id 跳过、空清单回退
+    void _testSetMonitorDevices();
 };

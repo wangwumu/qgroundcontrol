@@ -25,6 +25,7 @@
 #include <QtCore/QObject>
 #include <QtCore/QString>
 #include <QtCore/QTimer>
+#include <QtCore/QVariantList>
 
 #include "DeviceID.h"
 #include "DeviceKeyManager.h"
@@ -73,6 +74,37 @@ public:
     /// @param intervalMs  保活周期（毫秒，默认见 `kRegistrationIntervalMs`）
     void setRegistrationEnabled(bool enabled, int intervalMs = kRegistrationIntervalMs);
     bool registrationEnabled() const;
+
+    /// 超时阈值的编译期兜底（§3.6.4）。
+    /// 对应 1Hz 发帧频率，是**保守**选择：20Hz 下偏慢（晚 1s 才发现），
+    /// 但任何频率 ≥ 1Hz 都不会误判。
+    /// ⚠️ 主路径必须是后端下发：若后端不下发、而 PX4 又降到了 0.2Hz 以下，
+    ///    这个默认值会误判（每 3s 重发一次，而飞机 5s 才发一帧）。
+    static constexpr int DEFAULT_FRAME_TIMEOUT_MS = 3000;
+
+    /// 由 `RomView.qml` 在**每次成功轮询**后调用（§3.5.3）：
+    /// 传入"需要监控的飞机"的 deviceID 列表，以及本次生效的超时阈值（毫秒）。
+    ///
+    /// - 空列表 = "没有清单" ⇒ `_sendRegistration` 回退到 `_linkedDevices` 全体。
+    /// - `frameTimeoutMs <= 0` ⇒ 用 `DEFAULT_FRAME_TIMEOUT_MS`。
+    /// - 集合**内容变化**时立即跑一轮加速发送（§3.4）；
+    ///   内容不变则什么都不做——2s 轮询会反复调用本函数，
+    ///   若每次都加速，10s 保活周期会被打乱。
+    ///
+    /// ‼️ **轮询失败时不要调用本函数**（保留上一次的清单）。
+    ///    把"请求失败"当成"没有需要监控的飞机"会让登记集合清空，
+    ///    全部飞机在 60s TTL 后集体掉线，而失败原因可能只是一次网络抖动（§3.5.4）。
+    ///
+    /// ‼️ 阈值与清单**必须同一次调用传入**：拆成两个 setter 会造出
+    ///    "新阈值配旧清单"的中间态（§3.6.4）。
+    Q_INVOKABLE void setMonitorDevices(const QVariantList& deviceIds, int frameTimeoutMs);
+
+    /// 当前生效的超时阈值（毫秒）。
+    int frameTimeoutMs() const;
+
+    /// 当前监控清单的条数（0 = 无清单，回退 `_linkedDevices`）。
+    /// 供测试与诊断读——`_monitorDevices` 本身是 private。
+    int monitorDeviceCount() const;
 
     /// 从 `devices` 的 `cursor` 位置起取至多 `batch` 个（环形回绕），
     /// 并把 `cursor` 就地推进到**下一批的起点**（§3.3）。
@@ -223,6 +255,10 @@ private:
     void _onKeyFetched(DeviceID deviceID);
     void _onFetchFailed(DeviceID deviceID, const QString& error);
     void _sendRegistration(); ///< 发送 80005 登记/保活心跳（周期触发）
+    /// 把一批 deviceID 组帧并发出（§3.3 的组帧 + UDP link 过滤 + sent 日志）。
+    /// 抽出来是为了让定向重发（`reRegisterDevice`）复用同一套逻辑，
+    /// 避免 §3.3 的"定长 deviceBytes"约束出现两个维护点。
+    void _sendRegistrationFrame(const QList<DeviceID>& ids);
     void _startLinkLossMonitor(DeviceID deviceID); ///< 启动/重置失联检测（仅 Active 状态）
     void _stopLinkLossMonitor(); ///< 停止失联检测（回待命时）
     void _onLinkLossTimeout(); ///< 失联超时：发 px4LinkLost 信号
@@ -244,6 +280,13 @@ private:
     QTimer* _registrationTimer = nullptr; ///< 80005 周期发送定时器
     bool _registrationEnabled = false;
     QList<DeviceID> _linkedDevices; ///< 本 QGC 关联的 PX4 deviceID（登记心跳 payload）
+    /// 「需要监控的飞机」的 deviceID 列表（§3.5.3）。
+    /// 空 = 没有清单 ⇒ `_sendRegistration` 回退到 `_linkedDevices`。
+    QList<DeviceID> _monitorDevices;
+    /// 本次生效的超时阈值（毫秒）。与 `_monitorDevices` 同一次调用更新。
+    int _frameTimeoutMs = DEFAULT_FRAME_TIMEOUT_MS;
+    /// 分批发送的游标（§3.3），跨两次 `_sendRegistration()` 保持。
+    int _regCursor = 0;
     QTimer* _linkLossTimer = nullptr; ///< PX4 失联检测定时器
     DeviceID _linkLossDevice = kInvalidDeviceID; ///< 正在监测失联的活跃 deviceID
     mutable QMutex _mutex;

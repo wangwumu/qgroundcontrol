@@ -17,6 +17,7 @@
 #include <QRegularExpression>
 #include <QSet>
 #include <QTemporaryFile>
+#include <QVariantList>
 #include <cstring>
 
 namespace {
@@ -1529,6 +1530,51 @@ void CryptoTest::_testNextRegistrationBatch()
     QCOMPARE(s3.size(), 5);
     QCOMPARE(s3.first(), static_cast<DeviceID>(20000000u));
     QCOMPARE(negCursor, 0);
+}
+
+void CryptoTest::_testSetMonitorDevices()
+{
+    CryptoController* const crypto = CryptoController::instance();
+
+    // 缺省阈值 = 编译期默认（§3.6.4：后端不下发时用它兜底）
+    QCOMPARE(crypto->frameTimeoutMs(), CryptoController::DEFAULT_FRAME_TIMEOUT_MS);
+
+    const DeviceID a = makeDeviceID(0, 0, 0x31, 0x01);
+    const DeviceID b = makeDeviceID(0, 0, 0x31, 0x02);
+
+    // ⚠️ 阈值与清单**同一次**传入。判别力在于"故意选一个不同于默认值的数"——
+    //    若这里也传 3000，那么"实现了透传"和"完全没读这个实参"表现完全一致，
+    //    这一格会假绿（本项目已记录过的判据失效模式）。
+    const QVariantList ids{ static_cast<uint>(a), static_cast<uint>(b) };
+    crypto->setMonitorDevices(ids, 9000);
+    QCOMPARE(crypto->frameTimeoutMs(), 9000);
+    QCOMPARE(crypto->monitorDeviceCount(), 2);
+
+    // 非法条目必须跳过并留下日志，不能默默变成 0：
+    // 一条 device_id=0 的登记会在 mavp2p 里建出无意义的 pair，且没有任何一处会报错（§3.5.2）
+    //
+    // ‼️ withBad 里是**两种**非法形态（"not-a-number" 转不成 uint、0u == kInvalidDeviceID），
+    //    各产生一条 qCWarning ⇒ 必须配 **2** 次 expect + verify。
+    //    strict mode（UnitTest::cleanup 的 "Unexpected log messages"）会把未消费的日志
+    //    判为失败，而 verifyExpectedLogMessage 只消费**一条**。
+    expectLogMessage("MAVLink.Crypto.CryptoController", QtWarningMsg,
+                     QRegularExpression("setMonitorDevices"));
+    expectLogMessage("MAVLink.Crypto.CryptoController", QtWarningMsg,
+                     QRegularExpression("setMonitorDevices"));
+    const QVariantList withBad{ static_cast<uint>(a), QStringLiteral("not-a-number"), 0u };
+    crypto->setMonitorDevices(withBad, 5000);
+    verifyExpectedLogMessage();
+    verifyExpectedLogMessage();
+    QCOMPARE(crypto->monitorDeviceCount(), 1);   // 只剩 a
+
+    // 阈值 ≤ 0 或非法 ⇒ 回落默认，且**不清空清单**（§3.5.4：失败只降灵敏度、不改变方向）
+    crypto->setMonitorDevices(QVariantList{ static_cast<uint>(b) }, -1);
+    QCOMPARE(crypto->frameTimeoutMs(), CryptoController::DEFAULT_FRAME_TIMEOUT_MS);
+    QCOMPARE(crypto->monitorDeviceCount(), 1);
+
+    // 空清单 = "没有清单" ⇒ 回退到 _linkedDevices（§3.5.4 的未登录/RomView 未打开两支）
+    crypto->setMonitorDevices(QVariantList(), 3000);
+    QCOMPARE(crypto->monitorDeviceCount(), 0);
 }
 
 UT_REGISTER_TEST_LIGHTWEIGHT(CryptoTest, TestLabel::Unit)

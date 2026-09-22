@@ -128,6 +128,52 @@ bool CryptoController::registrationEnabled() const
     return _registrationEnabled;
 }
 
+void CryptoController::setMonitorDevices(const QVariantList& deviceIds, int frameTimeoutMs)
+{
+    QList<DeviceID> parsed;
+    parsed.reserve(deviceIds.size());
+    for (const QVariant& v : deviceIds) {
+        bool ok = false;
+        const uint id = v.toUInt(&ok);
+        // ⚠️ 与 addLinkedDevice 用**同一组**校验（非 0 + 签名位合法），
+        //    保证"能进 _linkedDevices 的就能进 _monitorDevices"，两处口径不漂移。
+        if (!ok || id == kInvalidDeviceID || !hasValidSignatureBit(static_cast<DeviceID>(id))) {
+            qCWarning(CryptoControllerLog) << "setMonitorDevices: 非法 deviceID，已跳过" << v;
+            continue;
+        }
+        parsed.append(static_cast<DeviceID>(id));
+    }
+
+    bool changed = false;
+    {
+        const QMutexLocker locker(&_mutex);
+        _frameTimeoutMs = (frameTimeoutMs > 0) ? frameTimeoutMs : DEFAULT_FRAME_TIMEOUT_MS;
+        // ‼️ 判据是"集合内容变了"，不是"被调用了一次"（§3.4）
+        changed = (parsed != _monitorDevices);
+        if (changed) {
+            _monitorDevices = parsed;
+            _regCursor = 0;  // 集合变了，旧游标没有意义
+        }
+    }
+
+    // ‼️ 集合变化时的"立即跑一轮加速发送"（§3.4）在 Task 5 接在这里：
+    //    `if (changed) { requestAcceleratedRegistration(); }`
+    //    本任务刻意**不加空实现占位**——空实现会让 Task 5 的用例假绿
+    //    （调用确实发生了，但没有任何可观测效果）。`changed` 保留在作用域里供其使用。
+}
+
+int CryptoController::frameTimeoutMs() const
+{
+    const QMutexLocker locker(&_mutex);
+    return _frameTimeoutMs;
+}
+
+int CryptoController::monitorDeviceCount() const
+{
+    const QMutexLocker locker(&_mutex);
+    return _monitorDevices.size();
+}
+
 QList<DeviceID> CryptoController::nextRegistrationBatch(const QList<DeviceID>& devices, int batch, int& cursor)
 {
     const int n = devices.size();
@@ -166,22 +212,38 @@ void CryptoController::addLinkedDevice(DeviceID deviceID)
 
 void CryptoController::_sendRegistration()
 {
-    // 收集关联 PX4 deviceID（当前单设备场景：活跃目标 + 手动关联的设备）
-    QList<DeviceID> devices;
+    QList<DeviceID> batch;
     {
         const QMutexLocker locker(&_mutex);
-        devices = _linkedDevices;
+        // §3.5.3：有监控清单时用清单，否则回退 _linkedDevices
+        //（未登录 / RomView 未打开 ⇒ 保持现状，零回归）
+        QList<DeviceID> devices = _monitorDevices.isEmpty() ? _linkedDevices : _monitorDevices;
         if (_activeDeviceID != kInvalidDeviceID && !devices.contains(_activeDeviceID)) {
             devices.append(_activeDeviceID);
         }
+        // §3.3：分批轮转。n ≤ 16 时退化为"一批全取、游标恒 0"，与改动前一致。
+        // ‼️ batch 实参必须是 MAX_QGC_LINKED_PX4：nextRegistrationBatch 只保证
+        //    「返回值 ≤ batch」，不裁剪上限；而下游 deviceBytes 是定长 64 字节，
+        //    batch > 16 会越界写 (batch-16)*4 字节（无日志、无断言、静默栈破坏）。
+        batch = nextRegistrationBatch(devices, MAX_QGC_LINKED_PX4, _regCursor);
     }
 
+    // 空批 = 没有关联设备：保持现状，发一个 num=0 的登记告诉 mavp2p "本 GCS 在线"
+    _sendRegistrationFrame(batch);
+}
+
+void CryptoController::_sendRegistrationFrame(const QList<DeviceID>& ids)
+{
     // 帧头 deviceID 用 GCS 段固定值（文档 §1.3 QGC_REGISTRATION_DEVICE_ID_DEFAULT），
     // 由 pack 函数拆入帧头 4 字节（方案 B）。payload 填关联 PX4 deviceID 集合。
-    const int deviceCount = qMin(devices.size(), static_cast<int>(MAX_QGC_LINKED_PX4));
+    const int deviceCount = qMin(ids.size(), static_cast<int>(MAX_QGC_LINKED_PX4));
+
+    // ⚠️ 定长数组，不是 VLA：`uint8_t deviceBytes[count * 4]` 是 GCC 扩展、
+    //    不是标准 C++，MSVC 直接编译失败，本仓是多平台构建（§3.3 关键点 1）。
+    //    count 恒 ≤ MAX_QGC_LINKED_PX4，故构造上不会越界。
     uint8_t deviceBytes[MAX_QGC_LINKED_PX4 * 4] = {};
     for (int i = 0; i < deviceCount; i++) {
-        const uint32_t dev = devices[i];
+        const uint32_t dev = ids.at(i);
         deviceBytes[i * 4 + 0] = static_cast<uint8_t>(dev >> 24);
         deviceBytes[i * 4 + 1] = static_cast<uint8_t>(dev >> 16);
         deviceBytes[i * 4 + 2] = static_cast<uint8_t>(dev >> 8);
