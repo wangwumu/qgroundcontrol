@@ -29,6 +29,7 @@ CryptoController::CryptoController(QObject* parent)
     : QObject(parent)
     , _keyManager(this)
 {
+    _frameClock.start();
     connect(&_keyManager, &DeviceKeyManager::keyFetched, this, &CryptoController::_onKeyFetched);
     connect(&_keyManager, &DeviceKeyManager::fetchFailed, this, &CryptoController::_onFetchFailed);
 }
@@ -275,6 +276,25 @@ void CryptoController::learnDeviceSystemMapping(DeviceID deviceID, uint8_t syste
     const QMutexLocker locker(&_mutex);
     _deviceToSystem.insert(deviceID, systemID);
     _systemToDevice.insert(systemID, deviceID);
+}
+
+void CryptoController::noteDeviceFrame(DeviceID deviceID)
+{
+    if (deviceID == kInvalidDeviceID) {
+        return;
+    }
+    const QMutexLocker locker(&_mutex);
+    _lastFrameMs.insert(deviceID, _frameClock.elapsed());
+}
+
+qint64 CryptoController::msSinceLastFrame(quint32 deviceID) const
+{
+    const QMutexLocker locker(&_mutex);
+    const auto it = _lastFrameMs.constFind(static_cast<DeviceID>(deviceID));
+    if (it == _lastFrameMs.constEnd()) {
+        return -1;
+    }
+    return _frameClock.elapsed() - it.value();
 }
 
 bool CryptoController::deviceIDForSystemID(uint8_t systemID, DeviceID& outDeviceID) const

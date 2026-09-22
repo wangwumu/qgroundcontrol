@@ -21,6 +21,9 @@ private slots:
     void _testReplayGuardTwoPhase();
     void _testReplayGuardUpDownSeparation();  // 上下行 lastNonce 分离：互不污染、reset/clear 双清
 
+    // 收帧时间戳（§3.6.1）：判据是「任意一帧」不是「心跳帧」，载体是本地单调时钟
+    void _testNoteDeviceFrame();
+
     // 加密帧编解码（标准帧 ↔ 加密帧）
     void _testCodecRoundTrip();
     void _testCodecWrongKey();

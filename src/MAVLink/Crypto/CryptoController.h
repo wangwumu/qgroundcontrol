@@ -17,6 +17,7 @@
 /// （CryptoController → ReplayGuard）故无死锁；接收路径经 Qt::AutoConnection 排队，
 /// 在主线程串行执行。
 
+#include <QtCore/QElapsedTimer>
 #include <QtCore/QHash>
 #include <QtCore/QList>
 #include <QtCore/QMutex>
@@ -118,6 +119,22 @@ public:
     /// 学习 deviceID ↔ systemID 映射（接收端解密成功后调用）。
     void learnDeviceSystemMapping(DeviceID deviceID, uint8_t systemID);
 
+    /// 记录「收到了该 deviceID 的任意一帧」的时刻（设计文档 §3.6.1）。
+    ///
+    /// ‼️ 是**任意帧**，不是心跳帧——建链后 PX4 停发明文心跳、改发加密遥测
+    /// （`data_writer/writer.go` 的「语义注意」段），只记心跳会让判据在
+    /// **接引成功那一刻起永久失效**，表现为每 2s 判一次超时、无限定向重发，
+    /// 而链路完全正常、日志上看不出任何异常。
+    ///
+    /// 由 `MAVLinkProtocol` 在**两个**收帧分支各显式调用一行（明文待命心跳支、
+    /// 加密帧支）。**不要**塞进 `learnDeviceSystemMapping` 内部——那个函数的名字
+    /// 只承诺"学习映射"，隐式更新时间戳属于名字没体现的行为。
+    void noteDeviceFrame(DeviceID deviceID);
+
+    /// 距上次收到该 deviceID 的帧过去了多少毫秒；**-1 = 从未收到**。
+    /// 由 `RomView.qml` 在每 2s 的轮询节拍上读取，与生效的阈值比较（§3.6.2）。
+    Q_INVOKABLE qint64 msSinceLastFrame(quint32 deviceID) const;
+
     /// 按 systemID 查 deviceID。
     /// @return true=命中，outDeviceID 填充；false=未学习到映射
     bool deviceIDForSystemID(uint8_t systemID, DeviceID& outDeviceID) const;
@@ -189,6 +206,12 @@ private:
     ReplayGuard _replayGuard;
     QHash<DeviceID, uint8_t> _deviceToSystem; ///< deviceID → systemID 映射（接收端学习）
     QHash<uint8_t, DeviceID> _systemToDevice; ///< systemID → deviceID 反向映射
+    /// deviceID → 最近一次收帧时 `_frameClock` 的毫秒读数。
+    /// ⚠️ 刻意**不做清理**：条目数 = 本进程见过的 deviceID 数（天花板 80），
+    ///    内存可忽略；加清理反而引入"清理时机"这个新判据，是净损失。
+    QHash<DeviceID, qint64> _lastFrameMs;
+    /// `_lastFrameMs` 的时间基准。单调、不受系统时钟调整影响。
+    QElapsedTimer _frameClock;
     QTimer* _registrationTimer = nullptr; ///< 80005 周期发送定时器
     bool _registrationEnabled = false;
     QList<DeviceID> _linkedDevices; ///< 本 QGC 关联的 PX4 deviceID（登记心跳 payload）

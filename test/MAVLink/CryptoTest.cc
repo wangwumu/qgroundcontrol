@@ -1417,4 +1417,43 @@ void CryptoTest::_testHeartbeatExtInjection()
     }
 }
 
+void CryptoTest::_testNoteDeviceFrame()
+{
+    // §3.6.1：QGC 必须自己记 per-deviceID 的收帧时刻——不能用服务端的
+    // last_heartbeat_at（接引成功后反而停更）或 last_telemetry_at（回答的是
+    // 另一个问题："飞机有没有在发"，而非"mavp2p 有没有转给我"）。
+    //
+    // 三个读数各有判别力，缺一不可：
+    //   ① 从未收到 = -1（不是 0——0 会被下游当成"刚刚收到"）
+    //   ② 收到后 ≈ 0
+    //   ③ 时间在走（读数随时钟增长）——只测 ①② 的话，一个"恒返回 0"的
+    //      实现会全绿，而它在生产里的表现是"永不超时"，即整个机制失效
+    CryptoController* const crypto = CryptoController::instance();
+    const DeviceID deviceID = 0x0A0B0C10u;  // 本用例独占：单例状态跨用例共享
+
+    QCOMPARE(crypto->msSinceLastFrame(deviceID), qint64(-1));
+
+    crypto->noteDeviceFrame(deviceID);
+    const qint64 t0 = crypto->msSinceLastFrame(deviceID);
+    QVERIFY2(t0 >= 0 && t0 < 100, qPrintable(QStringLiteral("t0=%1").arg(t0)));
+
+    // 等到读数确实随时钟增长（§3.6.1 的判据 ③）。
+    // ‼️ 不用 QTest::qWait(<n>)：本仓 Golden Rule 禁止固定延时
+    //    （`.pre-commit-config.yaml` 的 check-no-fixed-qwait 钩子、`AGENTS.md` 的 Golden Rule）。
+    //    QTRY_* 是「轮询到条件成立，最多等 N ms」，慢机器上比固定睡眠更稳，
+    //    而判据本身（读数须 ≥ 50ms）一字未动。
+    QTRY_VERIFY_WITH_TIMEOUT(crypto->msSinceLastFrame(deviceID) >= 50, TestTimeout::shortMs());
+
+    // 再次收帧 ⇒ 时间戳被刷新。
+    // 变异自证：把 _lastFrameMs.insert 改成"仅当不存在时插入"，此处变红。
+    crypto->noteDeviceFrame(deviceID);
+    const qint64 t2 = crypto->msSinceLastFrame(deviceID);
+    QVERIFY2(t2 < 50, qPrintable(QStringLiteral("t2=%1").arg(t2)));
+
+    // 非法 deviceID 不记账。0 是 kInvalidDeviceID；一条 device_id=0 的登记会在
+    // mavp2p 里建出一个无意义的 pair（0x00000000），且没有任何一处会报错（§3.5.2）。
+    crypto->noteDeviceFrame(kInvalidDeviceID);
+    QCOMPARE(crypto->msSinceLastFrame(kInvalidDeviceID), qint64(-1));
+}
+
 UT_REGISTER_TEST_LIGHTWEIGHT(CryptoTest, TestLabel::Unit)
