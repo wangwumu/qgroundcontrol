@@ -1519,6 +1519,16 @@ void CryptoTest::_testNextRegistrationBatch()
     const QList<DeviceID> s2 = CryptoController::nextRegistrationBatch(small, 16, staleCursor);
     QCOMPARE(s2.size(), 5);
     QCOMPARE(s2.first(), static_cast<DeviceID>(20000000u));
+
+    // 游标越界防御的**低侧**哨兵。判据：负游标必须与越界游标同样归零。
+    // ‼️ 与上面 41 那条互补——41 钉死的是高侧 `cursor >= n`，-3 钉死的是低侧 `cursor < 0`；
+    //    守卫写成 `if (cursor >= n)` （漏掉 `cursor < 0 ||`）时高侧用例仍然全绿，
+    //    而漏过低侧的后果是 `devices.at(负下标)` = **UB**（越界读，非报错）。
+    int negCursor = -3;
+    const QList<DeviceID> s3 = CryptoController::nextRegistrationBatch(small, 16, negCursor);
+    QCOMPARE(s3.size(), 5);
+    QCOMPARE(s3.first(), static_cast<DeviceID>(20000000u));
+    QCOMPARE(negCursor, 0);
 }
 
 UT_REGISTER_TEST_LIGHTWEIGHT(CryptoTest, TestLabel::Unit)
