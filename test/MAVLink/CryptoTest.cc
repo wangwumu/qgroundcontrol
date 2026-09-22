@@ -1664,7 +1664,8 @@ void CryptoTest::_testRequestAcceleratedRegistration()
     (void) QTest::qWaitFor([] { return false; }, TestTimeout::shortMs());
     QCOMPARE(crypto->registrationSendCountForTest(), s2 + 5);
 
-    // ---- ⑤ 未启用登记 ⇒ 集合变化也不加速（与 _sendRegistration 共用同一道门）----
+    // ---- ⑤ 未启用登记 ⇒ 集合变化也不加速（这道门在 requestAcceleratedRegistration
+    //      自己身上；`_sendRegistration()` **没有**门，别指望它自检）----
     crypto->setRegistrationEnabled(false);
     const int s3 = crypto->registrationSendCountForTest();
     crypto->setMonitorDevices(QVariantList(), 3000);   // 内容变了（96 → 空）

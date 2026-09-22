@@ -178,13 +178,28 @@ int CryptoController::monitorDeviceCount() const
 void CryptoController::requestAcceleratedRegistration()
 {
     if (!registrationEnabled()) {
-        return;  // 未启用登记时不加速（与 _sendRegistration 的门一致）
+        // ‼️ 登记的闸在**调用方**：本函数自带这道门，而 `_sendRegistration()` **没有**
+        //    （它零 `return`——只有计数 + 取批 + 发帧，假定调用方已把好关）。
+        //    登记关着时不发帧靠的是 `setRegistrationEnabled(false)` 停掉周期定时器，
+        //    **不是** `_sendRegistration()` 的自检。往 `_sendRegistration()` 加新调用点
+        //    （如定向重发）前必须自己确认登记已启用，否则会在关闭状态下照发。
+        return;
     }
 
     int n = 0;
     {
         const QMutexLocker locker(&_mutex);
-        n = _monitorDevices.isEmpty() ? _linkedDevices.size() : _monitorDevices.size();
+        // ‼️ 口径必须与 `_sendRegistration()` 取列表的那几行**一致**：那里在
+        //    `_activeDeviceID` 有效且不在清单里时会把它**追加到末尾**。
+        //    少算这一个的后果：清单条数为 16 的整数倍（16/32/48/64/80）时
+        //    `ceil(n/16)` 少排一批，而追加在末尾的 `_activeDeviceID` 恰好总落在最后一批
+        //    ⇒ 它这一轮永远取不到、要等下一个 10s 周期——而那架正是用户刚选定、
+        //    正在建链的目标。改完 n = 这一轮真正要发的总量。
+        const QList<DeviceID>& devices = _monitorDevices.isEmpty() ? _linkedDevices : _monitorDevices;
+        n = devices.size();
+        if (_activeDeviceID != kInvalidDeviceID && !devices.contains(_activeDeviceID)) {
+            n++;
+        }
     }
 
     const int batches = (n <= 0) ? 1 : ((n + MAX_QGC_LINKED_PX4 - 1) / MAX_QGC_LINKED_PX4);

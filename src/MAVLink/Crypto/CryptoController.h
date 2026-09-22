@@ -106,17 +106,22 @@ public:
     /// 供测试与诊断读——`_monitorDevices` 本身是 private。
     int monitorDeviceCount() const;
 
-    /// 立即跑一轮加速登记（§3.4）：连续 `ceil(n/16)` 次发送（批数封顶见
-    /// `kMaxRegistrationBatches`）、批间隔 `kRegistrationBurstIntervalMs`，
-    /// 让新集合在**秒级**内全部接上，而不是等 `batches × 10s` 的游标周期。
+    /// 立即跑一轮加速登记（§3.4）：连续 `ceil(n/16)` 次发送、批间隔
+    /// `kRegistrationBurstIntervalMs`，让新集合在**秒级**内全部接上，
+    /// 而不是等 `batches × 10s` 的游标周期。
+    /// `n` = 这一轮真正要发的 deviceID 总数，与 `_sendRegistration()` 取列表的口径一致
+    /// （含"`_activeDeviceID` 有效且不在清单里 ⇒ 追加一个"）；批数封顶见
+    /// `kMaxRegistrationBatches`。
     ///
     /// 触发点两处：① `setMonitorDevices` 检测到集合变化；② 登录成功后
     /// `AuthController` 通知（`_linkedDevices` 刚被填充）。
     ///
     /// ⚠️ **不要把它接到 2s 轮询上**——那会打乱 10s 保活周期。
     /// ⚠️ 集合没变时反复调用它最多多花几帧，不改集合、不改变行为方向。
-    /// ⚠️ 与 `_sendRegistration` 共用同一道 `registrationEnabled()` 门：
-    ///    登记关着时直接返回，否则会出现"登记关着却在发登记帧"。
+    /// ⚠️ 登记的闸在**调用方**：本函数自带 `registrationEnabled()` 门，而
+    ///    `_sendRegistration()` **没有**（它假定调用方已把好关）。要给
+    ///    `_sendRegistration()` 加新调用点（如定向重发）时，必须自己确认登记已启用——
+    ///    否则会在登记关闭状态下照发登记帧。
     Q_INVOKABLE void requestAcceleratedRegistration();
 
     /// ---- 仅供单测（生产代码不得调用）----
