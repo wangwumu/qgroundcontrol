@@ -59,4 +59,7 @@ private slots:
     void _testHeartbeatExt();
     // EXT 注入层：buildHeartbeatExtTelemetry 门控/哨兵/字段映射（合成遥测）
     void _testHeartbeatExtInjection();
+
+    // 80005 分批（§3.3/§3.4）：切批 + 环形轮转 + 覆盖性
+    void _testNextRegistrationBatch();
 };

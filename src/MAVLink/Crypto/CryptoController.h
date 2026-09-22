@@ -74,6 +74,20 @@ public:
     void setRegistrationEnabled(bool enabled, int intervalMs = kRegistrationIntervalMs);
     bool registrationEnabled() const;
 
+    /// 从 `devices` 的 `cursor` 位置起取至多 `batch` 个（环形回绕），
+    /// 并把 `cursor` 就地推进到**下一批的起点**（§3.3）。
+    ///
+    /// 语义：把 n 架切成 ceil(n/batch) 批，每批 ≤ batch
+    /// （n=18、batch=16 ⇒ 批次大小依次 16、2、16、2…）。
+    /// ⚠️ 不是"每次取满 batch 个的滑窗"——那样每批恒为 16 个，第二批会白白多带
+    ///    14 个 deviceID（56 字节），且与 §9.2 的实测判据不符。
+    ///
+    /// n ≤ batch 时退化为「一批全取、游标恒 0」，与改动前行为完全一致。
+    ///
+    /// 抽成 public static 纯函数是为了单测：`_sendRegistration()` 的发送路径依赖
+    /// `LinkManager`（单测里无 UDP link），无法观察它实际发了什么。
+    static QList<DeviceID> nextRegistrationBatch(const QList<DeviceID>& devices, int batch, int& cursor);
+
     /// 声明本 QGC 关联的 PX4 deviceID（加入登记心跳 payload）。
     /// 单设备场景：建链目标 deviceID 即关联对象。
     void addLinkedDevice(DeviceID deviceID);

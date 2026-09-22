@@ -128,6 +128,28 @@ bool CryptoController::registrationEnabled() const
     return _registrationEnabled;
 }
 
+QList<DeviceID> CryptoController::nextRegistrationBatch(const QList<DeviceID>& devices, int batch, int& cursor)
+{
+    const int n = devices.size();
+    if (n <= 0 || batch <= 0) {
+        cursor = 0;
+        return {};
+    }
+    // 防御：监控清单缩小后，上一轮留下的游标可能已越界
+    if (cursor < 0 || cursor >= n) {
+        cursor = 0;
+    }
+    const int count = qMin(batch, n - cursor);
+
+    QList<DeviceID> out;
+    out.reserve(count);
+    for (int i = 0; i < count; i++) {
+        out.append(devices.at((cursor + i) % n));
+    }
+    cursor = (cursor + count) % n;
+    return out;
+}
+
 void CryptoController::addLinkedDevice(DeviceID deviceID)
 {
     // 规范 §1.4：PX4 deviceID 的 bit24（incompatFlag bit0）必须为 0

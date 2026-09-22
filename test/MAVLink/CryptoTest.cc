@@ -15,6 +15,7 @@
 #include <QDir>
 #include <QFile>
 #include <QRegularExpression>
+#include <QSet>
 #include <QTemporaryFile>
 #include <cstring>
 
@@ -1454,6 +1455,67 @@ void CryptoTest::_testNoteDeviceFrame()
     // mavp2p 里建出一个无意义的 pair（0x00000000），且没有任何一处会报错（§3.5.2）。
     crypto->noteDeviceFrame(kInvalidDeviceID);
     QCOMPARE(crypto->msSinceLastFrame(kInvalidDeviceID), qint64(-1));
+}
+
+void CryptoTest::_testNextRegistrationBatch()
+{
+    // §3.3 的算法，§9.2 的判据。n=18、batch=16 ⇒ 每轮 2 批，批次大小依次 16、2。
+    // ⚠️ 设计文档 §3.3 的伪码写的是 `count = qMin(n, batch)`——那在 n=18 时恒为 16，
+    //    与 §9.2 的「16、2、16、2…」不符。本实现取「切批」语义，理由见计划 R1。
+    QList<DeviceID> ids;
+    for (int i = 0; i < 18; i++) {
+        ids.append(10000030u + static_cast<uint32_t>(i));
+    }
+
+    int cursor = 0;
+    const QList<DeviceID> b1 = CryptoController::nextRegistrationBatch(ids, 16, cursor);
+    QCOMPARE(b1.size(), 16);
+    QCOMPARE(b1.first(), static_cast<DeviceID>(10000030u));
+    QCOMPARE(b1.last(), static_cast<DeviceID>(10000045u));
+    QCOMPARE(cursor, 16);
+
+    const QList<DeviceID> b2 = CryptoController::nextRegistrationBatch(ids, 16, cursor);
+    QCOMPARE(b2.size(), 2);
+    QCOMPARE(b2.at(0), static_cast<DeviceID>(10000046u));
+    QCOMPARE(b2.at(1), static_cast<DeviceID>(10000047u));
+    QCOMPARE(cursor, 0);  // 回绕到起点，下一轮从头开始
+
+    // ‼️ 覆盖性：判据是「集合里每个 id 都被登记过」，不是「第一批 16 个都对」。
+    //    只跑一轮时，第一批之后的都没轮到，而"16 个都出现了"看起来像全对（§9.2）。
+    QSet<DeviceID> seen;
+    cursor = 0;
+    const int batches = (ids.size() + 15) / 16;  // ceil(18/16) = 2（§3.4）
+    for (int round = 0; round < 2; round++) {
+        for (int b = 0; b < batches; b++) {
+            const QList<DeviceID> batch = CryptoController::nextRegistrationBatch(ids, 16, cursor);
+            for (const DeviceID id : batch) {
+                seen.insert(id);
+            }
+        }
+    }
+    QCOMPARE(seen.size(), ids.size());
+
+    // n ≤ batch ⇒ 退化为「一批全取、游标恒 0」，与改动前的行为完全一致（§3.3 关键点 3）。
+    // 这是零回归风险的依据：监控清单 ≤16 架时行为一字不变。
+    QList<DeviceID> small;
+    for (int i = 0; i < 5; i++) {
+        small.append(20000000u + static_cast<uint32_t>(i));
+    }
+    int smallCursor = 0;
+    const QList<DeviceID> s1 = CryptoController::nextRegistrationBatch(small, 16, smallCursor);
+    QCOMPARE(s1.size(), 5);
+    QCOMPARE(smallCursor, 0);
+
+    // 空集合 ⇒ 空批、游标归零（调用方据此走"发 num=0 的登记"的现状分支）
+    int emptyCursor = 7;
+    QVERIFY(CryptoController::nextRegistrationBatch(QList<DeviceID>(), 16, emptyCursor).isEmpty());
+    QCOMPARE(emptyCursor, 0);
+
+    // 游标越界防御：集合缩小后旧游标可能落在界外，必须回到 0 而不是越界读
+    int staleCursor = 40;
+    const QList<DeviceID> s2 = CryptoController::nextRegistrationBatch(small, 16, staleCursor);
+    QCOMPARE(s2.size(), 5);
+    QCOMPARE(s2.first(), static_cast<DeviceID>(20000000u));
 }
 
 UT_REGISTER_TEST_LIGHTWEIGHT(CryptoTest, TestLabel::Unit)
