@@ -116,6 +116,23 @@ ColumnLayout {
                 Row {
                     width: parent.width
                     spacing: 6
+                    // 异常航班 ⇒ 置顶标记。中段表头写着「航班列表 · 异常置顶」，**被置顶的那一行
+                    // 必须自己说明它为什么在顶上**——否则表头在承诺一件界面没做的事。
+                    // ‼️ 判据与置顶判据**同源**：`OpsCommon.middleSectionTasks` 用 `isAbnormal`
+                    //    挑出第 1 节，这里用同一个函数决定画不画 ⇒ 两者不可能漂移。
+                    // ‼️ 色走 §5.3 的三色单点定义（备降橙 / 回航黄 / 迫降红），**不是**常量红
+                    //    ——这样同一条航班在中段列表里的标记色与地图上它那架飞机的 marker
+                    //    颜色恒等（`deviceColor` 用的是同一对函数）。
+                    // ⚠️ 未知 type 时 `abnormalColor` 返回**空串**，按该函数头部的硬约束
+                    //    **不得兜底成红**（红是迫降语义，兜红会让普通告警看着像坠机）
+                    //    ⇒ 回退成与常规信息同一档的灰字：标记照旧出现，只是不着色。
+                    //    `||` 在这里是对的判据——空串是 falsy，不想要的是 `??`（空串不触发）。
+                    Text {
+                        visible: OpsCommon.isAbnormal(modelData)
+                        color: OpsCommon.abnormalColor(OpsCommon.abnormalKind(modelData)) || "#8fa1bd"
+                        font.pixelSize: 12; font.bold: true
+                        text: "⚠"
+                    }
                     Rectangle {
                         width: 8; height: 8; radius: 4
                         anchors.verticalCenter: parent.verticalCenter

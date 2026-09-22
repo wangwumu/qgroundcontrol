@@ -38,12 +38,22 @@ var taskCardGap = 6
 // 任务显示号：优先航班号（无人机号），无则回退任务号
 function taskNo(task) { return task ? (task.uav_no ? task.uav_no : task.task_no) : "—" }
 
-// 任务状态 → 中文。⚠️ 原文如此**没有** `qsTr`，不要"顺手统一"加上。
+// task.status → 中文。**界面不出现裸枚举**（用户长期规则）。
+// ⚠️ 原文如此**没有** `qsTr`，不要"顺手统一"加上。
+// ⚠️ `default: return s` 是**断路器不是译文**：未知状态原样露出，好过编一个错的中文。
+//    它是"这里有个没收录的状态"的显式信号——看到它就该补 case，别把它当正常输出。
+// ‼️ 收录范围以**后端会写进 `table_flight_task.status` 的字面量**为准。`finishedTaskStatuses`
+//    （`handlers/task.go`）用的是 `"COMPLETED","ABORTED","CANCELED","CANCELLED"`——
+//    注意 **`ABORTED` 与这里的 `ABORT` 是两个不同字面量**（[[task-status-enum-literal-split]]
+//    的三套枚举之一），所以两个都得收，只留 `ABORT` 会让 `ABORTED` 裸奔。
+//    2026-09-23 实测真库在用的是 `READY` 与 **`CANCELED`**（各 7 / 2 条）。
 function statusLabel(s) {
     switch (s) {
     case "SCHEDULED": return "待起飞"; case "READY": return "就绪"; case "TAKEOFF": return "起飞中"
     case "IN_FLIGHT": return "航线中"; case "LANDING": return "降落中"; case "COMPLETED": return "已完成"
-    case "ABORT": return "中止"; case "FAILED": return "异常"; default: return s
+    case "ABORT": case "ABORTED": return "中止"; case "FAILED": return "异常"
+    case "CANCELED": case "CANCELLED": return "已取消"
+    default: return s
     }
 }
 
@@ -76,7 +86,12 @@ function statusColor(task, nowMs, handoverById) {
     switch (s) {
     case "TAKEOFF": case "IN_FLIGHT": case "LANDING": return "#ffc107"
     case "COMPLETED": return "#2ecc71"
-    case "ABORT": case "FAILED": return "#ff3b3b"
+    // ‼️ `ABORTED` **必须与 `ABORT` 并列**：两者是**不同的字面量**（`handlers/task.go` 的
+    //    `finishedTaskStatuses` 写的是 `ABORTED`），而 `statusLabel` 早已两个都收 ⇒ 只收
+    //    一个的后果是状态字写「中止」、颜色却是 default 的中性蓝，语义正好相反。
+    //    可达性：③ 的状态白名单不含 `ABORTED`，只有该航班**同时挂着未闭环异常**时才进列表。
+    // ⚠️ `CANCELED`/`CANCELLED` 同样落 default 蓝——那是有意的（"已取消"用中性色）。
+    case "ABORT": case "ABORTED": case "FAILED": return "#ff3b3b"
     default: return "#3b9cff"
     }
 }
@@ -231,3 +246,225 @@ function siteTasks(tasks, outbound, inbound, mySiteId, handoverById) {
 
 // 监控员视图的行集合：overview 已按负责航线过滤 IN_FLIGHT，原样返回
 function routeTasks(tasks) { return tasks }
+
+
+//--------------------------------------------------------------------------
+// 航线监控员：航线缓存派生与异常判定（设计文档 §2.3 / §4 / §5.3）
+//--------------------------------------------------------------------------
+
+// 异常：**唯一判据点**。`obj.event != null` ⇔ 该对象背后有一条未闭环的异常事件
+// （后端 ③ 只在 `event_type IN ('DIVERT','RETURN','FORCED_LANDING') AND status IN ('OPEN','STAGE_DONE')`
+//  时才填这个字段，所以"有没有 event"本身就是后端判完的结果，QGC 侧不再复判 type/status）。
+// ‼️ 入参 **task 或 device 都可以**——两者的 `event` 是**同一个对象**（§1.4）。
+//    **不要**因为两处调用长得不一样就复制出第二个函数：那会让"什么算异常"有两个定义。
+function isAbnormal(obj) { return !!(obj && obj.event != null) }
+
+// 异常种类。未知值返回**空串**而不是原值——界面不出现裸枚举（`ui-no-raw-enum-labels`）。
+function abnormalKind(obj) {
+    if (!isAbnormal(obj)) return ""
+    var t = obj.event.type
+    return (t === "DIVERT" || t === "RETURN" || t === "FORCED_LANDING") ? t : ""
+}
+
+// 异常三色，**单点定义**（§5.3 第 1 条）。
+// ⚠️ 未知 type 返回 `""`，调用方必须回退到常规色——**不要兜底成红色**：
+//    红色是迫降的语义，未知值兜底成红会让一条普通告警看起来像坠机（§5.3 明写）。
+function abnormalColor(kind) {
+    switch (kind) {
+    case "DIVERT":          return "#ff9800"   // 备降 橙
+    case "RETURN":          return "#ffd54f"   // 回航 黄
+    case "FORCED_LANDING":  return "#ff3b3b"   // 迫降 红
+    default:                return ""
+    }
+}
+
+// 飞机 marker 的着色（§5.3，**入参是 device 不是 task**）。
+// 优先级：异常 > 按飞机状态。
+// ⚠️ 第 2 条**没有**复用 `statusColor`：那个函数的 switch 判的是**任务**状态
+//    （TAKEOFF/IN_FLIGHT/LANDING/COMPLETED/ABORT/FAILED），拿**飞机**状态喂进去时
+//    `RETURNING`/`EMERGENCY_LANDING`/`READY_TO_TAKEOFF` 全会掉进 default 变蓝
+//    ——「返航中」被画成待命蓝。§5.3 写的是"复用既有色表"，此处按**该表表达的颜色语义**
+//    写死映射，取值与 `statusColor` 逐字相同（飞行黄 / 其余蓝）。
+function deviceColor(device) {
+    var c = abnormalColor(abnormalKind(device))
+    if (c !== "") return c
+    switch (device ? device.uav_status : "") {
+    case "TAKEOFF": case "IN_FLIGHT": case "LANDING": case "RETURNING": case "EMERGENCY_LANDING":
+        return "#ffc107"
+    default:
+        return "#3b9cff"
+    }
+}
+
+// 选中航线时的显隐（§5.3）。返回 "lit" | "dimmed" | "normal"。
+// ‼️ **异常飞机恒 "lit"**：用户同时要求「异常航班常驻」与「选中点亮、其余淡化」，
+//    机械执行后者会让一架**正在迫降**的飞机变成 35% 不透明。**异常优先于选中淡化。**
+//    （这是设计文档 §5.3 里作者自己标注的裁定，不是用户原话；若用户不同意，改这一个函数即可。）
+function visibleForSelection(device, selectedRouteId) {
+    if (selectedRouteId === null || selectedRouteId === undefined) return "normal"
+    if (isAbnormal(device)) return "lit"
+    return Number(device ? device.route_id : -1) === Number(selectedRouteId) ? "lit" : "dimmed"
+}
+
+// 淡化不透明度（数值本身无依据，§5.3 注明"按真机截图调"）
+var dimmedOpacity = 0.35
+
+// 位置主源选择（§5.2）。返回 `{lat, lon, source}` 或 **null**（调用方不画 marker）。
+//   source = "mavlink"（实时） | "rest"（最多陈旧 2s）
+// ‼️ 第三个实参 `vehicleCoord` **不是冗余**：`.pragma library` 里函数体读属性**不注册绑定依赖**
+//    （见本文件头部）。把坐标作为**实参**传进来，绑定依赖才落在调用点的表达式上——
+//    这样 MAVLink 坐标一变，marker 的 `coordinate` 绑定才会重估。写成 `vehicle.coordinate`
+//    在函数体内，界面**看不出异常**，只是位置永远停在第一帧。
+function resolvePosition(device, vehicle, vehicleCoord) {
+    if (vehicle && vehicleCoord && vehicleCoord.isValid) {
+        return { lat: vehicleCoord.latitude, lon: vehicleCoord.longitude, source: "mavlink" }
+    }
+    // ⚠️ `device.latest` 为 null 是**常态不是异常**（该机尚无任何遥测）⇒ 必须先判 `!!`。
+    //    直接写 `device.latest.lat` 会抛 TypeError，而 QML 绑定异常**不中断渲染**，
+    //    只把该属性留在 undefined（`qml-undefined-binding-falls-back-to-default-true`）。
+    var l = device ? device.latest : null
+    if (l && l.lat) return { lat: l.lat, lon: l.lon, source: "rest" }
+    return null
+}
+
+// 按 `deviceID` 找真实 Vehicle（复用 `OpsView.qml` 的 `_vehicleForTask()` 手法）。
+// ⚠️ 是 **deviceID**（MAVLink 帧头那个 32 位数），**不是 `uav_no`、不是 `uav_id`**
+//    ——库里的 `table_uav.device_id` 就是这个值。用错字段的后果是永远匹配不上，
+//    而匹配不上时的回退正好是 REST `latest` ⇒ 界面看起来完全正常，只是永远不实时。
+function matchDeviceToVehicle(device, vehicles) {
+    if (!device || !vehicles) return null
+    var want = Number(device.device_id)
+    if (!(want > 0)) return null          // device_id 缺失/0：**不要**拿 0 去匹配，会认领到别人的机
+    // `multiVehicleManager.vehicles` 是 `QmlObjectListModel`：`.count` + `.get(i)`，
+    // **不是** JS 数组（`vehicles[i]` / `vehicles.length` 都是 undefined）。
+    // `deviceID` 是 `Q_INVOKABLE uint deviceID()` ——**方法不是属性**，少写括号恒得 undefined。
+    var n = vehicles.count
+    for (var i = 0; i < n; i++) {
+        var v = vehicles.get(i)
+        if (v && Number(v.deviceID()) === want) return v
+    }
+    return null
+}
+
+// 某条航线下的**活跃飞机数量**（§2.3 / §4.1 上段），用于航线行后面的数字。
+// ‼️ 裁定 ③ 的原话是「后面显示飞机的数量」——**数量不是徽标列表**，不要改成逐个列 `uav_no`。
+// ‼️ 按 `uav_id` **去重**：③ 的 `tasks[]` 是**一个任务一行**，同一架飞机可能挂多条任务
+//    （真库实测：91102 与 91104 共用 uav）。数"条数"会把 1 架飞机显示成 2。
+// ‼️ 过滤 `uav_id <= 0`（未指派）——那是"这条任务还没有飞机"，不是"有一架编号为 0 的飞机"。
+function activeUavCount(tasks) {
+    var seen = {}
+    var n = 0
+    for (var i = 0; i < tasks.length; i++) {
+        var id = Number(tasks[i] ? tasks[i].uav_id : 0)
+        if (!(id > 0)) continue
+        if (seen[id]) continue
+        seen[id] = true
+        n++
+    }
+    return n
+}
+
+// 按 `route_id` 把 ③ 的 `tasks[]` 分组，返回 `{ "12": [task, ...] }`。
+// ‼️ **按 `routeOrder` 保证键的存在与次序**：无航班的航线 → **空数组，不是缺键**
+//    （缺键会让"这条航线没有航班"与"这条航线的数据还没加载"在界面上长得一样）。
+function groupTasksByRoute(tasks, routeOrder) {
+    var out = {}
+    for (var i = 0; i < routeOrder.length; i++) out[String(routeOrder[i])] = []
+    for (var j = 0; j < tasks.length; j++) {
+        var k = String(tasks[j].route_id)
+        if (out[k] === undefined) continue     // ③ 里出现了不在名册里的航线：不新增键
+        out[k].push(tasks[j])
+    }
+    return out
+}
+
+// 中段（航班列表）的行集合（§4.1 中段）= 第 1 节 ∪ 第 2 节：
+//   第 1 节 **异常航班**：`isAbnormal` 为真的全部航班，**与是否选中航线无关、置顶常驻**。
+//          这是裁定 ⑥ 的硬约束——用户指出过「异常飞机应该常驻在屏幕上，而我们又说选择航线，
+//          则在列表中显示该航班的航班，这个冲突了」。
+//   第 2 节 **在航航班**，随选中状态换口径（用户 2026-09-23 定）：
+//          **选中航线 ⇒ 只列该航线的**；**一条都没选中 ⇒ 列全部在航航班**。
+//          ‼️ "全部在航"不需要在这里再筛一次状态：③ 端点自己的 WHERE 就是
+//             `u.status IN ('READY_TO_TAKEOFF','TAKEOFF','IN_FLIGHT','LANDING','RETURNING',
+//              'EMERGENCY_LANDING') OR 有未闭环异常` ⇒ **`tasks` 整个集合本来就是"在航"**，
+//             直接全收即对。在这里另写一遍状态白名单＝多一份会与后端漂移的判据。
+//          ⚠️ 在这之前，未选中时第 2 节是**整体为空**的（只显示异常）。那是旧口径，已废。
+// ‼️ 两节可能包含**同一个航班**（选中了一条有异常航班的航线）⇒ **必须按 `task_id` 去重**，
+//    去重后**仍留在第 1 节**（异常的位置更高）。去重漏了的表现是同一条航班在列表里出现两次，
+//    看起来像"重复的数据"，不报错。
+function middleSectionTasks(tasks, selectedRouteId) {
+    var seen = {}, out = []
+    for (var i = 0; i < tasks.length; i++) {
+        var t = tasks[i]
+        if (!isAbnormal(t)) continue
+        if (seen[t.task_id]) continue
+        seen[t.task_id] = true
+        out.push(t)
+    }
+    // 未选中（null / undefined）与"选中了某条"共用下面这一轮循环，只差**过不过滤 route_id**：
+    // 早返回式的写法（`if (未选中) return out`）会让"全收"与"按航线收"变成两段各自演化的代码。
+    var filterByRoute = (selectedRouteId !== null && selectedRouteId !== undefined)
+    for (var j = 0; j < tasks.length; j++) {
+        var u = tasks[j]
+        if (filterByRoute && Number(u.route_id) !== Number(selectedRouteId)) continue
+        if (seen[u.task_id]) continue          // 已在异常节里：保持它在前面
+        seen[u.task_id] = true
+        out.push(u)
+    }
+    return out
+}
+
+// 从 ③ 的 `devices[]` 提取要推给 C++ 的 device_id 清单（§2.3 / §3.5.3）。
+// ‼️ 这是 QML → C++ 的**唯一入口**，漏掉 `<= 0` 的过滤就会在 mavp2p 侧建出一个
+//    `deviceID=0` 的 pair——**没有任何一处会报错**。重复项同样过滤（后端已去重，此处是第二道）。
+function monitorDeviceIds(devices) {
+    var seen = {}
+    var out = []
+    for (var i = 0; i < devices.length; i++) {
+        var id = Number(devices[i] ? devices[i].device_id : 0)
+        if (!(id > 0)) continue
+        if (seen[id]) continue
+        seen[id] = true
+        out.push(id)
+    }
+    return out
+}
+
+// 航点坐标是否有效 —— **单点定义**，`routeBounds` 与 QML 的 `OpsShell.routePathOf` 共用。
+// ‼️ 口径与 `MapFitFunctions.qml:58` **逐字一致**：两轴都要是有限数，且**任一轴为 0 即无效**
+//    （(0,0) 是"没有定位"的常见缺省值；本站航线不会落在赤道或本初子午线上）。
+// ⚠️ 这里原先写的是"两轴**同时**为 0 才跳过"，而注释却声称"与 MapFitFunctions 的过滤口径一致"
+//    ——**假的一致比不一致更坏**，它会让人不再去比对。而 QML 的 `routePathOf` 更是完全不过滤 0
+//    ⇒ 同一个 diff 里的三个消费点三种口径：包围盒丢掉 (0,0)，折线却画到 (0,0)
+//    （一条甩到几内亚湾的长线），视野又按不含它的盒子套。现在三处共用本函数。
+function isValidWaypoint(la, lo) {
+    return isFinite(la) && isFinite(lo) && la !== 0 && lo !== 0
+}
+
+// 全部负责航线的包围盒（§7.4）。返回 `{minLat, minLon, maxLat, maxLon}` 或 **null**。
+// ‼️ **不复用 `MapFitFunctions.fitMapViewportToAllCoordinates()`**，它有三处不匹配（§7.4）：
+//    绑 planMasterController、视口矩形硬编码整图（不扣右栏）、循环从 `i = 1` 起
+//    ⇒ **首点不做有效性检查**。这里从 0 起，逐点过滤 `isFinite` 与 0。
+// 退化情形由调用方处理：空集合返回 null（**不要**拿它去调 setVisibleRegion）。
+function routeBounds(routes) {
+    var minLat = NaN, minLon = NaN, maxLat = NaN, maxLon = NaN
+    var n = 0
+    for (var i = 0; i < routes.length; i++) {
+        var wps = routes[i] ? routes[i].waypoints : null
+        if (!Array.isArray(wps)) continue
+        for (var j = 0; j < wps.length; j++) {
+            var wp = wps[j]
+            var la = Number(wp ? wp.lat : NaN), lo = Number(wp ? wp.lon : NaN)
+            if (!isValidWaypoint(la, lo)) continue
+            if (n === 0) { minLat = maxLat = la; minLon = maxLon = lo }
+            else {
+                if (la < minLat) minLat = la
+                if (la > maxLat) maxLat = la
+                if (lo < minLon) minLon = lo
+                if (lo > maxLon) maxLon = lo
+            }
+            n++
+        }
+    }
+    return n === 0 ? null : { minLat: minLat, minLon: minLon, maxLat: maxLat, maxLon: maxLon }
+}
