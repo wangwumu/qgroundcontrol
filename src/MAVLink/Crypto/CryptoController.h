@@ -121,12 +121,12 @@ public:
     ///    登记报文的 payload 容量。`batch > 16` 时它会照常返回那么多元素。
     ///    （`batch <= 0` 不是违约：按空批处理并把游标归零，见下。）
     ///
-    ///    违约后果（**静默覆盖缺口，不是内存越界**）：调用方按 `batch` 推进游标，
-    ///    而 payload 只装得下 `MAX_QGC_LINKED_PX4` 个 id ⇒ 传入 `batch = 60` 时每轮有
-    ///    `batch - 16` 个 deviceID 被**永久跳过**（无日志、无断言、不报错）。
+    ///    违约后果（**静默覆盖缺口，不是内存越界**）：调用方按 `batch` 推进游标，而 payload
+    ///    只装得下 `MAX_QGC_LINKED_PX4` 个 deviceID ⇒ 传入 `batch = 60` 时每轮丢掉本轮取出的、
+    ///    超出 16 个的那部分（整批时为 `batch - 16`，尾批更少）被**永久跳过**（无日志、无断言、不报错）。
     ///    它是**内容**错误：飞机登记不上，而链路看上去一切正常。
     ///
-    ///    ⚠️ **不会**越界写：调用方 `_sendRegistrationFrame()` 的
+    ///    ⚠️ **不会**越界写：发送侧 `_sendRegistrationFrame()` 的
     ///    `qMin(ids.size(), MAX_QGC_LINKED_PX4)` 是**真实存在的运行期兜底**，
     ///    `deviceCount` 恒 ≤ 16、最大写索引 63 < 64。故「`deviceBytes` 定长、
     ///    构造上不会越界」这条论证由**发送侧自身**保证。接线时（Task 4）把 `batch`
