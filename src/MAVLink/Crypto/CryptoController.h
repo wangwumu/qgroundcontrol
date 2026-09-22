@@ -123,10 +123,13 @@ public:
     ///       而 `_sendRegistration()` 与 `_sendRegistrationFrame()` **两个都没有**
     ///       （前者零 `return`、只有取批 + 发帧；后者只管计数 + 组帧 + 发。都假定调用方已把好关）。
     ///       新增 C++ 调用点时必须自己带门判断。
-    ///    ② **QML 可达的入口（`Q_INVOKABLE`）必须自带门**：`registrationEnabled()`
-    ///       **不是** `Q_INVOKABLE` ⇒ QML 物理上查不到闸的状态，"闸在调用方"对它不成立。
-    ///       `setMonitorDevices()`（闸在其触发的 C++ 内部调用上）、`reRegisterDevice()`
-    ///       （自带门，见其声明处）都属此类。
+    ///    ② **QML 可达的入口（`Q_INVOKABLE`）不能依赖"闸在调用方"**：QML 是外部调用方，
+    ///       而 `registrationEnabled()` **不是** `Q_INVOKABLE` ⇒ QML 物理上查不到闸的状态，
+    ///       没法自己把门。故闸必须落在**这条路径上 QML 触不到的那一层**：
+    ///       - `reRegisterDevice()` **自己就发送** ⇒ 门在它自己身上（见其声明处）；
+    ///       - `setMonitorDevices()` **自己不发送**，发送发生在它触发的
+    ///         `requestAcceleratedRegistration()` 里 ⇒ 门在那个**被调方**，本函数不带门。
+    ///       ⇒ 判据不是"入口是不是 `Q_INVOKABLE`"，而是"从入口到发送这条链上至少有一层带门"。
     Q_INVOKABLE void requestAcceleratedRegistration();
 
     /// 对单个 deviceID 立即发一个**只含它**的 80005 报文（§3.6.2 的"定向加速重发"）。
@@ -137,8 +140,10 @@ public:
     ///
     /// ‼️ **只重发，绝不移出登记集合**（`_monitorDevices` / `_regCursor` 一概不碰）——
     ///    移出会让它更收不到帧 ⇒ 下一轮又超时 ⇒ **永久静默失效**，且日志上看不出
-    ///    任何异常。代价是幂等的：单架报文的 MAVLink 帧约 24 字节
-    ///    ⇒ **误判的代价是一个 24 字节的帧**。
+    ///    任何异常。代价是幂等的：单架报文的 MAVLink 帧 = 10 字节帧头 + 5 字节 payload
+    ///    （`CryptoTest::_testQgcRegistration` 断言 `msg.len == 5`）+ 2 字节 CRC = **17 字节**
+    ///    （未签名；启用 MAVLink 签名时再加 13 字节）
+    ///    ⇒ **误判的代价是一个 17 字节的帧**。
     ///
     /// ‼️ **自带 `registrationEnabled()` 门**（先校验参数、再校验状态 ⇒ 非法 deviceID 的
     ///    告警在关门时照常打）。门必须落在**被调用方**：本函数是 `Q_INVOKABLE`，而
