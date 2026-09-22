@@ -1511,8 +1511,11 @@ void CryptoTest::_testNextRegistrationBatch()
     QVERIFY(CryptoController::nextRegistrationBatch(QList<DeviceID>(), 16, emptyCursor).isEmpty());
     QCOMPARE(emptyCursor, 0);
 
-    // 游标越界防御：集合缩小后旧游标可能落在界外，必须回到 0 而不是越界读
-    int staleCursor = 40;
+    // 游标越界防御：集合缩小后旧游标可能落在界外，必须回到 0 而不是越界读。
+    // ‼️ 取 41 而不是 40：40 是 n=5 的整数倍，`cursor %= n` 这类"看起来更通用"的
+    //    重构也能让它变成 0 ⇒ 用例全绿而注释自称的判据「必须回到 0」已不成立。
+    //    41 % 5 = 1 ⇒ 取模变体会让首元素变成 20000001，判据才真正钉死。
+    int staleCursor = 41;
     const QList<DeviceID> s2 = CryptoController::nextRegistrationBatch(small, 16, staleCursor);
     QCOMPARE(s2.size(), 5);
     QCOMPARE(s2.first(), static_cast<DeviceID>(20000000u));

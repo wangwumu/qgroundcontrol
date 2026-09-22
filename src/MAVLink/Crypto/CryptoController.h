@@ -84,6 +84,21 @@ public:
     ///
     /// n ≤ batch 时退化为「一批全取、游标恒 0」，与改动前行为完全一致。
     ///
+    /// @pre ‼️ **`batch <= MAX_QGC_LINKED_PX4`（当前 16）——这条由调用方保证，不是本函数保证。**
+    ///    本函数**只保证「返回值 ≤ batch」，不做上限裁剪**——它是纯函数，不知道 80005
+    ///    登记报文的 payload 容量。`batch > 16` 时它会照常返回那么多元素。
+    ///    （`batch <= 0` 不是违约：按空批处理并把游标归零，见下。）
+    ///
+    ///    违约后果（**静默栈破坏**）：调用方 `_sendRegistration()` 里 payload 是定长的
+    ///    `uint8_t deviceBytes[MAX_QGC_LINKED_PX4 * 4]`（64 字节），而写循环以元素个数为界
+    ///    ⇒ 传入 `batch = 60` 就按 60 个元素写 240 字节，**越界写 (batch-16)*4 字节，
+    ///    无日志、无断言、不报错**。
+    ///
+    ///    ⚠️ 因此设计文档 §3.3 关键点 1 那条「`deviceBytes` 定长、构造上不会越界」的论证，
+    ///    在计划 R1 取「切批」语义后，已经从**函数自身保证**变成**调用方保证**：
+    ///    接线时（Task 4）必须把 `batch` 钉在 `MAX_QGC_LINKED_PX4`，不要传设计 §3.4
+    ///    升级路径里出现过的 60 之类的值。
+    ///
     /// 抽成 public static 纯函数是为了单测：`_sendRegistration()` 的发送路径依赖
     /// `LinkManager`（单测里无 UDP link），无法观察它实际发了什么。
     static QList<DeviceID> nextRegistrationBatch(const QList<DeviceID>& devices, int batch, int& cursor);
