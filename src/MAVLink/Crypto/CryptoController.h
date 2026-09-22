@@ -120,15 +120,37 @@ public:
     /// ⚠️ 集合没变时反复调用它最多多花几帧，不改集合、不改变行为方向。
     /// ⚠️ 登记的闸一律在**调用方**：本函数自带 `registrationEnabled()` 门，而
     ///    `_sendRegistration()` 与 `_sendRegistrationFrame()` **两个都没有**
-    ///    （前者零 `return`、只有计数 + 取批 + 发帧；后者只管组帧 + 发。都假定调用方已把好关）。
+    ///    （前者零 `return`、只有取批 + 发帧；后者只管组帧 + 发。都假定调用方已把好关）。
     ///    新增调用点时必须**自己带门判断**；**或**在注释里明写"有意不设门"并给出依据
-    ///    （定向重发 `reRegisterDevice` 即后者：设计文档 §3.6.3 场景表第 5 行
+    ///    （定向重发 `reRegisterDevice()` 即后者，见其声明处：设计文档 §3.6.3 场景表第 5 行
     ///    「`_sendRegistration` 因故停摆 ⇒ 全部重发」要求它在登记关闭时照常兜底）。
     Q_INVOKABLE void requestAcceleratedRegistration();
 
+    /// 对单个 deviceID 立即发一个**只含它**的 80005 报文（§3.6.2 的"定向加速重发"）。
+    ///
+    /// 由 `RomView.qml` 在每 2s 的轮询节拍上、对 `msSinceLastFrame(id)` 超过
+    /// 生效阈值（`frameTimeoutMs()`）的飞机调用。mavp2p 收到后只做**幂等刷新**
+    /// （`m.pairs[k] = e; e.lastSeen = now`），不触碰任何其它 pair、不断开已建立的链路。
+    ///
+    /// ‼️ **只重发，绝不移出登记集合**（`_monitorDevices` / `_regCursor` 一概不碰）——
+    ///    移出会让它更收不到帧 ⇒ 下一轮又超时 ⇒ **永久静默失效**，且日志上看不出
+    ///    任何异常。代价是幂等的：单架报文的 MAVLink 帧约 24 字节
+    ///    ⇒ **误判的代价是一个 24 字节的帧**。
+    ///
+    /// ‼️ **有意不设 `registrationEnabled()` 门**——设计文档
+    ///    （`航线监控员主界面设计-20260922.md` §3.6.3 场景表第 5 行）：
+    ///    「`_sendRegistration` 因故停摆（定时器被停等）⇒ 兜底：全部飞机超时 ⇒ 全部重发」。
+    ///    ⇒ 本函数是**周期轮转停摆时的兜底通道**，登记关闭时必须照常工作。
+    ///    （对照：`_sendRegistration()` / `_sendRegistrationFrame()` 也都没有门——闸一律在调用方；
+    ///    见 `requestAcceleratedRegistration()` 的注释。）
+    Q_INVOKABLE void reRegisterDevice(quint32 deviceID);
+
     /// ---- 仅供单测（生产代码不得调用）----
-    /// `_sendRegistration()` 被调用过的累计次数。单测里没有 UDP link，
-    /// 发送本身观察不到，只能数"函数进去过几次"。
+    /// **发送帧**的累计次数（计的是 `_sendRegistrationFrame()` 进入次数，
+    /// 含组帧失败后早退的那一次）。单测里没有 UDP link，发送本身观察不到，
+    /// 只能数"帧组了几次"。
+    /// ‼️ 不是 `_sendRegistration()` 被调用过的次数——定向重发 `reRegisterDevice()`
+    ///    绕过 `_sendRegistration()` 直调 `_sendRegistrationFrame()`，同样计入。
     /// ‼️ 不要用 `_regCursor` 代替：n ≤ 16 时它恒 0，n > 16 时跑满一个周期它会回绕到 0。
     int registrationSendCountForTest() const;
 

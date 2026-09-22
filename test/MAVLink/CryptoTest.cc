@@ -1684,4 +1684,81 @@ void CryptoTest::_testRequestAcceleratedRegistration()
     (void) QTest::qWaitFor([] { return false; }, TestTimeout::shortMs());
 }
 
+void CryptoTest::_testReRegisterDevice()
+{
+    CryptoController* const crypto = CryptoController::instance();
+
+    // strict mode 连 QtDebugMsg 都算未预期日志（见 UnitTest 的 cleanup 段）⇒ 每次发帧都会打一条
+    // "registration sent, ..."。条数随本用例的发送次数变化，而**它不是被测行为**
+    // （判据是 registrationSendCountForTest()）⇒ 对"确定性的 debug 噪音"用整类豁免
+    // （同 _testRequestAcceleratedRegistration 的先例）。
+    // ℹ️ 此处刻意不写行号引用——它会随同文件增删行静默顶偏（本项目已踩过两次）⇒ 用函数/段落锚点。
+    // ℹ️ ctest 给测试进程设了 QT_LOGGING_RULES=*.debug=false（cmake/QGCTest.cmake）⇒ 这条
+    //    在 ctest 口径下可能压根不生效；保留它使直接跑二进制时同样安全。
+    ignoreLogMessage("MAVLink.Crypto.CryptoController", QtDebugMsg, QRegularExpression("registration "));
+
+    // ‼️ 本用例**故意不开登记**（不调 setRegistrationEnabled(true, …)）。
+    //    setMonitorDevices 在集合变化时会触发 requestAcceleratedRegistration()，它会排一串
+    //    200ms 间隔的 burst 定时器、每批调一次 _sendRegistration() ⇒ 打乱下面的
+    //    `s0 + 1` 精确计数断言。而 requestAcceleratedRegistration() **自带
+    //    `registrationEnabled()` 门**：登记关着 ⇒ 集合变化触发的加速被挡掉 ⇒ 计数干净；
+    //    而 reRegisterDevice **有意无门** ⇒ 照发 ⇒ 计数精确 +1。
+    //    这一格把上述前提**显式断言**出来：前提若不成立，失败信息直接指向原因，
+    //    而不是表现为下面某格莫名其妙的 off-by-N。
+    QVERIFY2(!crypto->registrationEnabled(),
+             "定向重发用例用精确计数断言 ⇒ 必须确保登记关着（否则 burst 会污染计数）");
+
+    const DeviceID a = makeDeviceID(0, 0, 0x61, 0x01);
+    const DeviceID b = makeDeviceID(0, 0, 0x61, 0x02);
+
+    crypto->setMonitorDevices(QVariantList{ static_cast<uint>(a), static_cast<uint>(b) }, 3000);
+    QCOMPARE(crypto->monitorDeviceCount(), 2);
+    QCOMPARE(crypto->monitorDevicesForTest(), (QList<DeviceID>{ a, b }));
+
+    // ‼️ 本设计最危险的一处：超时只触发"多发一次"，**永远不触发"少登记一个"**。
+    //    若实现顺手把它从集合里删掉，它就更收不到帧 ⇒ 下一轮又超时 ⇒ 永久静默失效，
+    //    而日志上看不出任何异常（§3.6.2）。
+    //    ⇒ 用例必须**同时**断言"发了"与"集合没动"——
+    //      只断言"集合没动"会被空实现 `void reRegisterDevice(quint32) {}` 整片假绿；
+    //      只断言"发了"又放过上面那种"顺手移出集合"的实现。
+    //    ⚠️ 判据必须是 **registrationSendCountForTest()**（帧计数）：reRegisterDevice 绕过
+    //       _sendRegistration() 直调 _sendRegistrationFrame()，`_regCursor` 之类一概不动
+    //       （它恒 0，观测不到）。
+    const int s0 = crypto->registrationSendCountForTest();
+    crypto->reRegisterDevice(a);
+    QCOMPARE(crypto->registrationSendCountForTest(), s0 + 1);   // ‼️ 真的发了（一帧，且只一帧）
+    QCOMPARE(crypto->monitorDeviceCount(), 2);                   // ‼️ 且集合没动
+    QCOMPARE(crypto->monitorDevicesForTest(), (QList<DeviceID>{ a, b }));
+
+    // 集合里的另一个也必须原样在
+    const int s1 = crypto->registrationSendCountForTest();
+    crypto->reRegisterDevice(b);
+    QCOMPARE(crypto->registrationSendCountForTest(), s1 + 1);
+    QCOMPARE(crypto->monitorDeviceCount(), 2);
+    QCOMPARE(crypto->monitorDevicesForTest(), (QList<DeviceID>{ a, b }));
+
+    // 不在清单里的 deviceID 也可以重发（幂等刷新，mavp2p 只刷 lastSeen）
+    const DeviceID outsider = makeDeviceID(0, 0, 0x61, 0x09);
+    const int s2 = crypto->registrationSendCountForTest();
+    crypto->reRegisterDevice(outsider);
+    QCOMPARE(crypto->registrationSendCountForTest(), s2 + 1);
+    QCOMPARE(crypto->monitorDeviceCount(), 2);   // ‼️ 不得被"顺手加进清单"
+    QCOMPARE(crypto->monitorDevicesForTest(), (QList<DeviceID>{ a, b }));
+
+    // 非法 deviceID：只记日志、不发、不改集合
+    const int s3 = crypto->registrationSendCountForTest();
+    expectLogMessage("MAVLink.Crypto.CryptoController", QtWarningMsg,
+                     QRegularExpression("reRegisterDevice"));
+    crypto->reRegisterDevice(0);
+    verifyExpectedLogMessage();
+    QCOMPARE(crypto->registrationSendCountForTest(), s3);   // ‼️ 非法 ⇒ 一帧都不发
+    QCOMPARE(crypto->monitorDeviceCount(), 2);
+
+    // 复位（单例跨用例共享，且下一个用例假定"无清单"）。
+    // ⚠️ 登记关着 ⇒ 这次集合变化（2 → 空）触发的加速被 requestAcceleratedRegistration 的门
+    //    挡掉、安全；计数不受影响。
+    crypto->setMonitorDevices(QVariantList(), 3000);
+    QCOMPARE(crypto->monitorDeviceCount(), 0);
+}
+
 UT_REGISTER_TEST_LIGHTWEIGHT(CryptoTest, TestLabel::Unit)

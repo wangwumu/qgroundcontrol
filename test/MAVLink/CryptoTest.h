@@ -68,4 +68,7 @@ private slots:
 
     // 加速首轮（§3.4）：集合变化触发连续发送、集合不变不触发、容量天花板截断
     void _testRequestAcceleratedRegistration();
+
+    // 定向重发（§3.6.2）：只发一帧、**绝不移出登记集合**、无 registrationEnabled 门
+    void _testReRegisterDevice();
 };

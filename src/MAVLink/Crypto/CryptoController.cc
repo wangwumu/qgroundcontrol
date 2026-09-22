@@ -179,11 +179,11 @@ void CryptoController::requestAcceleratedRegistration()
 {
     if (!registrationEnabled()) {
         // ‼️ 登记的闸一律在**调用方**：本函数自带这道门，而 `_sendRegistration()` 与
-        //    `_sendRegistrationFrame()` **两个都没有**（前者零 `return`——只有计数 + 取批 +
-        //    发帧；后者只管组帧 + 发。都假定调用方已把好关）。登记关着时不发帧靠的是
+        //    `_sendRegistrationFrame()` **两个都没有**（前者零 `return`——只有取批 +
+        //    发帧；后者只管计数 + 组帧 + 发。都假定调用方已把好关）。登记关着时不发帧靠的是
         //    `setRegistrationEnabled(false)` 停掉周期定时器，**不是**它们的自检。
         //    新增调用点时必须自己带门判断，**或**明写"有意不设门"并给出依据
-        //    （定向重发 `reRegisterDevice` 即后者：设计文档 §3.6.3 场景表第 5 行
+        //    （定向重发 `reRegisterDevice()` 即后者，见其声明处：设计文档 §3.6.3 场景表第 5 行
         //    「`_sendRegistration` 因故停摆 ⇒ 全部重发」要求它在登记关闭时照常兜底）。
         return;
     }
@@ -225,6 +225,20 @@ void CryptoController::requestAcceleratedRegistration()
             _sendRegistration();
         });
     }
+}
+
+void CryptoController::reRegisterDevice(quint32 deviceID)
+{
+    if (deviceID == kInvalidDeviceID || !hasValidSignatureBit(static_cast<DeviceID>(deviceID))) {
+        qCWarning(CryptoControllerLog) << "reRegisterDevice: 非法 deviceID，忽略" << deviceID;
+        return;
+    }
+    // 单发一批（只含这一个），复用 _sendRegistrationFrame 的组帧与发送逻辑。
+    // ‼️ 这里**不碰** _monitorDevices、不碰 _regCursor —— 重发是幂等刷新，
+    //    任何集合改动都会把"超时自愈"变成"超时自我放逐"（§3.6.2）。
+    // ‼️ **有意不设 `registrationEnabled()` 门**（§3.6.3 场景表第 5 行：周期轮转停摆时
+    //    靠定向重发兜底）——详见头文件声明处的注释。
+    _sendRegistrationFrame(QList<DeviceID>{ static_cast<DeviceID>(deviceID) });
 }
 
 int CryptoController::registrationSendCountForTest() const
@@ -277,11 +291,6 @@ void CryptoController::addLinkedDevice(DeviceID deviceID)
 
 void CryptoController::_sendRegistration()
 {
-    {
-        // ‼️ 计数必须在任何 return 之前 —— 它数的是"函数被进入了几次"。
-        const QMutexLocker locker(&_mutex);
-        _registrationSendCount++;
-    }
     QList<DeviceID> batch;
     {
         const QMutexLocker locker(&_mutex);
@@ -304,6 +313,15 @@ void CryptoController::_sendRegistration()
 
 void CryptoController::_sendRegistrationFrame(const QList<DeviceID>& ids)
 {
+    // ‼️ 计数在**首条可执行语句**、且在下面的 `packLen == 0` 早退**之前**——
+    //    它数的是"发了多少帧"（含组帧失败那一帧），不是"`_sendRegistration()` 进去过几次"。
+    //    ⚠️ 放在 `_sendRegistration()` 里会让定向重发（`reRegisterDevice` 直调本函数）
+    //    整条路径**不计入**，而单测的判据正是这个计数。
+    {
+        const QMutexLocker locker(&_mutex);
+        _registrationSendCount++;
+    }
+
     // 帧头 deviceID 用 GCS 段固定值（文档 §1.3 QGC_REGISTRATION_DEVICE_ID_DEFAULT），
     // 由 pack 函数拆入帧头 4 字节（方案 B）。payload 填关联 PX4 deviceID 集合。
     const int deviceCount = qMin(ids.size(), static_cast<int>(MAX_QGC_LINKED_PX4));
