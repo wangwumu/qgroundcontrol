@@ -4,6 +4,7 @@
 
 #include <QtCore/QTimer>
 #include <QtCore/QDateTime>
+#include <QtCore/QVariantMap>
 
 QGC_LOGGING_CATEGORY(StatusTextHandlerLog, "MAVLink.StatusTextHandler")
 
@@ -11,6 +12,7 @@ StatusText::StatusText(MAV_COMPONENT componentid, MAV_SEVERITY severity, const Q
     : m_compId(componentid)
     , m_severity(severity)
     , m_text(text)
+    , m_timestamp(QDateTime::currentDateTimeUtc())
 {
     // qCDebug(StatusTextHandlerLog) << Q_FUNC_INFO << this;
 }
@@ -72,6 +74,33 @@ QString StatusTextHandler::formattedMessages() const
     return result;
 }
 
+QVariantList StatusTextHandler::messagesVariant() const
+{
+    QVariantList out;
+    out.reserve(m_messages.size());
+
+    for (const StatusText *message : m_messages) {
+        if (!message) {
+            continue;
+        }
+
+        QVariantMap entry;
+        entry.insert(QStringLiteral("componentid"), static_cast<int>(message->getComponentID()));
+        entry.insert(QStringLiteral("severity"), static_cast<int>(message->getSeverity()));
+        entry.insert(QStringLiteral("text"), message->getText());
+        // ⚠️ `Qt::ISODateWithMs` 而**不是** `Qt::ISODate`：后者在毫秒恰为 0 时**省略**
+        //    毫秒段 ⇒ 同一秒内的两条消息会得到两种长度的串，而按字典序排时
+        //    `...T01:02:03.123Z` 排在 `...T01:02:03Z` **前面**（'.' < 'Z'），
+        //    与真实先后**相反**。定宽格式让字符串序 = 时间序，QML 侧才有确定的兜底
+        //    （那里现在用 `Date.parse` 比数值，但格式漂移过一次就没人会发现）。
+        entry.insert(QStringLiteral("timestamp"), message->getTimestamp().toString(Qt::ISODateWithMs));
+
+        out.append(entry);
+    }
+
+    return out;
+}
+
 void StatusTextHandler::clearMessages()
 {
     qDeleteAll(m_messages);
@@ -82,6 +111,10 @@ void StatusTextHandler::clearMessages()
     m_normalCount = 0;
 
     _handleTextMessage(0);
+
+    // 清空同样是"内容变了"。⚠️ 放在 `_handleTextMessage(0)` **之后**，让
+    // `messageCountChanged` 先到——消费方若两个信号都听，先看到的是"计数归零"。
+    emit messagesChanged();
 }
 
 void StatusTextHandler::resetAllMessages()
@@ -237,6 +270,11 @@ void StatusTextHandler::handleHTMLEscapedTextMessage(MAV_COMPONENT compId, MAV_S
     const uint32_t count = m_messages.count();
 
     _handleTextMessage(count, messageType);
+
+    // 结构化的 QML 可见面（`Vehicle::statusTextMessages`）变了。
+    // ‼️ 这是本类**唯一**的"内容新增"发信号点：全仓 `m_messages` 只在这两处被改
+    //    （这里与 `clearMessages()`），别处的 `reset*Messages()` 只动计数、不动内容。
+    emit messagesChanged();
 
     if (message->severityIsError()) {
         emit newErrorMessage(message->getText());

@@ -15,4 +15,5 @@ private slots:
     void _testChunkedStatusTextTimeoutAddsEllipsis();
     void _testChunkedStatusTextResetsWhenChunkIdChanges();
     void _testMavlinkMessageReceivedIgnoresNonStatusText();
+    void _testMessagesVariant();
 };

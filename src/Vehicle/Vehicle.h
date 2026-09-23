@@ -1222,6 +1222,17 @@ private:
     Q_PROPERTY(bool    messageTypeError   READ messageTypeError   NOTIFY messageTypeChanged)
     Q_PROPERTY(int     messageCount       READ messageCount       NOTIFY messageCountChanged)
     Q_PROPERTY(QString formattedMessages  READ formattedMessages  NOTIFY formattedMessagesChanged)
+    /// 机载告警（`STATUSTEXT`）的**结构化**列表，供 QML 消费（航线监控员设计文档 §6.1 路 B）。
+    /// 元素为 `QVariantMap`：`{componentid:int, severity:int, text:QString, timestamp:QString}`
+    /// （`timestamp` 是 ISO8601 **UTC** 字符串，定宽到毫秒）。
+    /// ‼️ 与上一行的 `formattedMessages` **不是**一回事：那是个 `QString`，把所有历史消息
+    ///    `prepend` 拼成一整串、severity 用内联宏 `<#E>`/`<#I>`/`<#N>` 编码
+    ///    ⇒ **拿不到 `componentid`、也拿不到时间**。那是单机用法
+    ///    （`VehicleMessageList.qml`）；监控员要**跨机聚合**，用的是本属性。
+    /// ⚠️ 转发**数据**，而不是取消注释下面那行、把 `StatusTextHandler*` 交给 QML：本头文件
+    ///    只**前向声明**了那个类，裸指针要过 MOC 对不完整类型的处理；而 QML 那边其实
+    ///    一个字都不需要认识它。
+    Q_PROPERTY(QVariantList statusTextMessages READ statusTextMessages NOTIFY statusTextMessagesChanged)
 
     // Q_PROPERTY(StatusTextHandler *statusTextHandler READ statusTextHandler NOTIFY statusTextHandlerChanged)
 
@@ -1236,6 +1247,7 @@ public:
     bool messageTypeError() const;
     int messageCount() const;
     QString formattedMessages() const;
+    QVariantList statusTextMessages() const;
 
     // StatusTextHandler* statusTextHandler() { return m_statusTextHandler; }
 
@@ -1248,6 +1260,7 @@ signals:
     void messageTypeChanged();
     void messageCountChanged();
     void formattedMessagesChanged();
+    void statusTextMessagesChanged();
     void newFormattedMessage(QString formattedMessage);
 
     // void statusTextHandlerChanged();

@@ -3442,6 +3442,7 @@ bool Vehicle::messageTypeWarning() const { return m_statusTextHandler->messageTy
 bool Vehicle::messageTypeError() const { return m_statusTextHandler->messageTypeError(); }
 int Vehicle::messageCount() const { return m_statusTextHandler->messageCount(); }
 QString Vehicle::formattedMessages() const { return m_statusTextHandler->formattedMessages(); }
+QVariantList Vehicle::statusTextMessages() const { return m_statusTextHandler->messagesVariant(); }
 
 void Vehicle::_createStatusTextHandler()
 {
@@ -3449,6 +3450,11 @@ void Vehicle::_createStatusTextHandler()
     (void) connect(m_statusTextHandler, &StatusTextHandler::messageTypeChanged, this, &Vehicle::messageTypeChanged);
     (void) connect(m_statusTextHandler, &StatusTextHandler::messageCountChanged, this, &Vehicle::messageCountChanged);
     (void) connect(m_statusTextHandler, &StatusTextHandler::newFormattedMessage, this, &Vehicle::newFormattedMessage);
+    // 结构化告警的转发（设计文档 §6.1 路 B）。⚠️ 是 `messagesChanged` 而**不是**
+    // `messageCountChanged`：后者被 `resetAllMessages()` 清零时会发，而那时
+    // `m_messages` 一个字都没变 ⇒ 挂错信号会让列表在"标记已读"时白刷一次，
+    // 且真正的清空（`clearMessages()`）反倒不发。
+    (void) connect(m_statusTextHandler, &StatusTextHandler::messagesChanged, this, &Vehicle::statusTextMessagesChanged);
     (void) connect(m_statusTextHandler, &StatusTextHandler::textMessageReceived, this, &Vehicle::_textMessageReceived);
     (void) connect(m_statusTextHandler, &StatusTextHandler::newErrorMessage, this, &Vehicle::_errorMessageReceived);
 }
