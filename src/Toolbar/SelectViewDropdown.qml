@@ -129,6 +129,34 @@ ToolIndicatorPage {
                 }
             }
 
+            // §7.3「刷新航线与航点」（裁定 ② 明确要求）。放在视图组之后、Close 之前：
+            // 它与上面几项**不同类**——那些是"切换视图"，这一项是"在当前视图里重拉数据"，
+            // 混进视图组会让人以为点了会跳走。
+            SubMenuButton {
+                objectName: "toolbar_refreshRoutes"
+                implicitHeight: root._toolButtonHeight
+                Layout.fillWidth: true
+                // ⚠️ 读 `roles` 属性（NOTIFY rolesChanged）而非 `hasRole()` 方法：方法调用
+                //    不注册 QML 绑定依赖 ⇒ 若本项在 roles 填充**之前**被求值过一次，它就
+                //    永远停在 false。与 `RomView._isRouteMon` 同源同写法。
+                // ‼️ 只对航线监控员显示：站点视图没有航线缓存（`routeLayersEnabled` 恒 false），
+                //    这个动作在那边无事可做。
+                visible: AuthController.roles.indexOf("ROUTE_MONITOR") >= 0
+                text: qsTr("刷新航线与航点")
+                imageResource: "/res/clockwise-arrow.svg"
+                // ‼️ **刻意不调 `mainWindow.allowViewSwitch()`**（上面每一项都调了）。
+                //    那不是本项的语义，且会**挡掉它最该起作用的那一次重试**：
+                //    ① `allowViewSwitch()` 是"切换视图前的闸"（navigationBlockedReason、
+                //       聚焦控件的校验错误、未保存的航点/参数/连接），而本项**不切视图**；
+                //    ② §7.2 的失败提示恰恰是"航点加载失败"⇒ 用户点这里重试的那一刻，
+                //       屏幕上很可能正有一个校验未过的控件 ⇒ 闸返回 false ⇒ 最需要重试的
+                //       场景反而被自己的闸挡死。关抽屉自己做（其余几项是过闸之后才关的）。
+                onClicked: {
+                    mainWindow.closeIndicatorDrawer()
+                    mainWindow.refreshOpsRoutes()
+                }
+            }
+
             SubMenuButton {
                 id: closeButton
                 objectName: "toolbar_viewClose"

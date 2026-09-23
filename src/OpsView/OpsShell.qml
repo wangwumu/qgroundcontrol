@@ -1,6 +1,13 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+// L3 航班 marker 的箭头是 `Shape` + `PathSvg` 自绘的（见该段注释）。
+// ⚠️ `Shape` 属于 `QtQuick.Shapes`，**不属于** `QtQuick`——少了这一行，
+//    构建、单测、qmllint **三者都不会报错**，只有真的加载这个组件时才炸：
+//        OpsShell.qml:1205:29: Shape is not a type   ← 报错**原文**，1205 是当时的行号
+//    然后 `OpsView unavailable` → `MainWindow` 起不来（窗口是 null）。
+//    同目录 `SlotLayout.qml:2` 是既有先例，用的是同一个 import。
+import QtQuick.Shapes
 import QtQuick.Window
 import QtLocation
 import QtPositioning
@@ -88,6 +95,16 @@ Item {
     // 数据（轮询刷新；JS 数组整体重建以触发 Repeater 更新）
     //-------------------------------------------------------------------------
     property var  _tasks:          []      // /ops/overview 任务数组（已按角色过滤）
+    property string _tasksJson:    ""      // 上一轮 `_tasks` 载荷的内容指纹（作用见 `_fetchOverview`）
+    // 地图 L1 航线的**几何数据源**：只含任务身份 + 航点，**不含 `latest` 遥测**。
+    /// ‼️ 为什么要跟 `_tasks` 分开：`_tasks` 带 `latest`，飞机每动一次内容就变 ⇒ 换身份
+    ///    ⇒ 航线**陪着一起销毁重建**（离屏探针实测：只改一条 `latest`，4 条线全量 +4/−4）。
+    ///    而航线画的是航点，与遥测无关 —— 飞机在飞时这个空转每 2s 发生一次。
+    ///    这里再用**内容指纹**兜一层：几何没变就保持原数组身份。
+    /// ⚠️ `_taskGeom` 的元素是**新建的 JS 对象**，但 `waypoints` 仍指向原数组（不复制）。
+    /// ⚠️ 本属性**必须由 `_rebuildTaskGeom()` 显式维护**，不要改成读 `_tasks` 的绑定。
+    property var    _taskGeom:     []
+    property string _taskGeomKey:  ""
     property var  _pending:        []      // /handovers/pending 待确认交接数组
     property var  _handoverById:   ({})    // task_id -> pending handover
     property var  _seenHandovers:  []      // 已提示过的 handover id（防重复弹框）
@@ -97,6 +114,71 @@ Item {
     property string _handoverActionError: ""  // 交接确认/拒绝/撤回失败提示（handoverDialog 保留可重试）
     // 本站站点 id 来自登录响应 role_sites 单值（AuthController.siteId，仅内存），不再从任务反推。
     property var   _mySiteId:       AuthController.siteId
+    // 本站站点**坐标**（`GET /api/sites/:id` 的 `lat`/`lon`）。站点视图套视野的**中心锚点**。
+    /// ‼️ 为什么 id 与坐标分两个属性：id 是登录响应直接给的（内存里就有），坐标要走一次接口。
+    /// ‼️ 站点表**本身不存坐标**——`table_site` 只有 `waypoint_id`，坐标在关联的 `table_waypoint`。
+    ///    后端 `siteJoinSelect` 已 `LEFT JOIN table_waypoint` 把 `w.lat`/`w.lon` 并进响应，
+    ///    所以这里拿到的是**权威值**，前端不需要（也无法）自己拼。
+    /// ⚠️ `null` = 还没拿到 / 本站没挂航点（后端 `COALESCE(w.lat,0)` 会给出 0，被有效性检查挡掉）
+    ///    ⇒ 套视野退化为"居包围盒中心"，与监控员视图逐字一致；`center` 兜底链另有落点。**不崩**。
+    property var   _mySiteCoord:    null
+
+    // 机位范围圈的**最小可见直径**（屏幕像素）。用户 2026-09-23 裁定：「为站点设置一个最小
+    // 像素尺寸，当在某个比例尺下，站点圆圈小于最小像素尺寸，则按照最小像素尺寸显示」。
+    /// ‼️ 为什么非要有它：本站机位簇实测跨度约 177 m × 75 m，而「完整显示所有航线」套出来的
+    ///    比例尺约 **357 m/px** ⇒ 真实圆圈直径**不到 1 像素**。没有下限就是"画了但看不见"。
+    /// ⚠️ 取 120 是"够醒目、又不至于盖住半个屏幕"的**起点值**，没有理论依据——它最终是给
+    ///    人眼看的，要按真机目视结果调。别把它当成推导出来的数。
+    readonly property real _minSlotCircleDiameterPx: 120
+
+    /// 机位范围圈的**最大显示直径**（屏幕像素）—— 超过就**不画**（判据在地图图层处）。
+    /// ‼️ 这是**信息量**判据不是美观判据：圆一旦大到直径是满屏的好几倍，它在屏幕上剩下的
+    ///    那段"弧"已经近乎一条直线——用户看不出那是个圈，画出来只是干扰。与
+    ///    `_minSlotCircleDiameterPx` 对称：小到看不见就抬到最小可见，大到没信息量就不画。
+    /// ⚠️ 它同时是**防御**：`MapQuickItem` 的 `sourceItem` 是**屏幕像素**尺寸（半径要自己除
+    ///    米/像素），zoom 21 + 一个几公里跨度的站点能算出几十万像素的 Shape，那是真实的卡顿
+    ///    风险。取 20000（≈ 5 倍 4K 屏宽）远超任何真实屏幕，**正常使用永远不触发**——本站机位
+    ///    簇直径约 200 m，zoom 21 时也只有约 4400 px。
+    readonly property real _maxSlotCircleDiameterPx: 20000
+
+    // 本站机位数组（**已核准**，含维护/故障），**由视图注入** —— 范围圈的原料。
+    /// ‼️ 为什么注入的是**原始机位数组**而不是算好的圆：圆的圆心是**站点坐标**，而
+    ///    `_mySiteCoord` 是**异步**到手的（`_fetchMySite` 的回调，见 `_fetchMySite` 处）。
+    ///    若在视图侧命令式算圆，站点坐标**后到**时没有任何东西会触发重算 —— 圆永远画不出来。
+    ///    搬进基类做成**绑定**后，`_mySiteCoord` 与 `_slotList` 两个依赖源任一变化都自动重估。
+    /// ‼️ 仍然**必须由视图注入**（不能在基类自己拉）：机位数据挂在派生类型上，而**基类读不到
+    ///    派生类成员**。同 `rightPanelWidth` 的模式。
+    /// ‼️ 数据源是**已核准机位**（`_slotsAll`，`?include_unusable=1`）而不是"可用机位"：
+    ///    范围圈描述的是本站机位的**物理占地**，维护中/故障的机位照样占着那块地。
+    /// ⚠️ 视图侧按**几何指纹**维护身份，不是每次轮询都换数组
+    ///    （理由见 `OpsView._updateSlotList`）。
+    property var   _slotList: []
+
+    // 本站机位范围圈 = `{lat, lon, radiusM, count}`（`OpsCommon.siteCenteredCircle` 的返回值）；
+    // `null` = 站点坐标还没到 / 一个有效机位都没有。
+    /// ‼️ 圆心 = **站点坐标**，半径 = 站点到各机位的**最大**距离（用户 2026-09-23 裁定
+    ///    「改为以站点坐标为中心，圈住各个机位」）。**不是**最小包围圆——两者的差别不是精度
+    ///    是语义：机位簇偏心时本式的圆明显更大，那是刻意的。`OpsCommon` 里两个函数并存。
+    /// ⚠️ 这里**不许**预先取 `max(…, 最小可见直径)`：那是**渲染时**的事（见地图图层处），
+    ///    存进来会让"只有一个机位的站点"永久失去真值。
+    readonly property var _slotRangeCircle: OpsCommon.siteCenteredCircle(_mySiteCoord, _slotList)
+
+    // 范围圈在**屏幕上的直径**（像素）= 真实直径 ÷ 米每像素。渲染用。
+    /// ‼️ 这一条绑定同时吃三个依赖源（圆数据、地图缩放/就绪/尺寸），缺任一都会让圆不随缩放
+    ///    更新，**且不报任何错**。后三个靠**实参位置**读 `opsMap.*` 注册依赖——方法调用本身
+    ///    不注册（见 `_metersPerPixelAt` 的注释）。
+    /// ⚠️ 返回 0 = 没有可画的圆（没数据 / 地图未就绪 / mpp 无效），调用处据此隐藏。
+    /// ⚠️ 上界**不在这里**钳：这条绑定的语义就是"真实直径的像素值"，钳了就等于画错。
+    ///    见地图图层处 `_maxSlotCircleDiameterPx` 的判据。
+    readonly property real _slotRangeDiaPx: {
+        var c = _slotRangeCircle
+        if (!c) return 0
+        var mpp = _metersPerPixelAt(QtPositioning.coordinate(c.lat, c.lon),
+                                    opsMap.zoomLevel, opsMap.mapReady,
+                                    opsMap.width, opsMap.height)
+        if (!isFinite(mpp) || !(mpp > 0)) return 0
+        return Math.max(2 * (Number(c.radiusM) || 0) / mpp, _minSlotCircleDiameterPx)
+    }
 
     //-------------------------------------------------------------------------
     // 航线缓存（设计文档 §2.1；仅 `routeLayersEnabled` 的视图使用）
@@ -244,6 +326,10 @@ Item {
     // 地图中心跟随：默认跟随首个任务；用户平移地图/点选 marker 后转手动。
     // 手动中心走属性而非直接赋值 opsMap.center —— 直接赋值会破坏 center 绑定，
     // 且 2s 轮询（_tasks 重建）会触发绑定重估把地图拽回首个任务（抢占用户视野）。
+    // ‼️ 「跟随首个任务」现在**只对监控员视图生效**（`center` 绑定里那项带 `routeLayersEnabled &&`
+    //    前缀）：站点视图的中心归 §7.4 管，锚点是**本站坐标**（用户诉求「地图中心设置为当前
+    //    登陆站点」），不是飞机实时位置。站点视图里 `_mapFollowFirst` 因此成了惰性属性，但
+    //    `onMapPanStart` 仍在写它——留着无害，删掉反而让两个视图的平移路径分叉。
     property bool  _mapFollowFirst:  true
     property var   _mapManualCenter: null
 
@@ -369,6 +455,12 @@ Item {
                 opsShell._mapManualCenter = null;  opsShell._mapFollowFirst = true
                 opsShell._routeFitCenter = null;   opsShell._routeFitZoom = 0
                 opsShell._routeFitPending = false
+                // 本站坐标一并清：它是套视野的中心锚点，且在 `center` 的兜底链里**排在
+                // `_routeFitCenter` 之后**（见 `center` 绑定）。留着上一个站点的坐标，会让下一个
+                // 账号登录的瞬间把地图摆在**别人的站点**上，直到自己的坐标回来才纠正——
+                // 画面跳一下，且跳的方向是错的。
+                // ⚠️ `_mySiteId` 不用清：它是 `AuthController.siteId` 的**绑定**，登出自动失效。
+                opsShell._mySiteCoord = null
                 // ‼️ `_bootstrapping` 也必须清。它的复位只写在 `_bootstrap()` 自己的回调里，
                 //    而首拉的 ① 是**可以整个回调都到不了**的（② 的重试余额用尽时提前 return、
                 //    `_send` 在地址未配置时静默 return、登出发生在请求在途时）。
@@ -410,15 +502,109 @@ Item {
     function _get(path, onDone) { _send("GET", path, null, onDone) }
     function _post(path, body, onDone) { _send("POST", path, body, onDone) }
 
+    /// 从 `_tasks` 抽出地图航线要用的**纯几何**（任务身份 + 航点）。遥测不进指纹。
+    /// ‼️ 这是 `_tasks` 之上的**第二层**守卫，两层管的不是一回事：
+    ///    · `_tasksJson`（`_fetchOverview` 里）吃掉"整条载荷都没变"的空转，护的是 marker + 列表；
+    ///    · 本函数吃掉"航点没变、只是飞机动了"，护的是**航线**——否则飞机在飞时每 2s 白重建一次。
+    /// ⚠️ 指纹**不能**用 `JSON.stringify(g, ["task_id","waypoints"])` 那种 replacer 数组：
+    ///    它会把**嵌套**对象的键也一并过滤掉 ⇒ 航点内容被排除在指纹外 ⇒ **航点变了却不重绘**。
+    ///    （同 `_rebuildRouteGeom` 的既有教训，那边踩过一次。）
+    /// 返回**几何是否真的变了**（`true` = 换了数组身份）。调用方据它决定要不要重套视野：
+    /// 飞机在动只改 `_tasks[i].latest`、不动 `waypoints` ⇒ 指纹不变 ⇒ **不抢用户视野**。
+    function _rebuildTaskGeom() {
+        var g = []
+        for (var i = 0; i < _tasks.length; i++) {
+            var t = _tasks[i]
+            g.push({
+                task_id:   t.task_id,
+                route_id:  t.route_id,
+                waypoints: Array.isArray(t.waypoints) ? t.waypoints : []
+            })
+        }
+        var key = JSON.stringify(g)
+        if (key === _taskGeomKey) return false
+        _taskGeomKey = key
+        _taskGeom    = g
+        return true
+    }
+
     //---- 接口封装 ----
     function _fetchOverview() {
         _get("/api/ops/overview?view=" + opsShell.overviewView, function(status, data) {
             if (status !== 200 || !Array.isArray(data)) { console.warn("OpsView overview", status); return }
-            _tasks = data
+            // ‼️ **内容没变就不要重新赋值**（理由同 `_fetchRouteTasks`）。`property var` 一旦换身份，
+            //    吃 `_tasks` 的 `MapItemView`（飞机 marker）与右栏列表都会销毁重建全部委托。
+            //    实测（改动前）：载荷**逐字节相同**时，4 条航线仍每轮新建 4 个，累计 4→8→12→… 无休止。
+            //    判据取 delegate 自身的 `Component.onCompleted/onDestruction` 计数，**不是对象指针**
+            //    ——销毁后新建可能拿到同一块地址，指针相同会假绿。
+            //    ⚠️ 这一层**挡不住遥测**（`data` 带 `latest`，飞机一动就变），航线的空转由
+            //       `_rebuildTaskGeom()` 那一层挡。两层都要，少一层都不完整。
+            var json = JSON.stringify(data)
+            if (json !== _tasksJson) {
+                _tasksJson = json
+                _tasks     = data
+                // ‼️ 几何**真的变了**才重套视野（返回 false = 只是遥测在动，飞机位置变了而航点没变）。
+                //    站点视图每 2s 轮询一次，若无条件重套，`_applyBounds` 里的 `_mapManualCenter = null`
+                //    会**每 2 秒抢走用户的地图视野**——用户永远没法把地图拖到别处看。
+                //    这与 `refreshRoutes` 的既有语义一致：「只在航线集合真的变了时重置视野」。
+                if (_rebuildTaskGeom() && !routeLayersEnabled) _requestRoutesFit()
+            }
             _updateMockVehicle()
             // 本站站点 id 由 AuthController.siteId（登录 role_sites 单值）提供，不再从任务 data[i].site_id 反推。
         })
     }
+
+    /// 本站站点坐标（`GET /api/sites/:id`）。**站点视图套视野的中心锚点**，只取一次。
+    /// ‼️ 站点表本身不存坐标（见 `_mySiteCoord` 声明处），坐标由后端 JOIN 航点后下发。
+    /// ⚠️ 拿不到时**保持 `null` 并照常套视野**——退化路径是"居包围盒中心"（`_applyBounds` 的
+    ///    `centerOn` 缺省行为），与监控员视图逐字一致。**不要**在这里 `return` 掉整个套视野：
+    ///    那会让"本站没挂航点"变成一个空白地图，而它本该只是一个不那么理想的视野。
+    function _fetchMySite() {
+        var sid = Number(_mySiteId)
+        // 无站点身份（平台级账号 / role_sites 为空）⇒ 不请求。`/api/sites/0` 会 404，
+        // 而在控制台里打一行无意义的 warning 只会让真正的故障更难看见。
+        if (!(sid > 0)) return false
+        _get("/api/sites/" + sid, function(status, data) {
+            if (status !== 200 || !data) { console.warn("OpsView 本站站点", status); return }
+            var la = Number(data.lat), lo = Number(data.lon)
+            // 口径与 `OpsCommon.isValidWaypoint` **逐字一致**：两轴有限，且**任一轴为 0 即无效**。
+            // 后端对没挂航点的站点给的是 `COALESCE(w.lat, 0)` ⇒ 正好是 0，被这里挡住 ✓。
+            if (!OpsCommon.isValidWaypoint(la, lo)) return
+            _mySiteCoord = QtPositioning.coordinate(la, lo)
+            // 坐标是套视野的**输入**（`centerOn`），可能比首帧晚到 ⇒ 到了要重套一次。
+            // ‼️ 只在**站点视图**重套：监控员视图的视野与本站坐标无关，重套会平白抢走用户
+            //    正在看的局部（`_applyBounds` 会清 `_mapManualCenter`）。
+            // ‼️ 一条航线都没有时不套：`routeBounds` 会返回 null、套不出东西，此时地图中心
+            //    由 `center` 绑定链里的 `_mySiteCoord` 兜底给出（那条路不需要套视野）。
+            if (!routeLayersEnabled && _taskGeom.length > 0) _requestRoutesFit()
+        })
+        return true
+    }
+
+    /// 圆心处**每像素多少米**（返回 `NaN` = 地图未就绪 / 该坐标投影不出来）。
+    /// 给机位范围圈的「最小可见尺寸」把像素下限换算成米用。
+    ///
+    /// ‼️ `zoom`/`ready`/`w`/`h` 四个参数**存在的唯一理由是让调用点的绑定注册依赖**：
+    ///    QML 里**方法调用不注册绑定依赖**，函数体内读属性一律不算数（本文件头与
+    ///    `OpsCommon.js` 头部（`.pragma library` 那段）都有记录，`rightPanelWidth` 那条链
+    ///    就是靠实参传递绕开的）。
+    ///    所以依赖必须由调用方在**实参位置**读完再传进来——把 `opsMap.zoomLevel` 从
+    ///    实参里删掉，圆圈就再也不会随缩放更新，而且**不会报任何错**。
+    ///
+    /// ⚠️ 用「圆心右移 1 像素再量距离」而不是自己按 zoom 推公式：实际投影由地图插件决定
+    ///    （`FlightMap` 的插件是可换的），推公式会和真实渲染对不上。
+    function _metersPerPixelAt(coord, zoom, ready, w, h) {
+        if (!coord || !ready || !(w > 0) || !(h > 0)) return NaN
+        // `zoom` 不参与换算，只用来注册依赖（见上）。恒假判断会让人以为漏传了参数，
+        // 这里用一个**语义上也成立**的检查：zoom 不是有限数说明地图状态本身就不正常。
+        if (!isFinite(Number(zoom))) return NaN
+        var p = opsMap.fromCoordinate(coord, false)
+        if (!p || !isFinite(p.x) || !isFinite(p.y)) return NaN
+        var right = opsMap.toCoordinate(Qt.point(p.x + 1, p.y), false)
+        if (!right || !right.isValid) return NaN
+        return coord.distanceTo(right)
+    }
+
     function _fetchPending() {
         _get("/api/handovers/pending", function(status, data) {
             if (status !== 200 || !Array.isArray(data)) { console.warn("OpsView pending", status); return }
@@ -446,10 +632,11 @@ Item {
                     if (onDone) onDone(false)
                     return
                 }
-                // ⚠️ 不写"点菜单「刷新航线与航点」"——**那个菜单项目前不存在**
-                //    （`refreshRoutes()` 全仓无调用者，见任务 #89）。提示指向一个找不到的
-                //    入口，比不给提示更糟：用户会先去找、再怀疑自己找错了。
-                _routeLoadError = qsTr("负责航线加载失败，切换视图或重新登录可重试")
+                // §7.3 的菜单项已补上（`toolbar_refreshRoutes`）⇒ 文案改为指向它。
+                // ‼️ 当初绕开它的理由——"提示指向一个找不到的入口，比不给提示更糟：用户会先
+                //    去找、再怀疑自己找错了"——随菜单项落地而消失。而不改回来则是相反的错误：
+                //    入口**存在**却没有任何地方告诉用户，等于白做。
+                _routeLoadError = qsTr("负责航线加载失败，点菜单「刷新航线与航点」重试")
                 if (onDone) onDone(false)
                 return
             }
@@ -488,8 +675,8 @@ Item {
         _get("/api/ops/my-routes/waypoints", function(status, data) {
             if (status !== 200 || !data || typeof data !== "object" || Array.isArray(data)) {
                 console.warn("OpsShell my-routes/waypoints", status)
-                // ⚠️ 同 `_fetchMyRoutes`：不指向不存在的菜单项。
-                _routeLoadError = qsTr("航点加载失败，切换视图或重新登录可重试")
+                // 同 `_fetchMyRoutes`：指向 §7.3 的菜单项（§7.2 的原文即要求这句文案）。
+                _routeLoadError = qsTr("航点加载失败，点菜单「刷新航线与航点」重试")
                 if (onDone) onDone(false)
                 return
             }
@@ -549,9 +736,20 @@ Item {
     /// §7.2 首拉序列：① → ② → `_routeCacheReady` → ③ 的第一发。**不等 Timer 满 2s**
     /// （`running` 变 true 只是启动计时器，首次触发仍要等满一个周期 ⇒ 登录后最多 2s 空白）。
     /// ‼️ `_poll()` 必须在 `_routeCacheReady = true` **之后**：右栏上段要有内容。
+    /// ⚠️ 站点视图也走这里（原先是 `!routeLayersEnabled` 直接返回），但只跑 `_fetchMySite()`
+    ///    那一步：①② 是监控员视图的**航线缓存**，站点视图的几何来自 `overview?view=site`
+    ///    （`_taskGeom`）——两套数据源不相干，站点视图不需要也不该付 ①② 的代价。
     function _bootstrap() {
-        if (!routeLayersEnabled || _bootstrapping) return
+        if (_bootstrapping) return
         _bootstrapping = true
+        // 站点视图：唯一的输入是本站坐标；套视野由 `_fetchMySite` 的回调触发。
+        // ‼️ 两条分支都必须复位 `_bootstrapping`——卡在 true 会让 `_bootstrap` 从此被挡死，
+        //    登出再登录也不恢复（详见登出处那条长注释）。
+        if (!routeLayersEnabled) {
+            _fetchMySite()
+            _bootstrapping = false
+            return
+        }
         _routeRetryLeft = 3
         _fetchMyRoutes(function(ok) {
             // ⚠️ 失败时**不** `pollTimer.restart()`：`running` 是绑定
@@ -606,37 +804,61 @@ Item {
     /// 请求「把视野套到全部航线」。**数据回来时调它，不要直接调 `_fitRoutesToViewport()`。**
     /// 布局已给出尺寸就立刻套；否则置 `_routeFitPending`，等 `opsMap` 的 `onWidthChanged` 补套。
     function _requestRoutesFit() {
-        if (!routeLayersEnabled) return
         if (opsMap.width > 0 && opsMap.height > 0) {
             _routeFitPending = false
-            _fitRoutesToViewport()
+            _fitRoutesToViewport(_fitRows(), _fitCenterOn())
         } else {
             _routeFitPending = true
         }
     }
 
+    /// 套视野的**几何数据源**。两个视图各吃各的，形状相同（`{waypoints:[{lat,lon}]}`）
+    /// ⇒ `OpsCommon.routeBounds` 两边共用，不必分家。
+    /// ‼️ **必须分开、不能合并成一个数组**：站点视图的 `_routeGeom` 恒为空（它不跑 ①②），
+    ///    监控员视图的 `_taskGeom` 也恒为空（`overview?view=route` 实测 0 行）⇒ 取错一个
+    ///    的结果是「什么都套不出来」，而 `routeBounds` 返回 null 是**合法的静默路径**
+    ///    （§7.4 退化情形 2），屏幕上不会有任何提示。
+    function _fitRows() {
+        return routeLayersEnabled ? opsShell._routeGeom : opsShell._taskGeom
+    }
+
+    /// 套视野的**中心锚点**：站点视图钉在本站（用户诉求「地图中心设置为当前登陆站点」），
+    /// 监控员视图给 `null`（= 居包围盒中心，既有行为，一字不改）。
+    /// ⚠️ 站点坐标还没到（或本站没挂航点）时 `_mySiteCoord` 是 `null` ⇒ 自动退化成居中，
+    ///    与监控员视图同一条路径，**不会**套出空视野。
+    function _fitCenterOn() {
+        return routeLayersEnabled ? null : _mySiteCoord
+    }
+
     /// §7.4 视野：把可见区域套到**全部负责航线**上（用户诉求「比例尺要能够显示所有要显示的航线」）。
-    /// 返回是否真的调了 `setVisibleRegion`。`rows` 缺省 = 全部负责航线。
+    /// 返回是否真的调了 `setVisibleRegion`。
+    /// `rows` 缺省 = 监控员视图的全部负责航线；**两个视图都走这里**，各自的几何由 `_fitRows()` 给。
+    /// `centerOn` = 中心锚点（站点视图给本站坐标，监控员视图给 `null`）——见 `_fitCenterOn`。
     ///
-    /// ‼️ **只能由 `routeLayersEnabled` 的视图调用。** 理由**不是**"`setVisibleRegion()` 会打断
-    ///    `center`/`zoomLevel` 的绑定"——**它不打断**（那是 C++ 侧对 `_map.visibleRegion` 的写入，
-    ///    QML 绑定照旧活着；实测见 `_routeFitCenter` 声明处）。真正的理由：
-    ///    ① 它会写 `_routeFitCenter` / `_routeFitZoom`，而这两个值在 `center` / `zoomLevel` 的
-    ///       优先级链里会插进站点视图不该有的语义（`_routeFitZoom > 0` 直接**接管** `zoomLevel`）；
-    ///    ② 站点视图的 `center` 靠 `_firstTaskCoord()` **跟随首个任务**，套视野与那套语义互相干扰。
-    /// ⚠️ 本文件对这句话曾有过三种互相矛盾的说法：本条原写作"会打断它们的绑定"（**错的，已证伪**）、
-    ///    `_applyBounds` 附近那句"绑定照旧活着"（对的）、`_routeFitCenter` 声明处那句"没人能保证"
-    ///    （当时的未知态，现已实测）。以本条与 `_routeFitCenter` 声明处为准。
+    /// 📌 **本条原是"只能由 `routeLayersEnabled` 的视图调用"，2026-09-23 撤销。** 原文那两条理由
+    ///    都随需求变更失效了。留档的理由：下一个人会**再次**生出"站点视图不该套视野"的直觉，
+    ///    而当时的直觉是有依据的——要知道依据是怎么没的，才不会把它当噪音删掉又重建一遍：
+    ///    ① 「它会写 `_routeFitCenter`/`_routeFitZoom`，在 `center`/`zoomLevel` 的优先级链里插进
+    ///       站点视图不该有的语义」——用户现在**要**的正是这套语义。`center` 原先跟随首个任务
+    ///       （飞机实时位置），需求「地图中心设置为当前登陆站点」把那条语义取代掉了；
+    ///       而 `_routeFitZoom` 接管 `zoomLevel` 恰恰就是"按航线范围定比例尺"想要的效果。
+    ///    ② 「站点视图的 `center` 靠 `_firstTaskCoord()` 跟随首个任务，套视野与那套语义互相干扰」
+    ///       ——同上，两条语义不能共存，留下的是用户点名的那条（站点）。`center` 绑定里那个
+    ///       分支现在**带 `routeLayersEnabled &&` 前缀**，站点视图根本走不到它。
+    ///    ⚠️ 至于更早那句"`setVisibleRegion()` 会打断 `center`/`zoomLevel` 的绑定"——**它从来就是错的**
+    ///       （那是 C++ 侧写 `_map.visibleRegion`，QML 绑定照旧活着；实测见 `_routeFitCenter` 声明处）。
+    ///       本条曾同时存在三种互相矛盾的说法，现已统一到"不打断"这一条。
     ///
-    /// ⚠️ 调用点必须在 ② 之后：航点没回来时每条航线的 `waypoints` 都是空数组 ⇒
+    /// ⚠️ 调用点必须在几何数据到位之后：航点没回来时每条航线的 `waypoints` 都是空数组 ⇒
     ///    `routeBounds` 返回 null ⇒ 这里直接返回、什么都不做（这正是 §7.4 退化情形 2 的要求）。
-    function _fitRoutesToViewport(rows) {
-        if (!routeLayersEnabled) return false
+    /// ‼️ 站点视图的**触发闸在上游**（`_fetchOverview` 按几何指纹、`_fetchMySite` 按坐标到达），
+    ///    本函数自己**不做**节流：每被调一次就真的重套视野、并清掉 `_mapManualCenter`。
+    function _fitRoutesToViewport(rows, centerOn) {
         var b = OpsCommon.routeBounds(rows !== undefined ? rows : opsShell._routeGeom)
-        // §7.4 退化情形 2：一条航线都没有（没被指派，或 ①② 还没回来）⇒ **不要**调
+        // §7.4 退化情形 2：一条航线都没有（没被指派，或数据还没回来）⇒ **不要**调
         // `setVisibleRegion`——传空矩形进去的缩放结果不可预测。保持当前视野。
         if (b === null) return false
-        return _applyBounds(b)
+        return _applyBounds(b, centerOn)
     }
 
     /// 选中某条航线 ⇒ 套到**该条航线**的包围盒（用户诉求：「点击某航线，地图应该自动缩放以
@@ -676,10 +898,25 @@ Item {
     ///      `fitViewportToGeoShape` 里对墨卡托包围盒另有取整/留白处理，实测偏差约 2%），一次
     ///      到位会在贴边处越界几像素。迭代把这点误差当**残差**消掉——实测（1741×971）跑满
     ///      3 轮后落在「高 789px / 可用 857px」，两轴都在界内且各留 30px 上下边距。
-    /// ‼️ 全程**不直接赋** `center`/`zoomLevel`：那是 QML 赋值，会**打断**这两个绑定（站点视图
-    ///    正靠绑定跟随首个任务）。`setVisibleRegion` 是 C++ 侧写入，绑定照旧活着。
-    function _applyBounds(b) {
+    /// ‼️ 全程**不直接赋** `center`/`zoomLevel`：那是 QML 赋值，会**打断**这两个绑定（两个视图都
+    ///    靠绑定取回 `_routeFitCenter`/`_routeFitZoom`）。`setVisibleRegion` 是 C++ 侧写入，绑定照旧活着。
+    ///
+    /// 中心锚点 `centerOn`（可省）：站点视图传**本站坐标**，把本站钉在可见区中心；监控员视图
+    ///    不传 ⇒ 居包围盒中心，与改动前**逐字等价**。比例尺随之改由"锚点到盒子的**最远**距离"
+    ///    反解——锚点居中时它退化成原来的"半个盒宽"，两条路径共用同一式，不会各自漂移。
+    function _applyBounds(b, centerOn) {
         var minLat = b.minLat, maxLat = b.maxLat, minLon = b.minLon, maxLon = b.maxLon
+
+        // 中心锚点解析。⚠️ 锚点钉的是**可见区**中心，不是视口几何中心——右栏与上下两条横条
+        //    盖住的那部分用户根本看不见，他说的"地图中心"就是他看得见的那块区域的中心。
+        //    下面 `cx`/`cy` 那两处偏移正是为此而设。‼️ 因此 `_routeFitCenter` 回读出来的
+        //    **视口**中心与本站坐标**不是同一个点**——那是**对的**，不要"顺手修正"成锚点坐标，
+        //    那会让视口整体offset、航线被面板盖掉一截。
+        var anchored = false, cA = null
+        if (centerOn && isFinite(Number(centerOn.latitude)) && isFinite(Number(centerOn.longitude))) {
+            cA = QtPositioning.coordinate(Number(centerOn.latitude), Number(centerOn.longitude))
+            anchored = true
+        }
 
         // §7.4 退化情形 1：包围盒零面积（全部航线退化成一个点）⇒ `setVisibleRegion` 会缩放到
         // **最大级别**（贴到地面），用户看到的是"点一下刷新地图突然掉下去了"。补最小跨度
@@ -737,17 +974,36 @@ Item {
             // 套满整张地图 ⇒ 此刻它两轴都不可能超过视口，明显超了就是量具坏了，宁可什么都不做。
             if (i === 0 && (bw > w * 1.01 || bh > h * 1.01)) return false
 
+            // 视口该以哪个**像素点**为中心：有锚点用锚点，没有就用包围盒中心。
+            // ⚠️ 锚点与盒子是在**同一个比例尺**下量出来的（都在 ① 造出的那个状态里）⇒ 可直接比。
+            var cxp, cyp, halfW, halfH
+            var pa = anchored ? opsMap.fromCoordinate(cA, false) : null
+            if (pa && isFinite(pa.x) && isFinite(pa.y)) {
+                cxp = pa.x; cyp = pa.y
+                halfW = Math.max(pa.x - bx0, bx1 - pa.x)
+                halfH = Math.max(pa.y - by0, by1 - pa.y)
+            } else {
+                // 锚点缺失、或 `fromCoordinate` 量不出 ⇒ 退回居包围盒中心，与改动前一致。
+                cxp = (bx0 + bx1) / 2; cyp = (by0 + by1) / 2
+                halfW = bw / 2;        halfH = bh / 2
+            }
+            if (!(halfW > 0) || !(halfH > 0)) break
+
             // 目标比例尺（相对**当前**）：两轴取更紧的那个，缩完恰好有一轴贴在 `_fitPad` 上。
-            var sig = Math.min(uw * _fitPad / bw, uh * _fitPad / bh)
+            // ‼️ 分母是"中心点到盒子的**最远**横向（纵向）距离"，**不是**半个盒宽——锚点偏心时
+            //    （本站挂在航线一端，很常见）按半盒宽算会让**远端那一侧出界**，正是用户报过的
+            //    「航线超过当前视口」。锚点居中时 `halfW === bw/2` ⇒ 本式退化成原来那一式。
+            var sig = Math.min(uw * _fitPad / (2 * halfW), uh * _fitPad / (2 * halfH))
             // 已达标（还需要放大/缩小的幅度可忽略）⇒ 不动地图，避免无谓的瓦片重取。
             if (Math.abs(sig - 1) < 0.02) break
 
-            // 目标视口在当前比例尺下看，就是一块 `w/σ × h/σ` 的像素矩形；它的中心由"包围盒
-            // 中心要落在**可见区**中心"反推：屏幕坐标下 `screen(q) = (q − C)·σ + (w/2, h/2)`，
-            // 令 `screen(B) = (uw/2, topH + uh/2)` 解出 C。（`B` = 上面量出的包围盒中心。）
+            // 目标视口在当前比例尺下看，就是一块 `w/σ × h/σ` 的像素矩形；它的中心由"中心点
+            // 要落在**可见区**中心"反推：屏幕坐标下 `screen(q) = (q − C)·σ + (w/2, h/2)`，
+            // 令 `screen(中心点) = (uw/2, topH + uh/2)` 解出 C。无锚点时中心点就是包围盒中心，
+            // 此时 `cxp = (bx0+bx1)/2`，与改动前的式子**逐字相同**。
             var vw = w / sig, vh = h / sig
-            var cx = (bx0 + bx1) / 2 + (panelW / 2) / sig
-            var cy = (by0 + by1) / 2 + ((botH - topH) / 2) / sig
+            var cx = cxp + (panelW / 2) / sig
+            var cy = cyp + ((botH - topH) / 2) / sig
             var tl = opsMap.toCoordinate(Qt.point(cx - vw / 2, cy - vh / 2), false)
             var br = opsMap.toCoordinate(Qt.point(cx + vw / 2, cy + vh / 2), false)
             if (!tl || !tl.isValid || !br || !br.isValid) break
@@ -861,8 +1117,9 @@ Item {
     function _notifyNewPending(list) {
         for (var i = 0; i < list.length; i++) {
             var h = list[i]
-            if (_seenHandovers.indexOf(h.handover_id) >= 0) continue
-            _seenHandovers.push(h.handover_id)
+            var hid = OpsCommon.handoverId(h)
+            if (_seenHandovers.indexOf(hid) >= 0) continue
+            _seenHandovers.push(hid)
             if (_seenHandovers.length > 200) _seenHandovers.shift()   // 防长会话无界增长（缓慢内存泄漏）
             _handoverActionError = ""
             _confirmHandover = h
@@ -998,21 +1255,34 @@ Item {
             allowGCSLocationCenter:     false
             allowVehicleLocationCenter: false
             planView:                   false
-            // 优先级：用户手动平移 > §7.4 套出全部航线 > 模板缺省。
+            // 优先级：用户手动平移 > §7.4 套出全部航线 > 本站坐标（站点视图）> 模板缺省。
             // 监控员视图的 `_tasks` 恒 0 行（`overview?view=route`），没有 §7.4 那一段它就会
             // 停在模板缺省（本机 = 出厂默认苏黎世）。见 `_routeFitCenter` 的声明处。
-            zoomLevel:                  routeLayersEnabled && _routeFitZoom > 0
+            // ⚠️ `zoomLevel` 去掉了 `routeLayersEnabled &&` 前缀：站点视图现在也用 §7.4 定比例尺
+            //    （用户诉求「完整显示当前所有航线」）。没有它，站点视图会停在
+            //    `_tasks.length ? 14 : 17` 这个**与航线范围无关**的固定值上。
+            zoomLevel:                  _routeFitZoom > 0
                                         ? _routeFitZoom
                                         : (_tasks.length ? 14 : QGroundControl.flightMapInitialZoom)
-            center:                     _mapFollowFirst && _firstTaskCoord() !== null
+            // ‼️ 首项「跟随首个任务」**加了** `routeLayersEnabled &&` 前缀，不是顺手加的：站点视图的
+            //    center 现在由 §7.4 钉在本站（用户诉求「地图中心设置为当前登陆站点」），而
+            //    `_firstTaskCoord()` 给的是**飞机实时位置**——两条语义不能共存，留下的是用户点名
+            //    的那条。加前缀而不是删掉整个分支，是为了让监控员视图**逐字不变**：它 `_tasks`
+            //    恒 0 行、这分支从未生效过，但"从未生效"是**实测结论不是结构保证**，不能拿它当
+            //    删除的理由（哪天 `view=route` 有数据了，行为就变了）。
+            center:                     routeLayersEnabled && _mapFollowFirst && _firstTaskCoord() !== null
                                         ? _firstTaskCoord()
                                         : (_mapManualCenter !== null
                                            ? _mapManualCenter
                                            : (_routeFitCenter !== null
                                               ? _routeFitCenter
-                                              : (QGroundControl.flightMapPosition.isValid
-                                                 ? QGroundControl.flightMapPosition
-                                                 : QtPositioning.coordinate(31.2, 121.5))))
+                                              // 站点视图在**一条航线都没有**（套不出视野）时的落点：
+                                              // 中心仍是本站，只是比例尺走上面那条与范围无关的固定值。
+                                              : (_mySiteCoord !== null
+                                                 ? _mySiteCoord
+                                                 : (QGroundControl.flightMapPosition.isValid
+                                                    ? QGroundControl.flightMapPosition
+                                                    : QtPositioning.coordinate(31.2, 121.5)))))
             // 用户平移地图：先冻结当前中心（此时仍=跟随值，无跳变）再退出跟随，
             // 顺序不可颠倒（先退跟随会回落到 GCS 位置兜底，画面跳变）。
             onMapPanStart: { _mapManualCenter = opsMap.center; _mapFollowFirst = false }
@@ -1022,12 +1292,155 @@ Item {
             onWidthChanged:  if (_routeFitPending) _requestRoutesFit()
             onHeightChanged: if (_routeFitPending) _requestRoutesFit()
 
+            // 本站机位范围圈 —— **站点视图**用。
+            // 用户 2026-09-23：「在当前登陆站点显示一个能够圈进所有机位范围的圆圈」，
+            // 同日改口径：「改为以站点坐标为中心，圈住各个机位，圆圈用虚线」。
+            // ‼️ 声明在**航线之前**：QML 里先声明的 item 在地图**下层**。它是背景性的范围
+            //    提示，压住航线或飞机 marker 就成了干扰。
+            // ‼️ 为什么不是 `MapCircle`（QGC 有 4 处裸先例，属性写法也对得上）：QtLocation 的
+            //    `MapCircle` 边框**只有** width/color，**没有任何虚线能力**
+            //    （`grep -i dash .../QtLocation/plugins.qmltypes` 返回空）⇒ 做不出要的虚线。
+            //    唯一可行路径是 `MapQuickItem` + `Shape`：虚线 = `ShapePath.DashLine` +
+            //    `dashPattern`（先例：同目录 `SlotLayout.qml` 的机位卡空心虚线，但在**地图里**
+            //    没有先例，故另开探针实测过类型与属性名）。
+            // ‼️ 代价：`sourceItem` 是**屏幕像素**空间，半径得自己除以米/像素 —— 这恰好与
+            //    「最小像素尺寸」是同一件事，两者合并进 `_slotRangeDiaPx` 一次算完。
+            //    ⇒ 圆随缩放**重估**靠的是那条绑定的依赖注册，不再是 MapCircle 的 `radius`。
+            // ⚠️ 它不是 `MapItemView`：单个 item（不是 model 驱动），没有"委托整体重建"那类
+            //    抖动；但 `coordinate` / 尺寸仍是绑定，同样靠 `_slotRangeCircle` 的**身份稳定**
+            //    （视图侧按几何指纹维护）来避免每 2s 重算。
+            MapQuickItem {
+                objectName: "slotRangeCircle"
+                // ‼️ 三个条件缺一不可：`routeLayersEnabled` 是视图闸（监控员视图不显示范围圈）；
+                //    `> 0` = 没有可画的圆（无数据 / 地图未就绪 / mpp 无效，见 `_slotRangeDiaPx`）；
+                //    `<= 上界` = 大到没有信息量，**不画**（判读见 `_maxSlotCircleDiameterPx`）。
+                //    上界那个条件同时还挡住了"几十万像素的 Shape"这条卡顿路径——`visible:false`
+                //    的 item 不渲染，`sourceItem` 也就不会生成几何。
+                visible: !opsShell.routeLayersEnabled
+                         && opsShell._slotRangeDiaPx > 0
+                         && opsShell._slotRangeDiaPx <= opsShell._maxSlotCircleDiameterPx
+                coordinate: {
+                    var c = opsShell._slotRangeCircle
+                    return c ? QtPositioning.coordinate(c.lat, c.lon)
+                             : QtPositioning.coordinate(0, 0)
+                }
+                // 圆心 = 站点 ⇒ 锚点取 `sourceItem` 的**正中心**。直径变了锚点必须跟着变，
+                // 否则圆会偏心（此处是绑定，自动跟随）。
+                anchorPoint: Qt.point(opsShell._slotRangeDiaPx / 2, opsShell._slotRangeDiaPx / 2)
+                sourceItem: Shape {
+                    width:  opsShell._slotRangeDiaPx
+                    height: opsShell._slotRangeDiaPx
+                    ShapePath {
+                        // 用户 2026-09-23：「圆圈用虚线」。`DashLine` 是**唯一**能出虚线的枚举
+                        //（`ShapePath` 只有 SolidLine / DashLine / 无描边三种）。
+                        strokeStyle: ShapePath.DashLine
+                        // ⚠️ 单位是**线宽倍数**不是像素（Qt 文档：pattern is specified in units
+                        //    of the pen width）⇒ 配合下面的 strokeWidth: 2，实得 10 px 实 / 8 px 空。
+                        //    改 strokeWidth 会连带改虚线密度，别把它当成两个独立的旋钮。
+                        dashPattern: [5, 4]
+                        strokeColor: "#ffd400"
+                        strokeWidth: 2
+                        // 空心圈：实心填充会盖住底图上的地形与航线。**别改成半透明填充**——
+                        // 那在深色卫星底图上只会让圈与底图的对比度下降。
+                        fillColor: "transparent"
+                        PathAngleArc {
+                            centerX: opsShell._slotRangeDiaPx / 2
+                            centerY: opsShell._slotRangeDiaPx / 2
+                            // `- 1` 给 2 px 线宽留半个线身，让描边整个落在 `sourceItem` 内
+                            //（超出去的会被 item 边界裁掉）。`max(0, …)` 防直径极小时的负数。
+                            radiusX: Math.max(0, opsShell._slotRangeDiaPx / 2 - 1)
+                            radiusY: Math.max(0, opsShell._slotRangeDiaPx / 2 - 1)
+                            startAngle: 0
+                            sweepAngle: 360
+                        }
+                    }
+                }
+            }
+
+            //-----------------------------------------------------------------
+            // 轨迹线 —— 全部**已建链**载具各一条（**两个视图共用**，不加 `routeLayersEnabled` 闸）
+            // ‼️ 数据源是 `QGroundControl.multiVehicleManager.vehicles`（**真实** MAVLink 载具），
+            //    不是 `_tasks` / `_routeDevices`——那两个是后端 REST 的投影、按 2 s 轮询跳变；
+            //    轨迹是**逐帧**的东西，只有载具侧的 `TrajectoryPoints` 有它。
+            //    ⇒ 这也正是「OpsView 里飞机轨迹不出现」的根因：本文件此前**从未引用过**
+            //      `trajectoryPoints`（全文件零引用）。
+            // ‼️ `TrajectoryPoints` 是**纯内存、不落库**的（`Vehicle.h:155`，`CONSTANT` 属性），
+            //    且**只在解锁(armed)期间记录**：`Vehicle::_updateArmed`（`Vehicle.cc:1230`）
+            //    在转 armed 时 `start()`、转 disarmed 时 `stop()` ⇒ 未起飞的载具这条线天然是空的，
+            //    **不要**在这里再加一道"是否在飞"的判据。抽稀也由它自己做
+            //    （2 m / 1.5°，`TrajectoryPoints.h:40-41`）。
+            // ‼️ 参照实现 = `src/FlyView/FlyViewMap.qml:239-260`（用户点名的那份，已在 FlyView
+            //    实测通过）。与它的**唯一差别**：FlyView 只画**当前选中**载具一条
+            //    （靠 `onActiveVehicleChanged` 换 `Connections.target`），这里按 model **展开成
+            //    每条一架** ⇒ "换车时全量重取"那件事改由 `Component.onCompleted` /
+            //    `on_TpsChanged` 承担（FlyView 那份由 `Connection` 的 target 变化承担）。
+            //-----------------------------------------------------------------
+            // ‼️ `MapItemView` 而非裸 `Repeater`——理由见 L1 上方的长注释：**晚于地图创建**的
+            //    `MapPolyline` 不会被注册进地图（`path` 有值、`pathLength()` 正确、QML 零报错，
+            //    就是一条线都不画）。
+            MapItemView {
+                model: QGroundControl.multiVehicleManager.vehicles
+                delegate: MapPolyline {
+                    id: trajLine
+                    line.width: 3
+                    line.color: OpsCommon.trajectoryColor(index)
+                    z: QGroundControl.zOrderTrajectoryLines
+                    // ‼️ `path` **故意不给绑定**（对照本文件里其它几个 `MapPolyline` 都是
+                    //    `path: …` 绑定）：轨迹靠 `onPointAdded` **增量** `addCoordinate()` 追加，
+                    //    而绑定会在下一次重估时把已追加的点**整体覆盖掉**。
+                    //    FlyView 那份同样是命令式赋值（`FlyViewMap.qml:250`），也没有绑定。
+                    path: []
+                    // ‼️ 角色名是 **`object`** 不是 `modelData`：`vehicles` 是 `QmlObjectListModel`，
+                    //    它有两个角色 ⇒ `modelData` 会是 `QVariantMap` 而非 `Vehicle`。
+                    //    逐条理由见 `OpsView.qml:662-677`，以及下面 L3 marker 的同款注释。
+                    readonly property var _tps: object ? object.trajectoryPoints : null
+                    // 全量重取（`list()`：`TrajectoryPoints.h:18`）。`path` 无绑定 ⇒ 幂等，
+                    // 重复调用无害，所以下面两条触发路径可以重叠。
+                    function _reset() { path = _tps ? _tps.list() : [] }
+                    // ‼️ 两条触发路径**都要**，缺一条就是个静默错误：
+                    //    · `Component.onCompleted` 覆盖"**委托出生时**车上已有历史轨迹"
+                    //      （委托随 `vehicles` 增删重建）；
+                    //    · `on_TpsChanged` 覆盖"`object` **晚到**或被复用"——`QQmlDelegateModel`
+                    //      会把销毁的委托回收再派给别的行，只写前者的话，被复用的那条线会
+                    //      **停在上一架飞机的轨迹上**（而界面看起来完全正常）。
+                    //    ⚠️ 处理器名是 `on_TpsChanged` 不是 `on_tpsChanged`（下划线后首字母大写）。
+                    //       这不是照文档推的：同仓 `FlyViewMap.qml:33` 声明
+                    //       `property var _activeVehicleCoordinate`、`:184` 用
+                    //       `on_ActiveVehicleCoordinateChanged`，声明与处理器在同一文件里共存。
+                    Component.onCompleted: _reset()
+                    on_TpsChanged: _reset()
+                    Connections {
+                        target: trajLine._tps
+                        // 三个信号与 `TrajectoryPoints.h:26-29` 一一对应。
+                        function onPointAdded(coordinate) {
+                            trajLine.addCoordinate(coordinate)
+                        }
+                        // `updateLastPoint` 改的是**最后一个点**（原地更新，抑制静止时的抖动）。
+                        // ⚠️ 这里加了长度守卫，**不是**照抄 `FlyViewMap.qml:257` 的裸减法：
+                        //    空数组时 `pathLength()-1` 是 -1，会不会崩只取决于 Qt 对越界的容忍度
+                        //    ——不该把"Qt 恰好不崩"当成保证。
+                        function onUpdateLastPoint(coordinate) {
+                            if (trajLine.pathLength() > 0) {
+                                trajLine.replaceCoordinate(trajLine.pathLength() - 1, coordinate)
+                            }
+                        }
+                        function onPointsCleared() { trajLine.path = [] }
+                    }
+                }
+            }
+
             // 航路（全部任务 waypoints 连线）——**站点视图**用。
             // 监控员视图改吃航线缓存（下面的 L1），此处置空数组即可：Repeater 的 model 为
             // 空时**不创建任何项**，没有"隐藏但仍在"的残留（`visible: false` 才会留下不可见项）。
             // ‼️ `MapItemView` 而非裸 `Repeater`——理由见 L1 上方的长注释。
+            // ‼️ 吃 **`_taskGeom`** 而不是 `_tasks`：航线画的是航点，与 `latest` 遥测无关，
+            //    而吃 `_tasks` 会让飞机每动一次就整条线销毁重建（每 2s）。`_taskGeom` 由
+            //    `_rebuildTaskGeom()` 按**几何指纹**维护，航点不变就保持数组身份。
+            //    ⚠️ 元素只有 `task_id`/`route_id`/`waypoints`——**没有 `latest`**，
+            //       所以这里（以及今后往 delegate 里加的东西）不能引用任务的位置/状态；
+            //       要位置/状态就用下面吃 `_tasks` 的那个 marker `MapItemView`。
             MapItemView {
-                model: opsShell.routeLayersEnabled ? [] : _tasks
+                model: opsShell.routeLayersEnabled ? [] : _taskGeom
                 delegate: MapPolyline {
                     line.width: 2
                     line.color: "#00bfff"
@@ -1041,9 +1454,30 @@ Item {
             MapItemView {
                 model: opsShell.routeLayersEnabled ? [] : _tasks
                 delegate: MapQuickItem {
-                    visible: modelData.latest && modelData.latest.lat ? true : false
-                    coordinate: modelData.latest && modelData.latest.lat
-                                ? QtPositioning.coordinate(modelData.latest.lat, modelData.latest.lon)
+                    // ‼️ 位置主源是**报文**，不是 `modelData.latest`（用户 2026-09-24 报障：
+                    //    「飞机图标不会在 OpsView 中出现」）。`latest` 来自后端轮询的
+                    //    `table_telemetry`（最多陈旧 2 s，且 `data_writer` 一旦停写就恒为旧值
+                    //    甚至为 null）；载具坐标则是**逐帧**的 MAVLink 位置。
+                    //    `OpsCommon.resolvePosition` 的次序就是"报文优先、REST 兜底"（§5.2）。
+                    // ‼️ 下面两段与 L3（监控员视图）marker **逐条同构**，是同一处坑：
+                    //    · `vehicles` 必须在**绑定表达式里**读一次当实参传进去（`.pragma library`
+                    //      里函数体读属性**不注册绑定依赖**，见 `OpsCommon.js` 头部）；
+                    //    · `vs.count` 那一读是**依赖注册**不是短路优化：`vehicles` 在
+                    //      `MultiVehicleManager.h:22` 上是 `CONSTANT`，只读它这个绑定**永不重估**
+                    //      ⇒ 载具建链后 marker 永远找不到 Vehicle，而界面看起来完全正常；
+                    //    · `_veh.coordinate` 同理必须在**实参位置**读，否则 MAVLink 位置一变
+                    //      这个绑定不重估，marker **永远停在第一帧**。
+                    readonly property var _veh: {
+                        var vs = QGroundControl.multiVehicleManager.vehicles
+                        if (!vs || vs.count === 0) return null
+                        return OpsCommon.matchDeviceToVehicle(modelData, vs)
+                    }
+                    readonly property var _pos: OpsCommon.resolvePosition(
+                                                     modelData, _veh, _veh ? _veh.coordinate : null)
+                    // 两处都没有位置 ⇒ **不画**（与 L3 同一判据：该机尚无遥测）
+                    visible: _pos !== null
+                    coordinate: _pos !== null
+                                ? QtPositioning.coordinate(_pos.lat, _pos.lon)
                                 : QtPositioning.coordinate(0, 0)
                     anchorPoint: Qt.point(12, 12)
                     sourceItem: Rectangle {
@@ -1062,7 +1496,13 @@ Item {
                                 // 走属性更新中心（而非直接赋值 opsMap.center）：保留绑定，
                                 // 防止后续轮询/再次点击时中心被不期望地覆盖或绑定失效
                                 _mapFollowFirst = false
-                                _mapManualCenter = QtPositioning.coordinate(modelData.latest.lat, modelData.latest.lon)
+                                // ‼️ 用 `_pos` 而不是 `modelData.latest`：上面那个判据下
+                                //    **可能报文有位置而 REST 没有**（`latest` 为 null），
+                                //    直接取 `.lat` 会抛 TypeError ⇒ 点击**静默失效**。
+                                //    与 `visible` 同源，也保证"点得到的一定画得出来"。
+                                if (_pos !== null) {
+                                    _mapManualCenter = QtPositioning.coordinate(_pos.lat, _pos.lon)
+                                }
                             }
                         }
                     }
@@ -1121,10 +1561,14 @@ Item {
             }
 
             //-----------------------------------------------------------------
-            // L3 飞机 marker —— **监控员视图**用（设计文档 §5.1/§5.2/§5.3）
-            // ‼️ 吃 ③ 的 **`devices[]`**（不是 `tasks[]`）：`uav_status`（着色）、`latest`（位置回退）、
-            //    `event`（异常着色）、`route_id`（选中淡化）**全都只在这个数组里**。
+            // L3 航班 marker —— **监控员视图**用（设计文档 §5.1/§5.2/§5.3）
+            // ‼️ 吃 ③ 的 **`devices[]`**（不是 `tasks[]`）：`latest`（位置与**航向**）、
+            //    `event`（异常着色）、`task_id`（关联出航班）、`route_id`（选中淡化）
+            //    **全都只在这个数组里**。
             //    ⚠️ 不要为了"看起来对称"而改吃 `tasks`——两者的字段集不相交，互换只会缺字段。
+            //    ⚠️ **着色是唯一的例外**：它按 `task_id` 关联回 `tasks[]` 取**航班**状态色
+            //       （`OpsCommon.markerColor`，用户 2026-09-23 定的口径，理由见该函数注释）。
+            //       关联只取颜色，位置与航向仍然只从 `devices[]` 拿（单一位置源约定）。
             // ‼️ **恒画全部**，不随选中增减（用户 ⑥ 修正的原始冲突）：选中只改**样式**，
             //    不改**集合**——所以这里的 model 永不经过任何按选中过滤的函数。
             // ✅ 每个 device 都经任务→航线关联而来，`route_id` **必非 null**，没有"无航线飞机"这一支。
@@ -1153,6 +1597,14 @@ Item {
                     readonly property var _pos: OpsCommon.resolvePosition(
                                                      modelData, _veh, _veh ? _veh.coordinate : null)
                     readonly property string _vis: OpsCommon.visibleForSelection(modelData, opsShell._selectedRouteId)
+                    // 本机所属的航班。`_routeTasks` 与 `_routeDevices` 是后端**同一条 WHERE
+                    // 的两个投影**，所以这里查得到是常态、查不到才是异常（`markerColor` 对此有兜底）。
+                    readonly property var _task: OpsCommon.taskById(opsShell._routeTasks, modelData.task_id)
+                    // ‼️ `opsShell._now` 必须**作为实参**读进来：`.pragma library` 里函数体内读属性
+                    //    **不注册绑定依赖**（见 `OpsCommon.js` 头部）⇒ 写在 `markerColor` 内部读的话
+                    //    这个绑定永不重估，**交接超时红就永远不会出现**（而界面看起来完全正常）。
+                    readonly property color _markerColor: OpsCommon.markerColor(
+                                                             modelData, _task, opsShell._now, opsShell._handoverById)
 
                     // 两处都没有位置 ⇒ **不画**（`device.latest` 为 null 是常态：该机尚无遥测）
                     visible: _pos !== null
@@ -1164,39 +1616,85 @@ Item {
                     anchorPoint: Qt.point(12, 12)
 
                     sourceItem: Item {
-                        // ‼️ 本项宽度是**「圆 + 机号标」整块**，不是圆的 24：命中区要盖住两者
-                        //    （理由见下面 MouseArea）。`anchorPoint` 是 (12,12) 而圆仍从 (0,0)
-                        //    起画 ⇒ 只把本项撑宽**不会移动**圆，标注落点不受影响。
-                        width: 24 + 3 + uavLabelBox.width
+                        // ‼️ 本项宽度是**「图标 + 航班号标」整块**，不是图标的 24：命中区要盖住两者
+                        //    （理由见下面 MouseArea）。`anchorPoint` 是 (12,12) 而图标仍从 (0,0)
+                        //    起画 ⇒ 只把本项撑宽**不会移动**图标，标注落点不受影响。
+                        width: 24 + 3 + markerLabelBox.width
                         height: 24
-                        Rectangle {
+                        // 图标 = **QGC 缺省的地图飞机图标**的形状。来源是
+                        // `src/FlightMap/Images/vehicleArrowOpaque.svg`（`FirmwarePlugin.h:327`
+                        // 的 `vehicleImageOpaque()`，FlyView 地图用的就是它，PX4 插件未覆盖）。
+                        // ‼️ 用 `Shape` 自绘而**不是** `Image` + `MultiEffect` 染色：后者要过 shader，
+                        //    而"多色 SVG 到底有没有被压成单色"会变成一个只能靠肉眼验的隐含前提
+                        //    （原图是**硬编码三色红**，QGC 自己也没给它染过色——`VehicleMapItem`
+                        //    里那个 `MultiEffect` 只用来打阴影）。这里只取原图的**两个填充三角**
+                        //    （原图另有两条深红描边，是多色硬编码的，去掉才能按状态染色），
+                        //    path 坐标与上游 SVG **逐字相同**，便于日后与上游比对。
+                        // ‼️ 顶点在 (35.5, 2.118) ⇒ **机头朝正北**，故 `rotation` 就是航向本身。
+                        //    ⚠️ **不要**叠 −90°：站点机位图那个 `_airplanePath` 机头朝**右**、
+                        //    需要 −90°，两者朝向约定相反，别把那边的手法照搬过来。
+                        Item {
                             width: 24; height: 24
-                            radius: 12
-                            color: OpsCommon.deviceColor(modelData)
-                            border.color: devMarker._vis === "lit" ? "#ffffff" : "#c8d4e6"
-                            border.width: devMarker._vis === "lit" ? 3 : 2
+                            // ‼️ 航向旋转放在**这一层**，不放 `Shape` 上：`Shape` 内部那层
+                            //    `Scale`（72→24）与 `rotation` 谁先作用取决于 Qt 的变换合并顺序，
+                            //    "绕原点还是绕中心"会因此不同。在外层转，只绕 24×24 的中心，没有歧义。
+                            // ⚠️ `heading` 缺失时回 0（正北）——不能让它变成 NaN 传下去。
+                            rotation: Number(modelData.latest ? modelData.latest.heading : 0) || 0
+
+                            Shape {
+                                width: 72; height: 72
+                                // 原图 viewBox 是 72×72，缩到 24。用 `Scale` 而不是把 path 里的
+                                // 数字改小——改了数字就再也看不出它来自哪个图标了。
+                                transform: Scale { origin.x: 0; origin.y: 0; xScale: 1 / 3; yScale: 1 / 3 }
+
+                                ShapePath {
+                                    fillColor: devMarker._markerColor
+                                    strokeColor: "#ffffff"
+                                    // ‼️ 宽度是**量出来的**，不是照搬原来那个圆点的 `border.width`
+                                    //    —— 同样的 3px 在两种形状上完全不是一回事：圆点的 3px 边框
+                                    //    只占 24px 周长的 12.5%，而这条**尖三角形**最窄处趋近于零，
+                                    //    3px 描边会把填充色糊掉。离屏探针实测「状态色只剩 19%、
+                                    //    其余全被白边盖住」，图标看上去是**白的**——正好毁掉
+                                    //    "按状态显示不同颜色"这个诉求。
+                                    //    实测各档（橙色像素 / 描边+填充总像素）：
+                                    //      1.5px = 48%   1px = 64%   无描边 = 100%
+                                    //      0.67px ≈ 98%，但它被抗锯齿吃成 2 个像素 ⇒ 等于没画，
+                                    //      所以**没有**"细到刚好"这一档可选。
+                                    //    ⇒ 常态**不描边**（状态色完整可见），点亮时用 1px 白边；
+                                    //      两档的差别落在"有没有边"上，而不是边的粗细。
+                                    // ⚠️ `strokeWidth` 的单位是 **path 的坐标（未缩放的 72 制）**，
+                                    //    缩放 1/3 之后视觉宽度才等于它的三分之一 ⇒ 要 1px 视觉就写 3。
+                                    strokeWidth: devMarker._vis === "lit" ? 3 : 0
+                                    PathSvg { path: "M35.5 2.118v51.573L1.118 70.882zM36.5 53.691V2.118l34.382 68.764z" }
+                                }
+                            }
                         }
-                        // 机号标在圆右侧（自绘，**不用 ToolTip**：地图项是画在场景里的，
+                        // 航班号标在图标右侧（自绘，**不用 ToolTip**：地图项是画在场景里的，
                         // ToolTip 的 parent 会落到地图根而非被悬停项上，位置会漂移）
+                        // ‼️ 标的是**航班号**（`task_no`）而不是机号——地图上画的就是"航班"
+                        //    （用户 2026-09-23 定）。三级回退：航班号 → 机号 → 设备号。
+                        //    中间那级不是多余的：`task_no` 与 `uav_no` 都可能为空（后者在
+                        //    `devices[]` 里由后端关联出来），而 `device_id` 一定在。
                         Rectangle {
-                            id: uavLabelBox
-                            x: 27                        // = 圆宽 24 + 间距 3（与上面的 width 同源，别只改一处）
+                            id: markerLabelBox
+                            x: 27                        // = 图标宽 24 + 间距 3（与上面的 width 同源，别只改一处）
                             anchors.verticalCenter: parent.verticalCenter
-                            width: uavLabel.width + 8; height: uavLabel.height + 4
+                            width: markerLabel.width + 8; height: markerLabel.height + 4
                             radius: 3
                             color: "#cc0d1526"
                             border.color: "#3a4a66"; border.width: 1
                             Text {
-                                id: uavLabel
+                                id: markerLabel
                                 anchors.centerIn: parent
                                 color: "#e6edf7"; font.pixelSize: 10; font.bold: true
-                                text: modelData.uav_no ? modelData.uav_no : ("#" + modelData.device_id)
+                                text: modelData.task_no ? modelData.task_no
+                                      : (modelData.uav_no ? modelData.uav_no : ("#" + modelData.device_id))
                             }
                         }
-                        // ‼️ 命中区靠**撑宽 parent** 来涵盖机号标，而不是在这里写
-                        //    `width: parent.width + 3 + uavLabelBox.width`：
-                        //    原先只 `anchors.fill: parent` 填圆的 24×24，而机号标画在圆**之外**
-                        //    （x=27 起）⇒ **点机号毫无反应**。而用户眼里那是「飞机 + 机号」一个
+                        // ‼️ 命中区靠**撑宽 parent** 来涵盖航班号标，而不是在这里写
+                        //    `width: parent.width + 3 + markerLabelBox.width`：
+                        //    原先只 `anchors.fill: parent` 填图标的 24×24，而标画在图标**之外**
+                        //    （x=27 起）⇒ **点标毫无反应**。而用户眼里那是「飞机 + 航班号」一个
                         //    整体，点在哪一半都该算点中了这架飞机。
                         // ⚠️ 本项是最后一个子项（后声明者在上）。日后若往 sourceItem 里再加
                         //    Button/MouseArea，必须排在**本项之前**，否则会把命中区切掉一块。
@@ -1409,7 +1907,7 @@ Item {
                 Item { Layout.fillWidth: true }
                 Button {
                     text: qsTr("拒绝")
-                    onClicked: _rejectHandover(_confirmHandover.handover_id, function(ok) {
+                    onClicked: _rejectHandover(OpsCommon.handoverId(_confirmHandover), function(ok) {
                         if (ok) handoverDialog.close()
                         else _handoverActionError = qsTr("操作未送达服务端，请重试；仍失败请通知提出方撤回重提")
                     })
@@ -1419,7 +1917,7 @@ Item {
                     onClicked: {
                         var mine = _confirmHandover && OpsCommon.isMine(_confirmHandover, AuthController.userId)
                         var act = mine ? _cancelHandover : _acceptHandover
-                        act(_confirmHandover.handover_id, function(ok) {
+                        act(OpsCommon.handoverId(_confirmHandover), function(ok) {
                             if (ok) handoverDialog.close()
                             else _handoverActionError = qsTr("操作未送达服务端，请重试；仍失败请通知对方人工处理")
                         })

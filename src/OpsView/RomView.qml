@@ -15,9 +15,9 @@ import "OpsCommon.js" as OpsCommon
 ///
 ///   1. `routeLayersEnabled: true` —— 开航线图层（① 缓存 + ② 航点 + ③ 轮询），
 ///      地图的 L1/L2/L3 与右栏上段都吃它；
-///   2. 右栏两段（§4.1）：上段**航线列表（常驻）** + 中段**航班列表**，没有机位平面图。
-///      ⚠️ 下段**机载告警**（§6）未做——它要先补一处 C++（`StatusTextHandler` 把结构化告警
-///      暴露给 QML，§6.1），属于另一摊工作。
+///   2. 右栏三段（§4.1 / §6）：上段**航线列表（常驻）** + 中段**航班列表** + 下段**机载告警**，
+///      没有机位平面图。下段吃的 C++ 面是 `Vehicle::statusTextMessages`（§6.1 路 B，
+///      已在 `StatusTextHandler` / `Vehicle` 里补好）。
 ///   3. `overviewView: "route"` —— 保留但已**降级为兜底**，见下方该行的注释。
 ///
 /// ‼️ 本视图连 `polled()`，但**只为超时检查**（§3.6.2）：每 2s 看一遍登记集合里有没有飞机
@@ -196,6 +196,20 @@ OpsShell {
                 onTaskSelected: function(task) { romView.selectTask(task) }
                 onHandoverProposed: function(taskId, phase) { romView._proposeHandover(taskId, phase) }
                 onHandoverCancelRequested: function(handoverId) { romView._cancelHandover(handoverId) }
+            }
+
+            //-----------------------------------------------------------------
+            // 下段：机载告警（§6）
+            //-----------------------------------------------------------------
+            // ‼️ **不要**把 `devices` 当成"该显示哪些告警"的判据：飞机落地转 PARKED 后会从
+            //    `devices[]` 里消失，但它此刻若还在发 `STATUSTEXT`，那一行恰恰最该被看见。
+            //    `devices` 在这里**只用来把 `device_id` 翻译成 `uav_no` 与 `task_no`**（§6.2 步骤 4）。
+            // ‼️ 高度由面板内部固定（§6.3"下段固定高度、内部滚动"），此处**不写**
+            //    `fillHeight`——写了中段就没了兜底，告警一多就会把航班列表挤扁。
+            AlertListPanel {
+                Layout.fillWidth: true
+                headerText: qsTr("机载告警")
+                devices: romView._routeDevices
             }
         }
     }

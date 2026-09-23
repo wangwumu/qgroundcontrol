@@ -199,6 +199,23 @@ ApplicationWindow {
         romView.visible = false
     }
 
+    /// §7.3「刷新航线与航点」：把工具条的菜单动作转发给航线监控员视图的 `OpsShell`。
+    /// ⁉️ 为什么要这一层：`SelectViewDropdown` 在工具条里，够不到视图内部的 `OpsShell`
+    ///    （它唯一的把手是全局 `mainWindow`）；而两个视图都是 MainWindow 的直接子项 ⇒
+    ///    转发点只能落在两者都认识的地方，也就是这里。
+    /// ⚠️ **只发往 `romView`，不写 `opsView` 分支**：§7.3 把这个动作限定在 ROUTE_MONITOR，
+    ///    而站点视图的 `routeLayersEnabled` 恒 false（它没有航线缓存）——那边的
+    ///    `refreshRoutes()` 会照发 ① 的请求（对 SITE_ATC 是必然失败的一次无谓往返）。
+    ///    菜单项与本函数判据同源，所以"够不到 opsView"不需要在这里再兜一次。
+    /// ⚠️ 仍保留 `visible` 判断：菜单项可见 ⟺ 角色是航线监控员，但"角色对"与"视图已经切
+    ///    过来了"是两件事（`showRomView()` 由登录回调触发，与本函数不同步）。不可见时静默
+    ///    不发——刷新一个没显示的视图没有意义，而它发的是真实网络请求。
+    function refreshOpsRoutes() {
+        if (romView.visible) {
+            romView.refreshRoutes()
+        }
+    }
+
     function showTool(toolTitle, toolSource, toolIcon) {
         toolDrawer.backIcon     = flyView.visible ? "/qmlimages/PaperPlane.svg" : "/qmlimages/Plan.svg"
         toolDrawer.toolTitle    = toolTitle

@@ -4,9 +4,10 @@
 // OpsView / RomView 共用的纯函数库（展示映射、交接派生、本地报文判定、流向派生）
 //
 // ‼️ 为什么必须是 `.pragma library`：QML 里**方法调用不注册绑定依赖**——在 QML 文件内
-//    定义的函数，其函数体里读到的属性发生变化**不会**让调用点重估（`OpsView.qml:23-24`
-//    有同类记录：读 `AuthController.roles` 属性而非 `hasRole()` 方法，正是因为方法调用
-//    不注册依赖）。搬进库文件后一切输入都必须走**实参**，绑定依赖因此落在调用点的实参
+//    定义的函数，其函数体里读到的属性发生变化**不会**让调用点重估（`OpsView.qml` 的
+//    `_isSiteATC` 那处有同类记录：读 `AuthController.roles` 属性而非 `hasRole()` 方法，
+//    正是因为方法调用不注册依赖）。搬进库文件后一切输入都必须走**实参**，绑定依赖因此落在调用点的实参
+//    ⚠️ 引用用**锚点**（`_isSiteATC`）不用行号：行号会被同文件任何一次增删静默顶偏。
 //    表达式上——这正是两个视图能共用同一份判据、又各自正确刷新的原因。
 //
 // ‼️ 本文件里**不许**读任何 QML 属性、**不许**用 QML 单例（`multiVehicleManager` /
@@ -26,8 +27,9 @@
 //--------------------------------------------------------------------------
 
 // 任务列表两张卡之间、以及机位平面图相邻机位之间的间隔，**单点定义**在这里。
-// 用户 2026-09-18：「间隔参照任务列表中两个卡片的间隔」——`SlotLayout.fixedGap` 与
-// 两个 ListView 的 `spacing` 都绑它，别在别处另写字面量（`OpsView.qml:68` 原文）。
+// 用户 2026-09-18：「间隔参照任务列表中两个卡片的间隔」。
+// 消费者一律经 `OpsShell._taskCardGap` → 各面板的 `cardGap` / `SlotLayout.fixedGap`，
+// 别在别处另写字面量。（`AlertListPanel` 是唯一直接读 `OpsCommon.taskCardGap` 的。）
 var taskCardGap = 6
 
 
@@ -138,11 +140,36 @@ function uavStatusLabel(s) {
 // 交接派生
 //--------------------------------------------------------------------------
 
-// `handoverById` 由 OpsShell 从 pending 列表构建：`{task_id: handover}`，**仅含 PENDING 交接**。
+// 交接取数：**优先任务自带的 `task.handover`**，回落到 `handoverById`。
+//
+// 两个来源的差别是**按角色过滤与否**，缺口正出在这里：
+//   - `task.handover`：`Overview`/`RouteTasks` 给**每一项**都附带（后端 `pendingHandover`），
+//     **不按角色过滤**。它的语义是一个**事实**——该任务此刻有没有 PENDING 交接；
+//   - `handoverById`：由 OpsShell 从 `/handovers/pending` 构建，**按角色过滤**
+//     （SITE_ATC 只拿本站 LANDING、ROUTE_MONITOR 只拿其航线 ROUTE）。
+//     它的语义是"**待我确认**的交接"。
+//
+// ‼️ 起飞机场 ATC 是 ROUTE 交接的**提出方**，永远不在「待我确认」名单里 ⇒ 只认后者时，
+// 他签出成功的**那一刻**卡片就从自己列表里消失（后端站内视图 SQL 特意保留了
+// `IN_FLIGHT + PENDING ROUTE` 这一行，注释写明"签出重叠期出站方仍需见"——**前后端判据相反**），
+// 「撤回交接」入口也随之不可达。**可见性用"事实"判，该谁动手用"待办"判，两者不能混用。**
+//
 // 无交接的任务返回 `undefined`（调用点因此必须用三元式而非 `&&`，见 isMine 上方注释）。
 function handoverFor(task, handoverById) {
-    if (!task || !handoverById) return undefined
+    if (!task) return undefined
+    if (task.handover) return task.handover
+    if (!handoverById) return undefined
     return handoverById[task.task_id]
+}
+
+// 交接 id 的**两个字段名都是设计文档的约定**，不是笔误：
+//   - 任务上的 `handover`（overview/route-tasks 附带）→ `id`（《飞行监控主界面设计》§4.1 响应样例）
+//   - `/handovers/pending` 的项 → `handover_id`（同文档 §4 接口表）
+// 调用点一律走本函数取值。直接写死其中一个名字，**换源时就静默变 `undefined`**——
+// 表现为「撤回交接」POST 到 `/api/handovers/undefined/cancel`（400，且界面无任何提示）。
+function handoverId(handover) {
+    if (!handover) return undefined
+    return handover.handover_id !== undefined ? handover.handover_id : handover.id
 }
 
 // 某任务是否存在 PENDING 且 phase_to 匹配的交接。
@@ -217,13 +244,64 @@ function hasLiveTelemetry(task, nowMs, windowMs) {
 // 流向派生（站点视图用；监控员视图不过滤）
 //--------------------------------------------------------------------------
 
-// 出场=本站=起飞点且尚未完成切出：SCHEDULED/READY/TAKEOFF，以及落库 IN_FLIGHT 后 PENDING(ROUTE)
-// 交接待监控员确认的重叠期（§6.0-F：签出=责任里程碑；确认接管后退出出场）。
+// 中段飞行卡片的**交接状态**（`opsOverviewItem.checkout_state`，取值表与该字段的后端注释同源）：
+// "PENDING" / "REJECTED" / "CANCELLED" / "TIMEOUT" / "ACCEPTED"，无交接=空串。
+// 一律经本函数取值：直接读字段的地方一多，将来字段改名就会**静默变 undefined**——
+// 而 `undefined !== "ACCEPTED"` 恒真，界面会以"还没签出"的姿态渲染一个已经交出去的航班。
+function checkoutState(task) { return task && task.checkout_state ? task.checkout_state : "" }
+
+// 签出是否**正在等待接管**。中段飞行卡片的按钮组由它单点决定：
+//   PENDING → 【取消】【回航】；其余（空 / REJECTED / CANCELLED / TIMEOUT）→ 【签出】【回航】。
+// ‼️ 与 `pendingPhase(task,"ROUTE",…)` 不是同一件事：后者问"当前有没有一条 PENDING 交接"，
+// 本函数问"最近一次签出处在什么状态"。被驳回/撤回/超时之后前者为假而后者有值——
+// 而用户流程规格（2026-09-23）恰恰要求那三种终态**仍然显示【签出】【回航】**，
+// 所以按钮组只认本函数。
+function checkoutPending(task) { return checkoutState(task) === "PENDING" }
+
+// 中段飞行卡片上的**签出提示条**（用户 2026-09-21：「如果航线监控员拒绝签入，那么在站点
+// 操作员一侧必须有明确的提示功能，且可以再次签出」）。返回空串=不显示。
+//   REJECTED → 红字 + 驳回理由（`checkout_reject_reason` 仅该状态非空）
+//   TIMEOUT  → 红字说明未获接管（`scanTimeout` 置的终态，**没有**理由字段，别读成空理由）
+//   其余     → 不显示：PENDING 已有「待接管确认 · 剩余秒数」徽标；CANCELLED 多半是自己刚点的
+//              【取消】，再补一条只是噪音；ACCEPTED 说明责任已交出去，卡片本就该离开出站。
+// ‼️ `default` 回空串而不是兜底成红字：后端将来加状态时，界面**不显示**，
+//    而不是先自己喊一句没头没脑的错误（红=异常在本视图是**迫降/超时**那一族的语义）。
+function checkoutNotice(task) {
+    switch (checkoutState(task)) {
+    case "REJECTED":
+        return task.checkout_reject_reason
+               ? qsTr("签出被航线监控员驳回：%1").arg(task.checkout_reject_reason)
+               : qsTr("签出被航线监控员驳回，可重新签出或选择回航")
+    case "TIMEOUT":
+        return qsTr("签出超时：航线监控员未在规定时间内接管，可重新签出或选择回航")
+    default:
+        return ""
+    }
+}
+
+// 出场=本站=起飞点且**责任尚未交出去**：SCHEDULED/READY/TAKEOFF，以及落库 IN_FLIGHT 之后
+// 尚未被监控员接管的整段（§6.0-F：签出=责任里程碑；接管后退出出场）。
+//
+// ‼️ 判据是"**有没有 ACCEPTED 的 ROUTE 交接**"，不是"有没有 PENDING 的"——这两者互为**相反**判据
+// （2026-09-23 实测：后端站点出站分支已改成 `NOT EXISTS(ACCEPTED)`，前端还停在 PENDING 上）。
+// 后果不是"少显示一行"：签出被驳回/撤回/超时之后，PENDING 判据为假 ⇒ 卡片**整个从本站列表消失**
+// ⇒ 用户流程规格里的【签出】【回航】两个按钮**没有落点**，界面表现为"点了拒绝，飞机就没人管了"。
+//
+// ‼️ `!landingAccepted` 不可省：回航，以及监控员正常移交降落指挥之后，**本站已签入(LANDING)**
+// （`landing_accepted`），飞机已经进入本站的降落流程（`isInbound` 为真）⇒ 它不再是出站航班。
+// 少了这一条，同一张卡会**同时**满足出站与进站，而 `siteTasks` 是 `if / else if`（出站优先）
+// ⇒ 用户看到的是"回航之后卡片没去进站、按钮还是出站那一套"，真正该露出来的
+// 【发出降落指令】永远露不出来。
+// ⚠️ 第三个参数 `handoverById` 自 2026-09-23 起**本函数不再使用**（判据改读任务上的
+// `checkout_state`），保留在签名里只是让四个调用点保持同一形状；将来清理时可删，多传无副作用。
 function isOutbound(task, mySiteId, handoverById) {
+    if (!task) return false
     if (task.takeoff_site_id === undefined || task.takeoff_site_id === null) return false
     if (Number(task.takeoff_site_id) !== Number(mySiteId)) return false
     if (task.status === "SCHEDULED" || task.status === "READY" || task.status === "TAKEOFF") return true
-    return task.status === "IN_FLIGHT" && pendingPhase(task, "ROUTE", handoverById)
+    return task.status === "IN_FLIGHT"
+           && checkoutState(task) !== "ACCEPTED"
+           && !landingAccepted(task)
 }
 
 // 入场=本站=降落点：PENDING(LANDING) 待确认 / landing_accepted 已签入待发降落指令 / LANDING 已发降落指令。
@@ -311,6 +389,63 @@ function deviceColor(device) {
     default:
         return "#3b9cff"
     }
+}
+
+// 轨迹线配色，**按载具序号轮换**（图上是"每架已建链飞机各一条线"）。
+// ‼️ 为什么不全部用同一个颜色（`FlyViewMap.qml:243` 就是一条写死的 `"red"`）：
+//    FlyView 只画**当前选中**那一架，本视图按 model 同时画**多架**——同色时两条线在图上
+//    无从区分，而"哪架飞的是哪条"正是本图要回答的问题。`index` 由 `MapItemView` 注入。
+// ‼️ 取值首先避开**航线色**（三条都是青/蓝系：`#00bfff` / `#9fc4e8` / `#00e5ff`）：
+//    轨迹线与航线线是**同一图层上叠加的两组线**，撞色的代价是"分不清哪条是航线"，
+//    比与异常 marker 撞色大得多——异常 marker 是 24px 且带中文标签的点，形状维度已区分开。
+//    ⇒ 用红/绿/紫/黄/橙，整族远离青蓝。
+// ⚠️ 与 L1/L2 色值同一批教训：这些取值只在**深色卫星底图**上验过；亮底图上 `#ffea00`
+//    偏弱。最终以用户在 GL 后端目视为准（VNC 下 `MapPolyline.line.color` 的 R/B 会互换，
+//    在那里截图判色会得出完全错误的结论）。
+function trajectoryColor(index) {
+    var palette = ["#ff1744", "#00e676", "#d500f9", "#ffea00", "#ff6d00"]
+    var i = Number(index)
+    if (!(i >= 0)) i = 0                 // 非数字/负数一律回第 0 个，别让 NaN 传进下标
+    // ‼️ `Math.floor` 不是装饰：下标必须**整数**，否则 `palette[2.9]` 是 `undefined`
+    //    ⇒ `line.color: undefined`（QML 不报错，线会变成一个说不清的颜色）。
+    //    调用点传的是委托的 `index`（恒为整数），这里防的是今后换调用点。
+    return palette[Math.floor(i) % palette.length]
+}
+
+// `device.task_id` → ③ 的 `tasks[]` 里对应的那条任务。找不到回 `null`。
+// ‼️ 两侧来自**同一条 WHERE 的两个投影**（后端 `RouteTasks`："一处判据、两处投影"），
+//    所以这个关联是可靠的；返回 null 只可能是数据缺失，不是正常态。
+// ⚠️ 按**数值**比较：两端一个是 JSON 数字、一个可能是字符串。
+// ⚠️ `task_id` 为 0（未指派）、null、undefined 一律按找不到处理——用 `!taskId` 一个判据
+//    覆盖三种，**不要**写成 `taskId === null`，那会让 0 走进循环去跟别的 0 误配。
+function taskById(tasks, taskId) {
+    if (!tasks || !taskId) return null
+    for (var i = 0; i < tasks.length; i++) {
+        if (Number(tasks[i].task_id) === Number(taskId)) return tasks[i]
+    }
+    return null
+}
+
+// 地图 L3 marker 的着色（用户 2026-09-23 定的口径）。
+// 优先级：异常 > **航班**状态色 > 兜底回飞机状态色。
+//
+// ‼️ 第 2 条从「飞机状态」改成「航班状态」是**用户明确要求的**（"颜色可以参照航班列表中
+//    图标的颜色"），它推翻了 `deviceColor` 上方那段注释记录的**原**取舍（§5.3 第 3 条
+//    主张"三个判据的主语都是飞机"）。改的理由是**可见性**：中段列表行首那个状态点用的
+//    就是 `statusColor(task, …)`，地图与它同色之后，"列表里的那条航班"与"地图上的那架
+//    飞机"才是一眼能对上的同一个东西——否则同一件事在两处显示两种颜色，监控员无从对照。
+// ‼️ `deviceColor` 里"不能拿飞机状态喂 `statusColor`"那条告诫**依然成立**，本函数没有
+//    违反它：喂进去的是经 `taskById` 关联拿到的**真 task 对象**，不是 device。两者形状
+//    不同，混喂才会让 `RETURNING`/`EMERGENCY_LANDING` 掉进 default 变蓝。
+//
+// ⚠️ `task` 为 null（关联失败 / `task_id` 为 0）时兜底回 `deviceColor(device)`，
+//    **不要**写成 `statusColor(null, …)`：那个回中性蓝 `#3b9cff`，会让"关联失败"在界面上
+//    看起来与"一切正常"一模一样。
+function markerColor(device, task, nowMs, handoverById) {
+    var c = abnormalColor(abnormalKind(device))
+    if (c !== "") return c
+    if (task) return statusColor(task, nowMs, handoverById)
+    return deviceColor(device)
 }
 
 // 选中航线时的显隐（§5.3）。返回 "lit" | "dimmed" | "normal"。
@@ -484,4 +619,444 @@ function routeBounds(routes) {
         }
     }
     return n === 0 ? null : { minLat: minLat, minLon: minLon, maxLat: maxLat, maxLon: maxLon }
+}
+
+//--------------------------------------------------------------------------
+// 最小包围圆（Welzl）—— **通用几何工具，范围圈已不用它**
+
+/// ⚠️ 现状（2026-09-23）：地图上的本站范围圈已改用 `siteCenteredCircle`（圆心锁定站点
+///    坐标）。本组函数因此**没有生产调用点** —— 保留是因为它被测试完整覆盖，且
+///    `tst_OpsCommon.qml` 拿它当「偏心簇」用例的**对照**（证明两者确实不同）。
+///    ⇒ **别**以为两个都在用：范围圈只有 `siteCenteredCircle` 一个实现。
+
+// 一度纬度对应的米数。**与 `tst_OpsCommon.qml` 的 `_distM` 取同一个地球半径**
+// （6371000 m）——测试用 haversine 独立复算距离，两者若各取各的半径，几百米量级上
+// 就会差近 1 m，把「覆盖性」断言的容差吃到贴边。同 R 之后，两套公式的残差只剩
+// 「经度用常数 cos 还是逐点 cos」，实测 < 0.1 m。
+function _mecMetersPerDeg() { return 6371000 * Math.PI / 180 }
+
+// 「在圆内」的容差：**相对 + 绝对**。定得过严只会让 Welzl 多做一次重算（结果不变，
+// 只是慢），定得过松则会把真正在圆外的点漏掉 —— 所以宁可偏松一点点。
+function _mecEps(c) { return c.r * 1e-9 + 1e-9 }
+
+function _mecContains(c, p) {
+    var dx = p.x - c.x, dy = p.y - c.y, rr = c.r + _mecEps(c)
+    return dx * dx + dy * dy <= rr * rr
+}
+
+// 以两点为直径的圆。
+function _mecDiameter(a, b) {
+    var dx = a.x - b.x, dy = a.y - b.y
+    return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, r: Math.sqrt(dx * dx + dy * dy) / 2 }
+}
+
+// 三点外接圆；共线返回 null。
+// ‼️ 半径是**圆心到三个定义点的最大距离**，**不是** `√(ux²+uy²)`。`(ux, uy)` 是圆心
+//    相对「三点包围盒中心 (ox, oy)」的偏移，而 (ox, oy) 一般**不是圆心** —— 拿它当
+//    半径会算出偏小的圆（锐角构型实测差 4.3 倍），且小圆不含定义点，静默出错。
+function _mecCircumcircle(a, b, c) {
+    var ox = (Math.min(a.x, b.x, c.x) + Math.max(a.x, b.x, c.x)) / 2
+    var oy = (Math.min(a.y, b.y, c.y) + Math.max(a.y, b.y, c.y)) / 2
+    var ax = a.x - ox, ay = a.y - oy
+    var bx = b.x - ox, by = b.y - oy
+    var cx = c.x - ox, cy = c.y - oy
+    var d = (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by)) * 2
+    if (d === 0) return null
+    var ux = ((ax * ax + ay * ay) * (by - cy) +
+              (bx * bx + by * by) * (cy - ay) +
+              (cx * cx + cy * cy) * (ay - by)) / d
+    var uy = ((ax * ax + ay * ay) * (cx - bx) +
+              (bx * bx + by * by) * (ax - cx) +
+              (cx * cx + cy * cy) * (bx - ax)) / d
+    var px = ox + ux, py = oy + uy
+    var da = Math.sqrt((px - a.x) * (px - a.x) + (py - a.y) * (py - a.y))
+    var db = Math.sqrt((px - b.x) * (px - b.x) + (py - b.y) * (py - b.y))
+    var dc = Math.sqrt((px - c.x) * (px - c.x) + (py - c.y) * (py - c.y))
+    return { x: px, y: py, r: Math.max(da, Math.max(db, dc)) }
+}
+
+// 已知 `p`、`q` 在圆上时，含 `pts` 的最小圆（Welzl 的内层）。
+// ‼️ 候选圆按 `p→q` 的**左右两侧**分开维护，各自取「最外侧」的那个，最后取两者中
+//    **半径小的**。不能合成一个：一个候选圆只保证覆盖它那一侧的点，跨侧比较半径会
+//    选出不覆盖另一侧点的小圆。
+function _mecTwoPoints(pts, p, q) {
+    var circ = _mecDiameter(p, q)
+    var left = null, right = null
+    var pqx = q.x - p.x, pqy = q.y - p.y
+    for (var i = 0; i < pts.length; i++) {
+        var r = pts[i]
+        if (_mecContains(circ, r)) continue
+        var cross = pqx * (r.y - p.y) - pqy * (r.x - p.x)
+        if (cross === 0) continue                    // 落在 p→q 直线上，对圆没有约束
+        var c = _mecCircumcircle(p, q, r)
+        if (c === null) continue
+        var cc = pqx * (c.y - p.y) - pqy * (c.x - p.x)
+        if (cross > 0) {
+            if (left === null || cc > pqx * (left.y - p.y) - pqy * (left.x - p.x)) left = c
+        } else {
+            if (right === null || cc < pqx * (right.y - p.y) - pqy * (right.x - p.x)) right = c
+        }
+    }
+    if (left === null) return right === null ? circ : right
+    if (right === null) return left
+    return left.r <= right.r ? left : right
+}
+
+// 已知 `p` 在圆上时，含 `pts` 的最小圆（Welzl 的内层）。
+// ‼️ `c.r === 0` 判的是「圆还在退化态」，此时不能走两点分支（`_mecTwoPoints` 要求
+//    两个**不同的**边界点）。p 与 q 重合时直径圆半径也是 0，会再次进这个分支 —— 结果
+//    仍然正确（重合点的最小包围圆本就由后续点决定）。
+function _mecOnePoint(pts, p) {
+    var c = { x: p.x, y: p.y, r: 0 }
+    for (var i = 0; i < pts.length; i++) {
+        var q = pts[i]
+        if (_mecContains(c, q)) continue
+        c = (c.r === 0) ? _mecDiameter(p, q) : _mecTwoPoints(pts.slice(0, i + 1), p, q)
+    }
+    return c
+}
+
+// Welzl 最小包围圆（迭代形式）。
+// ⚠️ **不打乱点序**：随机化只影响**期望**复杂度，不影响结果。不打乱换来确定性
+//    （同输入必同输出，测试才可复现），代价是最坏 O(n³) —— 机位数量级下可忽略。
+function _mecSolve(pts) {
+    var c = null
+    for (var i = 0; i < pts.length; i++) {
+        if (c === null || !_mecContains(c, pts[i])) {
+            c = _mecOnePoint(pts.slice(0, i + 1), pts[i])
+        }
+    }
+    return c
+}
+
+// 本站所有机位的**最小包围圆**。返回 `{lat, lon, radiusM, count}` 或 **null**。
+//
+// ⚠️ **当前无生产调用点**（见上方段落标题）：范围圈已改用 `siteCenteredCircle`。
+//    **不要**把它接回地图图层 —— 那会退回"圆心跟着机位簇跑"的旧口径，与用户
+//    2026-09-23「改为以站点坐标为中心」的裁定相反。
+//
+// ‼️ 半径是**几何半径**，不含任何「最小可见尺寸」——那是**调用方**（地图图层）的事。
+//    在这里兜底会让「只有一个机位的站点」画出一个比真实范围大的圈，而调用方再也
+//    拿不回真值。两个量在调用点各自独立：`max(真实半径, 最小可见半径)`。
+//
+// ⚠️ 坐标无效（(0,0) / NaN / 缺字段）一律跳过，**与 `isValidWaypoint` 同一口径**。
+//    把 (0,0) 放进去会把圆心拉到几内亚湾、半径变成几千公里 —— 而界面上只是「圈变大
+//    了」，看不出是错的。
+//
+// 投影用**等距圆柱**：站点尺度（百米）下与球面距离偏差 < 0.1 m，换来把二维问题降成
+// 平面问题，才能直接用 Welzl。经度按机位簇的**平均纬度**收缩（`cos` 取常数）。
+function minEnclosingCircle(slots) {
+    if (!Array.isArray(slots)) return null
+
+    var lats = [], lons = [], sumLat = 0
+    for (var i = 0; i < slots.length; i++) {
+        var s = slots[i]
+        var la = Number(s ? s.lat : NaN)
+        var lo = Number(s ? s.lon : NaN)
+        if (!isValidWaypoint(la, lo)) continue
+        lats.push(la); lons.push(lo)
+        sumLat += la
+    }
+    var n = lats.length
+    if (n === 0) return null
+
+    var kx = Math.cos((sumLat / n) * Math.PI / 180)
+    // 极区（或异常纬度）下 cos → 0，经度会被放大到无意义。退回不收缩：宁可圈画大，
+    // 也不要 NaN 顺着圆心/半径把整个图层搞坏。本站不在极区，这是纯粹的兜底。
+    if (!(Math.abs(kx) > 1e-6)) kx = 1
+
+    var flat = []
+    for (i = 0; i < n; i++) flat.push({ x: lons[i] * kx, y: lats[i] })
+
+    var c = _mecSolve(flat)
+    if (c === null) return null
+
+    return {
+        lat: c.y,                       // y 就是纬度，无需换算
+        lon: c.x / kx,                  // 反投影回经度
+        radiusM: c.r * _mecMetersPerDeg(),
+        count: n
+    }
+}
+
+//--------------------------------------------------------------------------
+// 站点范围圆（圆心 = **站点坐标**）
+
+/// 两点间大圆距离（米）。
+/// ‼️ R **必须**与 `_mecMetersPerDeg()` 取同一个值（6371000），也与
+///    `tst_OpsCommon.qml` 的独立复算 `_distM` 同 R —— 三者若各取各的半径，
+///    几百米量级上会差出近 1 m，把测试容差吃到贴边（那条容差不是摆设）。
+function _greatCircleM(la1, lo1, la2, lo2) {
+    var R = 6371000
+    var p1 = la1 * Math.PI / 180
+    var p2 = la2 * Math.PI / 180
+    var dp = (la2 - la1) * Math.PI / 180
+    var dl = (lo2 - lo1) * Math.PI / 180
+    var h = Math.sin(dp / 2) * Math.sin(dp / 2) +
+            Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) * Math.sin(dl / 2)
+    // 浮点误差可能让 h 略大于 1 ⇒ `asin` 出 NaN。钳一下，别让 NaN 顺半径扩散到整个图层。
+    return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)))
+}
+
+/// 以**站点坐标**为中心、圈住所有机位的圆。返回 `{lat, lon, radiusM, count}` 或 **null**。
+///
+/// ‼️ 与 `minEnclosingCircle` 的差别**不是精度，是语义**：
+///    · `minEnclosingCircle` —— 圆心取几何最优点（Welzl），圆**最小**；
+///    · 本函数 —— 圆心**锁定为站点坐标**，半径 = 站点到各机位的**最大**距离。
+///    机位簇偏心时本函数的圆**明显更大**，这是刻意的：用户 2026-09-23 裁定
+///    「改为以站点坐标为中心，圈住各个机位」。**不要**为"更紧凑"把圆心挪向簇心。
+///
+/// ⚠️ 两个形参的字段名**故意不同**，别"顺手统一"：
+///    `siteCoord` 吃 `QtPositioning.coordinate()`（`.latitude`/`.longitude`，首字母大写），
+///    `slots` 吃后端 JSON（`.lat`/`.lon`）。生产里它们本就是两种东西，
+///    统一名字只会让传错对象时的失败从"立刻 NaN"退化成"静默算出错圆"。
+function siteCenteredCircle(siteCoord, slots) {
+    if (!siteCoord) return null
+    var la0 = Number(siteCoord.latitude)
+    var lo0 = Number(siteCoord.longitude)
+    if (!isValidWaypoint(la0, lo0)) return null
+    if (!Array.isArray(slots) || slots.length === 0) return null
+
+    var maxD = -1, n = 0
+    for (var i = 0; i < slots.length; i++) {
+        var s = slots[i]
+        var la = Number(s ? s.lat : NaN)
+        var lo = Number(s ? s.lon : NaN)
+        if (!isValidWaypoint(la, lo)) continue
+        n++
+        var d = _greatCircleM(la0, lo0, la, lo)
+        if (d > maxD) maxD = d
+    }
+    if (n === 0) return null
+    // `maxD` 初值 -1（不是 0）：单机位且正好落在站点上时结果是 0（合法），
+    // 必须与"一个有效机位都没有"（上面已提前返回 null）区分开。
+    return { lat: la0, lon: lo0, radiusM: maxD, count: n }
+}
+
+//--------------------------------------------------------------------------
+// 机载告警（设计文档 §6）
+
+// `MAV_SEVERITY`（八档）→ 中文（四档）——**单点定义**。
+// ‼️ 界面不得出现裸枚举（既有约束 `ui-no-raw-enum-labels`）：浏览器自动翻译会把
+//    `MAV_SEVERITY_WARNING` 这类裸标识曲解成别的词，而 severity 恰恰是这一列的核心信息。
+// ‼️ 八档合一不是偷懒：0~3（EMERGENCY/ALERT/CRITICAL/ERROR）在 MAVLink 语义里同属
+//    "错误级"（`StatusText::severityIsError()` 就是这四个 case 一起判的），对监控员而言
+//    "需要立刻处理"是同一个动作 ⇒ 分成四档是**有用**的四档，不是丢失信息。
+// ⚠️ 未知值（越界的 MAVLink 扩展、或字段缺失求值成 undefined/NaN）**必须**有一档兜底：
+//    返回空串会让那一行只剩"时间 · 机号 · 空 · 文本"，返回裸数字则直接违反上面的约束。
+function severityLabel(severity) {
+    switch (Number(severity)) {
+    case 0:                     // EMERGENCY
+    case 1:                     // ALERT
+    case 2:                     // CRITICAL
+    case 3: return qsTr("严重")  // ERROR
+    case 4: return qsTr("警告")  // WARNING
+    case 5: return qsTr("提示")  // NOTICE
+    default: return qsTr("信息") // INFO(6) / DEBUG(7) / 未知
+    }
+}
+
+// 由 ③ 响应的 `devices[]` 按 `device_id` 建索引，供 `alertRows` 补 `uav_no`。
+// ‼️ 过滤 `device_id <= 0`，理由与 `monitorDeviceIds` 同源：0 是"未学到映射"的缺省值，
+//    把它建成 `out[0]` 之后，任何 `deviceID()` 也是 0 的载具都会**认领到这一行**的
+//    `uav_no`——界面看起来完全正常，只是显示的是别人的机号。
+// ⚠️ 同一 `device_id` 出现多次时**后写覆盖**（取最后一行）。后端已按 `device_id` 去重
+//    （§3.5.2），这里是第二道；真要撞上，确定性也比"看哪个先来"好。
+function deviceIndexByDeviceID(devices) {
+    var out = {}
+    if (!devices) return out
+    for (var i = 0; i < devices.length; i++) {
+        var d = devices[i]
+        var id = Number(d ? d.device_id : 0)
+        if (!(id > 0)) continue
+        out[id] = d
+    }
+    return out
+}
+
+// 跨**全部**载具聚合机载告警（`STATUSTEXT`），按时间倒序，返回
+// `[{ time, ts, who, taskNo, severity, text }, ...]`。
+//
+// ‼️ 数据源是 `QGroundControl.multiVehicleManager.vehicles`，**不是** `_activeVehicle`
+//    （`VehicleMessageList.qml` 那种单机写法，监控员要跨机看），**更不是** `OpsShell.qml`
+//    里那个喂仪表的 `_mockVehicle`——那个是 REST `latest` 包装出来的假对象，没有告警。
+//
+// ‼️ `vehicles` 是 `QmlObjectListModel`：`.count` + `.get(i)`，**不是 JS 数组**
+//    （写 `vehicles.length` 得到 `undefined` ⇒ 循环零次 ⇒ 静默返回空列表，界面表现为
+//    "永远没有告警"，不报错）。与 `matchDeviceToVehicle` 同一口径。
+//
+// ‼️ `deviceID()` 是 `Q_INVOKABLE uint deviceID()` —— **方法不是属性**，少写括号恒得
+//    `undefined` ⇒ `Number(undefined)` 是 `NaN` ⇒ 查不到 device ⇒ 全部走 systemID 分支。
+//    而那个分支**看起来是对的**（显示了机号 `#5` 而不是报错），所以这个错法极难发现。
+//
+// ‼️ **找不到 device 的行必须保留**（§6.2 步骤 4），用 `vehicle.id`（systemID）标识。
+//    这不是边角情形：飞机在 `READY_TO_TAKEOFF` 时被接引，落地转 `PARKED` 后从
+//    `devices[]` 里**消失**，但 QGC 的 Vehicle 不会因此断开（§3.6.2"绝不移出登记集合"）。
+//    它此刻若还在发 `STATUSTEXT`，那一行恰恰是监控员最需要看见的。
+//    ⇒ 所以本列表的集合是 `vehicles`，**不是** `devices[]`。
+//
+// ⚠️ 每机取**末尾** N 条：`StatusTextHandler` 是 `append`（`m_messages.append(message)`），
+//    所以"最近"= 数组尾部。取成前 N 条的话，界面上会长期停在开机那几条，
+//    而最近的告警一条都看不见——**同样不报错**。
+//
+// ‼️ 告警取自 `Vehicle::statusTextMessages`（`Vehicle` 自己上的 `QVariantList`），
+//    **不是** `vehicle.statusTextHandler.messages`：`Vehicle.h` 只**前向声明**了
+//    `StatusTextHandler`，把裸指针暴露到 QML 要过 MOC 对不完整类型的处理，而 QML
+//    那边其实一个字都不需要认识那个类型——转发数据即可。两者在 QML 侧的形状不同
+//    （前者直接是数组），所以这不是"换个写法"，是换了一个接口。
+//
+// ‼️ **调用方必须信号驱动重算**：本节在 `.pragma library` 里，函数体读到的
+//    `v.statusTextMessages` **不注册绑定依赖**（本文件头部那条）。写成
+//    `property var rows: OpsCommon.alertRows(...)` 且不加别的依赖，列表会**永远停在
+//    首次求值的那一帧**——而那一帧通常是空的，界面表现是"这个列表永远没有告警"，
+//    不报错、也不刷新。`AlertListPanel.qml` 里的做法是：对每架载具的
+//    `statusTextMessagesChanged` 建连接，收到就 `_bump++`，而 `rows` 的绑定表达式里
+//    读 `_bump` ⇒ 依赖落在 `_bump` 上。
+function alertRows(vehicles, deviceByDeviceID, perVehicleLimit, totalLimit) {
+    var per = (perVehicleLimit > 0) ? perVehicleLimit : 20
+    var cap = (totalLimit > 0) ? totalLimit : 200
+    var index = deviceByDeviceID || {}
+    var out = []
+    if (!vehicles) return out
+
+    var n = vehicles.count
+    for (var i = 0; i < n; i++) {
+        var v = vehicles.get(i)
+        if (!v) continue
+        var msgs = v.statusTextMessages
+        if (!msgs || !msgs.length) continue
+
+        var devId = Number(v.deviceID())
+        var dev = (devId > 0) ? index[devId] : null
+        var who = (dev && dev.uav_no) ? dev.uav_no : ("#" + v.id)
+
+        var start = Math.max(0, msgs.length - per)
+        for (var j = start; j < msgs.length; j++) {
+            var m = msgs[j]
+            if (!m) continue
+            var iso = m.timestamp ? String(m.timestamp) : ""
+            var ts = Date.parse(iso)
+            // ⚠️ `NaN` 参与 `a - b` 会让排序结果**未定义**（比较函数返回 NaN 时实现可任选
+            //    顺序）⇒ 一条没有时间戳的告警足以把整张表的次序打乱，而且每次重算还可能
+            //    不一样。缺时间戳的排到最后（0 = 纪元），不比"随机位置"更坏。
+            if (isNaN(ts)) ts = 0
+            out.push({
+                time: iso,
+                ts: ts,
+                who: who,
+                // 航班号与 `who` 是**同一次查表**得来的（后端 `opsMonitorDevice` 同时带
+                // `uav_no` 与 `task_no`）。⚠️ 缺值时给**空串**而不是 `undefined`：后者直接
+                // 喂 QML 的 `text` 会渲染出字面量 "undefined"。
+                taskNo: (dev && dev.task_no) ? dev.task_no : "",
+                severity: Number(m.severity),
+                text: m.text ? String(m.text) : ""
+            })
+        }
+    }
+
+    out.sort(function(a, b) { return b.ts - a.ts })
+    return out.length > cap ? out.slice(0, cap) : out
+}
+
+
+//--------------------------------------------------------------------------
+// 航线 → mission items（站点操作员起飞前的航线下发）
+//
+// ‼️ 本文件是 `.pragma library`，顶层函数与 `var` 在 import 方和测试里**都可见**
+//    （既有先例：`tst_OpsCommon.qml` 直接调 `OpsCommon._mecTwoPoints`）。
+//--------------------------------------------------------------------------
+
+/// `MAV_CMD_NAV_WAYPOINT`。
+var MAV_CMD_NAV_WAYPOINT = 16
+
+/// `MAV_FRAME_GLOBAL` —— 高度按 **AMSL**（绝对高度）解释。
+///
+/// ‼️ 依据：**本计划 brief（2026-09-23）转述的真库观察**，**未经本任务独立复核**
+///    （本任务无数据库访问权限）。该转述为：`table_waypoint.altitude` 存的就是 AMSL
+///    ⇒ **零转换**直传，只需把参考系说清楚；其证据是 `route 4` 的 `.plan` 写
+///    `plannedHomePosition` 高度 413、航点 `z = 50`，而库内对应的
+///    `table_waypoint.altitude` 是 **463.0**（= 413 + 50）。
+///    ⚠️ 该前提**决定 `frame` 的取值**：若库值其实是 AGL，`frame = 0` 会让每个航点都
+///    偏高一个 home 高程，而任务卡上显示的高度看着完全正常。下游落地前须在有库环境核验。
+///    ⚠️ 反过来，QGC 的 `MissionItem` **默认** `frame = MAV_FRAME_GLOBAL_RELATIVE_ALT(3)`
+///    （相对 home）——构造 mission 时不显式覆盖，463 会被当成"离地 463 米"。
+var MAV_FRAME_GLOBAL = 0
+
+/// 航线**设计域**的 `command` → MAVLink 指令号。未知 ⇒ `null`。
+///
+/// ‼️ **两套编号同名不同义**，别按数值猜：设计域的 `21` 是"站点"（可降落的站点类型
+///    标记），而 MAVLink 的 `21` 是 `MAV_CMD_NAV_LAND`——数值巧合，语义无关。
+///    本函数是这两套编号之间**唯一**的翻译点（已复核：`src/OpsView/` 下除本块外无第二处映射）。
+///
+/// ⚠️ 值域 `{16, 21}` 的依据：**本计划 brief（2026-09-23）转述的真库观察**（真库
+///    `table_waypoint.command` 只有 16×12 与 21×13 两个值），**未经本任务独立复核**。
+///    紧随其后的"`site.go` 用它做闸"同样只是 brief 转述，来自**另一个仓库**，本任务未读过它。
+///    若真实库存在第三种设计域取值，那条航线会**静默**变成"不可下发"（回 `[]`，且零诊断）
+///    ⇒ 下游落地前须在有库环境核验该值域是否封闭。
+///
+/// 未知值一律 `null`（fail-closed），由调用方把整条航线作废。
+function _designCommandToMavCmd(c) {
+    var n = Number(c)
+    if (n === 16) return MAV_CMD_NAV_WAYPOINT   // 普通航点
+    if (n === 21) return MAV_CMD_NAV_WAYPOINT   // 站点航点（用户 2026-09-23 裁定：降落稍后再议，本次按普通航点下发）
+    return null
+}
+
+/// 把后端 `GET /routes/:id/waypoints` 的航点转成待下发的 mission 描述数组。
+///
+/// 产出**不含起飞项**——起飞项的坐标是"飞机当前 home 位置"（运行时才知道）。调用方
+/// 拿到 home 后用 `MissionController::insertTakeoffItem()` 插在第 0 位。
+///
+/// 顺序即 `wps` 顺序（调用方已按 `seq` 取好）。
+///
+/// ‼️ **任何一点不可用 ⇒ 整条航线作废（回 `[]`）**，不做"跳过这一点"。跳过会让飞机
+///    飞出一条用户没画过的路径，而界面上点的编号仍然连续、看不出少了哪个。
+///
+/// @param wps 航点数组，每项 `{lat, lon, altitude, command}`
+/// @return `[{command, lat, lon, alt, frame}]`；任一输入不可用 ⇒ `[]`
+function routeMissionItems(wps) {
+    if (!wps || !wps.length) return []
+    var out = []
+    for (var i = 0; i < wps.length; i++) {
+        var w = wps[i]
+        if (!w) return []
+        var mavCmd = _designCommandToMavCmd(w.command)
+        if (mavCmd === null) return []
+        // ‼️ **三个字段统一只按类型收**：必须是 JSON number。依据是"后端 `table_waypoint`
+        //    的这三个字段是非空/可空 REAL 列 ⇒ Go 读成 `float64` ⇒ 序列化成 JSON number"，
+        //    故字符串等形态在真实链路上不会出现，拒绝它们**不会误伤生产路径**。
+        //    为什么不逐个枚举"坏形态"：`Number(null)`、`Number(undefined)`、`Number("")`、
+        //    `Number(" ")`、`Number("\t")`、`Number("0")`、`Number(false)`、`Number([])`
+        //    **全都** `=== 0`，而 `isFinite(0)` 为真 —— 枚举永远会漏，漏掉的那个就从这道门
+        //    正门走进来，让 `takeoffAltitude` 回 **0 而不是 `NaN`** ⇒ **只判 `isNaN` 的
+        //    起飞闸会失效**（飞机被指令到 AMSL 0 米，而界面上看不出错）。按类型收把这个
+        //    "需要穷举"的问题整个消掉。
+        //    ⚠️ `typeof NaN === "number"` ⇒ 本行**替代不了**下面的 `isValidWaypoint`
+        //       与 `isFinite(alt)`，那两步（值域）必须保留。
+        //    ⚠️ **数值 `0`（及 `0.0`）仍会通过本函数并原样透传** —— 这是**有意的裁量**：
+        //       "高度恰好为 0"是**数据问题**（后端该不该存 0），不是**类型问题**；本函数
+        //       只负责类型，业务判定留给调用方的起飞闸（那里能给出中文文案）。
+        //       **别把本段读成"0 已被关闭"** —— 它有专门用例钉着（见 `tst_OpsCommon.qml`
+        //       的 `test_routeMissionItems_numericZeroAltitudeIsDeliberatelyAllowed`）。
+        if (typeof w.lat !== "number" || typeof w.lon !== "number" || typeof w.altitude !== "number") return []
+        var lat = Number(w.lat), lon = Number(w.lon), alt = Number(w.altitude)
+        // 坐标有效性**直接复用本文件的单点定义** `isValidWaypoint`：它已内含 `isFinite`，
+        // 且口径是"任一轴为 0 即无效"，比原先自写的"两轴同时为 0"更严。
+        if (!isValidWaypoint(lat, lon)) return []
+        if (!isFinite(alt)) return []
+        out.push({ command: mavCmd, lat: lat, lon: lon, alt: alt, frame: MAV_FRAME_GLOBAL })
+    }
+    return out
+}
+
+/// 起飞高度 = **第一个航点的高度**（用户 2026-09-23 裁定 e）。
+///
+/// 航线不可用 ⇒ `NaN`（**不是 0**）：回 0 会让飞机起飞到"AMSL 0 米"，
+/// 而那个数字在界面上看不出错。
+/// ‼️ 但**数值 0 是本函数有意放行的**（理由见 `routeMissionItems` 内注释）⇒ 调用方
+///    **只判 `isNaN` 是拦不住起飞的**，必须用值域判据。真实调用方
+///    `OpsRouteSync.qml` 用的是 `!(takeoffAlt > 0)`（`NaN > 0` 为 false ⇒ 取反为真 ⇒ 拦住）。
+function takeoffAltitude(wps) {
+    var items = routeMissionItems(wps)
+    return items.length ? items[0].alt : NaN
 }

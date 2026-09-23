@@ -12,6 +12,8 @@ qt_add_qml_module(OpsViewModule
     VERSION 1.0
     RESOURCE_PREFIX /qml
     QML_FILES
+        AlertListPanel.qml
+        OpsRouteSync.qml
         OpsShell.qml
         OpsView.qml
         RomView.qml
