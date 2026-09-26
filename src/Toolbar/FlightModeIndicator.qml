@@ -248,8 +248,11 @@ Item {
                     Layout.fillWidth:   true
                     label:              qsTr("Flight Modes")
                     buttonText:         qsTr("Configure")
+                    // 同 N6 其余各条：与原条件合取，**不覆盖**。
+                    // ‼️ 经 showKnownVehicleComponentConfigPage() 落到 showVehicleConfig() —— 与 BatteryIndicator 那条
+                    //    是同一个「配置」页，只是函数名不同（N6 最初按函数名穷举，两条都漏了）。
                     visible:            _activeVehicle.autopilotPlugin.knownVehicleComponentAvailable(AutoPilotPlugin.KnownFlightModesVehicleComponent) &&
-                                            QGroundControl.corePlugin.showAdvancedUI
+                                            QGroundControl.corePlugin.showAdvancedUI && AuthController.standaloneMode
 
                     onClicked: {
                         mainWindow.showKnownVehicleComponentConfigPage(AutoPilotPlugin.KnownFlightModesVehicleComponent)

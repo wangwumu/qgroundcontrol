@@ -7,6 +7,7 @@
 #include <QtCore/QTextStream>
 
 #include "AutoPilotPlugin.h"
+#include "AuthController.h"
 #include "CompInfoParam.h"
 #include "ComponentInformationManager.h"
 #include "FactGroup.h"
@@ -604,8 +605,14 @@ void ParameterManager::tryHashCheckCacheLoad()
         return;
     }
 
-    if (sharedLink->linkConfiguration()->isHighLatency() || _logReplay) {
-        qCDebug(ParameterManagerLog) << _logVehiclePrefix(-1) << "Cache-only hash check: high latency or log replay link, signalling failure";
+    // 联网运营模式（standaloneModeEnabled() == false）⇒ 不加载参数，同 _startParameterDownload 那道判据。
+    // ‼️ 本函数是**第三个**参数入口：由 InitialConnectStateMachine 在 cacheOnly 时**直接**调用，
+    //    **不经** _startParameterDownload ⇒ 必须在这里单独补同一判据。少了它，运营模式下参数会
+    //    **从本地缓存活过来**，与 N2「不产生缺失参数告警」的前提直接冲突。
+    // 复用既有的 cacheCheckOnlyFailed() ⇒ 走的是状态机本来就认识的失败路径，不新增失败语义。
+    if (sharedLink->linkConfiguration()->isHighLatency() || _logReplay
+        || !AuthController::standaloneModeEnabled()) {
+        qCDebug(ParameterManagerLog) << _logVehiclePrefix(-1) << "Cache-only hash check: high latency, log replay, or non-standalone mode, signalling failure";
         emit cacheCheckOnlyFailed();
         return;
     }
@@ -627,7 +634,16 @@ void ParameterManager::_startParameterDownload(uint8_t componentId)
         return;
     }
 
-    if (sharedLink->linkConfiguration()->isHighLatency() || _logReplay) {
+    // 联网运营模式（standaloneModeEnabled() == false）⇒ 本 QGC 不参与参数下载。
+    // 与 isHighLatency 并列，**复用**下面整段「不加载参数」下游（4 个成员赋值 + 2 个信号 + return）。
+    // ‼️ 本判据**同时盖住**本函数内的两条下载路径：FTP 拉 @PARAM/param.pck 与传统 PARAM_REQUEST_LIST。
+    //    只堵后者等于没堵 —— 走 FTP 的是 **ArduPilot**（_tryftp 由 apmFirmware() 判定），
+    //    PX4 常态走 _HASH_CHECK→传统 list（见下方 _tryftp 分支，以及 tryHashCheckCacheLoad 里的 px4Firmware() 判定）。
+    // ⚠️ 但本函数**不是唯一入口**：tryHashCheckCacheLoad() 由 InitialConnectStateMachine 直接调用、
+    //    不经此处，那里已单独补同一判据 —— 两处必须同进同退。
+    // 理由与取舍见 docs/qgc/联网运营模式界面裁剪-20260926.md 的 N1。
+    if (sharedLink->linkConfiguration()->isHighLatency() || _logReplay
+        || !AuthController::standaloneModeEnabled()) {
         // These links don't load params
         _parametersReady = true;
         _missingParameters = true;

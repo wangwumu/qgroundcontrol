@@ -407,7 +407,9 @@ RowLayout {
 
             SettingsGroupLayout {
                 Layout.fillWidth:   true
-                visible:            QGroundControl.corePlugin.showAdvancedUI
+                // 本组含「Vehicle Parameters」与「Vehicle Configuration」两个 Configure 按钮 —— N6 的两条旁路，
+                // 一处隐掉即覆盖两条。原条件用合取叠加，**不覆盖**。
+                visible:            QGroundControl.corePlugin.showAdvancedUI && AuthController.standaloneMode
 
                 GridLayout {
                     columns:            2

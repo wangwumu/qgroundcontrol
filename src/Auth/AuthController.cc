@@ -41,6 +41,11 @@ AuthController::AuthController(QObject* parent)
     if (s_instance == nullptr) {
         s_instance = this;
     }
+
+    // standaloneMode 只在登录状态变化时重算（为何不连 cryptoKeySource 见头文件 _updateStandaloneMode 注释）。
+    // ⚠️ 构造期刻意不调用 standaloneMode()：那时 SettingsManager 未必就绪。
+    //    初值与真实值不符只会多 emit 一次；QML 每次求值都走 getter，不会显示错。
+    connect(this, &AuthController::loggedInChanged, this, &AuthController::_updateStandaloneMode);
 }
 
 AuthController::~AuthController()
@@ -56,6 +61,44 @@ AuthController::~AuthController()
 AuthController* AuthController::instance()
 {
     return s_instance;
+}
+
+bool AuthController::standaloneMode() const
+{
+    if (_loggedIn) {
+        return false;   // 已登录 ⇒ 联网运营态
+    }
+    CryptoSettings* const cryptoSettings = SettingsManager::instance()->cryptoSettings();
+    if (cryptoSettings == nullptr) {
+        return true;    // 读不到设置 ⇒ 倒向"保留功能"
+    }
+    // cryptoKeySource：0 = 本地 key 文件（单机联调那一套）；1 = gcs_server / 数据库（运营）。
+    // ‼️ 用它而**不是** cryptoGcsDeviceID：后者是「本机 GCS 自己的 deviceID」，全仓只有
+    //    QGCApplication 一个读点、**没有任何写入点** ⇒ 没人填它时恒为默认 0 ⇒ 判据会**恒判成运营**
+    //    （实测：本机两个 ini 里都没有这个键）。而 cryptoKeySource 是全仓 3 处代码读点
+    //    （QGCApplication.cc 两处 + 本文件）构成的「本地联调 vs 服务端」分岔点，且与"本地登记的
+    //    那台 deviceID"(cryptoLocalKeyDeviceID) 成对出现；另有 2 处只是注释里提及，不算读点。
+    //    它的默认值是 1 ⇒ 全新机器自动判成运营态，正是要的效果。
+    // 用户 2026-09-26 裁定取此字段。
+    Fact* const keySourceFact = cryptoSettings->cryptoKeySource();
+    // 读不到该 Fact 时同样倒向"保留功能"（同上面两条）。
+    return keySourceFact == nullptr ? true : keySourceFact->rawValue().toUInt() == 0;
+}
+
+void AuthController::_updateStandaloneMode()
+{
+    const bool current = standaloneMode();
+    if (_lastStandaloneMode != current) {
+        _lastStandaloneMode = current;
+        emit standaloneModeChanged();
+    }
+}
+
+bool AuthController::standaloneModeEnabled()
+{
+    AuthController* const inst = instance();
+    // 单例未创建（QML 引擎尚未首次访问本类型）⇒ 倒向"保留功能"，不误裁剪。
+    return inst == nullptr ? true : inst->standaloneMode();
 }
 
 bool AuthController::backendLoggedIn()

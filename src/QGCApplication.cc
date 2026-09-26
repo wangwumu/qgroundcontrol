@@ -21,6 +21,7 @@
 #include "AppMessages.h"
 #include "AppSettings.h"
 #include "AudioOutput.h"
+#include "AuthController.h"
 #include "ColoredSvgImageProvider.h"
 #include "FollowMe.h"
 #include "GraphicsSetup.h"
@@ -430,6 +431,17 @@ void QGCApplication::_initForNormalAppBoot()
 
 void QGCApplication::reportMissingParameter(int componentId, const QString& name)
 {
+    // 联网运营模式不下载参数（见 ParameterManager 里与 isHighLatency 并列的那道判据），
+    // 因此「参数缺失」是**预期状态**而非故障。
+    // 拦在**入口**而非 _missingParamsDisplay()：后者只做到"弹之前"，入口才是"不产生"
+    // —— 不累积、不启动延时定时器。
+    // ⚠️ 但**拦不住日志**：调用方 FactPanelController::_reportMissingParameter 在本函数返回之后
+    //    仍会无条件 qCWarning 一条「Missing parameter」。想连日志一起静音得改调用方，那是另一处。
+    // 见 docs/qgc/联网运营模式界面裁剪-20260926.md 的 N2。
+    if (!AuthController::standaloneModeEnabled()) {
+        return;
+    }
+
     const QPair<int, QString> missingParam(componentId, name);
 
     if (!_missingParams.contains(missingParam)) {

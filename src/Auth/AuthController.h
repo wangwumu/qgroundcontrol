@@ -42,6 +42,12 @@ class AuthController : public QObject
     Q_PROPERTY(QString   errorString      READ errorString      NOTIFY errorStringChanged)
     /// 本站点 id（来自 login 响应 role_sites 单值；site_id 仅存内存，绝不落配置文件）。
     Q_PROPERTY(qint64    siteId           READ siteId           NOTIFY siteIdChanged)
+    /// 单机模式：本地按单机方式配置（cryptoKeySource == 0，走本地密钥文件）且未登录。
+    /// true（单机）⇒ 一切照旧：参数照常下载、开发菜单照显。
+    /// false（联网运营）⇒ 停参数下载 + 裁剪界面，见 docs/qgc/联网运营模式界面裁剪-20260926.md。
+    /// ‼️ 判据只在此处定义一次：C++ 侧读本方法、QML 侧读本属性，**禁止在别处重写表达式**
+    ///    ——同一条件写两遍必然漂移，而本仓已有过「只改了一侧」的先例。
+    Q_PROPERTY(bool      standaloneMode   READ standaloneMode   NOTIFY standaloneModeChanged)
 
 public:
     explicit AuthController(QObject* parent = nullptr);
@@ -59,6 +65,19 @@ public:
     static bool backendLoggedIn();
 
     bool    loggedIn() const { return _loggedIn; }
+
+    /// 单机模式判据：`!loggedIn && cryptoKeySource == 0`。
+    /// ‼️ 用 cryptoKeySource 而非 cryptoGcsDeviceID（用户 2026-09-26 裁定）：后者是「本机 GCS 自己的
+    ///    deviceID」，全仓零写入点、本机两个 ini 里都没这个键 ⇒ 恒取默认 0 ⇒ 判据会恒判成运营，
+    ///    与「单机要保留」正好相反。cryptoKeySource 默认 1（= 运营），全新机器自动落到运营态。
+    /// 安全取向：**读不到判据时返回 true**（宁可照常下载参数、照显菜单，也不误裁剪）
+    /// —— 与 backendLoggedIn() 的「宁可照常装载，也不误跳过」同一取向。
+    bool    standaloneMode() const;
+
+    /// C++ 侧判据入口（static 包装）：供不便持有实例的调用点使用（如 ParameterManager）。
+    /// 单例未创建时返回 true —— 同样是「宁可照常，也不误裁剪」。
+    /// ‼️ C++ 侧一律走本函数、QML 侧一律走上面的属性，**不要在任何地方重写那个表达式**。
+    static bool standaloneModeEnabled();
     QString currentUser() const { return _currentUser; }
     QString     displayName() const { return _displayName; }
     qint64      userId() const { return _userId; }
@@ -101,6 +120,7 @@ signals:
     void unlockDialogOpenChanged();
     void errorStringChanged();
     void siteIdChanged();
+    void standaloneModeChanged();
     void loginSucceeded();
     void loginFailed(const QString& error);
     void unlockSucceeded();
@@ -118,6 +138,11 @@ private:
     /// 事件坐标是否落在锁定覆盖层「解锁按钮」上（该按钮在锁定时保持可点）。
     bool _isOnUnlockButton(QObject* watched, QEvent* event) const;
     void _setError(const QString& error);
+    /// 登录状态变化后重算 standaloneMode，值真变了才 emit。
+    /// ⚠️ 刻意**不**连 cryptoKeySource 的 rawValueChanged：它是启动时读取的静态配置，
+    ///    改了本就要重启 QGC 才生效（QGCApplication 启动时按它决定密钥来源与注入）；
+    ///    且运营态下菜单入口已被隐掉 ⇒ 用户够不到"运行中改它"的路径。
+    void _updateStandaloneMode();
     /// 从 AppConfigLocation/qgc_device.cfg 读本机 QGC 设备序列号（key=value，# 注释跳过）。
     /// ⚠️ 安全局限：本期明文，可被拷贝；正式版须硬件 IC 卡（序列号在加密芯片内）。
     /// 失败/未配置返回空串。只读序列号，绝不读写 site_id。
@@ -136,6 +161,9 @@ private:
     QStringList _roles;             ///< roles（界面按角色渲染/分流）
     QString _pendingUsername;
     bool    _loggedIn = false;
+    /// 上次广播出去的 standaloneMode，仅用于判断"要不要 emit"。
+    /// QML 每次求值都走 getter，故初值与真实值不符只会多 emit 一次，不会显示错。
+    bool    _lastStandaloneMode = true;
     bool    _screenLocked = false;
     bool    _unlockDialogOpen = false;
     bool    _unlockInProgress = false;      ///< 当前响应来自 unlock()（仅校验密码，不重置会话）

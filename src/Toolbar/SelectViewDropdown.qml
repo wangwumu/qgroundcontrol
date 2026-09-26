@@ -74,6 +74,10 @@ ToolIndicatorPage {
                 implicitHeight: root._toolButtonHeight
                 Layout.fillWidth: true
                 text: qsTr("Plan")
+                // 联网运营模式（standaloneMode == false）隐掉。判据**只**来自 AuthController 那一个属性，
+                // 不在本文件重写表达式 —— 见 docs/qgc/联网运营模式界面裁剪-20260926.md 的 N5。
+                // ‼️ 只改 visible：showPlanView() 等函数依然存在且可调（§5.2），本设计要的是界面干净，不是安全边界。
+                visible: AuthController.standaloneMode
                 imageResource: "/qmlimages/Plan.svg"
                 onClicked: {
                     if (mainWindow.allowViewSwitch()) {
@@ -89,7 +93,8 @@ ToolIndicatorPage {
                 Layout.fillWidth: true
                 text: qsTr("Analyze")
                 imageResource: "/qmlimages/Analyze.svg"
-                visible: QGroundControl.corePlugin.showAdvancedUI
+                // 本项原已有可见性条件 ⇒ 用合取叠加，**不覆盖**原条件（同 N5 的 Settings 一项）。
+                visible: QGroundControl.corePlugin.showAdvancedUI && AuthController.standaloneMode
                 onClicked: {
                     if (mainWindow.allowViewSwitch()) {
                         mainWindow.closeIndicatorDrawer()
@@ -104,6 +109,7 @@ ToolIndicatorPage {
                 implicitHeight: root._toolButtonHeight
                 Layout.fillWidth: true
                 text: qsTr("Configure")
+                visible: AuthController.standaloneMode
                 imageResource: "/res/GearWithPaperPlane.svg"
                 onClicked: {
                     if (mainWindow.allowViewSwitch()) {
@@ -120,7 +126,7 @@ ToolIndicatorPage {
                 Layout.fillWidth: true
                 text: qsTr("Settings")
                 imageResource: "/res/QGCLogoWhite.svg"
-                visible: !QGroundControl.corePlugin.options.combineSettingsAndSetup
+                visible: !QGroundControl.corePlugin.options.combineSettingsAndSetup && AuthController.standaloneMode
                 onClicked: {
                     if (mainWindow.allowViewSwitch()) {
                         mainWindow.closeIndicatorDrawer()

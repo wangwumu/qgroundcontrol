@@ -556,8 +556,12 @@ Item {
             }
 
             SettingsGroupLayout {
+                // 与 N6 其余各条同口径：与原条件合取，**不覆盖**。
+                // ‼️ 本入口经 showKnownVehicleComponentConfigPage() 落到 MainWindow.showVehicleConfig()，
+                //    与 MainStatusIndicator 那条是**同一个**「配置」页，只是函数名不同 —— N6 最初按
+                //    showVehicleConfig 这个名字穷举调用点，因而漏掉了它（同一疏漏还有 FlightModeIndicator.qml）。
                 visible: _activeVehicle.autopilotPlugin.knownVehicleComponentAvailable(AutoPilotPlugin.KnownPowerVehicleComponent) &&
-                            QGroundControl.corePlugin.showAdvancedUI
+                            QGroundControl.corePlugin.showAdvancedUI && AuthController.standaloneMode
 
                 LabelledButton {
                     label:      qsTr("Vehicle Power")

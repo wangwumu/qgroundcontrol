@@ -58,6 +58,12 @@ ToolIndicatorPage {
             spacing: ScreenTools.defaultFontPixelHeight / 2
 
             SettingsGroupLayout {
+                // 联网运营模式隐掉 —— 与 N5 把整个「设置」菜单隐掉同一口径：「通信链路」本就是 Settings 里的一项，
+                // 单独留这个直达入口等于给设置页开了个后门。
+                // ⚠️ 已知取舍：离线页是链路连不上时的**自救入口**，隐掉后现场无法改链路配置。
+                //    运营机的链路在部署时定好、运行时不需要改，故接受；若将来要保留，删掉这一行即可。
+                visible: AuthController.standaloneMode
+
                 LabelledButton {
                     label:      qsTr("Communication Links")
                     buttonText: qsTr("Configure")

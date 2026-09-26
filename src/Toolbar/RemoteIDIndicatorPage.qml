@@ -44,6 +44,16 @@ ToolIndicatorPage {
     }
 
     function goToSettings() {
+        // 联网运营模式没有设置页（N5 已隐掉菜单入口）⇒ 本动作不存在。
+        // 拦在**函数**单点而非逐个调用点：本文件有 6 处调它（5 个 QGCMouseArea + 1 个 QGCButton），
+        // 逐个改漏一个就留一个后门。
+        // ‼️ 只拦"去设置页"这个动作，**不隐 RID 状态旗本身**：那 5 个 QGCMouseArea 是盖在旗子上的
+        //    点击热区，旗子是法规/安全状态显示，运营模式下必须照常可见。
+        //    （第 6 处调用点 —— 那个 Configure 按钮 —— 所在的 SettingsGroupLayout 另有 visible 判据，
+        //     运营模式下整块不出现，与本守卫是两道独立的闸。）
+        if (!AuthController.standaloneMode) {
+            return
+        }
         if (mainWindow.allowViewSwitch()) {
             mainWindow.closeIndicatorDrawer()
             globals.commingFromRIDIndicator = true
@@ -390,7 +400,10 @@ ToolIndicatorPage {
 
                 SettingsGroupLayout {
                     Layout.fillWidth:   true
-                    visible:            QGroundControl.corePlugin.showAdvancedUI
+                    // 同 N6 其余各条：与原条件合取，**不覆盖**。
+                    // 有它 ⇒ 运营模式下这个「Remote ID → Configure」按钮直接不出现（否则会留一个点了没反应的按钮）；
+                    // 万一仍被点到，goToSettings() 开头那道守卫兜底。
+                    visible:            QGroundControl.corePlugin.showAdvancedUI && AuthController.standaloneMode
 
                     RowLayout {
                         Layout.fillWidth: true

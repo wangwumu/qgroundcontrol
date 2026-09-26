@@ -78,13 +78,6 @@ Item {
         return RemoteIDIndicator.RIDState.HEALTHY
     }
 
-    function goToSettings() {
-        if (mainWindow.allowViewSwitch()) {
-            globals.commingFromRIDIndicator = true
-            mainWindow.showSettingsTool()
-        }
-    }
-
     QGCPalette { id: qgcPal }
 
     QGCColoredImage {
