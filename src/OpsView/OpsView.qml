@@ -950,6 +950,12 @@ OpsShell {
                             opsView._pendingAction = {kind:"cancelHandover", handoverId:handoverId, task:task}
                             actionConfirmDialog.open()
                         }
+                        // 【签入】**刻意不弹窗**，与上面三条**不同族**：签出/取消/回航会改变责任归属
+                        // 或直接给载具下指令；签入只是把已经摆在面前的待办接过来（提出方那边
+                        // 已经确认过一次了）。同一族的先例是卡片上的「申请切出」与「移交降落指挥」
+                        // （都直接抛）、以及交接弹框里的「确认接管」。⚠️ 失败反馈仍然有——由
+                        // `_checkinFromCard` 复用交接弹框给出，与弹框内的失败是同一套。
+                        onCheckinRequested: function(handoverId, task) { opsView._checkinFromCard(handoverId, task) }
                     }
                     // ── 下部：机位（按经纬度投影、贴底、装不下时可滚动）──
                     Flickable {

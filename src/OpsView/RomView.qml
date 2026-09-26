@@ -102,13 +102,17 @@ OpsShell {
     //=========================================================================
     // 右栏内容（设计文档 §4.1）
     //=========================================================================
-    // 中段（航班列表）的行集合 = 异常航班（置顶常驻）∪ 在航航班，按 task_id 去重。
+    // 中段（航班列表）的行集合 = （异常航班 ∪ 待我签入）（置顶常驻）∪ 在航航班，按 task_id 去重。
     // ‼️ 第 2 节的口径随选中状态变（用户 2026-09-23 定）：**选中某航线 ⇒ 只列该航线的；
     //    一条都没选中 ⇒ 列全部在航**（"所有在航无人机"）。判据细节见 `middleSectionTasks`。
     // ‼️ 判据住 `OpsCommon.middleSectionTasks`（纯函数，可测），本视图只传实参——
     //    写成这里的 inline function 的话，QML 测试基础设施**测不到**它（§2.3）。
+    // ‼️ 第三个实参 `_handoverById` 是 2026-09-24 裁定 丙-2 加的：置顶判据问的是
+    //    「该谁动手」⇒ 必须走**待办**口径（`/handovers/pending`，按角色过滤），
+    //    不能用任务自带的 `handover`（那是**事实**口径）。见 `awaitingMyCheckin`。
     readonly property var _panelTasks: OpsCommon.middleSectionTasks(romView._routeTasks,
-                                                                   romView._selectedRouteId)
+                                                                   romView._selectedRouteId,
+                                                                   romView._handoverById)
     // 陈旧提示条上的时刻（③ 上次**成功**的时刻）
     readonly property string _routeUpdatedText: romView._routeUpdatedAt
                                                ? Qt.formatTime(romView._routeUpdatedAt, "hh:mm:ss") : "—"
@@ -171,12 +175,15 @@ OpsShell {
             }
 
             //-----------------------------------------------------------------
-            // 中段：航班列表（异常置顶常驻 ∪ 选中航线的航班）
+            // 中段：航班列表（异常 ∪ 待我签入 置顶常驻 ∪ 选中航线的航班）
             //-----------------------------------------------------------------
             TaskListPanel {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                headerText: qsTr("航班列表 · 异常置顶")
+                // ⚠️ 表头承诺了置顶就**必须真的置顶**（判据见 `middleSectionTasks`），
+                //    反过来第 1 节**每一条都得自带徽标说明自己为什么在顶上**：
+                //    异常航班走 `abnormalLabel`，待签入走 `_awaitingMe` 那条警示条。
+                headerText: qsTr("航班列表 · 异常/待签入置顶")
                 tasks: romView._panelTasks
                 handoverById: romView._handoverById
                 nowMs: romView._now
@@ -196,6 +203,13 @@ OpsShell {
                 onTaskSelected: function(task) { romView.selectTask(task) }
                 onHandoverProposed: function(taskId, phase) { romView._proposeHandover(taskId, phase) }
                 onHandoverCancelRequested: function(handoverId) { romView._cancelHandover(handoverId) }
+                // 【签入】接管本航班（ROUTE 相位）。**不弹窗**（同族先例见 OpsView 那一处注释）；
+                // 失败反馈走 `_checkinFromCard`——它住在骨架里，本视图因此不必自备错误提示机制
+                // （本视图除了下面那条陈旧提示条之外没有任何弹窗设施）。
+                // ⚠️ `task` 要收：`_checkinFromCard` 用它回查待办名单，决定失败后还有没有可重试
+                //    的对象。上面那条 `handoverCancelRequested` 少收一个参数是合法的（QML 允许
+                //    处理器少声明实参），但那是因为它不需要；不要照抄成习惯。
+                onCheckinRequested: function(handoverId, task) { romView._checkinFromCard(handoverId, task) }
             }
 
             //-----------------------------------------------------------------

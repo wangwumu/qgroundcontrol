@@ -69,6 +69,16 @@ ColumnLayout {
     // 要加二次确认；挤进同一个信号就得靠"status 是不是 IN_FLIGHT"来分辨该不该弹窗，
     // 两处判据一旦漂移，要么该弹的不弹、要么不该弹的弹。
     signal checkoutRequested(var task)
+    // 接收方**签入**（接管）本航班：站点侧签入 LANDING、监控员侧签入 ROUTE。
+    // ‼️ 一条信号服务两个相位、**不带相位参数**——相位由 `handoverId` 唯一确定，提交端点
+    //    也只有一个（`POST /handovers/:id/accept`，后端自己按 `phase_to` 分支）。加一个
+    //    `phase` 参数只会多出一个**可以填错**的自由度，而填错了没有任何东西会报错：
+    //    照样 POST 到同一个端点，后端按库里那条记录的**真实**相位处理 ⇒ 参数自带误导性。
+    // ‼️ 与 `handoverProposed` 的分工：那个是**提出**交接（带 `phase`，因为提出时库里还没有
+    //    这条记录、相位正是要参数化的东西）；这条是**接受一条已存在的**交接，相位已经写在
+    //    那行数据上了。
+    // `task` 是可选的第二个载荷，理由同 `handoverCancelRequested`（视图侧要写"是哪一单"）。
+    signal checkinRequested(int handoverId, var task)
 
     //-------------------------------------------------------------------------
     // 可选标题（监控员视图「负责航线 · 执行中」）
@@ -113,6 +123,42 @@ ColumnLayout {
                 && OpsCommon.isOutbound(modelData, panel.mySiteId, panel.handoverById)
             // 签出提示条文案（驳回理由 / 超时说明；其余状态空串 ⇒ 不占位）。单点在 `checkoutNotice`。
             readonly property string _checkoutNotice: OpsCommon.checkoutNotice(modelData)
+            // 这条 PENDING 交接是不是**等我动手**（我是签入方）⇒ 警示条加底色/描边。
+            // 判据单点在 `OpsCommon.awaitingMyCheckin`（**待办**口径：`handoverById`，
+            // 按角色过滤、提出方不在名单里），与置顶用的是**同一条**——两处若各判各的，
+            // 就会出现"卡片长着警示条却没被置顶"这种自相矛盾的画面。
+            // ⚠️ 不用 `card._handover`（那是**事实**口径，见 `handoverFor` 上方注释）：
+            //    它不按角色过滤，站点视图里**同站点的另一个账号**会被误标成"待我确认"。
+            readonly property bool _awaitingMe:
+                OpsCommon.awaitingMyCheckin(modelData, panel.handoverById)
+            // 待我签入的**那一条**交接（**待办**口径，与 `_awaitingMe` 同源）。
+            // ‼️ 签入按钮提交的对象必须与它的 `visible` 判据同源，**不能**用 `card._handover`：
+            //    后者走**事实**口径（优先任务自带的 `task.handover`），两者正常情况下是同一条
+            //    记录，但一旦不是（事实口径还留着上一条已终结的交接），POST 出去的就是**另一个
+            //    id**——而 accept 的并发互斥是 `WHERE id=? AND status='PENDING'`，命中 0 行回
+            //    404，`_acceptHandover` 又把 404 当成"已被他端处理"**静默吞掉**（那是幂等收口
+            //    的正常代价）⇒ 界面表现为"点了签入，什么都没发生、也没报错"。
+            readonly property var _myCheckin:
+                panel.handoverById ? panel.handoverById[modelData.task_id] : undefined
+            // LANDING 交接作废告知（超时）。`isReceiver` 由**视图**决定：LANDING 的接收方恒为
+            // 降落机场，而站点视图就是给 SITE_ATC 的 ⇒ `showSiteActions` 即"我是接收方"。
+            readonly property string _landingNotice:
+                OpsCommon.landingNotice(modelData, panel.showSiteActions)
+            // 监控员侧的「尚未接管」提示条（`signedIn` / `checkinNotice` 一族，2026-09-24）。
+            // ‼️ 这是**缺口③的前端半边**：改前「移交降落指挥」只判 `status === "IN_FLIGHT"`，
+            //    于是飞机还没交到监控员手上时按钮就已可点，而站点侧此刻看到的仍是"责任在
+            //    监控员手上"——责任链中间断了一格。补上 `signedIn` 门控之后，未签入的卡片上
+            //    **一个可点按钮都没有**（「撤回交接」也不可见：那条交接是起飞机场提的，不是我），
+            //    所以必须同时有这条提示，否则就是"警示条喊着待办、却无处下手"的反面——
+            //    "什么都没有、也不说为什么"。两个缺口是同一件事的两半，要一起补。
+            // ‼️ 第一个参数传 `panel.isRouteMonitor`，**不是** `!panel.showSiteActions`。
+            //    两个属性在**当前接线**下取值恰好相反（`OpsView.qml:927` 硬编码
+            //    `isRouteMonitor: false`、`RomView.qml` 硬编码 `showSiteActions: false`），
+            //    但语义不同：`showSiteActions` 还叠了 `_isSiteATC`（`OpsView.qml:926`）
+            //    ——"不是站点按钮组"并不等于"我是监控员"。用语义正确的那个，将来站点视图
+            //    真接上双身份时才不会把"我是谁"和"这张卡给我哪套按钮"混成一个判据。
+            readonly property string _checkinNotice:
+                OpsCommon.checkinNotice(modelData, panel.isRouteMonitor, panel.handoverById)
 
             width: taskList.width - panel.cardRightGap - panel.cardMargin
             height: taskBody.height + 12
@@ -148,10 +194,12 @@ ColumnLayout {
                 Row {
                     width: parent.width
                     spacing: 6
-                    // 异常航班 ⇒ 置顶徽标。中段表头写着「航班列表 · 异常置顶」，**被置顶的那一行
-                    // 必须自己说明它为什么在顶上**——否则表头在承诺一件界面没做的事。
+                    // 异常航班 ⇒ 置顶徽标。中段表头写着「航班列表 · 异常/待签入置顶」，**被置顶的
+                    // 那一行必须自己说明它为什么在顶上**——否则表头在承诺一件界面没做的事。
                     // ‼️ 判据与置顶判据**同源**：`OpsCommon.middleSectionTasks` 用 `isAbnormal`
-                    //    挑出第 1 节，这里用同一族的 `abnormalKind` 决定写什么 ⇒ 不可能漂移。
+                    //    挑出第 1 节的异常那些，这里用同一族的 `abnormalKind` 决定写什么 ⇒ 不可能漂移。
+                    // ⚠️ 第 1 节的**另一类**（待我签入，2026-09-24 裁定 丙-2 加入）不走这里，
+                    //    它自带那条带底色/描边的警示条（`_awaitingMe`）⇒ 顶上的每一行都有交代。
                     // ‼️ 文案与底色都走 §5.3 的**单点定义**（`abnormalLabel` / `abnormalColor`）
                     //    ——这样同一条航班在中段列表里的徽标与地图上它那架飞机的 marker
                     //    恒等色（`markerColor` 的第一步用的就是同一对函数）。
@@ -235,14 +283,37 @@ ColumnLayout {
                 //    （`opsOverviewItem`/`opsRouteTaskItem` 都没有，它只在交接对象里），
                 //    故恒为 `undefined`，非本人提出时这一段恒渲染成空串：
                 //    徽标成了「待接管确认 ·  · 28s」，**两个角色都一样**，且不报错。
-                Text {
+                // ‼️ 2026-09-24（裁定 丙）：**等我动手**那一侧加底色与描边。改前两个角色看到的是
+                //    同一行 11px 无底色小字，而「待我确认」是需要立刻行动的状态、混在航班列表里
+                //    极易漏掉（超时扫描器 10 秒一轮，人还没看见就已经作废了）；提出方那侧只是在
+                //    等，保持原样式——给两边都加底色反而把"该动手的那个人"淹掉。
+                // ⚠️ 只加底色/描边/内边距，**不动字号**：任务卡宽度是按最宽的一行定过尺的
+                //    （见 `qgc-task-card-row-metrics`），字号一变那一行就会溢出。
+                // ⚠️ 高度链必须是 `宽度(外部给定) → Text.contentHeight → Rectangle.height`：
+                //    若反过来让 Text 去 anchor 父矩形（fill/verticalCenter），宽依赖高、高依赖宽，
+                //    QML 会报 "Binding loop detected" 并让这一块渲染成 0 高。
+                Rectangle {
                     width: parent.width
+                    height: noticeText.contentHeight + (card._awaitingMe ? 8 : 0)
                     visible: card._handover ? true : false
-                    color: card._timedOut ? "#ff3b3b" : "#ffc107"
-                    font.pixelSize: 11
-                    text: card._handover ? (qsTr("待") + OpsCommon.phaseToLabel(card._handover.phase_to) +
-                          qsTr("确认 · ") + (OpsCommon.isMine(card._handover, AuthController.userId) ? qsTr("我提出") : (card._handover.proposed_by_name ? card._handover.proposed_by_name : "")) +
-                          qsTr(" · ") + OpsCommon.remainingSec(card._handover, panel.nowMs)) : ""
+                    color: card._awaitingMe
+                           ? (card._timedOut ? "#4a1414" : "#463a0e")
+                           : "transparent"
+                    border.width: card._awaitingMe ? 1 : 0
+                    border.color: card._timedOut ? "#ff3b3b" : "#ffc107"
+                    radius: 3
+                    Text {
+                        id: noticeText
+                        x: card._awaitingMe ? 6 : 0
+                        y: card._awaitingMe ? 4 : 0
+                        width: parent.width - (card._awaitingMe ? 12 : 0)
+                        color: card._timedOut ? "#ff3b3b" : "#ffc107"
+                        font.pixelSize: 11
+                        wrapMode: Text.Wrap
+                        text: card._handover ? (qsTr("待") + OpsCommon.phaseToLabel(card._handover.phase_to) +
+                              qsTr("确认 · ") + (OpsCommon.isMine(card._handover, AuthController.userId) ? qsTr("我提出") : (card._handover.proposed_by_name ? card._handover.proposed_by_name : "")) +
+                              qsTr(" · ") + OpsCommon.remainingSec(card._handover, panel.nowMs)) : ""
+                    }
                 }
                 // 签出提示条（驳回理由 / 超时说明）
                 // ‼️ 用户 2026-09-21：「如果航线监控员拒绝签入，那么在站点操作员一侧**必须有明确的
@@ -257,6 +328,40 @@ ColumnLayout {
                     font.pixelSize: 11
                     wrapMode: Text.Wrap
                     text: card._checkoutNotice
+                }
+                // 降落指挥交接**作废**提示条（超时）。
+                // ‼️ 用户 2026-09-24 裁定「双方都告知」：监控员与降落机场 ATC 各有一句，
+                //    差别只在"谁该动手"——监控员是提出方（收到的是「请重新发起」），
+                //    降落机场是接收方（收到的是「待其重新发起」）。哪一句由 `landingNotice`
+                //    的第二个参数决定，本处传 `panel.showSiteActions`。
+                // ⚠️ 为什么必须有这条：这条交接一旦被 `scanTimeout` 置 TIMEOUT 就**立刻从接口
+                //    里消失**（改前两个下发接口都只出 PENDING），于是"刚超时作废"与"从未发起"
+                //    在界面上**完全不可区分**——监控员手上只剩一个【移交降落指挥】按钮，
+                //    无从知道刚才那次已经作废。后端为此专门下发了 `landing_state` /
+                //    `landing_changed_at`（见 `ops.go` 的 `lastLandingHandover`）。
+                // ⚠️ 同样不写任何枚举：状态→中文的唯一映射点在 `OpsCommon.landingNotice`。
+                Text {
+                    width: parent.width
+                    visible: card._landingNotice !== ""
+                    color: "#ff3b3b"
+                    font.pixelSize: 11
+                    wrapMode: Text.Wrap
+                    text: card._landingNotice
+                }
+                // 监控员：「起飞机场尚未签出」提示条（未签入 ⇒ 本卡片无可执行动作）。
+                // ‼️ 颜色取黄（与「待我确认」警示条同族），**不是红**：飞机在航、责任还在起飞机场
+                //    是**正常中间态**，不是异常；红在本视图是迫降/超时那一族的语义，用红了会让
+                //    每一架刚起飞的航班看起来都像出了事。
+                // ⚠️ 四条判据（含"已有 PENDING 等我签入时让位"这条最容易漏的）全部在
+                //    `OpsCommon.checkinNotice` 里，本处只按空串约定决定显隐，不写任何判据——
+                //    理由同下面两条提示条：判据写成 inline 的话 QML 测试基础设施**测不到**它。
+                Text {
+                    width: parent.width
+                    visible: card._checkinNotice !== ""
+                    color: "#ffc107"
+                    font.pixelSize: 11
+                    wrapMode: Text.Wrap
+                    text: card._checkinNotice
                 }
                 // 操作按钮行
                 Row {
@@ -356,11 +461,42 @@ ColumnLayout {
                                  ? qsTr("停泊（待落地）") : qsTr("停泊（无遥测）"))
                         onClicked: panel.parkRequested(modelData)
                     }
+                    // ── 接收方：签入（两个视图共用一格）──
+                    Button {
+                        // 【签入】= 接管本航班。**站点侧签 LANDING、监控员侧签 ROUTE**，判据同一条
+                        // （`_awaitingMe` 走 `/handovers/pending` 的**待办**口径，而那个接口对
+                        // SITE_ATC 只发本站 LANDING、对 ROUTE_MONITOR 只发其航线 ROUTE、且提出方
+                        // 不在名单里）⇒ 同一格在两个视图里各自指向正确的相位，不需要在这里再判一次
+                        // 相位，也就不存在"两份判据漂移"。
+                        // ‼️ 这个按钮同时是**缺口②的修法**：待办到达时 `OpsShell._notifyNewPending`
+                        //    会自动弹 `handoverDialog`，但那个弹框关掉之后**没有第二次入口**
+                        //    （`_seenHandovers` 去重，重新打开不会弹；`Dialog` 默认还允许点框外关闭）
+                        //    ⇒ 误关一次就再也签不进来，只能干等交接超时。卡片上这一格是常驻入口。
+                        // ⚠️ 与弹框「确认接管」是同一个提交（`/handovers/:id/accept`）、同一条信号
+                        //    处理，两个入口**不是**两套逻辑。
+                        visible: card._awaitingMe
+                        // 取 id 走 `_myCheckin`（待办口径，与 `visible` 同源），不是 `card._handover`
+                        //——理由见 `_myCheckin` 上方注释（拿错 id ⇒ 404 被静默吞掉）。
+                        enabled: OpsCommon.handoverId(card._myCheckin) !== undefined
+                        height: 24; padding: 0
+                        text: qsTr("签入")
+                        onClicked: panel.checkinRequested(OpsCommon.handoverId(card._myCheckin), modelData)
+                    }
                     // ── 监控员视图 ──
                     Button {
                         // 仅无 PENDING(LANDING) 交接时可发起（防重复 409；已有交接可走"撤回交接"）
+                        // ‼️ `signedIn` 是 2026-09-24 补的闸（缺口③）：改前只判 `IN_FLIGHT`，
+                        //    于是**飞机还没交给监控员时**他就能把降落指挥交给降落机场——责任链
+                        //    中间断了一格，而此刻起飞机场侧看到的仍是"责任在监控员手上"。
+                        //    本闸与【签入】按钮是**同一个槽位的两种形态**，互斥由判据天然保证：
+                        //    `_awaitingMe`（有 ROUTE PENDING 等我签入）⇒ `signedIn` 必为假。
+                        //    ⚠️ 不要再补一条 `!card._awaitingMe`：那会造出第二个判据点，
+                        //       两处一旦漂移就是"两个按钮同时出现"或"一个都不出现"。
+                        // ⚠️ 后端 `Propose` 的 LANDING 分支有同一道闸（防绕过界面直接 POST），
+                        //    两处必须同时存在：前端管"看得见/点得动"，后端管"做不做得到"。
                         visible: !panel.showSiteActions && panel.isRouteMonitor
                                  && modelData.status === "IN_FLIGHT"
+                                 && OpsCommon.signedIn(modelData)
                                  && !OpsCommon.pendingPhase(modelData, "LANDING", panel.handoverById)
                         height: 24; padding: 0
                         text: qsTr("移交降落指挥")

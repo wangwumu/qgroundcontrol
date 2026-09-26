@@ -1107,6 +1107,34 @@ Item {
               })
     }
 
+    /// 卡片上的【签入】（`TaskListPanel.checkinRequested` 的唯一落点，**两个视图共用**）。
+    ///
+    /// ‼️ 为什么住骨架、而不是各视图各接一次：失败反馈只有一套机制——复用 `handoverDialog`
+    ///    的 `_handoverActionError` 与它的「确认接管」重试入口。而 `actionConfirmDialog`
+    ///    定义在 `OpsView.qml`（站点视图私有），RomView 那边**没有任何弹窗或错误提示设施**
+    ///    ⇒ 各写一份的话，监控员侧签入失败就只剩 `console.warn`。骨架是两个视图共同的祖先，
+    ///    写在这里=只写一份、两边同时有。
+    ///
+    /// ‼️ 这个入口同时是**缺口②（"关框即无再确认入口"）的修法**：待办到达时
+    ///    `_notifyNewPending` 会自动弹框，但那个框关掉之后就再也不会弹（`_seenHandovers`
+    ///    去重），而 `Dialog` 默认还允许点框外关闭 ⇒ 误关一次就永远签不进来，只能干等超时。
+    ///    卡片上这一格是**常驻**入口，不依赖弹框出现过几次。
+    ///
+    /// ⚠️ 失败时若名单里已经没有这一条，**不开框**：那种情况说明它已被处理（`_poll()` 之后
+    ///    界面已自洽），而一个没有对象的弹框，它的按钮会 POST `/handovers/undefined/accept`。
+    function _checkinFromCard(handoverId, task) {
+        if (handoverId === undefined) return
+        _acceptHandover(handoverId, function(ok) {
+            if (ok) return
+            var h = task ? _handoverById[task.task_id] : undefined
+            if (!h) return
+            // 文案与弹框内 accept 失败那句**逐字相同**：两处同因同果，分开写就会漂移。
+            _handoverActionError = qsTr("操作未送达服务端，请重试；仍失败请通知对方人工处理")
+            _confirmHandover = h
+            handoverDialog.open()
+        })
+    }
+
     // 选中任务：**唯一写点**（地图 marker 与列表点击都走它），写状态与发信号成对出现。
     function selectTask(task) {
         if (!task) return

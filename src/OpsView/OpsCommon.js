@@ -188,15 +188,79 @@ function landingAccepted(task) { return !!(task && task.landing_accepted) }
 // 调用点同理：必须是三元式 `h ? isMine(h, id) : false`，不能写 `h && isMine(...)`。
 function isMine(handover, userId) { return !!(handover && handover.proposed_by === userId) }
 
-// deadline_at 由后端以 UTC 裸串落库/返回（time.Now().UTC().Format("2006-01-02 15:04:05")，无 T/时区标记）；
-// ECMAScript 对无时区串按本地时区解析（中国 CST=UTC+8 → 会提前 8h 判"超时"）。此处补 'T' 与 'Z' 使其按 UTC
-// 解析，与后端 datetime('now') 比较口径及遥测 timestamp（RFC3339 带 Z）一致；已是 ISO+时区则原样放行。
-function deadlineMs(handover) {
-    var s = handover ? handover.deadline_at : ""
+// 「待**我**动手」：这条任务上有一条 PENDING 交接**在等我签入**（用户 2026-09-24 裁定的
+// 「待签入航班置顶」与「任务卡醒目警示条」共用本判据）。
+//
+// ‼️ 判据只取 **`handoverById`**（`/handovers/pending` 构建，**按角色过滤**），
+//    **不是** `handoverFor`。理由就是本文件开头划的那条界限：
+//    `task.handover` 是**事实**（该任务此刻有没有 PENDING 交接，**不按角色过滤**），
+//    `handoverById` 才是**待办**（"待**我**确认的交接"）。本判据问的是"该谁动手"
+//    ⇒ 只能走后者。⚠️ 图省事用 `handoverFor`，站点视图里**同站点的另一个账号**就会
+//       看到"待我确认"——他既提不出也签入不了，是一条**假警示**（比没有警示更坏）。
+//
+// 角色过滤由构建侧完成、本函数不复判：SITE_ATC 的名单只含**本站 LANDING**、
+// ROUTE_MONITOR 的只含**其航线 ROUTE**，且**提出方自己不在名单里**——于是
+// "接收方是不是我"「这条相位该不该我管」「是不是我自己提的」三个问题一次解决，
+// 且与本系统既有口径**同源**（不新增第二份会漂移的判据）。
+//
+// 返回真 bool（`!!` 不可省，理由同 isMine 上方注释）。
+function awaitingMyCheckin(task, handoverById) {
+    if (!task || !handoverById) return false
+    return !!handoverById[task.task_id]
+}
+
+// 监控员**已否接管**本航班（设计文档 §0.2.2 裁定 1A）：该任务上存在 `phase_to='ROUTE'`
+// 且 `status='ACCEPTED'` 的交接。后端在 `opsOverviewItem` 与 `opsRouteTaskItem` 上各下发
+// 一个 `signed_in`（**布尔**，不是枚举），**全设计只此一处判定** ⇒ 前端不再自己从交接
+// 记录里推导第二份判据（两份判据必然漂移，且漂移时没有任何东西会报错）。
+//
+// ‼️ 它在签入门控里的位置（2026-09-24 用户批准的差异 A 修正）：未签入时
+// 「移交降落指挥」**不可点**。缺这道闸时责任链会断——飞机还没交给监控员，监控员已经
+// 把降落指挥交给了降落机场；而此刻起飞机场侧看到的仍是"责任还在监控员手上"。前后端
+// 两侧都要有这道闸（后端在 `Propose` 的 LANDING 分支，防止绕过界面直接 POST）。
+//
+// 返回真 bool（`!!` 不可省，理由同 isMine 上方注释；在这里的表现是
+// **未签入的航班反而能点「移交降落指挥」**，即本函数要防的那个缺陷本身）。
+function signedIn(task) { return !!(task && task.signed_in) }
+
+// 监控员侧的「尚未接管」提示条。返回空串 = 不显示。
+//
+// 四个判据，少一条就会误报：
+//   1. `isMonitor`——站点侧不需要：那边同一张卡上有【签出】按钮，"还没签出"本身有出口
+//      （且站点侧的对应提示由 `checkoutNotice` 负责，两者是不同的状态）。
+//   2. `status === "IN_FLIGHT"`——与「移交降落指挥」按钮的判据**对齐**：那几档本来就没有
+//      操作，提示"暂不可操作"等于解释一件用户不会去尝试的事。
+//   3. `!signedIn`——已签入还挂着提示，看起来像签入没生效。
+//   4. `!awaitingMyCheckin`——**最容易漏的一条**，且与上一条方向相反：已有 PENDING 等我
+//      签入时，警示条（"有人在等你动手"）与【签入】按钮已经在讲这件事，而本提示条讲的是
+//      "还没有人交给你"。两者同时出现就是自相矛盾的画面，按"有没有在等我"二选一。
+//      缺这条时，签出被驳回/撤回/超时之后（PENDING 消失、仍未签入）本提示条才会回来——
+//      那正是它该出现的时刻。
+function checkinNotice(task, isMonitor, handoverById) {
+    if (!isMonitor) return ""
+    if (!task || task.status !== "IN_FLIGHT") return ""
+    if (signedIn(task)) return ""
+    if (awaitingMyCheckin(task, handoverById)) return ""
+    return qsTr("起飞机场尚未签出，暂不可操作")
+}
+
+// 后端的时间串一律是 **UTC 裸串**（`time.Now().UTC().Format("2006-01-02 15:04:05")` 与
+// SQLite 的 `datetime('now')` 两种写法都不带 T、也不带时区标记）；ECMAScript 对无时区串按
+// **本地**时区解析（中国 CST=UTC+8 → 整整偏 8 小时，会把"还有 30 秒"读成"已超时"）。
+// 此处补 'T' 与 'Z' 使其按 UTC 解析，与后端 `datetime('now')` 的比较口径及遥测 timestamp
+// （RFC3339 带 Z）一致；已是 ISO+时区则原样放行。
+//
+// ‼️ **单点函数**：`deadlineMs`（交接期限）与 `changedAtMs`（交接终结时刻）都经它。
+// 两处各抄一遍补串逻辑，将来只改一处就会让其中一类时间**静默**偏 8 小时。
+function utcNaiveMs(s) {
     if (!s) return NaN
     if (s.indexOf("T") < 0) s = s.replace(" ", "T")
     if (s.indexOf("Z") < 0 && !/[+-]\d{2}:\d{2}$/.test(s) && !/[+-]\d{4}$/.test(s)) s += "Z"
     return Date.parse(s)
+}
+
+function deadlineMs(handover) {
+    return utcNaiveMs(handover ? handover.deadline_at : "")
 }
 
 function remainingSec(handover, nowMs) {
@@ -279,6 +343,58 @@ function checkoutNotice(task) {
     }
 }
 
+//--------------------------------------------------------------------------
+// LANDING（移交降落指挥）交接 —— 与上面 `checkoutState` 一族**同手法、另一相位**
+//--------------------------------------------------------------------------
+// `checkout_state` 只看 ROUTE（站点把飞机签出给监控员），本族只看 LANDING（监控员把飞机
+// 移交给降落机场）。两个相位各有自己的提出方与接收方，判据、文案、时效都不同，别合并。
+
+// 最近一条 LANDING 交接的状态（`opsOverviewItem` / `opsRouteTaskItem` 上的同名字段）。
+// 取值 "PENDING" / "ACCEPTED" / "REJECTED" / "CANCELLED" / "TIMEOUT"，无交接 = 空串。
+//
+// ‼️ 与 `pendingPhase(task,"LANDING",…)` **不是同一件事**：后者问"现在有没有一条 PENDING"，
+// 本函数问"上一条 LANDING 交接收在什么结果上"。超时作废之后前者为假、后者仍是 "TIMEOUT"——
+// 而"作废之后"与"从未发起"在界面上必须能分开（2026-09-24 裁定 乙）。
+function landingState(task) { return task && task.landing_state ? task.landing_state : "" }
+
+// 交接终结时刻的 HH:MM（**本地**时钟，与 `remainingSec` 的倒计时同一时区）。
+// 空/解析不出 ⇒ 空串（调用方据此降级成不带时刻的文案，而不是渲染一个 "NaN:NaN"）。
+function changedAtMs(task) { return utcNaiveMs(task ? task.landing_changed_at : "") }
+
+function changedAtClock(task) {
+    var ms = changedAtMs(task)
+    if (isNaN(ms)) return ""
+    var d = new Date(ms)
+    return ("0" + d.getHours()).slice(-2) + ":" + ("0" + d.getMinutes()).slice(-2)
+}
+
+// LANDING 交接**作废之后的告知条**。返回空串 = 不显示。
+//
+// `isReceiver` = 看这条的人是**接收方**（降落机场 SITE_ATC）还是**提出方**（航线监控员）：
+// 「请重新发起」只有提出方做得到，接收方看到的是"待其重新发起"——两边说同一件事，
+// 但**动作的主语不同**，写反了就是让一个点不动按钮的角色去点按钮。
+// 由调用点按**视图**决定（站点视图 = 接收方）：LANDING 交接的接收方恒为降落机场，
+// 而站点视图就是给 SITE_ATC 的，不必再等一个 `proposed_by` 字段下发。
+//
+//   TIMEOUT  → 红字 + 作废时刻。`scanTimeout` 置的终态，正是本项目"人员不知道"的病灶：
+//              改前它一置 TIMEOUT 这条交接就从接口里消失，界面上与"从未发起"不可区分。
+//   其余     → 不显示。PENDING 已有「待…确认 · 剩余秒数」徽标；ACCEPTED 是正常闭环；
+//              CANCELLED 多半是自己刚点的【取消】。REJECTED 后端**已经能区分**，但本轮
+//              不下发 `reject_reason`，没有理由的"被拒绝"提示说不清该改什么 ⇒ 一并留空
+//              （要补时连同理由字段一起下发，参照 `checkout_reject_reason`）。
+// ‼️ `default` 回空串而不是兜底成红字：后端将来加状态时界面**不显示**，
+//    而不是先自己喊一句没头没脑的错误（红=异常在本视图是**迫降/超时**那一族的语义）。
+function landingNotice(task, isReceiver) {
+    if (landingState(task) !== "TIMEOUT") return ""
+    var t = changedAtClock(task)
+    if (isReceiver) {
+        return t ? qsTr("航线监控员移交降落指挥已于 %1 超时作废，待其重新发起").arg(t)
+                 : qsTr("航线监控员移交降落指挥已超时作废，待其重新发起")
+    }
+    return t ? qsTr("移交降落指挥已于 %1 超时作废，请重新发起").arg(t)
+             : qsTr("移交降落指挥已超时作废，请重新发起")
+}
+
 // 出场=本站=起飞点且**责任尚未交出去**：SCHEDULED/READY/TAKEOFF，以及落库 IN_FLIGHT 之后
 // 尚未被监控员接管的整段（§6.0-F：签出=责任里程碑；接管后退出出场）。
 //
@@ -312,14 +428,21 @@ function isInbound(task, mySiteId, handoverById) {
 }
 
 // 站点视图的行集合：出站/进站两个勾选框分别过滤
+// ‼️ 2026-09-24（裁定 丙-2）：**待我签入的排在最前**。超时是硬性的（10 秒一轮的
+//    `scanTimeout`，期限默认 5 分钟），而这条交接混在几十条航班里就是一行 11px 小字
+//    ⇒ 排序是「让人来得及动手」的最后一道手段。判据单点在 `awaitingMyCheckin`。
+// ⚠️ 是**分桶再拼接**，不是排序函数：一条任务只出现一次（原先 outbound/inbound
+//    是 `else if`，改成 `||` 后仍是"收一次"，语义未变），拼接后桶内**保持原顺序**。
 function siteTasks(tasks, outbound, inbound, mySiteId, handoverById) {
-    var out = []
+    var first = [], rest = []
     for (var i = 0; i < tasks.length; i++) {
         var t = tasks[i]
-        if (outbound && isOutbound(t, mySiteId, handoverById)) out.push(t)
-        else if (inbound && isInbound(t, mySiteId, handoverById)) out.push(t)
+        if (!((outbound && isOutbound(t, mySiteId, handoverById)) ||
+              (inbound && isInbound(t, mySiteId, handoverById)))) continue
+        if (awaitingMyCheckin(t, handoverById)) first.push(t)
+        else rest.push(t)
     }
-    return out
+    return first.concat(rest)
 }
 
 // 监控员视图的行集合：overview 已按负责航线过滤 IN_FLIGHT，原样返回
@@ -531,9 +654,11 @@ function groupTasksByRoute(tasks, routeOrder) {
 }
 
 // 中段（航班列表）的行集合（§4.1 中段）= 第 1 节 ∪ 第 2 节：
-//   第 1 节 **异常航班**：`isAbnormal` 为真的全部航班，**与是否选中航线无关、置顶常驻**。
-//          这是裁定 ⑥ 的硬约束——用户指出过「异常飞机应该常驻在屏幕上，而我们又说选择航线，
+//   第 1 节 **异常航班 ∪ 待我签入**，**与是否选中航线无关、置顶常驻**。
+//          前半是裁定 ⑥ 的硬约束——用户指出过「异常飞机应该常驻在屏幕上，而我们又说选择航线，
 //          则在列表中显示该航班的航班，这个冲突了」。
+//          后半是 2026-09-24 裁定 丙-2 加的（用户：「人员不知道/或者没有注意到才是问题」）
+//          ——超时作废前，接管提示必须**一直在最上面**，理由见 `awaitingMyCheckin`。
 //   第 2 节 **在航航班**，随选中状态换口径（用户 2026-09-23 定）：
 //          **选中航线 ⇒ 只列该航线的**；**一条都没选中 ⇒ 列全部在航航班**。
 //          ‼️ "全部在航"不需要在这里再筛一次状态：③ 端点自己的 WHERE 就是
@@ -542,13 +667,20 @@ function groupTasksByRoute(tasks, routeOrder) {
 //             直接全收即对。在这里另写一遍状态白名单＝多一份会与后端漂移的判据。
 //          ⚠️ 在这之前，未选中时第 2 节是**整体为空**的（只显示异常）。那是旧口径，已废。
 // ‼️ 两节可能包含**同一个航班**（选中了一条有异常航班的航线）⇒ **必须按 `task_id` 去重**，
-//    去重后**仍留在第 1 节**（异常的位置更高）。去重漏了的表现是同一条航班在列表里出现两次，
+//    去重后**仍留在第 1 节**（第 1 节的位置更高）。去重漏了的表现是同一条航班在列表里出现两次，
 //    看起来像"重复的数据"，不报错。
-function middleSectionTasks(tasks, selectedRouteId) {
+function middleSectionTasks(tasks, selectedRouteId, handoverById) {
+    // ‼️ 2026-09-24（裁定 丙-2）：第 1 节除异常之外**再收"待我签入"**（ROUTE 交接等着
+    //    监控员接管），理由与 `siteTasks` 同上——超时到期这条交接就作废了。
+    // ⚠️ 判据写在**调用 `isAbnormal` 的这里**、**不写进 `isAbnormal` 本身**：那个函数
+    //    被 `abnormalKind`/`abnormalColor` 与**地图 marker 着色**共用（见其上方注释），
+    //    往里加一条"待签入也算异常"会让地图上的飞机跟着变色。
+    // ⚠️ 第 1 节**不受 `selectedRouteId` 过滤**（原有口径，异常航班常驻置顶）；"待签入"
+    //    沿用同一口径。此处不会因此多收：`handoverById` 对监控员本就**只含其航线**。
     var seen = {}, out = []
     for (var i = 0; i < tasks.length; i++) {
         var t = tasks[i]
-        if (!isAbnormal(t)) continue
+        if (!isAbnormal(t) && !awaitingMyCheckin(t, handoverById)) continue
         if (seen[t.task_id]) continue
         seen[t.task_id] = true
         out.push(t)

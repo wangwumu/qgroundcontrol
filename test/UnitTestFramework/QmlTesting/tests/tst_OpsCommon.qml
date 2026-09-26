@@ -778,6 +778,285 @@ TestCase {
     }
 
     //-------------------------------------------------------------------------
+    // 待**我**签入（2026-09-24 裁定 丙-1/丙-2）
+    //   「任务卡醒目警示条」与「待签入航班置顶」**共用** `awaitingMyCheckin`。
+    //   本组钉的是那条口径分界：**事实**（`task.handover`，不按角色过滤）
+    //   ≠ **待办**（`handoverById`，按角色过滤且提出方不在名单里）。
+    //-------------------------------------------------------------------------
+
+    /// 与 `opsRouteTaskItem` 同形的任务项（比 `_hoTask` 多一个降落场地）。
+    /// `landing_site_id` 是 `siteTasks` 判进站用的键，少了它进站分支恒假 ⇒ 用例会
+    /// "什么都没测到"却全绿（阴性对照缺失的典型形状）。
+    function _siteTask(taskId, status, takeoffSiteId, landingSiteId, handover) {
+        return {
+            task_id: taskId,
+            status: status,
+            takeoff_site_id: takeoffSiteId,
+            landing_site_id: landingSiteId,
+            latest: null,
+            handover: handover || undefined
+        }
+    }
+
+    /// 有异常事件的在航任务（`isAbnormal` 为真的最小形状）。
+    function _abnormalTask(taskId) {
+        return { task_id: taskId, status: "IN_FLIGHT", latest: null,
+                 event: { type: "DIVERT", status: "OPEN" } }
+    }
+
+    /// ‼️ **本组最关键的一格**：判据必须只看**待办名单**，不看任务自带的事实。
+    /// 场景：站点 ATC 自己提出了一条 ROUTE 交接 ⇒ `task.handover` 有值（事实），
+    /// 但 `/handovers/pending` **不把他自己那条发给他**（待办名单里没有）。
+    /// 若实现走 `handoverFor`（它优先 `task.handover`），这一格会返回 true ⇒ **红**。
+    /// 后果不是"少一个提示"而是**假警示**：他既提不出也签入不了，警示条却让他去点。
+    function test_awaitingMyCheckin_ignoresEmbeddedHandoverNotInPendingList() {
+        var task = _hoTask(91103, "IN_FLIGHT", 1, _embeddedHo(7, "ROUTE", 16))
+        verify(!OpsCommon.awaitingMyCheckin(task, {}),
+               "自己提出的交接不在待办名单里 ⇒ 不得标成「待我签入」（假警示）")
+        verify(OpsCommon.awaitingMyCheckin(task, { 91103: _embeddedHo(7, "ROUTE", 16) }),
+               "同一条任务进了待办名单 ⇒ 必须为 true（否则上一行是恒假，毫无区分度）")
+    }
+
+    /// 阴性对照：两处都没有交接 ⇒ false。返回 undefined 会让 QML 的 `visible` 退回 true。
+    function test_awaitingMyCheckin_noHandoverAtAll() {
+        verify(OpsCommon.awaitingMyCheckin(_hoTask(91103, "TAKEOFF", 1, undefined), {}) === false,
+               "无交接 ⇒ 必须返回真 bool false（undefined 会让警示条恒亮）")
+        verify(OpsCommon.awaitingMyCheckin(null, {}) === false)
+        verify(OpsCommon.awaitingMyCheckin(_hoTask(1, "TAKEOFF", 1, undefined), null) === false,
+               "名单尚未建好（null）时不得抛错，也不得亮警示")
+    }
+
+    /// 置顶：名单里那条排到最前，且**一条不丢、一条不重**。
+    /// 阴性对照紧随其后——没有它，一个"把所有行都倒过来"的实现也能让上面那行绿。
+    function test_siteTasks_putsAwaitingFirstOnlyWhenListed() {
+        var t1 = _siteTask(1, "LANDING", 9, 1, undefined)
+        var t2 = _siteTask(2, "LANDING", 9, 1, _embeddedHo(7, "LANDING", 16))
+        var t3 = _siteTask(3, "LANDING", 9, 1, undefined)
+        var all = [t1, t2, t3]
+
+        var listed = OpsCommon.siteTasks(all, false, true, 1, { 2: _embeddedHo(7, "LANDING", 16) })
+        compare(listed.length, 3, "置顶不得多收或少收行")
+        compare(listed[0].task_id, 2, "待我签入的那条必须排在最前")
+        compare(listed[1].task_id, 1, "其余保持原有先后")
+        compare(listed[2].task_id, 3, "其余保持原有先后")
+
+        // 阴性对照：名单为空 ⇒ 顺序与输入一致（证明上一行的 2 是"被置顶"而非"排序恰好如此"）
+        var plain = OpsCommon.siteTasks(all, false, true, 1, {})
+        compare(plain[0].task_id, 1, "名单为空时不得重排")
+        compare(plain[2].task_id, 3, "名单为空时不得重排")
+    }
+
+    /// 回归：出站/进站两个勾选框从 `else if` 改成 `||` 之后，**一条任务仍只出现一次**。
+    /// 造一条**同时**满足两个分支的任务：本站起飞 ∧ 本站降落 ∧ 有 PENDING(LANDING) 交接
+    /// （此时 `isOutbound` 的 `checkoutState !== 'ACCEPTED'` 与 `!landingAccepted` 都成立）。
+    /// 重复收会让同一条航班在列表里出现两次——看起来像"重复的数据"，不报错。
+    function test_siteTasks_countsOverlappingTaskOnce() {
+        var t = _siteTask(5, "IN_FLIGHT", 1, 1, _embeddedHo(7, "LANDING", 16))
+        verify(OpsCommon.isOutbound(t, 1, {}), "夹具前提：这条应判为出站")
+        verify(OpsCommon.isInbound(t, 1, {}), "夹具前提：这条应判为进站")
+        compare(OpsCommon.siteTasks([t], true, true, 1, {}).length, 1,
+                "两个勾选框同时命中时仍只收一次")
+    }
+
+    /// 监控员视图：待我签入同样进第 1 节（置顶节），且异常航班的位置不受影响。
+    /// 阴性对照同上——名单为空时不得重排。
+    function test_middleSectionTasks_putsAwaitingFirstOnlyWhenListed() {
+        var a = _task(1, "IN_FLIGHT")
+        var b = _task(2, "IN_FLIGHT")
+        var c = _task(3, "IN_FLIGHT")
+        var all = [a, b, c]
+
+        var listed = OpsCommon.middleSectionTasks(all, null, { 3: _embeddedHo(7, "ROUTE", 16) })
+        compare(listed.length, 3, "置顶不得多收或少收行")
+        compare(listed[0].task_id, 3, "待我签入的那条必须排在最前")
+
+        var plain = OpsCommon.middleSectionTasks(all, null, {})
+        compare(plain.length, 3)
+        compare(plain[0].task_id, 1, "名单为空时不得重排")
+
+        // 选中一条航线时，第 1 节的「待签入」**不受航线过滤**（与异常航班同口径）
+        var filtered = OpsCommon.middleSectionTasks(
+                    [ _siteTask(4, "IN_FLIGHT", 1, 1, undefined),
+                      _siteTask(5, "IN_FLIGHT", 1, 1, undefined) ],
+                    99, { 4: _embeddedHo(7, "ROUTE", 16) })
+        compare(filtered[0].task_id, 4,
+                "第 1 节不受 selectedRouteId 过滤——它与异常航班同为常驻置顶")
+    }
+
+    /// ‼️ **回归靶子**：判据**不得**塞进 `isAbnormal`。
+    /// `isAbnormal` 被 `abnormalKind`/`abnormalColor` 与**地图 marker 着色**共用
+    /// （`markerColor` 的第一步就是它）——往里加一条"待签入也算异常"，地图上那架
+    /// 飞机就会跟着变色。本格存在，是为了让那次误改**当场红**而不是上线后才被看见。
+    function test_isAbnormal_unaffectedByAwaitingCheckin() {
+        var task = _hoTask(91103, "IN_FLIGHT", 1, _embeddedHo(7, "ROUTE", 16))
+        verify(OpsCommon.awaitingMyCheckin(task, { 91103: _embeddedHo(7, "ROUTE", 16) }),
+               "夹具前提：这条确实在待办名单里")
+        verify(!OpsCommon.isAbnormal(task),
+               "有 PENDING 交接 ≠ 异常：地图 marker 的着色判据不能被置顶判据污染")
+    }
+
+    //-------------------------------------------------------------------------
+    // LANDING 交接**终态告知**（2026-09-24 裁定 乙）的时间链与文案
+    //   后端下发 `landing_state` / `landing_changed_at`（`lastLandingHandover`），
+    //   本组钉住 QGC 侧怎么把它变成那句提示。
+    //-------------------------------------------------------------------------
+
+    /// 与 `opsOverviewItem` 同形、带 LANDING 终态字段的任务项。
+    function _landingTask(state, changedAt) {
+        return { task_id: 91103, status: "IN_FLIGHT", latest: null,
+                 landing_state: state, landing_changed_at: changedAt }
+    }
+
+    /// ‼️ 本组的地基：后端时间串是**无时区裸串**（`"2026-09-24 03:04:05"`），
+    /// 用 `Date.parse` 直接吃会**按本地时区**解析 ⇒ 偏一个时区（东八区差 8 小时）。
+    /// 断言写成 `Date.UTC(...)` 的毫秒值 ⇒ **与跑测试的机器时区无关**；写成
+    /// `Qt.formatTime` 的本地时钟就变成了"在 CI 上必红"的用例。
+    /// 追溯：`webui-naive-utc-timestamps`（同一个坑的另一端）。
+    function test_utcNaiveMs_parsesNaiveStringAsUtc() {
+        compare(OpsCommon.utcNaiveMs("2026-09-24 03:04:05"), Date.UTC(2026, 8, 24, 3, 4, 5),
+                "无时区裸串必须按 UTC 解析")
+        compare(OpsCommon.utcNaiveMs("2026-09-24T03:04:05Z"), Date.UTC(2026, 8, 24, 3, 4, 5),
+                "已带 Z 的串不得被二次补 Z")
+        compare(OpsCommon.utcNaiveMs("2026-09-24T03:04:05+08:00"), Date.UTC(2026, 8, 23, 19, 4, 5),
+                "已带偏移量的串不得被当成本地时间")
+    }
+
+    /// 解析不出来时返回 **NaN**（不是 0）：0 是一个合法时刻（1970-01-01），
+    /// 会被下游当成"真的有个时间"渲染出来。
+    function test_utcNaiveMs_invalidIsNaN() {
+        verify(isNaN(OpsCommon.utcNaiveMs("")), "空串 ⇒ NaN")
+        verify(isNaN(OpsCommon.utcNaiveMs(undefined)), "undefined ⇒ NaN")
+        verify(isNaN(OpsCommon.utcNaiveMs("不是时间")), "垃圾串 ⇒ NaN")
+    }
+
+    /// 回归：`deadlineMs` 与 `landing_changed_at` 走**同一个** `utcNaiveMs`。
+    /// 改前两处各抄过一遍"补 Z"逻辑——将来只改一处，就会让其中一类时间**静默**偏 8 小时
+    /// （倒计时看着正常，只是比真实期限早/晚 8 小时，没有任何报错）。
+    function test_deadlineMs_sharesUtcBasis() {
+        compare(OpsCommon.deadlineMs({ deadline_at: "2026-09-24 03:04:05" }),
+                Date.UTC(2026, 8, 24, 3, 4, 5),
+                "交接期限与作废时刻必须同源，否则两者会朝相反方向偏")
+    }
+
+    /// 非 TIMEOUT ⇒ **空串**（空串 = 不占位）。这一格是阴性对照：没有它，
+    /// 一个"任何状态都吐一句话"的实现能让下面几格全绿，而界面上每条任务都挂着提示条。
+    function test_landingNotice_emptyUnlessTimeout() {
+        compare(OpsCommon.landingNotice(_landingTask("", ""), false), "", "无交接 ⇒ 空")
+        compare(OpsCommon.landingNotice(_landingTask("ACCEPTED", ""), false), "", "已签入 ⇒ 空")
+        compare(OpsCommon.landingNotice(_landingTask("PENDING", ""), false), "", "进行中 ⇒ 空")
+        compare(OpsCommon.landingNotice(_landingTask("REJECTED", ""), false), "",
+                "REJECTED 本轮不下发（后端能区分、但界面还没接），一并留空")
+        compare(OpsCommon.landingNotice(null, false), "", "无任务 ⇒ 空")
+        verify(OpsCommon.landingNotice(_landingTask("TIMEOUT", "2026-09-24 03:04:05"), false) !== "",
+               "TIMEOUT ⇒ 必须非空（否则上面五格是恒真，毫无区分度）")
+    }
+
+    /// 用户 2026-09-24 裁定「**双方都告知**」：同一条作废，两个角色各得一句，
+    /// 且**动作主语不同**——提出方（监控员）做得到「请重新发起」，接收方（降落机场）
+    /// 只能「待其重新发起」。写反了就是让一个点不动按钮的角色去点按钮。
+    function test_landingNotice_tellsBothSidesDifferently() {
+        var t = _landingTask("TIMEOUT", "2026-09-24 03:04:05")
+        var proposer = OpsCommon.landingNotice(t, false)
+        var receiver = OpsCommon.landingNotice(t, true)
+        verify(proposer !== receiver, "提出方与接收方不得是同一句（否则等于只告知了一方）")
+        verify(proposer.indexOf("请重新发起") >= 0, "提出方那一句要他重新发起")
+        verify(receiver.indexOf("待其重新发起") >= 0, "接收方那一句只能等对方重新发起")
+    }
+
+    /// 时刻缺失时必须**回落成不带时刻的文案**，而不是渲染出 `undefined` 或垃圾串。
+    /// `changedAtClock` 对解析不出的时刻返回空串，就是为了让这里走另一句。
+    function test_landingNotice_withoutTimestampDegradesGracefully() {
+        var withAt = OpsCommon.landingNotice(_landingTask("TIMEOUT", "2026-09-24 03:04:05"), true)
+        var withoutAt = OpsCommon.landingNotice(_landingTask("TIMEOUT", ""), true)
+
+        // ‼️ 这两格**直接**钉住 `changedAtClock` 的契约，不靠文案间接推断。
+        //    教训（实测）：本函数最初只写了下面那句 `indexOf("NaN") < 0`，结果
+        //    「删掉 isNaN 守卫」的变异**照绿**——因为 `("0" + NaN).slice(-2)` 是 **"aN"**，
+        //    不是 "NaN"。判据串选错 ⇒ 零区分度，且失败形状与"实现正确"长得一样。
+        compare(OpsCommon.changedAtClock(_landingTask("TIMEOUT", "")), "",
+                "解析不出时刻 ⇒ 必须返回空串，由调用点走另一句")
+        verify(/^\d{2}:\d{2}$/.test(
+                   OpsCommon.changedAtClock(_landingTask("TIMEOUT", "2026-09-24 03:04:05"))),
+               "有时刻 ⇒ 必须是 HH:MM 形状（去掉 isNaN 守卫会退化成 'aN:aN'）")
+
+        verify(withoutAt !== "", "缺时刻仍须告知作废（这恰恰是最该说清楚的那种情况）")
+        verify(withoutAt.indexOf("undefined") < 0 && withoutAt.indexOf("aN") < 0,
+               "缺时刻不得把 NaN/undefined 的残渣渲染进文案")
+        verify(withoutAt !== withAt, "有/无时刻必须是两句不同的文案，否则时刻没真的进去")
+    }
+
+    //-------------------------------------------------------------------------
+    // signedIn / checkinNotice：接收方签入（2026-09-24）
+    //
+    //   背景：`signed_in` 后端**早就在下发**（`handlers/ops.go` 的 `opsOverviewItem` 与
+    //   `opsRouteTaskItem` 各一个，`ops_rom_test.go` 有用例钉着），而 **QGC 侧一个字都没读**
+    //   （`src/` 下零命中）⇒ 设计文档 §0.2.2 要它承担的两件事一件都没发生：
+    //     · 「操作按钮的可用性」——监控员在**航班还没交给自己**时就拿到了「移交降落指挥」，
+    //       而后端那条路径**当时也没有闸**（责任链会断：飞机还没交给监控员，监控员却已经
+    //       把降落指挥交给了降落机场）；
+    //     · 「未签入提示」——判据缺失，界面上既没有按钮也没有解释。
+    //-------------------------------------------------------------------------
+
+    /// 与 `opsRouteTaskItem` / `opsOverviewItem` 同形的最小任务项。
+    /// `signed_in` 是**布尔**（裁定 1A：`phase_to='ROUTE' AND status='ACCEPTED'` 有无记录），
+    /// **不是枚举**——别照 `checkout_state` 那族的形状写这个夹具，那会诱导实现去比字符串。
+    function _signedTask(status, signedIn, handover) {
+        return { task_id: 91103, status: status, latest: null,
+                 signed_in: signedIn, handover: handover || undefined }
+    }
+
+    /// ‼️ 本组地基：必须返回**真 bool**。`visible` / `enabled` 吃到 undefined 会退回默认值
+    /// **true**（`qml-undefined-binding-falls-back-to-default-true`）——在这里的表现是
+    /// "**未签入的航班反而能点移交**"，即本函数要防的那个缺陷本身。故 `!!` 不可省。
+    function test_signedIn_alwaysReturnsRealBoolean() {
+        verify(OpsCommon.signedIn(_signedTask("IN_FLIGHT", true)) === true, "已签入 ⇒ true")
+        verify(OpsCommon.signedIn(_signedTask("IN_FLIGHT", false)) === false,
+               "未签入 ⇒ 必须是真 bool false（undefined 会让「移交降落指挥」照常可点）")
+        verify(OpsCommon.signedIn({ task_id: 1, status: "IN_FLIGHT" }) === false,
+               "字段缺失（老缓存 / 老后端）⇒ false，fail-closed")
+        verify(OpsCommon.signedIn(null) === false, "无任务 ⇒ false，且不得抛错")
+    }
+
+    /// 「尚未接管」提示条：**只在监控员侧、且飞机已在航线中**时才有意义。
+    /// 站点侧不需要它——那边同一张卡上有【签出】按钮，"还没签出"本身就有一个出口。
+    function test_checkinNotice_onlyForMonitorOnInFlightUnsigned() {
+        var unsigned = _signedTask("IN_FLIGHT", false)
+        verify(OpsCommon.checkinNotice(unsigned, true, {}) !== "",
+               "监控员 + 在航 + 未签入 + 无人待我签入 ⇒ 必须给出提示（这正是「人员不知道」那一格）")
+        compare(OpsCommon.checkinNotice(unsigned, false, {}), "",
+                "站点侧不显示：那边有【签出】按钮，再挂一条是噪音")
+        compare(OpsCommon.checkinNotice(_signedTask("IN_FLIGHT", true), true, {}), "",
+                "已签入 ⇒ 无提示（否则签入按钮点完提示条还在，看起来像没生效）")
+        compare(OpsCommon.checkinNotice(null, true, {}), "", "无任务 ⇒ 空")
+    }
+
+    /// 飞机尚未进入航线时**不说**。判据与「移交降落指挥」按钮的 `status === "IN_FLIGHT"`
+    /// 对齐：那几档本来就没有操作，提示"暂不可操作"是在解释一件用户不会去尝试的事。
+    function test_checkinNotice_silentBeforeInFlight() {
+        var states = ["SCHEDULED", "READY", "READY_TO_TAKEOFF", "TAKEOFF", "LANDING", "COMPLETED"]
+        for (var i = 0; i < states.length; i++) {
+            compare(OpsCommon.checkinNotice(_signedTask(states[i], false), true, {}), "",
+                    "非在航状态（" + states[i] + "）⇒ 不提示")
+        }
+    }
+
+    /// ‼️ **本组最关键的一格**：已经有一条 PENDING 交接在等我签入时，**本提示条让位**。
+    /// 两条说的是相反的事——警示条「有人在等你动手」vs 本提示「还没有人交给你」——
+    /// 同时出现就是自相矛盾的画面。缺这一格的话，一个"只要未签入就吐提示"的实现
+    /// 能让上面几格全绿，而界面上那两种情况会一起挂出来。
+    function test_checkinNotice_yieldsToAwaitingCheckin() {
+        var h = _embeddedHo(7, "ROUTE", 16)
+        var task = _signedTask("IN_FLIGHT", false, h)
+        var byId = { 91103: h }
+        compare(OpsCommon.checkinNotice(task, true, byId), "",
+                "有 PENDING 等我签入 ⇒ 交给警示条与【签入】按钮，本提示条让位")
+        verify(OpsCommon.awaitingMyCheckin(task, byId),
+               "同一条任务确实进了待办名单（否则上一行是恒真，毫无区分度）")
+        verify(OpsCommon.checkinNotice(task, true, {}) !== "",
+               "同一条任务**不在**待办名单里（签出被驳回 / 撤回 / 超时之后）⇒ 提示条必须回来")
+    }
+
+    //-------------------------------------------------------------------------
     // routeMissionItems / takeoffAltitude：航线 → 待下发的 mission
     //（2026-09-23 站点操作员起飞前置动作：握手完成后自动下发航线）
     //-------------------------------------------------------------------------
