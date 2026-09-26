@@ -12,6 +12,7 @@
 
 #include "AppMessages.h"
 #include "AppSettings.h"
+#include "AuthController.h"
 #include "LinkManager.h"
 #include "MAVLinkLib.h"
 #include "LinkInterface.h"
@@ -223,7 +224,20 @@ void MAVLinkProtocol::_receiveEncryptedBytes(LinkInterface* link, const SharedLi
                 crypto->beginLinking(deviceID);
             }
 
-            _feedStandardFrame(link, linkPtr, channel, frameData, frame.size());
+            // 联网运营模式且未登录：本机尚未从 gcs_server 取得任何 deviceID/密钥，不认任何飞机。
+            // ⚠️ 上面 learnDeviceSystemMapping / noteDeviceFrame 必须**照常执行** —— 失联判据依赖它们；
+            //    本判据只截断"喂标准解析器"这一步，不改动任何收帧记账。
+            // ⚠️ 必须同时带 backendLoggedIn()：standaloneMode 的定义是「!loggedIn && cryptoKeySource == 0」，
+            //    网络版（cryptoKeySource=1）**登录之后它仍为 false**，单写 !standaloneModeEnabled()
+            //    会把"网络版登录后"一并封死。单机版两项短路为真，行为与改动前完全一致。
+            // ⚠️ 只能条件化调用、**不能 return**：本函数外层是 while 逐帧循环，return 会丢掉同一
+            //    缓冲区里后续所有帧（本帧已在上面从 buffer 移除，不会被重新处理）。
+            // 不截断的后果（2026-09-26 实测）：凭空建出 Vehicle → InitialConnectStateMachine 启动 →
+            //    其命令在 Standby 下全被 LinkInterface 丢弃 → RequestMission 重试耗尽 →
+            //    弹「任务传输失败。错误：任务请求列表失败,超过了最大重试次数。」
+            if (AuthController::standaloneModeEnabled() || AuthController::backendLoggedIn()) {
+                _feedStandardFrame(link, linkPtr, channel, frameData, frame.size());
+            }
         } else {
             _processEncryptedFrame(link, linkPtr, channel, frame);
         }
