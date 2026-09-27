@@ -2023,12 +2023,43 @@ Item {
     ///    且其 WHERE 已用 `u.device_id > 0` 剔除未指派行），故换源后匹配成立。
     /// ⚠️ 判据沿用 `routeLayersEnabled`——与地图 marker 那处**同一个**分流条件，
     ///    不新增第二个会漂移的口径。
+    ///
+    /// ‼️ 兜底**不能**取 `src[0]`（2026-09-27 实测修复）：③ 是 `ORDER BY t.id DESC`，而它的
+    ///    候选集里**同时**有"别的飞机"的任务——真库实测 `user_rom`(user_id=20) 的候选首条是
+    ///    `91104`（`TASK-00101`，任务已 `CANCELED`，但它的飞机 `uav 9102` 状态仍是
+    ///    `READY_TO_TAKEOFF` ⇒ 仍入选），而场上**只建链了一架**（`sys 152` / `device_id
+    ///    10000385`，即 uav 6 那条 `91103`）。于是 `matchDeviceToVehicle` 拿 `device_id 91002`
+    ///    找不到载具 ⇒ `_selectedVehicle` 为 null ⇒ 底部整排与姿态仪/罗盘显示 "—"，
+    ///    而**地图箭头照常动**（L3 marker 吃 `_routeDevices`，一架飞机一个 delegate，
+    ///    10000385 那个自己匹配得上）——「一个活一个死」正是两条路吃不同数组造成的。
+    ///
+    /// ‼️ 这条兜底同时是**对上一版修复的回退修正**：上一版只换了数据源、兜底仍是 `src[0]`，
+    ///    结果是「`TAKEOFF`/`READY` 阶段没修好（仍旧取到 91104）+ `IN_FLIGHT` 阶段反而新坏」
+    ///    （旧代码只吃 ② 的 `IN_FLIGHT` 子集，那时 `src[0]` 恰好就是那架在飞的）。
+    ///
+    /// 判据取「**其设备当前已建链**」而不是"状态更高"之类：这是客户端**唯一**的客观信号，
+    /// 且与 `_routeDevices` 那侧 marker 能画出来的条件是同一个（载具已建链）。
+    /// ⚠️ 读 `vehicles.count` 是**依赖注册**不是顺手读一下：`vehicles` 是 `CONSTANT` 属性，
+    ///    本函数被 `_selectedVehicle` 的绑定调用，少了这一读，载具建链后那个绑定不会重估。
     function _selectedTask() {
         var src = routeLayersEnabled ? _routeTasks : _tasks
+        if (!src || src.length === 0) return null
+        // ① 用户显式点过的那一行，永远优先——哪怕它对应的飞机没建链（那时仪表显示 "—" 是对的，
+        //    因为"选中的那架没上线"与"没选中任何架"是两回事）。
         for (var i = 0; i < src.length; i++) {
             if (src[i].task_id === _selectedTaskId) return src[i]
         }
-        return src.length ? src[0] : null
+        // ② 没点过：优先取「其设备当前已建链」的那条任务。
+        //    ⚠️ `vs` 必须在**本函数内**读一次作为实参传给 `matchDeviceToVehicle`：
+        //       `OpsCommon` 是 `.pragma library`，其函数体内读属性不注册依赖。
+        var vs = QGroundControl.multiVehicleManager.vehicles
+        if (vs && vs.count > 0) {
+            for (var j = 0; j < src.length; j++) {
+                if (OpsCommon.matchDeviceToVehicle(src[j], vs)) return src[j]
+            }
+        }
+        // ③ 一架都没建链：退回第一条（保持原行为，界面显示 "—"）。
+        return src[0]
     }
 
 }
