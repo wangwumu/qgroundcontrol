@@ -257,6 +257,14 @@ void QGCApplication::init()
         // 本地模式下，从 AppConfigLocation/mavlink_key.bin 读 32 字节密钥，注入到 cryptoLocalKeyDeviceID
         // 指定的目标无人机；成功后该 deviceID 的密钥即就绪，beginLinking 时 hasKey 命中、不再走 gcs_server。
         if (crypto->cryptoEnabled() && cryptoSettings->cryptoKeySource()->rawValue().toUInt() == 0) {
+            // 责任方闸（2026-09-27 用户裁定）：本地密钥源 = 单机联调直连，**根本不登录**
+            // （AuthController::standaloneMode 的定义即 !loggedIn && cryptoKeySource==0）
+            // ⇒ 此时本 QGC 是唯一操作者，不存在"谁该发言"之争，标为责任方。
+            // 缺省是 false（fail-closed），不在这里放行就会把本地联调这条路径整个封死。
+            // 联网运营模式（cryptoKeySource==1）不走本分支：那时责任方由 AuthController
+            // 登录时按角色写入（含 SITE_ATC 才是），且它会**无条件覆写**这里的值——所以
+            // 本机若配了本地密钥源却仍然登录，以角色为准。
+            crypto->setResponsibleParty(true);
             const QString localKeyPath = QDir(QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation))
                                              .filePath(QStringLiteral("mavlink_key.bin"));
             const MAVLinkCrypto::DeviceID localDeviceID = static_cast<MAVLinkCrypto::DeviceID>(

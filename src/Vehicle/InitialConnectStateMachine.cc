@@ -14,6 +14,7 @@
 #include "QGCLoggingCategory.h"
 #include "SettingsManager.h"
 #include "MavlinkSettings.h"
+#include "MAVLink/Crypto/CryptoController.h"
 
 #include <cstring>
 
@@ -31,7 +32,19 @@ InitialConnectStateMachine::InitialConnectStateMachine(Vehicle* vehicle, QObject
     _wireProgressTracking();
     _wireTimeoutHandling();
 
-    setInitialState(_stateAutopilotVersion);
+    // 本机无发言权（加密链路已启用、但本机不是责任方）⇒ 下面六类请求**一条都发不出去**：
+    // LinkInterface 对非 Active 逐条 drop，各自的 CommandSender 重试到耗尽，最后弹
+    // 「任务传输失败。错误：任务请求列表失败,超过了最大重试次数。」——而根因（本机被收回了
+    // 发言权）在界面上完全看不见。此时直接把初始状态指向 SignalComplete：initialConnectComplete
+    // 照常发出（界面不会一直停在"正在连接"），但不发任何一条注定被丢弃的请求。
+    //
+    // 判据在**构造时**求值即可，无需等到 start()：Vehicle 的构造与 start() 在同一个函数体内
+    // （Vehicle.cc），其间不返回事件循环，而标志只可能被事件循环里的回调改写。
+    // 联网主路径上这判据一定正确——登录（写标志）必然早于建 Vehicle（MAVLinkProtocol 只在
+    // standaloneMode 或 backendLoggedIn 时才喂帧，而喂帧才建得出 Vehicle）。
+    // 本地密钥源那条路径由 CryptoController::setResponsibleParty(false) 撤销链路兜底。
+    setInitialState(_shouldSkipForNoResponsibleParty() ? static_cast<QState*>(_stateComplete)
+                                                      : static_cast<QState*>(_stateAutopilotVersion));
 }
 
 InitialConnectStateMachine::~InitialConnectStateMachine()
@@ -313,6 +326,14 @@ bool InitialConnectStateMachine::_shouldSkipForPlanLoad()
         return true;
     }
     return false;
+}
+
+bool InitialConnectStateMachine::_shouldSkipForNoResponsibleParty() const
+{
+    // cryptoEnabled() 为假（未启用加密链路）⇒ 本判据整体不适用，行为与改动前一致。
+    // 因此单机版、以及所有未开加密的部署都不受影响。
+    MAVLinkCrypto::CryptoController* const crypto = MAVLinkCrypto::CryptoController::instance();
+    return crypto->cryptoEnabled() && !crypto->isResponsibleParty();
 }
 
 // ============================================================================

@@ -424,8 +424,59 @@ bool CryptoController::activeKey(Key& outKey) const
     return _keyManager.keyForDevice(_activeDeviceID, outKey);
 }
 
+void CryptoController::setResponsibleParty(bool responsible)
+{
+    bool revokeActiveLink = false;
+    {
+        const QMutexLocker locker(&_mutex);
+        _responsibleParty = responsible;
+        // 收回发言权时，已建立的链路必须**当场**降回待命。闸只在 beginLinking 的入口
+        // 检查一次，而 LinkInterface 只看 state()——标志翻转本身不会撤销 Active 链路，
+        // 于是本机会以「当前 Active」继续加密外发（操纵杆 MANUAL_CONTROL 天然走这条路）。
+        // 判据用 != Standby 而非 == Active：Linking 中途被收回同样要打断（它会走向 Active，
+        // 且 _activeDeviceID 已被占用）。
+        revokeActiveLink = !responsible && _state != State::Standby;
+    }
+    // returnToStandby 自己取 _mutex，必须在锁外调用（QMutex 非递归）。
+    if (revokeActiveLink) {
+        returnToStandby();
+    }
+}
+
+bool CryptoController::isResponsibleParty() const
+{
+    const QMutexLocker locker(&_mutex);
+    return _responsibleParty;
+}
+
 void CryptoController::beginLinking(DeviceID targetDeviceID)
 {
+    // 责任方闸（2026-09-27 用户裁定）：**只有站点操作员那一台 QGC 与 PX4 握手**。
+    // 航线监控员在获取权限前没有权限向 PX4 发送任何指令——它向 PX4 发任务/围栏/
+    // 集结点命令是完全错误的。非责任方在此直接返回，状态保持 Standby。
+    //
+    // 位置：**函数最前**，早于非法 deviceID 检查、早于任何状态写入与其它日志。
+    // 这是"本进程压根不该建链"的更高层判据，与参数是否合法无关；放后面还会让非责任方
+    // 每次收到待命心跳都刷一条 invalid deviceID 告警。
+    // 之所以能一处覆盖全部上行：三个建链入口（MAVLinkProtocol 的明文待命心跳 / 加密下行、
+    // MissionController::sendToVehicle → beginLinkingForSystemID）全部汇聚到本函数；而
+    // "不发指令"由 LinkInterface 对非 Active 直接 drop 兜住——任务/围栏/集结点/参数/心跳
+    // 一条都发不出去，无需在各自控制器里再布闸。
+    //
+    // ‼️ 拒绝路径**刻意不打任何日志**，不是遗漏：
+    //   ① 这是航线监控员的**正常业务状态**，不是故障——按 memory 里"未预期日志即失败"
+    //      的测试约定，打日志就要在每个用例里预期它，收益为零。
+    //   ② 频率上更不允许：本函数在非责任方下会被**每一条**明文待命心跳（1 Hz，PX4 在
+    //      建链前一直发）和**每一条**加密遥测下行（另一台建链后，本机有密钥即可解密、
+    //      频率远高于 1 Hz）各调一次。逐次告警会在几秒内淹没有用的日志。
+    //   ③ 该类别（QGC_LOGGING_CATEGORY ⇒ Q_LOGGING_CATEGORY(..., QtWarningMsg)）的
+    //      debug 默认关闭，且 QGCLoggingCategoryManager 装了自定义 category filter，
+    //      setFilterRules 被它覆写——想在测试里观察必须走 --logging= 命令行，不值得。
+    // 需要判断"本机是不是责任方"的调用方直接读 isResponsibleParty()，不要靠日志。
+    if (!isResponsibleParty()) {
+        return;
+    }
+
     // 拒绝非法目标：sentinel 0 与签名位非法值（规范 §1.4）
     if (targetDeviceID == kInvalidDeviceID || !hasValidSignatureBit(targetDeviceID)) {
         qCWarning(CryptoControllerLog) << "beginLinking: invalid target deviceID" << targetDeviceID;
@@ -579,25 +630,35 @@ bool CryptoController::nextOutgoingCounter(uint64_t& outCounter)
         return false;
     }
 
-    uint64_t last = 0;
-    if (_replayGuard.peekUpLastNonce(_activeDeviceID, last)) {
-        // 取严格大于 last 的最小奇数
-        outCounter = (last & 1u) ? (last + 2) : (last + 1);
-    } else if (_replayGuard.peekDownLastNonce(_activeDeviceID, last)) {
-        // QGC 重启恢复（规范 §3.2.4.2）：上行水位随进程丢失，改用下行水位推起点。
-        // Y = 已提交的下行 counter 最大值（两阶段调用保证，见 ReplayGuard.h），
-        // Y+1 即其奇数后继，也就是本档的起点。
-        // 不可取随机起点（§2.5 建链首帧规则）：约 50% 概率落回旧上行区间，且
-        // accept() 随即记下该值，此后每条 +2 仍低于旧水位 ⇒ 上行持续被 mavp2p
-        // 边缘判重丢弃，而 QGC 侧察觉不到（§2.5：按自身节奏发送、不确认）。
+    // 起点基准 = max(上行水位, 下行水位)，取其严格后继的奇数。
+    //
+    // 档①/档②**合并**（2026-09-27 用户裁定）：原实现档①（有上行水位）优先，导致
+    // **接管方卡在自己的旧上行序列上**——一台 QGC 用「PX4 下行 nonce + 1」把 mavp2p
+    // 的边缘防重放水位顶高后，接管的 QGC 仍按**自己的**上行水位 +2，两者步长相同
+    // ⇒ 差距永不缩小 ⇒ 该台上行被持续判重丢弃、很久才恢复（QGC 无 ack、察觉不到，
+    // 规范 §2.5）。合并后两台同源：一律从 PX4 当前下行水位续起。
+    //
+    // 正常情形「下行恒领先上行」（建链时 DOWNLINK_INIT_OFFSET 给出余量，见下），故
+    // 本式结果恒等于「下行 + 1」，与规范 §3.2.4.2 的重启恢复规则同形；下行稀疏、
+    // 上行领先时取上行，避免把已发出的水位拉回去。
+    uint64_t upLast = 0;
+    uint64_t downLast = 0;
+    const bool hasUp = _replayGuard.peekUpLastNonce(_activeDeviceID, upLast);
+    const bool hasDown = _replayGuard.peekDownLastNonce(_activeDeviceID, downLast);
+
+    if (hasUp || hasDown) {
+        const uint64_t last = (hasUp && hasDown) ? (upLast > downLast ? upLast : downLast)
+                                                 : (hasUp ? upLast : downLast);
+
         // 安全性依赖「下行 counter 恒领先上行」：DOWNLINK_INIT_OFFSET（=1001，**PX4
         // 侧常量**，QGC 仓库不持有；见规范 §2.5/附录 A）给出 500 帧余量 ⇒ 只要
-        // N_up − N_down ≤ 500 就有 Y+1 > 重启前的上行水位。
+        // N_up − N_down ≤ 500 就有 Y+1 > 接管前的上行水位。
         // ⚠️ 这是**现状约束**而非未来风险：摇杆 MANUAL_CONTROL 现在就走本加密发送
         // 路径（默认 25 Hz、上限 200 Hz）持续消耗余量；是否真被击穿取决于当时的
         // 下行速率，本侧无法测定。完整论证见实现说明文档 §3.2.4.2。
         // ⚠️ 范围守卫必须在算式**之前**（照抄 PX4 next_tx_counter）：last 越界时
         // last+2 会回绕成小奇数，而下方 2^62 守卫判在回绕之后、根本拦不住。
+        // 实际只有下行可能越界——上行水位由下方「≥ 2^62 拒发」守卫保证恒 < 2^62。
         if (last >= (1ull << 62)) {
             qCWarning(CryptoControllerLog)
                 << "downlink counter out of range, refuse to send:" << last << "device" << _activeDeviceID;
@@ -606,14 +667,13 @@ bool CryptoController::nextOutgoingCounter(uint64_t& outCounter)
         // (last & 1u) 分支是防御：下行序列异常为奇数时不得产出偶数上行 counter。
         outCounter = (last & 1u) ? (last + 2) : (last + 1);
     } else {
-        // 上行与下行水位皆空（本进程尚未提交过任何下行）⇒ 沿用建链首帧的随机起点，
-        // 避免重启后从 1 重来导致 nonce 复用（规范 §2.5）。§3.2.4.2 只禁止用确定性
-        // 或旧 counter，随机起点不违反。
-        // ⚠️ 这是一次性抉择：下方 accept() 随即写入上行水位，此后本进程内必命中第一
-        // 档，不会「待 PX4 恢复下行后按 Y+1 收敛」（resetReplay 无生产调用方）。
+        // 上行与下行水位皆空 ⇒ 沿用建链首帧的随机起点，避免重启后从 1 重来导致
+        // nonce 复用（规范 §2.5）。§3.2.4.2 只禁止用确定性或旧 counter，随机起点不违反。
         // 能走到这里只有两条路，且都安全：① 明文待命心跳触发 beginLinking —— 此时
         // QGC 是建链发起方，§2.5 的随机起点正是正确规则，且该待命心跳已清掉 mavp2p
         // 的水位；② 同一次 receiveBytes 内先提交下行、后建链（微秒级窗口）。
+        // 注意：本档**不是**一次性抉择——生产路径无 resetReplay 调用方，但若进程内
+        // 先走本档、再收到下行，下一帧即按上式改取「下行 + 1」。
         outCounter = randomOddCounter();
     }
 

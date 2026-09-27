@@ -7,6 +7,10 @@ class CryptoTest : public UnitTest
     Q_OBJECT
 
 private slots:
+    // 每个用例前统一把单例标为责任方（见 .cc 里的实现注释）。
+    // 唯一不适用的是 _testBeginLinkingRequiresResponsibleParty，它自己会置回 false。
+    void init();
+
     // DeviceID 重组
     void _testDeviceIDEncodeDecode();
     void _testDeviceIDSignatureBit();
@@ -41,7 +45,11 @@ private slots:
     void _testRandomOddCounter();
     void _testNextOutgoingCounter();         // nextOutgoingCounter 端到端：首帧随机、+2 递增、非 Active 拒绝
     void _testNextOutgoingCounterRestartYPlusOne();  // 规范 §3.2.4.2：重启后取下行 Y 的奇数后继，非随机起点
+    void _testNextOutgoingCounterPrefersHigherDownlink();  // 档①②合并：一律取 max(上行,下行) 的奇数后继
     void _testNextOutgoingCounterRejectsWrappedDownlink();  // 下行越界须拒发（守卫在算式之前）
+
+    // 责任方闸：只有站点操作员（含 SITE_ATC 身份）的 QGC 才允许建链进 Active
+    void _testBeginLinkingRequiresResponsibleParty();
 
     // VTOL 自定义消息（80000-80003）：字段排序 + CRC_EXTRA + 往返（纳入加密链路）
     void _testVtolMessages();

@@ -4,10 +4,10 @@
 ///
 /// 职责：
 /// - 状态机：待命(Standby) → 建链中(Linking) → 正常(Active) → 回待命；
-/// - counter 管理：QGC 发送用**奇数**，起点按三档选取（见 `nextOutgoingCounter()`）——
-///   ① 本设备上行水位在 → 取其最小奇数后继；② 上行缺失但下行水位在（QGC 重启恢复，
-///   规范 §3.2.4.2）→ 取下行最大值 Y 的奇数后继 Y+1；③ 两者皆无 → 加密安全随机 62 位
-///   奇数（规范 §2.5）；
+/// - counter 管理：QGC 发送用**奇数**，起点按两档选取（见 `nextOutgoingCounter()`）——
+///   ① 上行或下行水位有其一 → 取其 **max** 的奇数后继（正常情形下行恒领先，结果即
+///   `Y+1`，与规范 §3.2.4.2 的重启恢复规则同形；两台 QGC 据此同源，2026-09-27 用户
+///   裁定合并原档①/档②）；② 两者皆无 → 加密安全随机 62 位奇数（规范 §2.5）；
 /// - 防重放：按 deviceID + 方向（上行/下行）**分别**维护 lastNonce，`本次 > lastNonce` 才接受；
 /// - 密钥：经 DeviceKeyManager 获取，本控制器持有一个「活跃目标 deviceID + 密钥」。
 ///
@@ -249,8 +249,39 @@ public:
     // 握手流程
     // -----------------------------------------------------------------------
 
+    /// 责任方（站点操作员）标志：**只有责任方的 QGC 允许建链**，其余身份（航线监控员、
+    /// 飞行安全监理）停在 Standby——即 State::Standby 的定义「只读（解密遥测），不建链、
+    /// 不发指令」。三个建链入口全部汇聚到 beginLinking，这一处闸就覆盖了任务/围栏/集结点/
+    /// 参数/心跳的全部上行（LinkInterface 对非 Active 直接 drop），而接收/解密路径不看
+    /// state ⇒ 非责任方仍照常收到遥测，是"只读监视"而不是"断线"。
+    ///
+    /// 判据是「**含** SITE_ATC」，不是「不含 ROUTE_MONITOR」——后端 roles.go 明确允许
+    /// SITE_ATC 与 ROUTE_MONITOR 双身份并存（角色是并集），按后者写会把这类账号误判成
+    /// 非责任方。另：站点归属无需在此判断——能走到 beginLinking 就说明该 deviceID 在本站
+    /// 集合里（登录时后端已校验 site_id ∈ 用户 role_sites）。
+    ///
+    /// 缺省 **false**（fail-closed：没被授予就不能发言）。生产路径有三个写入点：
+    ///   · AuthController 登录成功 ⇒ setResponsibleParty(roles 含 SITE_ATC)。**无条件覆写**，
+    ///     这样即使 ini 里 cryptoKeySource 仍是 0（下面那条写的 true），登录后也以角色为准。
+    ///   · AuthController 登录被拒（清 _roles 的那条分支）⇒ setResponsibleParty(false)，
+    ///     不能留下上一账号的责任方身份。
+    ///   · QGCApplication::init 本地密钥源（cryptoKeySource==0）⇒ setResponsibleParty(true)。
+    ///     那是单机联调直连、**根本不登录**（AuthController::standaloneMode 的定义即
+    ///     !loggedIn && cryptoKeySource==0），此时本 QGC 是唯一操作者，不存在"谁该发言"之争。
+    ///
+    /// ⚠️ 本函数**不只是写标志**：收回（false）时会把已建立的链路当场降回 Standby。理由是闸
+    /// 只在 beginLinking 的入口检查一次，而 LinkInterface 只看 state()——只翻标志不撤链路，
+    /// 闸对"先 Active 后收回"这条路径等于没生效（详见 .cc 内的实现说明）。
+    ///
+    /// @param responsible true=责任方（可建链）
+    void setResponsibleParty(bool responsible);
+
+    /// 当前是否为责任方（线程安全，加锁读取）。
+    bool isResponsibleParty() const;
+
     /// 任务建链：选定目标无人机，取密钥，进入 Linking。
     /// 由上层在「确定航线 + 选定无人机」时调用。
+    /// ⚠️ 非责任方调用时**直接返回、状态保持 Standby**（判据见 setResponsibleParty）。
     void beginLinking(DeviceID targetDeviceID);
 
     /// 按 systemID 触发建链（便捷方法：内部查 deviceID↔systemID 映射）。
@@ -295,11 +326,13 @@ public:
     // -----------------------------------------------------------------------
 
     /// 取下一个本方向（QGC 奇数）发送 counter，并**原子预留**（更新 lastNonce）。
-    /// 起点选取：上行水位在 → 严格大于它的最小奇数（运行期 +2 节拍）；上行水位缺失
-    /// 但下行水位在 → 下行最大值 Y 的奇数后继 Y+1（QGC 重启恢复，规范 §3.2.4.2）；
+    /// 起点选取：**max(上行水位, 下行水位) 的奇数后继**——上下行水位皆在时取较大者，
+    /// 正常情形下行领先（建链时 DOWNLINK_INIT_OFFSET 给余量）故结果恒为「下行 Y 的
+    /// 奇数后继 Y+1」（规范 §3.2.4.2）；下行稀疏、上行领先时取上行，不把水位拉回去。
     /// 两者都无 → 加密安全随机 62 位奇数（规范 §2.5 的建链首帧规则，同时也覆盖
     /// 「本进程尚未提交过任何下行」的情形）。
-    /// 仅 Active 状态可调用。第二档在下行 counter 越界时拒发（守卫在算式之前）。
+    /// 仅 Active 状态可调用。水位越界时拒发（守卫在算式之前；实际只有下行能越界，
+    /// 上行水位由下方「≥ 2^62 拒发」保证恒 < 2^62）。
     /// @return true=成功，outCounter 填充；false=非 Active 状态，或 counter 越界 /
     ///         预留失败（均已记日志；调用方须丢弃该帧，不得复用 counter）
     bool nextOutgoingCounter(uint64_t& outCounter);
@@ -353,6 +386,10 @@ private:
     DeviceID _activeDeviceID = kInvalidDeviceID;
     DeviceKeyManager _keyManager; ///< 密钥管理（内部持有，构造时以 this 为 parent）
     bool _cryptoEnabled = false;
+    /// 责任方标志（站点操作员）。缺省 false = fail-closed：没被授予就不能建链。
+    /// 写入点见 setResponsibleParty 的文档注释；**不受 returnToStandby 影响**——
+    /// 它是"登录会话/运行模式"的属性，不是"本次任务"的属性。
+    bool _responsibleParty = false;
     ReplayGuard _replayGuard;
     QHash<DeviceID, uint8_t> _deviceToSystem; ///< deviceID → systemID 映射（接收端学习）
     QHash<uint8_t, DeviceID> _systemToDevice; ///< systemID → deviceID 反向映射

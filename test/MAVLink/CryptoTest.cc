@@ -242,6 +242,19 @@ ExtRoundTrip roundTripExt(const QByteArray& extFrame, const Key& key, DeviceID d
 
 } // namespace
 
+void CryptoTest::init()
+{
+    UnitTest::init();
+    // CryptoController 是单例（Q_APPLICATION_STATIC，跨用例共享），而测试进程没有登录
+    // 会话 ⇒ 责任方标志的缺省值（false，fail-closed）会让本文件里全部 8 处 beginLinking
+    // 停在 Standby。除专门验证该闸的用例外，一律先标为责任方。
+    // ‼️ 「8」是**数出来的**（`command grep -c "crypto->beginLinking(" test/MAVLink/CryptoTest.cc`，
+    //    2026-09-27 实测）；此前写 6 是过时值——§3.5.1 那条用例自己带 2 处调用，把它顶了上去。
+    //    本文件再增删 beginLinking 调用时请重新数，别信这个数字。
+    // 放这里而不是逐个用例加：新增用例时漏写会红在"state 不是 Active"上，红得晚且理由不直观。
+    MAVLinkCrypto::CryptoController::instance()->setResponsibleParty(true);
+}
+
 void CryptoTest::_testDeviceIDEncodeDecode()
 {
     const DeviceID id = makeDeviceID(0x12, 0x34, 0x56, 0x78);
@@ -785,13 +798,69 @@ void CryptoTest::_testNextOutgoingCounterRestartYPlusOne()
     crypto->resetReplay(deviceID);
 }
 
+void CryptoTest::_testNextOutgoingCounterPrefersHigherDownlink()
+{
+    // 档①/档②合并（用户 2026-09-27 裁定）：两台 QGC 统一走「PX4 下行 nonce + 1」。
+    // 背景：一台把 mavp2p 的上行水位顶高后，接管的 QGC 若仍按**自己的上行水位** +2，
+    // 两者步长相同 ⇒ 差距永不缩小 ⇒ 该台上行被边缘判重持续丢弃、很久才恢复。
+    // 修法：一律取 max(上行水位, 下行水位) 的奇数后继 —— 接管方据此从 PX4 当前
+    // 下行水位续上，与对端同源。
+    CryptoController* const crypto = CryptoController::instance();
+    const DeviceID deviceID = 0x0A0B0C0Fu;  // bit24=0，满足签名位约束（规范 §1.4）
+
+    crypto->returnToStandby();
+    crypto->resetReplay(deviceID);
+
+    crypto->deviceKeyManager()->cacheKey(deviceID, testKey());
+    crypto->beginLinking(deviceID);
+    QCOMPARE(crypto->state(), CryptoController::State::Active);
+
+    // 档②：上行/下行水位皆 unset ⇒ 首帧仍为随机 62 位奇数（既有语义不变）
+    uint64_t base = 0;
+    QVERIFY(crypto->nextOutgoingCounter(base));
+    QVERIFY((base & 1u) != 0u);
+
+    // 格 1：下行**低于**上行 ⇒ 不得把上行水位拉回去。
+    // 随机起点量级 2^61，远高于这个下行值 ⇒ max 取上行。
+    const uint64_t lowDownlink = 100;  // 偶数，符合下行序列
+    QVERIFY(crypto->isIncomingAcceptable(deviceID, lowDownlink));
+    crypto->commitIncoming(deviceID, lowDownlink);
+
+    uint64_t c1 = 0;
+    QVERIFY(crypto->nextOutgoingCounter(c1));
+    QCOMPARE(c1, base + 2);
+
+    // 格 2：下行**高于**上行 ⇒ 跳到 Y+1（本用例的主判据）。
+    // 偏移取奇数 ⇒ base(奇) + 奇数 = 偶数，符合下行序列。
+    // base 由随机起点给出，取值空间 [1, 2^62)；落在距上界 10001 以内的概率约 2e-15，
+    // 与既有 `c1 != 1` 用例（P=2^-61）同一量级的可忽略风险。
+    const uint64_t highDownlink = base + 10001;
+    QVERIFY(crypto->isIncomingAcceptable(deviceID, highDownlink));
+    crypto->commitIncoming(deviceID, highDownlink);
+
+    uint64_t c2 = 0;
+    QVERIFY(crypto->nextOutgoingCounter(c2));
+    QCOMPARE(c2, highDownlink + 1);  // 合并前档①优先，会产出 c1+2 = base+4 ⇒ 本条即失败点
+    QVERIFY(c2 > c1 + 2);
+
+    // 恢复影响只此一帧：此后回到常规 +2 节拍
+    uint64_t c3 = 0;
+    QVERIFY(crypto->nextOutgoingCounter(c3));
+    QCOMPARE(c3, c2 + 2);
+
+    // 清理（单例 + 全局 lastNonce + key cache 均持久，避免污染同进程其他测试）
+    crypto->returnToStandby();
+    crypto->deviceKeyManager()->removeKey(deviceID);
+    crypto->resetReplay(deviceID);
+}
+
 void CryptoTest::_testNextOutgoingCounterRejectsWrappedDownlink()
 {
-    // 防御：下行 counter 越界时第二档必须拒发。取 2^64-1（奇数）——此时算式
+    // 防御：下行 counter 越界时档①必须拒发。取 2^64-1（奇数）——此时算式
     // last+2 会**回绕成 1**，而下方「≥ 2^62」守卫判在回绕之后、根本拦不住，
     // 于是会以 counter=1 发出（nonce 复用，规范 §2.5 禁止）。
-    // 线上不可达（PX4 next_tx_counter 在 2^62 即拒发），此处直接构造该状态；
-    // 顺带覆盖 (last & 1u) 的奇数防御分支（对端违规发奇数下行）。
+    // 线上不可达（PX4 next_tx_counter 在 2^62 即拒发），此处直接构造该状态。
+    // ⚠️ 本用例**覆盖不到** `(last & 1u)` 的奇数防御分支——范围守卫在算式**之前**就 return 了。
     CryptoController* const crypto = CryptoController::instance();
     const DeviceID deviceID = 0x0A0B0C0Eu;
 
@@ -807,13 +876,78 @@ void CryptoTest::_testNextOutgoingCounterRejectsWrappedDownlink()
     QVERIFY(crypto->isIncomingAcceptable(deviceID, wrapped));
     crypto->commitIncoming(deviceID, wrapped);
 
-    // 第二档命中，但守卫须拒发（若守卫缺失，这里会返回 true 且 c == 1）。
+    // 档①命中，但守卫须拒发（若守卫缺失，这里会返回 true 且 c == 1）。
     // 拒发必须留下日志——strict mode 下这条日志是行为的一部分，须显式预期。
     expectLogMessage("MAVLink.Crypto.CryptoController", QtWarningMsg,
                      QRegularExpression("downlink counter out of range"));
     uint64_t c = 0;
     QVERIFY(!crypto->nextOutgoingCounter(c));
     verifyExpectedLogMessage();
+
+    // 清理（单例 + 全局 lastNonce + key cache 均持久，避免污染同进程其他测试）
+    crypto->returnToStandby();
+    crypto->deviceKeyManager()->removeKey(deviceID);
+    crypto->resetReplay(deviceID);
+}
+
+void CryptoTest::_testBeginLinkingRequiresResponsibleParty()
+{
+    // 责任方闸（2026-09-27 用户裁定）：**只有站点操作员那一台 QGC 才与 PX4 握手**。
+    // 「航线监控员在获取权限前没有权限向 PX4 发送任何指令」——它向 PX4 发
+    // 任务/围栏/集结点命令是完全错误的；真正的分岔只该在"能否建链"这一个点上。
+    //
+    // 闸放在 beginLinking **函数内部**而非各个调用点：三个建链入口全部汇聚到这里——
+    //   ① MAVLinkProtocol.cc 明文待命心跳（判据 state()==Standby && hasKey）
+    //   ② MAVLinkProtocol.cc 加密下行（加密心跳也触发，不依赖明文待命心跳）
+    //   ③ MissionController.cc::sendToVehicle → beginLinkingForSystemID → 本函数
+    // 一处即全覆盖；散在调用点就会漏掉将来新增的入口。
+    //
+    // 非责任方停在 Standby。按 State::Standby 的定义（"只读：解密遥测，不建链、
+    // 不发指令"），mission/fence/rally/参数/心跳**一条都发不出去**——LinkInterface
+    // 对非 Active 直接 drop，无需在各自控制器里再布闸。而接收/解密路径不看 state
+    // ⇒ 遥测照常上屏，航线监控员仍是"只读监视"而不是"断线"。
+    CryptoController* const crypto = CryptoController::instance();
+    const DeviceID deviceID = 0x0A0B0C0Fu;   // bit24=0，满足签名位约束（规范 §1.4）
+
+    crypto->returnToStandby();
+    crypto->resetReplay(deviceID);
+    // 密钥**就绪**是本判据有效的前提：若无本闸，beginLinking 会因 hasKey 命中而同步
+    // confirmLinking 进 Active。这一行排除了"没进 Active 其实是因为取不到密钥"这个
+    // 替代解释——否则本用例在闸缺失时也可能绿（假绿）。
+    crypto->deviceKeyManager()->cacheKey(deviceID, testKey());
+
+    // ---- 格 1：非责任方 ⇒ 停在 Standby，且不得占用 activeDeviceID ----
+    // ⚠️ 本格**刻意不预期任何日志**：拒绝路径是静默的（理由见 CryptoController.cc 里
+    //    那一段——该函数会被每条待命心跳/加密遥测各调一次，打日志即刷屏）。若将来有人
+    //    在闸里加了日志，strict mode 会在这里以"未预期日志"的形式立刻红，正是我们要的。
+    crypto->setResponsibleParty(false);
+    crypto->beginLinking(deviceID);
+    QCOMPARE(crypto->state(), CryptoController::State::Standby);
+    QCOMPARE(crypto->activeDeviceID(), kInvalidDeviceID);
+
+    // ---- 格 2：停在 Standby ⇒ 取不到上行 counter ----
+    // 这是"指令一条都发不出去"的最内层证据：即使有人绕过 LinkInterface 直接调
+    // nextOutgoingCounter，也拿不到合法 counter。
+    uint64_t denied = 0;
+    QVERIFY(!crypto->nextOutgoingCounter(denied));
+
+    // ---- 格 3：授权后**同一次调用**即可建链 ----
+    // 判据读的是"调用当时的标志"，不是建链时一次性缓存的结果——否则将来接入
+    // 「获取权限」事件入口时，必须先建链再授权，顺序就反了。
+    crypto->setResponsibleParty(true);
+    crypto->beginLinking(deviceID);
+    QCOMPARE(crypto->state(), CryptoController::State::Active);
+    QCOMPARE(crypto->activeDeviceID(), deviceID);
+
+    // ---- 格 4：收回标志必须**当场撤销已建立的链路** ----
+    // 闸（beginLinking 入口那一条）只在建链那一刻检查一次，而 LinkInterface 只看
+    // state()——所以标志从 true 翻回 false 若不把链路降回 Standby，闸等于没生效：
+    // 本机会以"当前 Active"继续加密外发（操纵杆 MANUAL_CONTROL 天然走这条路径）。
+    QVERIFY(crypto->isResponsibleParty());
+    crypto->setResponsibleParty(false);
+    QVERIFY(!crypto->isResponsibleParty());
+    QCOMPARE(crypto->state(), CryptoController::State::Standby);
+    QCOMPARE(crypto->activeDeviceID(), kInvalidDeviceID);
 
     // 清理（单例 + 全局 lastNonce + key cache 均持久，避免污染同进程其他测试）
     crypto->returnToStandby();

@@ -374,6 +374,11 @@ void AuthController::_onLoginFinished(QNetworkReply* reply)
         _roles.clear();
         _siteId = 0;
         _loggedIn = false;
+        // 责任方标志一并收回。**本分支是普通被拒登录路径**——任何无三类角色的账号尝试登录
+        // 都会走到这里，不只是"已登录再换账号登录"（后者才因无登出路径而不可达）。与上面
+        // 清 _roles 同理：不能留下上一账号的责任方身份。注意 setResponsibleParty(false)
+        // 会**顺带把已建立的加密链路降回 Standby**（见 CryptoController.h 内说明）。
+        MAVLinkCrypto::CryptoController::instance()->setResponsibleParty(false);
         if (wasLoggedIn) {
             emit loggedInChanged();
         }
@@ -390,6 +395,20 @@ void AuthController::_onLoginFinished(QNetworkReply* reply)
     // 会话 token 注入 DeviceKeyManager（衔接加密链路取密钥鉴权）
     MAVLinkCrypto::CryptoController* const crypto = MAVLinkCrypto::CryptoController::instance();
     MAVLinkCrypto::DeviceKeyManager* const keyManager = crypto->deviceKeyManager();
+
+    // 责任方闸（2026-09-27 用户裁定）：**只有站点操作员那一台 QGC 与 PX4 握手**。
+    // 航线监控员在获取权限前没有权限向 PX4 发送任何指令——它的 QGC 停在 Standby，
+    // 只解密遥测，任务/围栏/集结点/参数/心跳一条都发不出去（LinkInterface 对非 Active
+    // 直接 drop；闸的落点是 CryptoController::beginLinking，那是三个建链入口的汇聚点）。
+    //
+    // 判据是「**含** SITE_ATC」而非「不含 ROUTE_MONITOR」：后端 roles.go 明确允许这两种
+    // 身份并存（角色是并集），按后者写会把兼双身份的账号误判成非责任方。
+    //
+    // ‼️ **无条件覆写**，不能写成"只在为 false 时才设"：QGCApplication::init 在本地密钥源
+    //    （cryptoKeySource==0）时已写过 true，而那是"单机联调不登录"场景的判断。若用户在
+    //    那样配置的机器上仍然登录（进运营模式），必须以角色为准把那个 true 收回来，
+    //    否则航线监控员会带着 init 留下的责任方身份建链。
+    crypto->setResponsibleParty(_roles.contains(QStringLiteral("SITE_ATC")));
     keyManager->setAuthToken(_token);
     PlanUploader::instance()->setAuthToken(_token);   // 航线上传后台会话 token
 
