@@ -12,9 +12,10 @@ import "OpsCommon.js" as OpsCommon
 // 与 `RouteListPanel` / `TaskListPanel` 同构：只负责"画列表"，一切判据来自**输入属性**，
 // 本文件不持有网络、不发请求、不认识角色。
 //
-// ‼️ 数据源是 `QGroundControl.multiVehicleManager.vehicles`（**真实** MAVLink 载具），
-//    **不是** `OpsShell.qml` 里那个喂姿态仪的 `_mockVehicle`——后者是 REST `latest`
-//    包装出来的假对象，身上根本没有告警。两个 vehicle 概念必须分清（§6.1）。
+// ‼️ 数据源是 `QGroundControl.multiVehicleManager.vehicles`（**真实** MAVLink 载具）。
+//    原文此处要与 `OpsShell.qml` 那个喂姿态仪的 `_mockVehicle` 划清界限——**那个对象已于
+//    2026-09-27 删除**：姿态仪/罗盘现在也直接吃真实 Vehicle，REST `latest` 包装出来的假
+//    对象在整个 OpsView 里已不存在，"两个 vehicle 概念"的分辨问题随之消失。
 //
 // ‼️ 集合是 `vehicles` 而**不是** ③ 的 `devices[]`：飞机落地转 `PARKED` 后会从
 //    `devices[]` 里**消失**，但 QGC 的 Vehicle 不会因此断开（§3.6.2"绝不移出登记

@@ -394,15 +394,33 @@ Item {
     //    **没有任何重试路径**，地图就此停在错的比例尺上（用户报障「没有自动缩放显示所有航线」）。
     //    ⇒ 数据回来只**置标志**，真正套视野等 `opsMap.width > 0` 时由 `onWidthChanged` 执行。
     property bool  _routeFitPending: false
-    // 喂给原版姿态仪/罗盘组件的 mock vehicle：云平台遥测（/ops/overview.latest）需转成
-    // QGC Fact 形（`{rawValue}`），组件 vehicle 为 null 时会显示 0/"OFF"；null 时才不崩，
-    // 故提供完整 Fact 契约对象，随一次轮询重建触发组件内部绑定重估。
-    property var   _mockVehicle:    null
+    // 选中任务对应的**真实载具**（报文源），直接喂给原版姿态仪/罗盘——`Vehicle` 继承
+    // `VehicleFactGroup`（`Vehicle.h:86`），故 `vehicle.roll` / `.heading` / `.groundSpeed` /
+    // `.gps.courseOverGround` 这些 Fact 在 QML 里天然可用，**不需要**再拿 REST 遥测伪造一个
+    // `{rawValue}` 形的 mock 对象。载具为 null 时两个组件按 QGC 原生行为显示 0 / "OFF"。
+    // ‼️ 与下面两处 marker（站点、L3）**同构**的坑，三条缺一不可：
+    //    · `vehicles` 必须在**绑定表达式里**读一次当实参传进去（`.pragma library` 里函数体读
+    //      属性**不注册绑定依赖**，见 `OpsCommon.js` 头部）；
+    //    · `vs.count` 那一读是**依赖注册**不是短路优化：`vehicles` 在 `MultiVehicleManager.h:22`
+    //      上是 `CONSTANT`，只读它这个绑定**永不重估** ⇒ 载具建链后仪表永远找不到 Vehicle，
+    //      而界面看起来完全正常（显示 0 / "OFF"，与"没数据"无从区分）。
+    readonly property var _selectedVehicle: {
+        var vs = QGroundControl.multiVehicleManager.vehicles
+        if (!vs || vs.count === 0) return null
+        return OpsCommon.matchDeviceToVehicle(_selectedTask(), vs)
+    }
+    // 选中载具的报文侧判定量。**必须是属性**（在 QML 表达式里读 `vehicle.xxx`），不能把读取
+    // 挪进 `OpsCommon.*` 的函数体——`.pragma library` 不注册依赖，状态字/状态色会永远停在
+    // 第一帧而**不报任何错**（同 `TaskListPanel` 的 `_vtolFwd`/`_onGround`）。
+    readonly property bool _selVtolFwd:  OpsCommon.isCruising(_selectedVehicle ? _selectedVehicle.vtolInFwdFlight : undefined)
+    readonly property bool _selOnGround: OpsCommon.isLandedOnGround(_selectedVehicle ? _selectedVehicle.flying : undefined)
 
     // 超时/剩余秒阈值（与后端 OPS_HANDOVER_TIMEOUT 联动；显示用）
     readonly property int _handoverTimeoutSec: 30
-    // 实时遥测判定窗口（6.0-C 失联放行判据）：latest.timestamp 距 _now ≤15s 视为在线
-    readonly property int _liveTelemetryWindowMs: 15000
+    // 「实时遥测」窗口已随 2026-09-27 改报文源而**取消**：原判据是 `latest.timestamp` 距
+    // `_now` ≤15s（数据库落库时间），现在直接问 QGC「这架载具还在不在模型里」——
+    // `VehicleLinkManager` 心跳超时 3.5s 就把它摘掉，比 15s 窗口更及时，也不再有
+    // 「飞机掉线而库里那行还留着 ⇒ 继续报在线」的滞后。见 `OpsCommon.hasLiveTelemetry`。
 
     //-------------------------------------------------------------------------
     // 轮询：2s 数据 + 1s 时钟（驱动剩余秒/超时红闪）
@@ -549,7 +567,6 @@ Item {
                 //    这与 `refreshRoutes` 的既有语义一致：「只在航线集合真的变了时重置视野」。
                 if (_rebuildTaskGeom() && !routeLayersEnabled) _requestRoutesFit()
             }
-            _updateMockVehicle()
             // 本站站点 id 由 AuthController.siteId（登录 role_sites 单值）提供，不再从任务 data[i].site_id 反推。
         })
     }
@@ -1154,7 +1171,12 @@ Item {
             handoverDialog.open()
         }
     }
-    // 地图中心：首个有效任务坐标，否则全局设置位置兜底
+    // 地图中心：首个有效任务坐标，否则全局设置位置兜底。
+    // ⚠️ 这是**唯一**还在读库的一处（`t.latest.lat` 来自 `/ops/overview`），刻意留着：
+    //    它的用途是**开局那一次取景**，不是"显示飞行器当前位置"——后者（marker、轨迹、
+    //    航向、状态栏、仪表）已全部改吃报文。若这里也改报文，载具尚未建链时地图就没有中心，
+    //    而 `t.waypoints[0]` 兜底虽在、语义却不同（航线起点 ≠ 飞机当前位置）。
+    //    **留待用户裁决**：要不要连初始取景也只认报文。
     function _firstTaskCoord() {
         for (var i = 0; i < _tasks.length; i++) {
             var t = _tasks[i]
@@ -1510,7 +1532,8 @@ Item {
                     anchorPoint: Qt.point(12, 12)
                     sourceItem: Rectangle {
                         width: 24; height: 24; radius: 12
-                        color: OpsCommon.statusColor(modelData, opsShell._now, opsShell._handoverById)
+                        color: OpsCommon.statusColor(modelData, opsShell._now, opsShell._handoverById,
+                                                     OpsCommon.isLandedOnGround(_veh ? _veh.flying : undefined))
                         border.color: "#ffffff"; border.width: 2
                         Text {
                             anchors.centerIn: parent
@@ -1632,7 +1655,8 @@ Item {
                     //    **不注册绑定依赖**（见 `OpsCommon.js` 头部）⇒ 写在 `markerColor` 内部读的话
                     //    这个绑定永不重估，**交接超时红就永远不会出现**（而界面看起来完全正常）。
                     readonly property color _markerColor: OpsCommon.markerColor(
-                                                             modelData, _task, opsShell._now, opsShell._handoverById)
+                                                             modelData, _task, opsShell._now, opsShell._handoverById,
+                                                             OpsCommon.isLandedOnGround(_veh ? _veh.flying : undefined))
 
                     // 两处都没有位置 ⇒ **不画**（`device.latest` 为 null 是常态：该机尚无遥测）
                     visible: _pos !== null
@@ -1666,8 +1690,14 @@ Item {
                             // ‼️ 航向旋转放在**这一层**，不放 `Shape` 上：`Shape` 内部那层
                             //    `Scale`（72→24）与 `rotation` 谁先作用取决于 Qt 的变换合并顺序，
                             //    "绕原点还是绕中心"会因此不同。在外层转，只绕 24×24 的中心，没有歧义。
-                            // ⚠️ `heading` 缺失时回 0（正北）——不能让它变成 NaN 传下去。
-                            rotation: Number(modelData.latest ? modelData.latest.heading : 0) || 0
+                            // 航向取**报文**（ATTITUDE.yaw → `Vehicle::heading`），不再读库里的
+                            // `latest.heading`。依赖落在这里读 `_veh.heading.rawValue` 上——
+                            // 挪进函数体就不注册依赖，机头会永远朝第一帧的方向（同 `_veh` 的注释）。
+                            // ⚠️ `heading` 缺失/NaN 时回 0（正北）——不能把 NaN 传给 `rotation`。
+                            rotation: {
+                                var h = _veh ? _veh.heading.rawValue : NaN
+                                return (typeof h === "number" && !isNaN(h)) ? h : 0
+                            }
 
                             Shape {
                                 width: 72; height: 72
@@ -1813,7 +1843,7 @@ Item {
                     anchors.left: parent.left
                     anchors.verticalCenter: parent.verticalCenter
                     size: (instrumentsBlock.width - 12) / 2
-                    vehicle: _mockVehicle
+                    vehicle: _selectedVehicle
                 }
                 QGCCompassWidget {
                     id: compassWidget
@@ -1821,7 +1851,7 @@ Item {
                     anchors.leftMargin: 12
                     anchors.verticalCenter: parent.verticalCenter
                     size: (instrumentsBlock.width - 12) / 2
-                    vehicle: _mockVehicle
+                    vehicle: _selectedVehicle
                 }
             }
 
@@ -1873,19 +1903,31 @@ Item {
         }
     }
 
-    // 仪表取值（云平台遥测 latest；无数据返回 "—"）
+    // 仪表取值（**报文源**：选中任务对应载具的实时 Fact，不再读 `/ops/overview.latest`）。
+    // QML 文件内普通函数体里读属性**照常注册绑定依赖**（只有 `.pragma library` 的 JS 文件
+    // 不注册），故这里直接读 `v.xxx.rawValue` 是对的——Fact 一变文本就刷新，无需轮询触发。
+    // ⚠️ Fact 无数据时 `rawValue` 是 **NaN 而不是 0** ⇒ 必须折成 "—"。直接 `toFixed()` 会
+    //    渲染出 "NaN m"，而界面上那看起来跟有数据无异。
+    function _fmtFact(fact, digits, unit) {
+        if (!fact) return "—"
+        var x = fact.rawValue
+        if (typeof x !== "number" || isNaN(x)) return "—"
+        return x.toFixed(digits) + " " + unit
+    }
     function _instrumentValue(key) {
-        var t = _selectedTask()
-        if (!t || !t.latest) return "—"
-        var l = t.latest
+        if (key === "status")
+            return OpsCommon.displayStatus(_selectedTask(), opsShell._handoverById, _selVtolFwd, _selOnGround)
+        var v = _selectedVehicle
+        if (!v) return "—"
         switch (key) {
-        case "alt": return (l.alt_rel || 0).toFixed(0) + " m"
-        case "speed": return (l.ground_speed || 0).toFixed(1) + " m/s"
-        case "airspeed": return (l.air_speed || 0).toFixed(1) + " m/s"
-        case "climb": return (l.climb_rate || 0).toFixed(1) + " m/s"
-        case "battery": return (l.battery_pct || 0).toFixed(0) + "%"
-        case "heading": return (l.heading || 0).toFixed(0) + "°"
-        case "status": return OpsCommon.displayStatus(t, opsShell._handoverById)
+        case "alt":      return _fmtFact(v.altitudeRelative, 0, "m")     // GPI.relative_alt（EXT relAlt）
+        case "speed":    return _fmtFact(v.groundSpeed, 1, "m/s")         // VFR_HUD.groundspeed（vx/vy 合成）
+        case "airspeed": return _fmtFact(v.airSpeed, 1, "m/s")            // VFR_HUD.airspeed（EXT airspeed）
+        case "climb":    return _fmtFact(v.climbRate, 1, "m/s")           // VFR_HUD.climb（−vz）
+        case "heading":  return _fmtFact(v.heading, 0, "°")               // ATTITUDE.yaw
+        case "battery":
+            if (!v.batteries || v.batteries.count === 0) return "—"
+            return _fmtFact(v.batteries.get(0).percentRemaining, 0, "%")  // BATTERY_STATUS.battery_remaining
         default: return "—"
         }
     }
@@ -1962,26 +2004,4 @@ Item {
         return _tasks.length ? _tasks[0] : null
     }
 
-    // 构造 QGC Fact 形对象（`{ rawValue }`）—— 供原版姿态仪/罗盘组件消费。
-    function _fact(v) { return { rawValue: (v === undefined || v === null) ? 0 : v } }
-    // 按选中任务最新遥测重建 mock vehicle（每次轮询调用；新建对象 → vehicle 属性变化 →
-    // 组件内部 `vehicle.xxx.rawValue` 绑定重估 → 仪表刷新）。headingToHome/headingToNextWP
-    // 云平台无此数据，补 0 兜底以免罗盘 property 立即评估时报 undefined 错误。
-    function _buildMockVehicle(t) {
-        var l = t ? t.latest : null
-        if (!l) return null
-        return {
-            armed: true,
-            roll:      _fact(l.roll),
-            pitch:     _fact(l.pitch),
-            heading:   _fact(l.heading),
-            groundSpeed: _fact(l.ground_speed),
-            headingToHome:  _fact(0),
-            headingToNextWP: _fact(0),
-            gps: { courseOverGround: _fact(l.heading) }
-        }
-    }
-    function _updateMockVehicle() {
-        _mockVehicle = _buildMockVehicle(_selectedTask())
-    }
 }

@@ -198,7 +198,6 @@ OpsShell {
                 cardMargin: romView._taskCardMargin
                 cardRightGap: romView._taskCardRightGap
                 cardGap: romView._taskCardGap
-                liveTelemetryWindowMs: romView._liveTelemetryWindowMs
                 // 点整项由骨架写 _selectedTaskId 并发 taskSelected（机位同步是站点视图的事）
                 onTaskSelected: function(task) { romView.selectTask(task) }
                 onHandoverProposed: function(taskId, phase) { romView._proposeHandover(taskId, phase) }

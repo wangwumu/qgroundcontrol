@@ -696,13 +696,16 @@ OpsShell {
     // 遍历 `multiVehicleManager.vehicles` 而不是反查 `CryptoController` 的 deviceID↔sysid 表：
     // 那张表**只增不删**，载具断开后记录仍在 ⇒ 判据会"粘住"恒真；vehicles 在断开时移除，
     // 遍历它天然自洽。
+    // ‼️ 具体匹配已并入 `OpsCommon.matchDeviceToVehicle`（同一个 deviceID 查法，任务行与
+    //    设备行共用）；这里只补 `vs` 的读取与 `count` 那一读。
+    //    `vs.count` 是**依赖注册**不是短路优化：`vehicles` 是 `CONSTANT` 属性，而
+    //    `.pragma library` 的函数体内读 `count` 不算进本绑定的依赖 ⇒ 不读它，载具上线后
+    //    按钮状态永不重估（同 `OpsShell` 两处 marker 的注释）。
     function _vehicleForTask(task) {
         if (!task || !task.device_id) return null
         var vs = QGroundControl.multiVehicleManager.vehicles
-        for (var i = 0; i < vs.count; i++) {
-            if (vs.get(i).deviceID() === task.device_id) return vs.get(i)
-        }
-        return null
+        if (!vs || vs.count === 0) return null
+        return OpsCommon.matchDeviceToVehicle(task, vs)
     }
     // 该任务的无人机是否已连到 QGC。
     function _uavOnline(task) { return _vehicleForTask(task) !== null }
@@ -928,7 +931,6 @@ OpsShell {
                         cardMargin: opsView._taskCardMargin
                         cardRightGap: opsView._taskCardRightGap
                         cardGap: opsView._taskCardGap
-                        liveTelemetryWindowMs: opsView._liveTelemetryWindowMs
                         canTakeoffFn: opsView._canTakeoff
                         takeoffBlockReasonFn: opsView._takeoffBlockReason
                         // 点整项：选中任务 + 同步点亮对应机位（骨架负责写 _selectedTaskId）

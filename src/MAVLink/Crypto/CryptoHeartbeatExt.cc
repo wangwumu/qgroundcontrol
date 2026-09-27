@@ -3,6 +3,9 @@
 #include "CryptoCodec.h"
 #include "MAVLinkLib.h"
 
+#include <QtMath>
+
+#include <cmath>
 #include <cstring>
 
 namespace MAVLinkCrypto {
@@ -176,6 +179,46 @@ QList<mavlink_message_t> buildHeartbeatExtTelemetry(const uint8_t* plainFrame, c
         batt.time_remaining = 0;
         mavlink_message_t msg{};
         (void) mavlink_msg_battery_status_encode(sysid, compid, &msg, &batt);
+        msgs.append(msg);
+    }
+
+    // VFR_HUD：`groundSpeed` / `airSpeed` / `climbRate` 三个 Fact 的**唯一**来源
+    // （`VehicleFactGroup::_handleVfrHud`）。恒打包——该消息无 NaN/哨兵语义，QGC handler
+    // 也把无效值折成 0，故哨兵分量按 0 计。注意航向不在该 handler 里：`heading` 由上面的
+    // ATTITUDE.yaw 经 `_handleAttitudeWorker` 写入，此处填的 heading 仅供其它消费者使用。
+    {
+        const int16_t kBad16 = HeartbeatExt::kInvalidInt16;
+        const double vx       = (ext.vx != kBad16)       ? ext.vx / 100.0       : 0.0; // cm/s → m/s
+        const double vy       = (ext.vy != kBad16)       ? ext.vy / 100.0       : 0.0;
+        const double vz       = (ext.vz != kBad16)       ? ext.vz / 100.0       : 0.0;
+        const double airspeed = (ext.airspeed != kBad16) ? ext.airspeed / 100.0 : 0.0;
+        double hdgDeg = qRadiansToDegrees(static_cast<double>(ext.yaw));
+        hdgDeg = std::fmod(hdgDeg, 360.0);
+        if (hdgDeg < 0.0) {
+            hdgDeg += 360.0;
+        }
+        mavlink_message_t msg{};
+        (void) mavlink_msg_vfr_hud_pack(
+            sysid, compid, &msg,
+            static_cast<float>(airspeed),                       // airspeed (m/s, TAS)
+            static_cast<float>(std::sqrt(vx * vx + vy * vy)),   // groundspeed (m/s)：由 NED 水平分量合成
+            static_cast<int16_t>(qRound(hdgDeg)),               // heading (deg)
+            0,                                                  // throttle (%)：EXT 无油门量
+            ext.hasAltitude() ? static_cast<float>(ext.alt / 1000.0) : 0.0f, // alt (m, MSL)
+            static_cast<float>(-vz));                           // climb (m/s)：NED 的 vz 向下为正，取负
+        msgs.append(msg);
+    }
+
+    // EXTENDED_SYS_STATE：`Vehicle::_handleExtendedSysState` 据此同时驱动
+    // `flying`/`landing`（landed_state）与 `vtolInFwdFlight`（vtol_state == MAV_VTOL_STATE_FW）。
+    // ‼️ 仅 hasExtendedFields（55B）时打包：37B 兼容帧的 landed/vtolState 是「未提供」的 0，
+    //    映射成 IN_AIR 等于对飞行事实撒谎。37B 时**不注入**，QGC 保持上一次已知状态。
+    if (ext.hasExtendedFields) {
+        mavlink_message_t msg{};
+        (void) mavlink_msg_extended_sys_state_pack(
+            sysid, compid, &msg,
+            ext.vtolState,   // 与 MAV_VTOL_STATE_* 1:1（PX4 VtolVehicleStatus.msg 首行保证）
+            (ext.landed & 0x01) ? MAV_LANDED_STATE_ON_GROUND : MAV_LANDED_STATE_IN_AIR);
         msgs.append(msg);
     }
     return msgs;

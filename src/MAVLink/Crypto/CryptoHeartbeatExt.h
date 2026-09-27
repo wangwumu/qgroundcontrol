@@ -98,10 +98,13 @@ bool parseHeartbeatExt(const uint8_t* extBytes, int extLen, HeartbeatExt* out);
 bool parseHeartbeatExtFromFrame(uint32_t msgid, const uint8_t* frame, int frameLen, HeartbeatExt* out);
 
 /// 把加密心跳 EXT 打包成标准遥测消息（GLOBAL_POSITION_INT / ATTITUDE / GPS_RAW_INT /
-/// BATTERY_STATUS），供 QGC Vehicle 消费（替代 PX4 精简后的独立遥测流）。
+/// BATTERY_STATUS / VFR_HUD / EXTENDED_SYS_STATE），供 QGC Vehicle 消费（替代 PX4 精简后的独立遥测流）。
 /// sysid/compid 取自解密标准帧头 plainFrame[5]/[6]（decryptFrame 已从 deviceID 还原）。
 /// 哨兵字段不注入假值：位置/GPS 要求 lat/lon/alt 全有效才打包对应消息；
 /// 电压未知（0）→ BATTERY_STATUS 用 UINT16_MAX（显示 NaN）；无电池数据 → 不打包。
+/// ATTITUDE / VFR_HUD 恒打包（哨兵分量按 0 计，两者都不依赖位置）；
+/// EXTENDED_SYS_STATE 仅 55B 扩展帧打包——37B 兼容帧的 landed/vtolState 是「未提供」而非
+/// 「在地面/非 VTOL」，注入会把 QGC 的 `flying`/`landing`/`vtolInFwdFlight` 钉死在错误值上。
 /// 返回空列表 = 无有效遥测可注入。
 QList<mavlink_message_t> buildHeartbeatExtTelemetry(const uint8_t* plainFrame, const HeartbeatExt& ext);
 

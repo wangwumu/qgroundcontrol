@@ -1433,7 +1433,8 @@ void CryptoTest::_testHeartbeatExtInjection()
     const DeviceID deviceID = 66051u; // 0x00010203 → sys=0x02, comp=0x03
     const uint64_t counter = 1000;
 
-    // --- 有效 EXT(55B) → 4 条遥测：GLOBAL_POSITION_INT / ATTITUDE / GPS_RAW_INT / BATTERY_STATUS ---
+    // --- 有效 EXT(55B) → 6 条遥测：GLOBAL_POSITION_INT / ATTITUDE / GPS_RAW_INT / BATTERY_STATUS
+    //     / VFR_HUD / EXTENDED_SYS_STATE ---
     const ExtRoundTrip good = roundTripExt(
         makeExtFrame(312345678, 1214567890, 50000, 100, 200, -50, 3, 12, 11100, 85, 6, 1,
                      12345, 4321, 5678, 1, 4, 3, -5, 20, 0x03),
@@ -1441,11 +1442,13 @@ void CryptoTest::_testHeartbeatExtInjection()
     QVERIFY(!good.decFrame.isEmpty());
     const QList<mavlink_message_t> goodMsgs = buildHeartbeatExtTelemetry(
         reinterpret_cast<const uint8_t*>(good.decFrame.constData()), good.ext);
-    QCOMPARE(goodMsgs.size(), 4);
+    QCOMPARE(goodMsgs.size(), 6);
     QCOMPARE(goodMsgs[0].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_GLOBAL_POSITION_INT));
     QCOMPARE(goodMsgs[1].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_ATTITUDE));
     QCOMPARE(goodMsgs[2].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_GPS_RAW_INT));
     QCOMPARE(goodMsgs[3].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_BATTERY_STATUS));
+    QCOMPARE(goodMsgs[4].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_VFR_HUD));
+    QCOMPARE(goodMsgs[5].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_EXTENDED_SYS_STATE));
     // sysid/compid 从解密帧头还原（deviceID 拆分）
     QCOMPARE(goodMsgs[0].sysid, static_cast<uint8_t>(0x02));
     QCOMPARE(goodMsgs[0].compid, static_cast<uint8_t>(0x03));
@@ -1474,7 +1477,26 @@ void CryptoTest::_testHeartbeatExtInjection()
     QCOMPARE(batt.current_battery, static_cast<int16_t>(-50)); // 60824.0 current 0.1A×10 → cA
     QCOMPARE(batt.temperature, static_cast<int16_t>(200));     // cdegC（EXT 0.1°C×10：20×0.1°C=2.0°C → 200 cdegC）
 
-    // --- 位置全哨兵 → 仅 ATTITUDE（GLOBAL/GPS 跳过；无电池数据跳过） ---
+    // VFR_HUD：vx/vy → 地速（合成），vz → 爬升（NED 下 vz 向下为正，故取负），airspeed → 空速。
+    // 这是 QGC 侧 `groundSpeed`/`airSpeed`/`climbRate` 三个 Fact 的**唯一来源**
+    // （`VehicleFactGroup::_handleVfrHud`），不注入则界面恒无值。
+    mavlink_vfr_hud_t vfr;
+    mavlink_msg_vfr_hud_decode(&goodMsgs[4], &vfr);
+    QVERIFY(qAbs(vfr.airspeed - 56.78f) < 0.001f);                       // 5678 cm/s → m/s
+    QVERIFY(qAbs(vfr.groundspeed - std::sqrt(100.0 * 100.0 + 200.0 * 200.0) / 100.0) < 0.001f); // cm/s → m/s
+    QVERIFY(qAbs(vfr.climb - 0.5f) < 0.001f);                            // -(-50 cm/s) → +0.5 m/s
+    QVERIFY(qAbs(vfr.alt - 50.0f) < 0.001f);                             // 50000 mm → 50 m（MSL）
+    QCOMPARE(vfr.heading, static_cast<int16_t>(17));                     // yaw 0.3 rad → 17.19° → 17
+
+    // EXTENDED_SYS_STATE：一条消息同时驱动 `Vehicle::flying`/`landing`（landed_state）与
+    // `vtolInFwdFlight`（vtol_state==MAV_VTOL_STATE_FW），是 VTOL 转换完成的报文判据。
+    mavlink_extended_sys_state_t ess;
+    mavlink_msg_extended_sys_state_decode(&goodMsgs[5], &ess);
+    QCOMPARE(ess.vtol_state, static_cast<uint8_t>(4));   // 与 MAV_VTOL_STATE_FW 1:1（PX4 保证）
+    QCOMPARE(ess.landed_state, static_cast<uint8_t>(MAV_LANDED_STATE_ON_GROUND)); // landed 位掩码 bit0=1
+
+    // --- 位置全哨兵 → GLOBAL/GPS 跳过、无电池数据跳过；但 ATTITUDE 恒发，
+    //     VFR_HUD 与 EXTENDED_SYS_STATE 也恒发（两者都不依赖位置） ---
     const ExtRoundTrip sentinelRt = roundTripExt(
         makeExtFrame(HeartbeatExt::kInvalidInt32, HeartbeatExt::kInvalidInt32, HeartbeatExt::kInvalidInt32,
                      HeartbeatExt::kInvalidInt16, HeartbeatExt::kInvalidInt16, HeartbeatExt::kInvalidInt16,
@@ -1483,8 +1505,10 @@ void CryptoTest::_testHeartbeatExtInjection()
     QVERIFY(!sentinelRt.decFrame.isEmpty());
     const QList<mavlink_message_t> sentinelMsgs = buildHeartbeatExtTelemetry(
         reinterpret_cast<const uint8_t*>(sentinelRt.decFrame.constData()), sentinelRt.ext);
-    QCOMPARE(sentinelMsgs.size(), 1);
+    QCOMPARE(sentinelMsgs.size(), 3);
     QCOMPARE(sentinelMsgs[0].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_ATTITUDE));
+    QCOMPARE(sentinelMsgs[1].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_VFR_HUD));
+    QCOMPARE(sentinelMsgs[2].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_EXTENDED_SYS_STATE));
 
     // --- lat/lon 有效但 alt 哨兵 → GLOBAL/GPS 跳过（避免 0m 假高度），仅 ATTITUDE + BATTERY ---
     const ExtRoundTrip noAltRt = roundTripExt(
@@ -1493,9 +1517,11 @@ void CryptoTest::_testHeartbeatExtInjection()
     QVERIFY(!noAltRt.decFrame.isEmpty());
     const QList<mavlink_message_t> noAltMsgs = buildHeartbeatExtTelemetry(
         reinterpret_cast<const uint8_t*>(noAltRt.decFrame.constData()), noAltRt.ext);
-    QCOMPARE(noAltMsgs.size(), 2);
+    QCOMPARE(noAltMsgs.size(), 4);
     QCOMPARE(noAltMsgs[0].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_ATTITUDE));
     QCOMPARE(noAltMsgs[1].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_BATTERY_STATUS));
+    QCOMPARE(noAltMsgs[2].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_VFR_HUD));
+    QCOMPARE(noAltMsgs[3].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_EXTENDED_SYS_STATE));
 
     // --- 电池第三分支：voltage=0（未知）但 remaining=50 → 打包 BATTERY，voltages[0]=UINT16_MAX（NaN） ---
     // 位置设哨兵以聚焦电池映射（仅 ATTITUDE + BATTERY 两条）。
@@ -1507,9 +1533,11 @@ void CryptoTest::_testHeartbeatExtInjection()
     QVERIFY(!battOnlyRt.decFrame.isEmpty());
     const QList<mavlink_message_t> battOnlyMsgs = buildHeartbeatExtTelemetry(
         reinterpret_cast<const uint8_t*>(battOnlyRt.decFrame.constData()), battOnlyRt.ext);
-    QCOMPARE(battOnlyMsgs.size(), 2);
+    QCOMPARE(battOnlyMsgs.size(), 4);
     QCOMPARE(battOnlyMsgs[0].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_ATTITUDE));
     QCOMPARE(battOnlyMsgs[1].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_BATTERY_STATUS));
+    QCOMPARE(battOnlyMsgs[2].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_VFR_HUD));
+    QCOMPARE(battOnlyMsgs[3].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_EXTENDED_SYS_STATE));
     mavlink_battery_status_t battOnly;
     mavlink_msg_battery_status_decode(&battOnlyMsgs[1], &battOnly);
     QCOMPARE(battOnly.voltages[0], static_cast<uint16_t>(UINT16_MAX)); // 未知电压 → NaN
@@ -1530,8 +1558,10 @@ void CryptoTest::_testHeartbeatExtInjection()
     QVERIFY(currTempRt.ext.hasTemperature());
     const QList<mavlink_message_t> currTempMsgs = buildHeartbeatExtTelemetry(
         reinterpret_cast<const uint8_t*>(currTempRt.decFrame.constData()), currTempRt.ext);
-    QCOMPARE(currTempMsgs.size(), 2);  // ATTITUDE + BATTERY（门控含 current/temp，BATTERY 不丢）
+    QCOMPARE(currTempMsgs.size(), 4);  // ATTITUDE + BATTERY（门控含 current/temp，BATTERY 不丢）+ VFR_HUD + EXT_SYS_STATE
     QCOMPARE(currTempMsgs[1].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_BATTERY_STATUS));
+    QCOMPARE(currTempMsgs[2].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_VFR_HUD));
+    QCOMPARE(currTempMsgs[3].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_EXTENDED_SYS_STATE));
     mavlink_battery_status_t ctBatt;
     mavlink_msg_battery_status_decode(&currTempMsgs[1], &ctBatt);
     QCOMPARE(ctBatt.voltages[0], static_cast<uint16_t>(UINT16_MAX)); // 电压未知 → NaN

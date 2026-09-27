@@ -40,7 +40,10 @@ ColumnLayout {
     property real   cardMargin: 10              // 卡片左空位；站点视图传机位左空隙，与之对齐
     property real   cardRightGap: 20
     property real   cardGap: OpsCommon.taskCardGap
-    property real   liveTelemetryWindowMs: 15000
+    // 报文源：QGC 的载具模型——逐帧、纯内存，**不是**数据库。`QmlObjectListModel`：
+    // `.count` + `.get(i)`（`vehicles[i]` / `.length` 都是 undefined）。载具在心跳超时
+    // 3.5s 后被 `VehicleLinkManager` 摘掉，故"查得到"⟺"在线"（详见 `OpsCommon.hasLiveTelemetry`）。
+    readonly property var vehicles: QGroundControl.multiVehicleManager.vehicles
     property string headerText: ""              // 空串则标题行整行不占位（站点视图）
 
     // 注入的求值函数：依赖 multiVehicleManager / 机位，无法纯函数化。
@@ -114,6 +117,22 @@ ColumnLayout {
             // `_handoverFor(modelData)`，此处抽成一条绑定——纯函数、依赖不变，行为等价。
             readonly property var  _handover: OpsCommon.handoverFor(modelData, panel.handoverById)
             readonly property bool _timedOut: OpsCommon.isTimeout(_handover, panel.nowMs)
+            // ── 报文侧实时量（2026-09-27 起，源＝加密心跳 EXT 重建的合成遥测）──
+            // 本任务对应的**真实 Vehicle**（按 deviceID 在载具模型里认领；不在线即 null）。
+            // ‼️ 下面三个属性存在的唯一理由：`OpsCommon.*` 是 `.pragma library` 的**纯函数**，
+            //    函数体内读属性**不注册绑定依赖** ⇒ 必须在这里（QML 表达式）把值读出来再当
+            //    实参传进去。若图省事写成 `OpsCommon.isCruising(_uav)` 让函数体自己去读
+            //    `vtolInFwdFlight`，按钮会永远停在第一帧且**不报任何错**。
+            // ‼️ `vs.count` 那一读是**依赖注册**、不是短路优化：`vehicles` 是 `CONSTANT` 属性，
+            //    而 `.pragma library` 的函数体内读 `count` **不算进本绑定的依赖** ⇒ 不写这一读，
+            //    载具上线/掉线都不会让本卡重估，按钮永远停在第一帧（同 `OpsShell.qml` 两处 marker）。
+            readonly property var  _uav: {
+                var vs = panel.vehicles
+                if (!vs || vs.count === 0) return null
+                return OpsCommon.matchDeviceToVehicle(modelData, vs)
+            }
+            readonly property bool _vtolFwd:  OpsCommon.isCruising(_uav ? _uav.vtolInFwdFlight : undefined)
+            readonly property bool _onGround: OpsCommon.isLandedOnGround(_uav ? _uav.flying : undefined)
             // 中段飞行卡片：本站责任尚未交出去的**在飞**航班。判据复用 `isOutbound`（出站/进站的
             // 同一份），再叠 `IN_FLIGHT`——起飞前那些状态用的是另一组按钮（起飞 / 申请切出）。
             // ‼️ 写成独立属性而不是在三处按钮里各写一遍：按钮组与提示条必须**同源**，
@@ -230,12 +249,12 @@ ColumnLayout {
                     Rectangle {
                         width: 8; height: 8; radius: 4
                         anchors.verticalCenter: parent.verticalCenter
-                        color: OpsCommon.statusColor(modelData, panel.nowMs, panel.handoverById)
+                        color: OpsCommon.statusColor(modelData, panel.nowMs, panel.handoverById, card._onGround)
                     }
                     Text {
-                        color: OpsCommon.statusColor(modelData, panel.nowMs, panel.handoverById)
+                        color: OpsCommon.statusColor(modelData, panel.nowMs, panel.handoverById, card._onGround)
                         font.pixelSize: 12; font.bold: true
-                        text: OpsCommon.displayStatus(modelData, panel.handoverById)
+                        text: OpsCommon.displayStatus(modelData, panel.handoverById, card._vtolFwd, card._onGround)
                     }
                     Text {
                         color: "#8fa1bd"; font.pixelSize: 11
@@ -387,8 +406,7 @@ ColumnLayout {
                         // 无遥测置灰（6.0-C 失联不签发；DB 在 Propose ROUTE 时落 IN_FLIGHT=责任里程碑）。
                         visible: panel.showSiteActions && modelData.status === "TAKEOFF"
                                  && !OpsCommon.pendingPhase(modelData, "ROUTE", panel.handoverById)
-                        enabled: OpsCommon.isCruising(modelData)
-                                 && OpsCommon.hasLiveTelemetry(modelData, panel.nowMs, panel.liveTelemetryWindowMs)
+                        enabled: card._vtolFwd && OpsCommon.hasLiveTelemetry(card._uav)
                         height: 24; padding: 0
                         text: qsTr("申请切出")
                         onClicked: panel.handoverProposed(modelData.task_id, "ROUTE")
@@ -450,14 +468,15 @@ ColumnLayout {
                         onClicked: panel.assignSlotRequested(modelData)
                     }
                     Button {
-                        // 6.0-B 停泊门控：已落地(landed bit0) 可停泊；有实时遥测未落地→置灰"停泊（待落地）"；
-                        // 失联/无遥测→放行"停泊（无遥测）"；均不隐藏，供人工收尾
+                        // 6.0-B 停泊门控：已落地可停泊；载具在线但未落地→置灰"停泊（待落地）"；
+                        // 失联/无载具→放行"停泊（无遥测）"；均不隐藏，供人工收尾。
+                        // "已落地"＝`Vehicle::flying === false`，由加密心跳 EXT 的
+                        // `landed_state == ON_GROUND` 驱动（原判据读库里的 `latest.landed` bit0）。
                         visible: panel.showSiteActions && modelData.status === "LANDING"
-                        enabled: OpsCommon.isLandedOnGround(modelData)
-                                 || !OpsCommon.hasLiveTelemetry(modelData, panel.nowMs, panel.liveTelemetryWindowMs)
+                        enabled: card._onGround || !OpsCommon.hasLiveTelemetry(card._uav)
                         height: 24; padding: 0
-                        text: OpsCommon.isLandedOnGround(modelData) ? qsTr("停泊")
-                              : (OpsCommon.hasLiveTelemetry(modelData, panel.nowMs, panel.liveTelemetryWindowMs)
+                        text: card._onGround ? qsTr("停泊")
+                              : (OpsCommon.hasLiveTelemetry(card._uav)
                                  ? qsTr("停泊（待落地）") : qsTr("停泊（无遥测）"))
                         onClicked: panel.parkRequested(modelData)
                     }

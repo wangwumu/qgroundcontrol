@@ -63,12 +63,15 @@ function statusLabel(s) {
 function phaseToLabel(p) { return p === "ROUTE" ? "航线监控" : p === "LANDING" ? "降落指挥" : p }
 
 // 状态文字 = task.status + 本地报文判定叠加（仅显示不落库，2026-09-02 触发语义）：
-// task TAKEOFF 且 vtol_state=FW(4) → "飞行中"；task LANDING 且 landed bit0(ON_GROUND) → "已落地"。
-function displayStatus(task, handoverById) {
+// task TAKEOFF 且 VTOL 已转前飞 → "飞行中"；task LANDING 且已在地面 → "已落地"。
+// ‼️ 后两个实参由**调用点**从 `Vehicle` 上读好再传进来（`vtolInFwdFlight` / `flying`），
+//    **不要**改成在函数体里读 `vehicle.xxx`：`.pragma library` 的函数体内读属性**不注册
+//    绑定依赖**（同 `resolvePosition` 第三实参的注释），状态字会永远停在第一帧而界面不报错。
+// 数据源：加密心跳 EXT 重建的 EXTENDED_SYS_STATE（`Vehicle::_handleExtendedSysState`）。
+function displayStatus(task, handoverById, vtolInFwdFlight, landedOnGround) {
     if (!task) return "—"
-    var l = task.latest
-    if (task.status === "TAKEOFF" && l && Number(l.vtol_state) === 4) return qsTr("飞行中")
-    if (task.status === "LANDING" && l && (Number(l.landed) & 1) !== 0) return qsTr("已落地")
+    if (task.status === "TAKEOFF" && vtolInFwdFlight === true) return qsTr("飞行中")
+    if (task.status === "LANDING" && landedOnGround === true) return qsTr("已落地")
     // IN_FLIGHT 阶段文案，与按钮重键一致（§6.0-E/F）：待监控员接管 / 待接收降落 / 已签入待发降落指令
     if (task.status === "IN_FLIGHT") {
         if (pendingPhase(task, "ROUTE", handoverById)) return qsTr("待接管")
@@ -79,12 +82,12 @@ function displayStatus(task, handoverById) {
 }
 
 // 状态色：交接超时优先（红），其次按 task.status + 本地落地判定
-function statusColor(task, nowMs, handoverById) {
+// `landedOnGround` 同 `displayStatus`：调用点读好传入，不在函数体里读 `vehicle`。
+function statusColor(task, nowMs, handoverById, landedOnGround) {
     var s = task ? task.status : ""
     if (isTimeout(handoverFor(task, handoverById), nowMs)) return "#ff3b3b"
-    var l = task ? task.latest : null
-    // 已落地（本地报文 landed bit0，显示态）→ 绿；飞行中叠加态沿用黄色
-    if (s === "LANDING" && l && (Number(l.landed) & 1) !== 0) return "#2ecc71"
+    // 已落地（本地报文，显示态）→ 绿；飞行中叠加态沿用黄色
+    if (s === "LANDING" && landedOnGround === true) return "#2ecc71"
     switch (s) {
     case "TAKEOFF": case "IN_FLIGHT": case "LANDING": return "#ffc107"
     case "COMPLETED": return "#2ecc71"
@@ -280,27 +283,37 @@ function isTimeout(handover, nowMs) {
 
 //--------------------------------------------------------------------------
 // 本地报文判定（仅显示/门控，不落库；2026-09-02 触发语义）
-// vtol_state=FW(4)=巡航；landed 取 bit0（起降位掩码 bit0=ON_GROUND）；遥测新鲜=latest.timestamp 在窗口内。
+// 2026-09-27 起**全部改吃加密心跳 EXT 重建的合成遥测**（`CryptoHeartbeatExt.cc`），
+// 不再读 `/ops/overview` 的 `latest`（那是数据库里的落库快照，滞后且与链路死活无关）。
+// ‼️ 本组函数一律**只做纯计算**：所有需要建立绑定依赖的属性读取都在**调用点的 QML 表达式**
+//    里完成，再作为实参传进来。`.pragma library` 的函数体内读属性不注册依赖（同
+//    `resolvePosition` 第三实参的注释）——写进去界面**看不出异常**，只是按钮永远停在
+//    第一帧的状态，而这类缺陷编译、lint、离屏快照全都发现不了。
 //--------------------------------------------------------------------------
 
-function isCruising(task) {
-    var l = task ? task.latest : null
-    return !!(l && Number(l.vtol_state) === 4)
+// 巡航：EXTENDED_SYS_STATE.vtol_state == MAV_VTOL_STATE_FW ⇒ `Vehicle::vtolInFwdFlight`。
+// ⚠️ `Vehicle::_handleExtendedSysState` 里这段被 `if (vtol())` 包着 ⇒ **机型不是 VTOL 时
+//    该属性恒 false**，巡航判定随之恒 false。这是 QGC 的既定行为，不是本函数能补救的。
+function isCruising(vtolInFwdFlight) {
+    return vtolInFwdFlight === true
 }
 
-function isLandedOnGround(task) {
-    var l = task ? task.latest : null
-    return !!(l && (Number(l.landed) & 1) !== 0)
+// 已落地：EXTENDED_SYS_STATE.landed_state == ON_GROUND ⇒ `Vehicle::flying === false`。
+// ⚠️ `flying` 初值就是 false ⇒ **从未收到过 ESS 时报"在地面"**。起飞前这个结论恰好正确；
+//    但 37B 兼容帧不注入 ESS（见 `CryptoHeartbeatExt.cc` 的门控），若整条链路都是 37B，
+//    飞机起飞后本判定**仍**报"在地面"。
+function isLandedOnGround(flying) {
+    return flying === false
 }
 
-// `windowMs` 原为视图上的 `_liveTelemetryWindowMs`（15000）
-function hasLiveTelemetry(task, nowMs, windowMs) {
-    var l = task ? task.latest : null
-    if (!l || !l.timestamp) return false
-    var ts = Date.parse(l.timestamp)
-    if (isNaN(ts)) return false
-    var age = nowMs - ts
-    return age <= windowMs && age >= -5000   // 容忍服务器时钟超前 ≤5s
+// 在线：该机还挂在 `multiVehicleManager.vehicles` 里（`vehicle` 由调用点查好传入）。
+// 判据不是"最近有过帧"而是**载具对象是否还在模型里**：`VehicleLinkManager` 每
+// `_heartbeatMaxElpasedMSecs`(3.5s) 检查一次，超时即移除最后一条链路 → 触发 `allLinksRemoved`
+// → `MultiVehicleManager::_deleteVehiclePhase2` 把载具摘掉。故「查得到」⟺「心跳在 3.5s 窗口内」。
+// 这比原先那套 `latest.timestamp` 的 15s 窗口**更及时**，且判的是**链路死活**本身——
+// 原判据读的是数据库落库时间，飞机掉线后库里那行还留着，会继续报"在线"直到窗口耗尽。
+function hasLiveTelemetry(vehicle) {
+    return !!vehicle
 }
 
 
@@ -564,10 +577,12 @@ function taskById(tasks, taskId) {
 // ⚠️ `task` 为 null（关联失败 / `task_id` 为 0）时兜底回 `deviceColor(device)`，
 //    **不要**写成 `statusColor(null, …)`：那个回中性蓝 `#3b9cff`，会让"关联失败"在界面上
 //    看起来与"一切正常"一模一样。
-function markerColor(device, task, nowMs, handoverById) {
+// `landedOnGround` 同样由调用点在实参位置读好（`.pragma library` 不注册依赖），
+// 与 `statusColor` 的第 4 参是同一条链——漏传的后果是"已落地"的航班在地图上不变绿。
+function markerColor(device, task, nowMs, handoverById, landedOnGround) {
     var c = abnormalColor(abnormalKind(device))
     if (c !== "") return c
-    if (task) return statusColor(task, nowMs, handoverById)
+    if (task) return statusColor(task, nowMs, handoverById, landedOnGround)
     return deviceColor(device)
 }
 
@@ -602,7 +617,9 @@ function resolvePosition(device, vehicle, vehicleCoord) {
     return null
 }
 
-// 按 `deviceID` 找真实 Vehicle（复用 `OpsView.qml` 的 `_vehicleForTask()` 手法）。
+// 按 `deviceID` 找真实 Vehicle。**第一个实参是"任何带 `device_id` 的行"**：站点/监控员的
+// 设备行（`device`）与任务行（`task`）用的是同一个字段、同一个查法，故两处共用本函数
+// （`OpsView.qml` 原来的 `_vehicleForTask()` 是它的逐字复制，已并入）。
 // ⚠️ 是 **deviceID**（MAVLink 帧头那个 32 位数），**不是 `uav_no`、不是 `uav_id`**
 //    ——库里的 `table_uav.device_id` 就是这个值。用错字段的后果是永远匹配不上，
 //    而匹配不上时的回退正好是 REST `latest` ⇒ 界面看起来完全正常，只是永远不实时。
@@ -1010,8 +1027,9 @@ function deviceIndexByDeviceID(devices) {
 // `[{ time, ts, who, taskNo, severity, text }, ...]`。
 //
 // ‼️ 数据源是 `QGroundControl.multiVehicleManager.vehicles`，**不是** `_activeVehicle`
-//    （`VehicleMessageList.qml` 那种单机写法，监控员要跨机看），**更不是** `OpsShell.qml`
-//    里那个喂仪表的 `_mockVehicle`——那个是 REST `latest` 包装出来的假对象，没有告警。
+//    （`VehicleMessageList.qml` 那种单机写法，监控员要跨机看）。原文此处另与 `OpsShell.qml`
+//    那个喂仪表的 `_mockVehicle` 划界——**那个对象已于 2026-09-27 删除**，仪表现在也直接吃
+//    真实 Vehicle，REST `latest` 包装的假对象在 OpsView 里已不存在。
 //
 // ‼️ `vehicles` 是 `QmlObjectListModel`：`.count` + `.get(i)`，**不是 JS 数组**
 //    （写 `vehicles.length` 得到 `undefined` ⇒ 循环零次 ⇒ 静默返回空列表，界面表现为
