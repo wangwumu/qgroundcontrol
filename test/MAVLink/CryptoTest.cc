@@ -248,8 +248,10 @@ void CryptoTest::init()
     // CryptoController 是单例（Q_APPLICATION_STATIC，跨用例共享），而测试进程没有登录
     // 会话 ⇒ 责任方标志的缺省值（false，fail-closed）会让本文件里全部 8 处 beginLinking
     // 停在 Standby。除专门验证该闸的用例外，一律先标为责任方。
-    // ‼️ 「8」是**数出来的**（`command grep -c "crypto->beginLinking(" test/MAVLink/CryptoTest.cc`，
+    // ‼️ 「8」是**数出来的**（`command grep -cE "^[[:space:]]*crypto->beginLinking\(" test/MAVLink/CryptoTest.cc`，
     //    2026-09-27 实测）；此前写 6 是过时值——§3.5.1 那条用例自己带 2 处调用，把它顶了上去。
+    //    ⚠️ **必须带行首锚**：不加锚的 `grep -c` 会把本段注释里提到的函数名一起数进来
+    //    （实测过程中出现过「数得 9、真值 8」）——判据命令的作用范围含同名文本时，先标定再采信。
     //    本文件再增删 beginLinking 调用时请重新数，别信这个数字。
     // 放这里而不是逐个用例加：新增用例时漏写会红在"state 不是 Active"上，红得晚且理由不直观。
     MAVLinkCrypto::CryptoController::instance()->setResponsibleParty(true);
