@@ -66,6 +66,12 @@ public:
 
     bool    loggedIn() const { return _loggedIn; }
 
+    /// 单测专用：直接置登录态。
+    /// 真实登录要走网络（login() 发 HTTP 到 gcs_server），单测无法驱动 ⇒ 供"只判 standaloneMode()"的用例使用。
+    /// 只改 _loggedIn 并广播（连带 _updateStandaloneMode 重算），不碰 token/roles/siteId。
+    /// ⚠️ 用例的 cleanup() 必须复位为 false —— 单例跨用例存活，不复位会污染后续用例。
+    void    setLoggedInForTest(bool loggedIn);
+
     /// 单机模式判据：`!loggedIn && cryptoKeySource == 0`。
     /// ‼️ 用 cryptoKeySource 而非 cryptoGcsDeviceID（用户 2026-09-26 裁定）：后者是「本机 GCS 自己的
     ///    deviceID」，全仓零写入点、本机两个 ini 里都没这个键 ⇒ 恒取默认 0 ⇒ 判据会恒判成运营，

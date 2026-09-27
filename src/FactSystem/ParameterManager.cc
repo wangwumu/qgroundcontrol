@@ -173,6 +173,19 @@ void ParameterManager::_handleParamValue(int componentId, const QString &paramet
 
     _waitingParamTimeoutTimer.stop();
 
+    // 参数**消费端**闸（2026-09-27 用户裁定）：联网运营态下，PARAM_VALUE 可以由**别的 GCS** 请求后
+    // 经 mavp2p 下行扇出到达本机 —— 本机零上行却仍然收帧，于是在本机建表、推进进度条。
+    // 已有两道闸（tryHashCheckCacheLoad / _startParameterDownload）都只挡"**发出**请求"这一侧，
+    // 在扇出拓扑下"谁请求"≠"谁收到"，故必须在消费侧再补一道。
+    // ‼️ 位置刻意在 `_waitingParamTimeoutTimer.stop()` **之后**：提前 return 会让请求侧的
+    //    `_paramRequestListTimer` / `_waitingParamTimeoutTimer` 继续跑完并重试，反而促成上行。
+    // ‼️ 判据与 `_startParameterDownload` 完全一致（同一 static 入口，不重写表达式）；
+    //    单例未创建时它返回 true ⇒ 单机照常下载，QGC 缺省行为不变。
+    if (!AuthController::standaloneModeEnabled()) {
+        qCDebug(ParameterManagerVerbose1Log) << _logVehiclePrefix(componentId) << "Ignoring param update in networked ops mode" << parameterName;
+        return;
+    }
+
     // Update our total parameter counts
     if (!_paramCountMap.contains(componentId)) {
         _paramCountMap[componentId] = parameterCount;

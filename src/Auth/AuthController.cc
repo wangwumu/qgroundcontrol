@@ -106,6 +106,16 @@ bool AuthController::backendLoggedIn()
     return s_instance && s_instance->_loggedIn;
 }
 
+void AuthController::setLoggedInForTest(bool loggedIn)
+{
+    if (_loggedIn == loggedIn) {
+        return;
+    }
+    _loggedIn = loggedIn;
+    // 构造函数里已把 loggedInChanged 连到 _updateStandaloneMode ⇒ 这里会自动重算并（值真变时）广播。
+    emit loggedInChanged();
+}
+
 void AuthController::setUnlockDialogOpen(bool open)
 {
     if (_unlockDialogOpen != open) {

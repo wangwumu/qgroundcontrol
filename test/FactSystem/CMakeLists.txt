@@ -23,6 +23,8 @@ target_sources(${CMAKE_PROJECT_NAME}
         HashCheckTest.h
         ParameterEditorControllerTest.cc
         ParameterEditorControllerTest.h
+        ParameterConsumeGateTest.cc
+        ParameterConsumeGateTest.h
         ParameterManagerTest.cc
         ParameterManagerTest.h
         ParameterMetaDataTestHelper.h
@@ -47,4 +49,5 @@ add_qgc_test(FactTest LABELS Unit)
 add_qgc_test(FactValueSliderListModelTest LABELS Unit)
 add_qgc_test(HashCheckTest LABELS Integration Vehicle TIMEOUT ${QGC_TEST_TIMEOUT_EXTENDED})
 add_qgc_test(ParameterEditorControllerTest LABELS Integration Vehicle)
+add_qgc_test(ParameterConsumeGateTest LABELS Integration Vehicle TIMEOUT ${QGC_TEST_TIMEOUT_EXTENDED} SERIAL)
 add_qgc_test(ParameterManagerTest LABELS Integration Vehicle TIMEOUT ${QGC_TEST_TIMEOUT_EXTENDED} SERIAL)
