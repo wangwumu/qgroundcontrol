@@ -1997,11 +1997,38 @@ Item {
         }
     }
 
+    /// 「选中的那条航班」。**数据源随视图分流**，不是恒取 `_tasks`：
+    ///   站点视图 → `_tasks`（`/ops/overview?view=site`）；
+    ///   监控员视图 → ③ 的 `_routeTasks`（`/ops/route-tasks`）。
+    ///
+    /// ‼️ 监控员视图**必须**换源：两个端点的入选判据**不是一套**——
+    ///   · ② `overview?view=route` 看的是**任务**状态：`t.status='IN_FLIGHT'`
+    ///     （或存在 PENDING 的 ROUTE 交接）；
+    ///   · ③ `/ops/route-tasks` 看的是**无人机**状态：`u.status IN ('READY_TO_TAKEOFF',
+    ///     'TAKEOFF','IN_FLIGHT','LANDING','RETURNING','EMERGENCY_LANDING')`（或挂未闭环异常）。
+    ///   故除 `IN_FLIGHT` 外的每个阶段（`READY_TO_TAKEOFF`/`TAKEOFF`/`LANDING`/`RETURNING`/
+    ///   `EMERGENCY_LANDING`）都是「② 回 0 行、③ 有这一行」。此时若仍读 `_tasks`，下面的
+    ///   循环一次都不执行、回退那行又因 `length === 0` 返回 null ⇒ `_selectedTask()` 为 null。
+    ///   而它的消费者是 `_selectedVehicle`（经 `OpsCommon.matchDeviceToVehicle` 按 `device_id`
+    ///   匹配载具），后者直接喂底部状态栏与姿态仪/罗盘 ⇒ 症状是那一整排显示 "—"，
+    ///   看着像"数据不刷新"，实则是**没选中任何载具**。
+    ///   ⚠️ 其中 `TAKEOFF` 一段最要命：那正是「TAKEOFF→IN_FLIGHT 由 VTOL 转换完成驱动」
+    ///      要被观察的阶段，而它整个落在 ② 的空窗里。
+    ///
+    /// ⚠️ 别把「监控员视图的 `_tasks` 恒 0 行」（`RomView.qml` 与 `zoomLevel` 两处注释）
+    ///    当**结构保证**：那是**经验结论**，任务一旦 `IN_FLIGHT` ② 就有行。分流判据取
+    ///    `routeLayersEnabled` 而不是"`_tasks` 空不空"，正是为了不依赖那件事。
+    ///
+    /// ⚠️ 两个端点的 task 元素都带 `device_id`（后端 `RouteTasks` 的 `opsRouteTaskItem.DeviceID`，
+    ///    且其 WHERE 已用 `u.device_id > 0` 剔除未指派行），故换源后匹配成立。
+    /// ⚠️ 判据沿用 `routeLayersEnabled`——与地图 marker 那处**同一个**分流条件，
+    ///    不新增第二个会漂移的口径。
     function _selectedTask() {
-        for (var i = 0; i < _tasks.length; i++) {
-            if (_tasks[i].task_id === _selectedTaskId) return _tasks[i]
+        var src = routeLayersEnabled ? _routeTasks : _tasks
+        for (var i = 0; i < src.length; i++) {
+            if (src[i].task_id === _selectedTaskId) return src[i]
         }
-        return _tasks.length ? _tasks[0] : null
+        return src.length ? src[0] : null
     }
 
 }
