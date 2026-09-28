@@ -1119,6 +1119,19 @@ function alertRows(vehicles, deviceByDeviceID, perVehicleLimit, totalLimit) {
 /// `MAV_CMD_NAV_WAYPOINT`。
 var MAV_CMD_NAV_WAYPOINT = 16
 
+/// `MAV_CMD_NAV_VTOL_LAND` —— **垂起着陆**：飞向指定坐标（高度不变），
+/// 过渡到多旋翼并着陆。即单机版航线编辑器「选择航线任务指令」里的那一项。
+///
+/// ‼️ **不要和设计域的 `21` 混**：本值是 **85**。`21` 在 MAVLink 里是
+///    `MAV_CMD_NAV_LAND`（在指定坐标降落，**不换机型**），与本函数要表达的"转多旋翼着陆"
+///    是两条不同的指令 —— 数值上差得远，但设计域的站点标记恰好也叫 21，
+///    极易顺手写错。
+///    （2026-09-29 审查 A7 修正：原注释写「就地/固定翼降落」——"固定翼"是错的，
+///      `MAV_CMD_NAV_LAND` 与机型无关；"就地"也是用户 2026-09-28 明确否掉的措辞。）
+///    断言在 `test/UnitTestFramework/QmlTesting/tests/tst_OpsCommon.qml`（**不在 `src/OpsView/`**）：
+///    `:1180` / `:1244` 断 `items[..].command === 85`，写成 21 会当场变红。
+var MAV_CMD_NAV_VTOL_LAND = 85
+
 /// `MAV_FRAME_GLOBAL` —— 高度按 **AMSL**（绝对高度）解释。
 ///
 /// ‼️ 依据：**本计划 brief（2026-09-23）转述的真库观察**，**未经本任务独立复核**
@@ -1132,6 +1145,29 @@ var MAV_CMD_NAV_WAYPOINT = 16
 ///    （相对 home）——构造 mission 时不显式覆盖，463 会被当成"离地 463 米"。
 var MAV_FRAME_GLOBAL = 0
 
+/// `MAV_VTOL_STATE_MC` —— 飞机**已在多旋翼档**（转换已完成，悬停/平飞在旋翼模式）。
+///
+/// ‼️ 判「切换多旋翼完成了没」**只能用这个取值**，不能去问「机型是不是多旋翼」：
+///    `Vehicle::multiRotor()` 读的是 `vehicleType()`，而 VTOL 机体的 `MAV_TYPE` 是
+///    `MAV_TYPE_VTOL_*`、**永远不会**变成 `MAV_TYPE_QUADROTOR`
+///    （`QGCMAVLink::vehicleClass()` 是纯 switch，两类不相交）
+///    ⇒ 该判据对 VTOL 机体**恒为 false**，切成功了也判不出来（2026-09-28 实测：
+///    飞机确实切了多旋翼，界面却报「未报告转换完成」并放弃发出回航）。
+///    同理 `vehicleTypeChanged` 也永不触发，别拿它当信号。
+///    数据源：`EXTENDED_SYS_STATE.vtol_state`，由加密心跳 EXT 帧重建
+///    （`CryptoHeartbeatExt.cc`），与 MAVLink `MAV_VTOL_STATE_*` 及 PX4
+///    `VtolVehicleStatus.vehicle_vtol_state` 三者 1:1。
+var MAV_VTOL_STATE_MC = 3
+
+/// `MAV_VTOL_STATE_TRANSITION_TO_MC` —— 正在转多旋翼，**还没转完**。
+///
+/// ‼️ 单独列出来，是因为它是最容易漏掉的一档：转多旋翼一开始 `vtol_state` 就不再是
+///    `FW`，于是 `!vtolInFwdFlight`（＝「不在固定翼档」）这类判据会**在转换途中就为真**。
+///    此刻发出回航，PX4 仍视机体为固定翼，回航会重新落回那个卡死的 `LOITER_DOWN` 格
+///    —— 症状与修复前一模一样，且看起来像是"修了没效果"。
+///    `tst_OpsCommon.qml` 有专门一格钉住它。
+var MAV_VTOL_STATE_TRANSITION_TO_MC = 2
+
 /// 航线**设计域**的 `command` → MAVLink 指令号。未知 ⇒ `null`。
 ///
 /// ‼️ **两套编号同名不同义**，别按数值猜：设计域的 `21` 是"站点"（可降落的站点类型
@@ -1144,12 +1180,76 @@ var MAV_FRAME_GLOBAL = 0
 ///    若真实库存在第三种设计域取值，那条航线会**静默**变成"不可下发"（回 `[]`，且零诊断）
 ///    ⇒ 下游落地前须在有库环境核验该值域是否封闭。
 ///
+/// 【2026-09-28 用户裁定】**垂起着陆**：**终点站**的站点航点在 VTOL 机型上映射为
+///    `MAV_CMD_NAV_VTOL_LAND(85)` —— 飞机在终点**转多旋翼着陆**，而不是像固定翼
+///    那样绕终点一直盘旋（用户实测的故障现象）。用户不用额外操作，画完航线就带降落。
+///
 /// 未知值一律 `null`（fail-closed），由调用方把整条航线作废。
-function _designCommandToMavCmd(c) {
+///
+/// @param c      设计域 command（`16` 普通航点 / `21` 站点）
+/// @param isEnd  本点是否为**该航线的终点站**。判据由 `routeMissionItems` 按
+///                `id === 航线的终点航点 id` 算出 —— **不许按"列表里的最后一项"推断**，
+///                那个推断已被真库实测推翻（理由与证据见 `_endWaypointIndex`）。
+///                站点航点在你们模型里**首尾都用**（始发站 + 目的站），把 `21` 整体
+///                映射成降落会让航线在**始发站就被截断**。
+/// @param isVtol 机型是否为 VTOL。**只认真布尔 `true`**（理由见 `routeMissionItems`）。
+function _designCommandToMavCmd(c, isEnd, isVtol) {
     var n = Number(c)
     if (n === 16) return MAV_CMD_NAV_WAYPOINT   // 普通航点
-    if (n === 21) return MAV_CMD_NAV_WAYPOINT   // 站点航点（用户 2026-09-23 裁定：降落稍后再议，本次按普通航点下发）
+    if (n === 21) {
+        // 终点站 + VTOL ⇒ 垂起着陆；其余几支（始发站 / 中间站 / 非 VTOL）继续按用户
+        // 2026-09-23 的裁定「降落稍后再议」当普通航点下发。
+        if (isEnd === true && isVtol === true) return MAV_CMD_NAV_VTOL_LAND
+        return MAV_CMD_NAV_WAYPOINT
+    }
     return null
+}
+
+/// 在 `wps` 里找出**航线终点航点**的下标；找不到、或命中多于一处 ⇒ `-1`
+///（＝这条列表里没有可确认的终点 ⇒ **不产生降落指令**，fail-closed）。
+///
+/// ‼️ 判据是 `id === endWaypointId`，**不是**"最后一项"。这个推断曾被我写进实现，
+///    2026-09-28 真库实测将其**推翻**：
+///
+///  · `GET /routes/:id/waypoints`（后端 `route.go` 的 `ListWaypoints`）**不返回起降点**：
+///    它读 `table_route_waypoint`（+JOIN `table_waypoint`）拿中间航点，**再**读
+///    `table_route.plan_data`，用 `mission.items[i].command` 覆写各点 command、并在头部
+///    插一个 home 点（`command=-1`）；**唯独不读** `table_route.start_waypoint_id` /
+///    `end_waypoint_id` 这两列 ⇒ 始发站 / 终点站**不在返回列表里**。
+///    （2026-09-29 审查 A5 修正：原注释写「只读 `table_route_waypoint` 一张表」——错，
+///      它还读 `plan_data`。⚠️ 这个过简的措辞是从后端照抄的，`ops.go:584-586` 亦然。）
+///    对照：`ops.go` 的 `buildTaskWaypoints`（`:414`）才额外把这两列读进来拼在首尾
+///    （该口径差记在 `ops.go:584-586`；原注释引 `545-548`，是 2026-09-29 审查 A3 修正的错行号）。
+///  · 实测样本 **RT-003**（真库）：`start=2` 北七家镇政府 / `end=5` 保定市政府，
+///    而返回列表只有 `seq=0 → wp3` 良乡区政府(cmd 21) 与 `seq=1 → wp4` 房山镇政府(cmd 16)
+///    ⇒ 列表"最后一项"是**中途点**。按它打 85 ⇒ **飞机在房山镇政府降落**，
+///    而任务的目的地是保定市政府 —— 正是用户红线上"只能在机位上降落"那一类事故。
+///  · 反例 **RT-SITL01**：`start=26` / `end=28` **恰好也在** `table_route_waypoint` 里
+///    （seq 0/1/2 → wp 26/27/28）⇒ "最后一项"在那条航线上**恰好**对。
+///    ⚠️ **这正是该推断能在 SITL 上验出"能用"的原因**，也是它最危险的地方：
+///    拿 SITL 那条航线当判据的样本，会得到一个假绿的 ✓。
+///
+/// ⚠️ 于是本函数在**当前**数据源下恒回 `-1`（列表里没有 `id` 等于 `endWaypointId`
+///    的点）⇒ 垂起着陆**不会触发**，行为与本改动之前完全一致。
+///    解封条件与下一步动作见 `OpsRouteSync.qml` ⑤a 的注释。
+///
+/// @param endWaypointId 航线终点航点 id（`table_route.end_waypoint_id`）。
+///        只认 JSON number 且 `> 0`；其余一切取值（含 `undefined` / `0` / `null`
+///        / `"5"`）一律按"没有可确认的终点"处理。
+function _endWaypointIndex(wps, endWaypointId) {
+    if (typeof endWaypointId !== "number" || !isFinite(endWaypointId) || endWaypointId <= 0) return -1
+    var found = -1
+    for (var i = 0; i < wps.length; i++) {
+        var w = wps[i]
+        if (!w) continue
+        if (typeof w.id === "number" && w.id === endWaypointId) {
+            // 命中多于一处 ⇒ 无法确定"哪一个是终点" ⇒ 不降落（fail-closed）。
+            // 两条 85 会让飞机在航路中途落一次，后果不可撤销。
+            if (found >= 0) return -1
+            found = i
+        }
+    }
+    return found
 }
 
 /// 把后端 `GET /routes/:id/waypoints` 的航点转成待下发的 mission 描述数组。
@@ -1162,15 +1262,29 @@ function _designCommandToMavCmd(c) {
 /// ‼️ **任何一点不可用 ⇒ 整条航线作废（回 `[]`）**，不做"跳过这一点"。跳过会让飞机
 ///    飞出一条用户没画过的路径，而界面上点的编号仍然连续、看不出少了哪个。
 ///
-/// @param wps 航点数组，每项 `{lat, lon, altitude, command}`
+/// @param wps 航点数组，每项 `{id, lat, lon, altitude, command}`
+/// @param isVtol 机型是否为 VTOL（调用点从 `vehicle.vtol` 读好再传进来 ——
+///        本文件是 `.pragma library`，函数体内读属性**不注册绑定依赖**）。
+///        ‼️ **只认真布尔 `true`**，其余一切取值（含 `1` / `"true"` / `"false"`）
+///        一律按"非 VTOL"处理。选 fail-closed 这一侧的理由：**漏掉降落**的后果是
+///        飞机在终点**可见地**盘旋（与今天的行为一致，现场一眼能看出不对）；
+///        **多插一个降落**的后果是飞机真的落下去，不可撤销。
+///        ⚠️ 尤其 `"false"` 在 JS 里是**真值** —— 凡用 `if (isVtol)` 强转的实现都会放行它。
+/// @param endWaypointId 航线终点航点 id（`table_route.end_waypoint_id`）。只有它能在
+///        列表里**指认出**终点；指认不出（含不传 / `undefined`）⇒ 本函数**不产生**
+///        垂起着陆。判据与真库证据见 `_endWaypointIndex` 的注释。
 /// @return `[{command, lat, lon, alt, frame}]`；任一输入不可用 ⇒ `[]`
-function routeMissionItems(wps) {
+function routeMissionItems(wps, isVtol, endWaypointId) {
     if (!wps || !wps.length) return []
+    // ‼️ 「哪一点是终点」由**航线自己的终点航点 id** 指定，不许按"列表最后一项"推断
+    //    （真库实测推翻了那个推断，证据见 `_endWaypointIndex`）。
+    //    当前数据源下恒为 `-1` ⇒ 垂起着陆不触发，行为与改动前一致。
+    var endIdx = _endWaypointIndex(wps, endWaypointId)
     var out = []
     for (var i = 0; i < wps.length; i++) {
         var w = wps[i]
         if (!w) return []
-        var mavCmd = _designCommandToMavCmd(w.command)
+        var mavCmd = _designCommandToMavCmd(w.command, i === endIdx, isVtol)
         if (mavCmd === null) return []
         // ‼️ **三个字段统一只按类型收**：必须是 JSON number。依据是"后端 `table_waypoint`
         //    的这三个字段是非空/可空 REAL 列 ⇒ Go 读成 `float64` ⇒ 序列化成 JSON number"，
@@ -1207,6 +1321,110 @@ function routeMissionItems(wps) {
 ///    **只判 `isNaN` 是拦不住起飞的**，必须用值域判据。真实调用方
 ///    `OpsRouteSync.qml` 用的是 `!(takeoffAlt > 0)`（`NaN > 0` 为 false ⇒ 取反为真 ⇒ 拦住）。
 function takeoffAltitude(wps) {
+    // ‼️ **有意不传 `isVtol` / `endWaypointId`**：垂起着陆只改**终点站那一点**的
+    //    `command`，既不改变航线是否可用（`length`），也不碰**首点**的高度
+    //    ⇒ 本函数与机型、与终点在哪都无关。
+    //    传了也不会错，但那会让下一个人以为"起飞高度跟机型/终点有关"。
     var items = routeMissionItems(wps)
     return items.length ? items[0].alt : NaN
+}
+
+//------------------------------------------------------------------------------
+// 起飞点（cmd 84）：按起飞机位朝向偏移
+//------------------------------------------------------------------------------
+
+/// 只认**有限数字**。`isFinite("90")` 是 `true`（会强转），所以 `typeof` 前置不可省 ——
+/// 少了它，后端若把数字发成字符串就会静默放行，而算出来的点看不出错。
+function _finiteNumber(v) { return typeof v === "number" && isFinite(v) }
+
+/// 从任务响应取出**可用的起飞机位朝向**（度）；不可用 ⇒ `null`，调用方据此回落 `home`。
+///
+/// 读的是后端三个字段 `current_slot_lat` / `current_slot_lon` / `current_slot_heading`
+/// （`ops.go` 由 `table_uav.current_slot_id` → `table_slot` 拼好）。
+///
+/// ⚠️ **只返回朝向，不返回坐标**：起飞点的**起点**是飞机当前 `home`（用户 2026-09-23
+///    裁定 c），机位坐标在本功能里**只用来判哨兵**，不参与计算。
+///
+/// ‼️ 返回 **`0` 是合法结果**（正北）。调用方**必须**用 `!== null` 判"有没有"，
+///    **不能**写 `if (heading)` —— `0` 是 falsy，那样会把"正北"当成"没有"，
+///    于是恰好朝正北的机位静默回落 `home`。本函数回 `null`（而非 `0`）表示"没有"，
+///    就是为了让这个区分**在代码里看得见**。
+///
+/// ‼️ 哨兵只由**坐标**判定，**不能**拿 `heading === 0` 当"没填"：
+///    0° 是正北，是**合法朝向**，而真库 12 个机位的朝向恰恰只有 0 和 1.0 两种取值。
+///    把 0 当哨兵 ⇒ 绝大多数机位静默回落 `home`，现象与"这功能根本没做"完全一样，
+///    且没有任何一处会报错（`tst_OpsCommon.qml` 有专门一格钉住这一点）。
+///
+/// ‼️ 坐标**半填**（只有一个 0）同样当无效：中国境内不可能出现经度或纬度为 0 的机位，
+///    拿它去偏移会得到一个**看似正常、实际错在地球另一边**的点。
+function takeoffSlotHeading(task) {
+    if (!task) return null
+    var lat = task.current_slot_lat
+    var lon = task.current_slot_lon
+    var heading = task.current_slot_heading
+    if (!_finiteNumber(lat) || !_finiteNumber(lon) || !_finiteNumber(heading)) return null
+    // 后端「未指定机位」时下发 0/0/0（`omitempty` 会让字段整个消失 ⇒ 上面的
+    // `_finiteNumber` 先拦住，两种"没有"都落到 `null`）。
+    if (lat === 0 || lon === 0) return null
+    return heading
+}
+
+/// 从 `(lat, lon)` 出发、沿 `headingDeg` 方位走 `distM` 米后的落点。
+///
+/// 方位语义：**0 = 正北，顺时针**（与 `table_slot.heading` 同口径 —— `SiteList.vue`
+/// 的「朝向(°)」输入框就是度；也与 Qt 的 `QGeoCoordinate::atDistanceAndAzimuth` 一致）
+/// ⇒ **无需任何换算**。
+///
+/// 用途：起飞点（MAVLink `cmd 84`）的坐标 = `home` 沿**起飞机位朝向**偏移
+/// `vtolTransitionDistance` 米。依据是 PX4 的 84 项状态机把 `yaw` 设为
+/// 「飞机当前位置 → 84 项坐标」的方位角并 `force_heading=true`
+///（`PX4-Autopilot/src/modules/navigator/mission.cpp:365-370`：`:366-368` 把 `yaw` 赋成
+///  「飞机当前位置 → 84 项坐标」的方位角，`:370` 再置 `_mission_item.force_heading = true`。
+///  ⚠️ 2026-09-29 审查 A6 修正：原注释写 `:365-367`，那只覆盖了 yaw 赋值、**漏掉了
+///  `force_heading`**（它在 `:370`）—— 而"朝向能被强制执行"恰恰是这两句合起来的效果。）
+/// ⇒ **该坐标就是"起飞后朝哪飞"的唯一决定者**。
+///
+/// ⚠️ 纯 JS 球面公式（`.pragma library` 文件里**没有 Qt 对象可用**），地球半径取
+///    **6371000 m**。离屏探针实测（`/tmp/calib_azimuth.qml`，用 Qt 自己的
+///    `atDistanceAndAzimuth` 当权威）：四方位上与 Qt 的最大偏差 3.98e-9 度 ≈ **0.44 mm**，
+///    远小于 GPS 精度、也远小于 PX4 的接受半径（`acceptance_radius` 默认 10 m）⇒ 同口径。
+///    （反过来说：若误用赤道半径 6378137，四方位上偏 3.02e-6 度 ⇒ `tst_OpsCommon.qml`
+///     的 1e-6 度容差会红，见 `_nearDeg` 的注释。）
+///
+/// 无效输入一律回 `null`（调用方回落 `home`），**不猜**：坐标非有限/越界、
+/// 朝向非数字、距离非有限或为**负**。
+///   - `distM === 0` 是**合法**输入（偏移 0），原样返回起点；
+///   - 朝向可以是任意实数，内部归一化到 [0,360)；
+///   - ⚠️ **不处理跨换日线**（算出的经度不会折回 ±180）：本业务的地面站与机位
+///     全在中国境内，加一个无人会走到的分支不如不加。
+function takeoffTransitionPoint(lat, lon, headingDeg, distM) {
+    if (!_finiteNumber(lat) || !_finiteNumber(lon)) return null
+    if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return null
+    if (!_finiteNumber(headingDeg) || !_finiteNumber(distM)) return null
+    if (distM < 0) return null
+
+    var R = 6371000.0
+    var d = distM / R
+    var brng = (((headingDeg % 360) + 360) % 360) * Math.PI / 180
+    var p1 = lat * Math.PI / 180
+    var l1 = lon * Math.PI / 180
+
+    var p2 = Math.asin(Math.sin(p1) * Math.cos(d) + Math.cos(p1) * Math.sin(d) * Math.cos(brng))
+    var l2 = l1 + Math.atan2(Math.sin(brng) * Math.sin(d) * Math.cos(p1),
+                             Math.cos(d) - Math.sin(p1) * Math.sin(p2))
+    return { lat: p2 * 180 / Math.PI, lon: l2 * 180 / Math.PI }
+}
+
+/// 「切换到多旋翼」是否**已完成**。`Vehicle::vtolState` 传进来，回的必是布尔。
+///
+/// 只有 `MAV_VTOL_STATE_MC` 一个取值代表完成；其余四档（未定义 / 转固定翼中 /
+/// **转多旋翼中** / 固定翼）都不算。为什么不能改用「机型是不是多旋翼」来判，
+/// 见 `MAV_VTOL_STATE_MC` 的注释。
+///
+/// 非法 / 缺失输入一律回 `false`（不宣布完成）：宁可让操作员看到超时提示，
+/// 也不在没有证据时宣布完成 —— 后者会发出一份落在错误状态机上的回航指令，
+/// 而界面上一切正常、无人知道出了事。
+/// 只认数字类型：字符串 `"3"` 不算（`===` 已排除，但要写明，免得后来者改成 `==`）。
+function vtolTransitionDone(vtolState) {
+    return typeof vtolState === "number" && vtolState === MAV_VTOL_STATE_MC
 }

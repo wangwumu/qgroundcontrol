@@ -46,6 +46,15 @@ Item {
     /// 注入的 GET 函数：`function(path, onDone(status, data))`。
     /// 骨架的 `_get`（`OpsShell.qml`）签名的子集，这里只用到两参形式。
     property var    get:      null
+    /// 任务对象（`/tasks` 响应里的一项），只读 `current_slot_lat/lon/heading` 三个字段。
+    ///
+    /// 用途：算出**起飞机位朝向**，把起飞项（MAVLink `cmd 84`）的坐标从
+    /// 「`home` 本身」改成「`home` 沿该朝向偏移 `vtolTransitionDistance` 米」——
+    /// 理由见下方 §④c。
+    ///
+    /// ⚠️ 默认 `null` 是**合法输入**（不是错误）：缺省 ⇒ `takeoffSlotHeading` 回 `null`
+    ///    ⇒ 起飞点回落 `home`，与本次改动之前的行为**逐字一致**。
+    property var    task:     null
 
     //-------------------------------------------------------------------------
     // 输出（调用方只读）
@@ -118,6 +127,11 @@ Item {
             //    -1 被摘掉、84/85 仍会让整条作废 ⇒ 这行过滤**不是完整修复**。
             //    84/85 的正确处置牵着「起飞项坐标必须是飞机当前 home」与「降落稍后再议」
             //    （用户 2026-09-23 裁定 f），**明确不在本次范围**。
+            //
+            //  ［2026-09-28 更新］用户已裁定**垂起着陆**方案（见下方 ⑤a）。⚠️ 但**本条依然成立**：
+            //    设计域的值域仍是 `{16, 21}`，`85` 在本链路里是**产出**不是**输入** ⇒
+            //    plan_data 里带着 85 过来的航线**照样整条作废**。别把新增的垂起着陆
+            //    当成"临时航线 84/85 已支持"——那两件事没有关系。
             //    本行的实际价值仅限于一个子场景：plan_data 里有 plannedHomePosition、但 items 为空
             //    （此时覆盖不发生，只有 home 会被插进来）。
             wps = wps.filter(function(w) { return !w || w.command !== -1 })
@@ -145,7 +159,48 @@ Item {
     function _buildAndSend(wps) {
         // ① 航点先过一遍纯函数的闸：任何一点不可用都会让整条航线作废（回 []）。
         //    这样"构造到一半才发现第 3 点没坐标"不会留下一个半成品 mission。
-        var items = OpsCommon.routeMissionItems(wps)
+        // ‼️ 第二个实参 `vehicle.vtol` 由**本组件**（调用点）读好再传进 `.pragma library`
+        //    的纯函数 —— 放在 `OpsCommon.js` 的函数体里读属性**不注册绑定依赖**。
+        //    ⚠️ 它**只认真布尔 `true`**：`vtol` 是 `Q_PROPERTY(bool)`（`Vehicle.h:169`），
+        //    QML 读出来就是 JS boolean，正好满足那道严格判据。
+        //
+        // ❌❌ **【2026-09-28】垂起着陆在本链路当前恒不触发 —— 这一行是死的。**
+        //    第三个实参 `endWaypointId` 刻意**没传**：它必须来自 `table_route.end_waypoint_id`，
+        //    而本组件手上**没有任何来源**（本文件唯一那次 `get()` 只取
+        //    `/api/routes/<id>/waypoints`，其响应体里**不含** `end_waypoint_id`）。
+        //    缺省 ⇒ `OpsCommon._endWaypointIndex` 恒回 `-1` ⇒ 恒不产生 85。
+        //    ⇒ **本次改动的净行为变化 ＝ 零**（这正是 fail-closed 想要的落点，不是意外）。
+        //
+        // ‼️ **为什么"没传"是对的，而不是"忘了接"**：即使把终端站**按列表中的位置**推出来
+        //    也不能用 —— `GET /routes/:id/waypoints`（后端 `route.go` 的 `ListWaypoints`）
+        //    **不返回起降点**：它读 `table_route_waypoint`（+JOIN `table_waypoint`）拿中间航点，
+        //    **再**读 `table_route.plan_data`，用 `mission.items[i].command` 覆写各点 command、
+        //    并在头部插一个 home 点（`command=-1`）；**唯独不读**
+        //    `table_route.start_waypoint_id` / `end_waypoint_id` 这两列 ⇒ 始发站/终点站
+        //    **不在返回列表里**。
+        //    （2026-09-29 审查 A5 修正：原注释写「只读 `table_route_waypoint` 一张表」——
+        //      错，它还读 `plan_data`。⚠️ 这个过简措辞是从后端照抄来的，`ops.go:584-586` 亦然。）
+        //    （对照：`handlers/ops.go` 的 `buildTaskWaypoints`（`:414`）才把这两列读进来拼在首尾，
+        //      两处口径差在 `ops.go:584-586` 记为"已知且不修" —— 原注释引 `545-548`，
+        //      是 2026-09-29 审查 A3 修正的错行号。）
+        //    真库实测 **RT-003**：`end=5 保定市政府`，而本接口只回 `wp3 良乡区政府(21)`、
+        //    `wp4 房山镇政府(16)` ⇒ 列表末项是**中途点**。按它打 85
+        //    ⇒ **飞机在房山镇政府降落**，而任务目的地是保定市政府。
+        //    ⚠️ 反例 **RT-SITL01** 的 start/end **恰好也在** `table_route_waypoint` 里
+        //    ⇒ "末项即终点"在那条航线上**恰好**成立 —— 这正是该错判据能在 SITL 上验出
+        //    "能用"的原因，也是它最危险的地方。
+        //
+        // 🔓 **解封条件（两件都做完才生效，缺一不可）**：
+        //    ① 后端在 `/routes/:id/waypoints` 的响应里带上 `end_waypoint_id`
+        //       （或在列表里补上起降点两点）；② 把该值作为第三个实参传进本行。
+        //    ⚠️ 若走"列表里补起降点"那条，会**连带改变** webui 的
+        //    `RouteList.vue`（它把本接口的返回值直接当作要保存的 `waypoint_ids`）
+        //    ⇒ 前端必须同步改，否则保存航线会**把起降点塞进中途点集合**。
+        //    ❗ 另有一个**语义**问题未决、且不是接线能解决的：终点站航点坐标 ≠ 机位坐标，
+        //    而用户的运行红线是「**除非要坠机了，否则飞机只能在机位上降落**」
+        //    ⇒ 即使接线通了，"落在终点站航点"是否合规仍需用户裁定。**已上报待裁决。**
+        //    详见 `OpsCommon._endWaypointIndex` 的注释。
+        var items = OpsCommon.routeMissionItems(wps, vehicle.vtol)
         if (!items.length) return _fail(qsTr("航线没有可用航点，无法下发"))
         _waypointCount = items.length
 
@@ -180,7 +235,7 @@ Item {
         //    两个来源都要挡：
         //    · **首次**同步：确实是空的 —— ③ 已说明（登录闸挡住了下载）；
         //    · **复用**：**不空**。本组件按 `task_id` 复用同一个 controller
-        //      （`OpsView.qml:566-570`：换飞机时 `reset()` 后 `start()`），
+        //      （`OpsView.qml:690`：换飞机时 `reset()` 后 `start()`），
         //      而上一轮**成功下发**后 `MissionController` 会把 `_visualItems`
         //      重装成飞机上那一份（`MissionController.cc:1971-1972`）；
         //      本文件的 `reset()` 函数**只清状态与轮询、不碰 `_plan`**
@@ -243,13 +298,87 @@ Item {
         //      brief 修订前写成"顺带"，偏绝对），为假时只改 takeoff item 自己。
         //      **但两种取值下本行都成立** —— 我们要的正是「takeoff item 自己的坐标 = home」；
         //      为真那支与已做的 `setHomePosition(home)` 同值，无害。
-        if (takeoff) takeoff.coordinate = home
+        //
+        // ④c 坐标不再直接取 `home`，而是「`home` 沿**起飞机位朝向**偏移 `vtolTransitionDistance` 米
+        //    后的点」。 ［2026-09-28］
+        //
+        //    ‼️ **为什么起飞点要有方向**：PX4 的 84 项状态机里，`WORK_ITEM_TYPE_CLIMB` 把 `yaw`
+        //    设为「飞机当前位置 → 84 项坐标」的方位角，并且 `force_heading = true`
+        //    （`PX4-Autopilot/src/modules/navigator/mission.cpp:365-370`：`:366-368` 赋 `yaw`，
+        //      `:370` 置 `_mission_item.force_heading = true`。
+        //      ⚠️ 2026-09-29 审查 A6 修正：原注释写 `:365-367`，那只覆盖 yaw 赋值、**漏掉了
+        //      `force_heading`** —— 而「朝向能被强制执行」恰恰是这两句合起来的效果。
+        //      与 `OpsCommon.js` 的 `takeoffTransitionPoint` 注释同口径。）
+        //    ⇒ **84 项坐标就是「起飞后朝哪飞」的唯一决定者**。用户要求「站点的机位都有一个朝向，
+        //    应该按照该朝向飞」，所以坐标必须偏到朝向上去。
+        //    ⚠️ 转 FW 与否**不由本点决定**：`ALIGN_HEADING` 里那句 `set_vtol_transition_item(FW)`
+        //    在 `if (do_need_move_to_takeoff())` **之外**，是无条件的，由**时间**参数
+        //    `VT_F_TRANS_DUR`（默认 5 s）决定。别把「点给多远」当成「什么时候转固定翼」的旋钮。
+        //
+        //    ⚠️ 偏移的**起点是 `home`，不是机位坐标**（用户 2026-09-23 裁定 c：起飞点取飞机当前
+        //    home 位置）。后端下发的 `current_slot_lat/lon` 在本文件里**只用于判哨兵**
+        //    （「到底有没有起飞机位」），**不参与计算** —— 这也是 `takeoffSlotHeading`
+        //    只返回朝向、不返回坐标的原因。
+        //
+        //    ‼️ **三处回落，全部回到 `home`**（= 与本次改动之前逐字一致的旧行为）：
+        //      ① `task` 没注入 / 响应里没有那三个字段；② 后端下发 0/0/0 哨兵（未指定机位）；
+        //      ③ 偏移算失败（`takeoffTransitionPoint` 对无效输入一律回 `null`）。
+        //    ⇒ 功能失效时的现象是「起飞后朝正北」，**不会**是「没有起飞点」或「报错」，
+        //      排查时先看这一层。
+        //
+        //    ‼️ 判据必须写 `!== null`，**不能**写 `if (slotHeading)`：`0` 是**合法的正北朝向**
+        //      同时也是 falsy ⇒ 写成 `if (slotHeading)` 会让恰好朝正北的机位**静默**回落 `home`，
+        //      而现象与「这功能根本没做」完全一样。（真库 12 个机位的朝向恰恰只有 `0` 和 `1.0`
+        //      两种取值，这一支不是理论边角。）`OpsCommon.takeoffSlotHeading` 刻意用 `null`
+        //      （而不是 `0`）表示「没有」，就是为了让这个区分在代码里看得见。
+        var takeoffPoint = home
+        var slotHeading = OpsCommon.takeoffSlotHeading(task)
+        if (slotHeading !== null) {
+            var transitionM = Number(QGroundControl.settingsManager.planViewSettings
+                                     .vtolTransitionDistance.rawValue)
+            var moved = OpsCommon.takeoffTransitionPoint(home.latitude, home.longitude,
+                                                         slotHeading, transitionM)
+            if (moved) takeoffPoint = QtPositioning.coordinate(moved.lat, moved.lon)
+        }
+        if (takeoff) takeoff.coordinate = takeoffPoint
 
         // ⑤ 逐点追加。`visualItemIndex = -1` = append 到末尾。
         for (var i = 0; i < items.length; i++) {
             var it = items[i]
             var vi = _plan.missionController.insertSimpleMissionItem(
                         QtPositioning.coordinate(it.lat, it.lon), -1)
+
+            // ⑤a ‼️ 把 `it.command` **真正写进** mission item —— 这一行是垂起着陆的落地判据。
+            //
+            //     ❗ **本行当前恒不执行**（条件 `it.command !== 16` 永不成立，理由见 §① 那段
+            //     "垂起着陆恒不触发"）。**但它绝不能因此被删**：
+            //     · 它是**用户已裁定方案的实现**，缺了它即使 §① 的解封条件全部满足，
+            //       85 也**一个字节都到不了飞机**，且纯函数层单测**全绿**（它们只看返回值）
+            //       ⇒ 会退化成"看起来做完了、实际没接线"，比没做更难查；
+            //     · 它**不改变任何现有行为**（条件不成立 ⇒ 不赋值），删除它也不改变现状
+            //       ⇒ "删掉死代码"在这里的收益是零、风险是把已裁定方案悄悄拆掉。
+            //
+            //     为什么必需：`insertSimpleMissionItem`（`MissionController.cc:376-379`）
+            //     把命令**硬编码**成 `MAV_CMD_NAV_WAYPOINT`，**没有**命令形参
+            //     ⇒ 少了本行，`routeMissionItems` 算出来的 `command` **一个字节都到不了飞机**，
+            //       终点站点的垂起着陆(85)会静默退化成普通航点(16)，
+            //       而纯函数层的单测**全绿**（它们只看返回值）。
+            //
+            //     ‼️ **顺序不可交换：必须在本行的 `_applyAltitude` 之前。**
+            //     `SimpleMissionItem` 把 `_commandFact` 的 `valueChanged` 接到了
+            //     `_setDefaultsForCommand`（`SimpleMissionItem.cc:158`），后者会
+            //     **把 `_altitudeFrame` 重置为 `AltitudeFrameRelative`、并把高度重置成
+            //     应用默认值**（`.cc:829-834`）。若先写高度再改命令，本项目的
+            //     `frame = MAV_FRAME_GLOBAL(0)`（AMSL）会被翻回"相对 home"
+            //     ⇒ 463 米 AMSL 被当成"离地 463 米"，而界面上看不出任何异常。
+            //     坐标不受影响：`_setDefaultsForCommand` 只重置 param1-4，仅在
+            //     "无坐标命令"时才清 param5/6（`.cc:812-826`），而 85 是
+            //     `specifiesCoordinate: true` ⇒ 坐标原样保留。
+            //
+            //     ⚠️ 只对**非普通航点**赋值：普通航点本来就等于 C++ 侧的默认值，
+            //     写一次会白白触发 `_setDefaultsForCommand` 那一整套重置。
+            if (vi && it.command !== OpsCommon.MAV_CMD_NAV_WAYPOINT) vi.command = it.command
+
             _applyAltitude(vi, it.alt)
         }
 
@@ -356,7 +485,7 @@ Item {
             //       **不是**"新增一个转发信号"—— 同名同签名的信号加不出来（原注释的处方是错的）。
             //       那是**独立的 C++ 工作包**，已记入 ledger 待裁决，
             //       **明确不在本计划范围内** —— 不要在这里顺手加 C++。
-            //       （另：全仓 `.qml` **零处**使用 `.missionManager`，且 `Vehicle.h:581` 是普通
+            //       （另：全仓 `.qml` **零处**使用 `.missionManager`，且 `Vehicle.h:592` 是普通
             //        getter（无 `Q_PROPERTY` / `Q_INVOKABLE`）⇒ **别指望在 QML 侧接这个信号绕开 C++**。）
             if (ticks >= 2 && !_plan.syncInProgress && !_plan.dirtyForUpload) {
                 stop()

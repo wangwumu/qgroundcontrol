@@ -576,7 +576,12 @@ OpsShell {
         var sync = _routeSyncComponent.createObject(opsView, {
             "vehicle": vehicle,
             "routeId": task.route_id,
-            "get":     _get
+            "get":     _get,
+            // 起飞机位朝向的来源 —— `OpsRouteSync` 据此把起飞项（`cmd 84`）的坐标从 `home`
+            // 偏到机位朝向上（见该文件 §④c）。这里**传整个 task** 而不是先取出朝向：
+            // 朝向是 `createObject` 之后才算的，而 `createObject` 的初值只在建的这一刻求值一次
+            // ⇒ 先把 task 交给它，由它自己按同一份数据算，避免"两处各算一遍"。
+            "task":    task
         })
         if (!sync) {
             // `createObject` 失败在 QML 里**不报错**，只静默回 null。

@@ -1065,8 +1065,10 @@ TestCase {
     /// `lat` / `lon` / `altitude` / `command`。接口还下发 `id`/`name`/`code`/
     /// `company_id` 等，但**下发逻辑不该依赖它们**——多写会让下一个人以为
     /// 函数还读了别的字段，从而不敢动那些字段。
-    function _wp(lat, lon, alt, cmd) {
-        return { lat: lat, lon: lon, altitude: alt, command: cmd }
+    /// 可选第 5 参 `id`（航点 id）：只有"指认终点站"那一组用例用得上，
+    /// 其余调用点照旧传 4 个实参 ⇒ `id` 为 `undefined`，行为一字不变。
+    function _wp(lat, lon, alt, cmd, id) {
+        return { id: id, lat: lat, lon: lon, altitude: alt, command: cmd }
     }
 
     /// route 20 的两个航点。值依据：**本计划 brief（2026-09-23）转述的真库观察**，
@@ -1100,13 +1102,205 @@ TestCase {
     }
 
     /// ‼️ `command=21` 是**航线设计域**的"站点"标记，不是 `MAV_CMD_NAV_LAND`
-    ///（后者也恰好是 21，纯属数值巧合）。本次裁定"降落稍后再议"⇒ 站点航点
-    /// 按普通航点下发。这条防的是"看到 21 就发降落指令"这个误读 ——
+    ///（后者也恰好是 21，纯属数值巧合）。这条防的是"看到 21 就发降落指令"这个误读 ——
     /// 一旦误读，飞机会在中途**直接降落**，而界面上看不出任何异常。
+    ///
+    /// 【2026-09-28 裁定更新】用户裁定：**终点站**的站点航点在 **VTOL** 机型上映射为
+    /// `MAV_CMD_NAV_VTOL_LAND(85)`（垂起着陆）。本用例覆盖的因此**收窄**为
+    /// "非终点 / 非 VTOL"两支。
+    /// ⚠️ 85 **不是** 21 —— 本用例顺带钉住"不许有人图省事直接返回设计域那个 21"。
     function test_routeMissionItems_siteWaypointBecomesPlainWaypoint() {
-        var items = OpsCommon.routeMissionItems([_wp(39.748823, 116.143486, 50.0, 21)])
+        var items = OpsCommon.routeMissionItems([_wp(39.748823, 116.143486, 50.0, 21)], false)
         compare(items.length, 1)
-        compare(items[0].command, 16, "站点航点(设计域 cmd=21)下发时必须映射成 NAV_WAYPOINT(16)")
+        compare(items[0].command, 16, "非 VTOL ⇒ 站点航点必须映射成 NAV_WAYPOINT(16)")
+        // 省略第二/第三个实参同样按"非 VTOL / 无终点"处理：默认值必须是 fail-closed
+        // 的那一侧（漏掉降落＝飞机可见地盘旋；多发一个降落＝飞机真的落下去，不可撤销）。
+        compare(OpsCommon.routeMissionItems([_wp(39.748823, 116.143486, 50.0, 21)])[0].command, 16,
+                "不传 isVtol ⇒ 默认按非 VTOL，绝不默认启用垂起着陆")
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // 垂起着陆（VTOL_LAND=85）一组
+    //
+    // ‼️ 本组的夹具一律**带航点 id**，且分两类形状：
+    //   · `_routeRt003()` —— **当前数据源的真实形状**：列表里**没有终点站**；
+    //   · `_routeWithEnd()` —— **后端补上起降点之后**才会出现的形状。
+    //   两类都要有，缺了任何一类都会得到一个假绿的 ✓：
+    //   只测后者 ⇒ 看不见"当前根本不触发"；只测前者 ⇒ 看不见功能是否真的接得上。
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **当前数据源的真实点集**，逐字取自真库（2026-09-28 实测）：
+    /// 航线 RT-003 `start_waypoint_id=2`（北七家镇政府）/ `end_waypoint_id=5`（保定市政府），
+    /// 而 `GET /routes/:id/waypoints` 返回的**只有** `table_route_waypoint` 两行：
+    /// `seq=0 → wp3` 良乡区政府(cmd 21)、`seq=1 → wp4` 房山镇政府(cmd 16)。
+    /// ⇒ 起降站是 `table_route` 的两列、**不在该表内**，所以列表里**没有终点站**。
+    ///
+    /// ⚠️ **危险形状要用它的重排版**（见 `_routeMidStationLast`），不能只用本函数：
+    /// RT-003 的**末项**恰好是普通航点(cmd 16)，而 `16 → 16` 与"是不是终点"无关
+    /// ⇒ 单用本函数时，"末尾=终点"那条错判据**照样全绿**（已实测：只红 1 格）。
+    /// 这正是"夹具必须覆盖能分辨两种实现的那一格"的实例。
+    function _routeRt003() {
+        return [_wp(39.748823, 116.143486, 50.0, 21, 3),   // 良乡区政府（站点，中途）
+                _wp(39.748800, 116.143400, 50.0, 16, 4)]   // 房山镇政府（普通航点，中途）
+    }
+    /// RT-003 的终点航点 id（= 保定市政府）。**它不在上面那个列表里**。
+    readonly property int _rt003EndId: 5
+
+    /// **危险形状**：和 `_routeRt003()` 同点集，只是把两个中途点**换个顺序**，
+    /// 于是**末项是站点航点(21) 而它不是终点**。
+    /// 真库可达性：webui 的 `moveWp`（`RouteList.vue`）允许自由调整中途点顺序 ⇒
+    /// 这个形状在真实链路上**随手可得**。
+    /// 判据价值：旧的"末尾=终点"错判据在本形状下会把**良乡区政府**打成 85
+    /// ⇒ 飞机在航路中途降落，而目的地是保定市政府。
+    function _routeMidStationLast() {
+        return [_wp(39.748800, 116.143400, 50.0, 16, 4),   // 房山镇政府（普通航点，中途）
+                _wp(39.748823, 116.143486, 50.0, 21, 3)]   // 良乡区政府（站点，中途）← 末项
+    }
+
+    /// **后端补上起降点之后**的形状：终点站（id = `_rt003EndId`，站点，cmd 21）
+    /// 作为最后一项出现在列表里。坐标取自真库 `table_waypoint.id=5`。
+    function _routeWithEnd() {
+        var wps = _routeMidStationLast()
+        return wps.concat([_wp(38.874500, 115.464500, 30.0, 21, 5)])
+    }
+
+    /// 【2026-09-28 用户裁定】**终点站**站点航点 + VTOL ⇒ `MAV_CMD_NAV_VTOL_LAND(85)`。
+    ///
+    /// 语义（`MavCmdInfoCommon.json:363-389` 逐字）：「Fly to specified location at
+    /// current altitude, transition to multi-rotor and land.」—— 这正是单机版航线编辑器
+    /// 「选择航线任务指令」里那一项**垂起着陆**。
+    ///
+    /// 本条是本次改动的**主判据**：VTOL 飞机在终点**转为多旋翼着陆**，
+    /// 而不是像固定翼那样绕终点一直盘旋（用户实测的故障现象）。
+    function test_routeMissionItems_vtolEndStationBecomesVtolLand() {
+        var items = OpsCommon.routeMissionItems(_routeWithEnd(), true, _rt003EndId)
+        compare(items.length, 3, "三点都要下发：降落是**映射**终点那一点，不是**替换**它")
+        compare(items[0].command, 16, "中途站点(21)不是终点 ⇒ 保持 16")
+        compare(items[1].command, 16, "中途普通航点 ⇒ 保持 16")
+        compare(items[2].command, 85, "终点站 + VTOL ⇒ 必须是 VTOL_LAND(85)")
+        // ‼️ 阴性对照：85 ≠ 21。写成 21 会被 MAVLink 当成 `MAV_CMD_NAV_LAND`
+        //    （数值巧合），行为完全不同。这条断言防的是"顺手返回设计域那个 21"。
+        verify(items[2].command !== 21, "85 与 21 是两条不同的指令，绝不能写成 21(=NAV_LAND)")
+        // 降落的**坐标**必须原样透传：85 是 specifiesCoordinate 的命令，
+        // 坐标错了飞机就落到别处去了，而界面上看不出异常。
+        compare(items[2].lat, 38.8745, "降落点纬度必须原样透传")
+        compare(items[2].lon, 115.4645, "降落点经度必须原样透传")
+    }
+
+    /// ‼️ **本组最关键的一格 —— 它钉的是一条已被真库实测推翻的旧判据。**
+    ///
+    /// 旧判据是"列表里的**最后一项**就是终点站"。它在 `_routeRt003()` 这种形状上会让
+    /// **房山镇政府（中途点，id=4）** 变成 85 ⇒ 飞机在**航路中途**降落，
+    /// 而任务的目的地是保定市政府（id=5）—— 正是用户红线上"只能在机位上降落"那类事故，
+    /// 且界面上看不出任何异常。
+    ///
+    /// ⚠️ 这条用例之所以必须有：**反例 RT-SITL01** 的 `start_waypoint_id` /
+    ///    `end_waypoint_id` **恰好也在** `table_route_waypoint` 里，于是"最后一项"在
+    ///    那条航线上**恰好**对 —— 只拿 SITL 那条航线当样本的验证会给出一个假绿的 ✓。
+    function test_routeMissionItems_vtolLastItemIsNotTheEnd() {
+        var wps = _routeMidStationLast()
+        var items = OpsCommon.routeMissionItems(wps, true, _rt003EndId)
+        compare(items.length, 2)
+        compare(items[1].command, 16,
+                "列表最后一项是**中途**的良乡区政府(id=3)，而航线终点是 id=5 ⇒ 不得变 85")
+        verify(items[1].command !== 85, "旧判据（最后一项=终点）在本形状下会让飞机中途降落")
+        compare(items[1].lat, 39.748823, "坐标原样透传，别为了避开 85 而改动坐标")
+    }
+
+    /// 终点站**不在**下发列表里（＝当前数据源的真实情形）⇒ **不产生降落指令**。
+    /// 这是 fail-closed 的落点：行为与本改动之前完全一致（飞机在最后一个航点盘旋），
+    /// 而不是"改错了但看起来在工作"。解封条件见 `_endWaypointIndex` 的注释。
+    function test_routeMissionItems_vtolEndMissingProducesNoLand() {
+        var wps = _routeMidStationLast()
+        compare(OpsCommon.routeMissionItems(wps, true)[1].command, 16,
+                "不传 endWaypointId ⇒ 指认不出终点 ⇒ 一概 16")
+        compare(OpsCommon.routeMissionItems(wps, true, undefined)[1].command, 16, "undefined ⇒ 16")
+        compare(OpsCommon.routeMissionItems(wps, true, null)[1].command, 16, "null ⇒ 16")
+        // 端点值本身也按类型收：`"5"` 不是 number，`0` / 负数不是合法 id。
+        compare(OpsCommon.routeMissionItems(wps, true, "5")[1].command, 16,
+                "字符串 \"5\" 不是 number ⇒ 不指认（按类型收，与其余字段同口径）")
+        compare(OpsCommon.routeMissionItems(wps, true, 0)[1].command, 16, "0 不是合法航点 id")
+        compare(OpsCommon.routeMissionItems(wps, true, -1)[1].command, 16, "负数不是合法航点 id")
+        // 阳性对照：没有这一条，上面六条对一个"永远返回 16"的实现**全是绿的**。
+        compare(OpsCommon.routeMissionItems(_routeWithEnd(), true, _rt003EndId)[2].command, 85,
+                "阳性对照：终点站确实在列表里时，必须能指认出来并映射成 85")
+    }
+
+    /// 航线的**始发站**也是 `command=21`（站点航点在你们模型里**首尾都用**）。
+    /// 若把 21 整体映射成降落，飞机会在**始发站就降落**，整条航线被中途截断 ——
+    /// 而界面上看不出任何异常。
+    ///
+    /// ⚠️ 本形状（起降站**都在** route_waypoint 里）**当前不会出现**，
+    ///    它测的是"后端补上起降点之后"的行为。
+    function test_routeMissionItems_vtolStartStationIsNotLand() {
+        var wps = [_wp(40.117950, 116.424789, 50.0, 21, 2),   // 始发站（站点）
+                   _wp(39.748823, 116.143486, 50.0, 21, 3),   // 中途（站点）
+                   _wp(38.874500, 115.464500, 30.0, 21, 5)]   // 终点站（站点）
+        var items = OpsCommon.routeMissionItems(wps, true, 5)
+        compare(items.length, 3)
+        compare(items[0].command, 16,
+                "始发站也是站点(command=21)，但**不是终点** ⇒ 必须仍是普通航点(16)")
+        compare(items[1].command, 16, "中途站点(21)同样不是终点 ⇒ 16")
+        compare(items[2].command, 85, "只有**终点站**那一点才是垂起着陆")
+    }
+
+    /// 终点站是**普通航点**（用户没把它设成站点）⇒ **不发明用户没画的东西**。
+    /// 飞机在最后一个航点盘旋是既有行为，不因本次改动而变。
+    function test_routeMissionItems_vtolEndPlainWaypointStaysWaypoint() {
+        var wps = [_wp(39.748800, 116.143400, 50.0, 21, 3),
+                   _wp(39.748823, 116.143486, 50.0, 16, 5)]
+        var items = OpsCommon.routeMissionItems(wps, true, 5)
+        compare(items.length, 2)
+        compare(items[1].command, 16, "终点站是普通航点 ⇒ 不得自动补一条降落指令")
+    }
+
+    /// 单点航线：那个点**既是始发站也是终点站**（`id` 就是航线的终点 id）。
+    /// VTOL 下它变成 85 ⇒ mission 为 `[TAKEOFF, VTOL_LAND]`。
+    /// 钉住它是为了让这条裁量**可见**：日后若要改成"单点航线不降落"，
+    /// 必须先显式推翻本用例，而不是悄悄改掉。
+    function test_routeMissionItems_vtolSinglePointIsLand() {
+        var single = [_wp(39.748823, 116.143486, 50.0, 21, 7)]
+        var items = OpsCommon.routeMissionItems(single, true, 7)
+        compare(items.length, 1)
+        compare(items[0].command, 85, "单点航线的那个点就是航线终点 ⇒ 它就是降落点")
+        // 起飞高度取**首点**高度，与"首点是不是降落点"无关 ⇒ 不得被本次改动波及。
+        compare(OpsCommon.takeoffAltitude(single), 50.0,
+                "起飞高度仍取首点高度；引入 85 不得改变它")
+    }
+
+    /// 同一个 `endWaypointId` 在列表里命中**多于一处** ⇒ 无法确定哪一个是终点
+    /// ⇒ **不产生**降落（fail-closed）。两条 85 会让飞机在航路中途落一次，不可撤销。
+    /// 这是数据异常（`table_route_waypoint` 没有 `(route_id, waypoint_id)` 唯一约束），
+    /// 真实链路上不该出现，但后果不可撤销 ⇒ 值得一格。
+    function test_routeMissionItems_vtolAmbiguousEndProducesNoLand() {
+        var wps = [_wp(39.748800, 116.143400, 50.0, 21, 5),
+                   _wp(39.748823, 116.143486, 50.0, 21, 5)]   // 同一个 id 出现两次
+        var items = OpsCommon.routeMissionItems(wps, true, 5)
+        compare(items.length, 2)
+        compare(items[0].command, 16, "终点 id 有歧义 ⇒ 第 0 点不得变成降落")
+        compare(items[1].command, 16, "终点 id 有歧义 ⇒ 第 1 点也不得变成降落")
+    }
+
+    /// ‼️ `isVtol` **只认真布尔 `true`**（与本文件其余部分"按类型收"同一口径）。
+    /// 真值非布尔（`1` / `"true"` / `"false"`）一律**不启用**垂起着陆。
+    ///
+    /// 选 fail-closed 这一侧的理由：**漏掉降落**的后果是飞机在终点**可见地**盘旋
+    ///（与今天的行为一致，用户一眼能看出不对）；**多插一个降落**的后果是飞机
+    /// 真的落下去，不可撤销。默认值取后果较轻的那一侧。
+    /// ⚠️ 尤其 `"false"` 在 JS 里是**真值** —— 凡用 `if (isVtol)` 强转的实现都会放行它。
+    function test_routeMissionItems_vtolFlagRequiresStrictBoolean() {
+        var wps = _routeWithEnd()
+        var end = _rt003EndId
+        compare(OpsCommon.routeMissionItems(wps, 1, end)[2].command, 16, "数值 1 不是 true ⇒ 不启用")
+        compare(OpsCommon.routeMissionItems(wps, "true", end)[2].command, 16,
+                "字符串 \"true\" 不是 true ⇒ 不启用")
+        compare(OpsCommon.routeMissionItems(wps, "false", end)[2].command, 16,
+                "字符串 \"false\" 在 JS 里是真值 ⇒ 更不能靠强转放行")
+        compare(OpsCommon.routeMissionItems(wps, null, end)[2].command, 16, "null ⇒ 不启用")
+        compare(OpsCommon.routeMissionItems(wps, undefined, end)[2].command, 16, "undefined ⇒ 不启用")
+        // 阳性对照：没有这一条，上面五条对一个"永远返回 16"的实现**全是绿的**。
+        compare(OpsCommon.routeMissionItems(wps, true, end)[2].command, 85,
+                "阳性对照：真布尔 true 必须启用垂起着陆")
     }
 
     /// 未知的设计域 `command` ⇒ **整条航线作废**（回空数组），不做"跳过这一点"。
@@ -1241,5 +1435,281 @@ TestCase {
         verify(isNaN(OpsCommon.takeoffAltitude(null)), "null 应回 NaN")
         verify(isNaN(OpsCommon.takeoffAltitude([_wp(0, 0, 50.0, 16)])), "坐标无效应回 NaN")
         verify(OpsCommon.takeoffAltitude([]) !== 0, "回 0 是危险的兜底值")
+    }
+
+    //-------------------------------------------------------------------------
+    // takeoffSlotPose / takeoffTransitionPoint：起飞点（cmd 84）按机位朝向偏移
+    //-------------------------------------------------------------------------
+
+    /// 大圆距离（米）—— **本文件里的独立实现**，与被测的目标点公式互为反函数。
+    /// 「距离守恒」那条断言必须用它反算，**不能**照抄被测实现的公式：
+    /// 两边共用同一套推导时，半径/单位/经纬顺序写错会一起错、一起绿。
+    function _haversineM(lat1, lon1, lat2, lon2) {
+        var R = 6371000.0
+        var p1 = lat1 * Math.PI / 180, p2 = lat2 * Math.PI / 180
+        var dp = (lat2 - lat1) * Math.PI / 180
+        var dl = (lon2 - lon1) * Math.PI / 180
+        var a = Math.sin(dp / 2) * Math.sin(dp / 2)
+                + Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) * Math.sin(dl / 2)
+        return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+    }
+
+    /// 起点→终点的**初始方位角**（度，0=正北、顺时针）。同上，独立实现。
+    function _bearingDeg(lat1, lon1, lat2, lon2) {
+        var p1 = lat1 * Math.PI / 180, p2 = lat2 * Math.PI / 180
+        var dl = (lon2 - lon1) * Math.PI / 180
+        var y = Math.sin(dl) * Math.cos(p2)
+        var x = Math.cos(p1) * Math.sin(p2) - Math.sin(p1) * Math.cos(p2) * Math.cos(dl)
+        return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360
+    }
+
+    /// 1e-6 度 ≈ 0.11 m。这个容差**不是随手取的**：离屏探针（`/tmp/calib_azimuth.qml`，
+    /// 用 Qt 自己的 `QGeoCoordinate::atDistanceAndAzimuth`）实测，球面公式（R=6371000）
+    /// 与 Qt 在四方位上的最大偏差是 3.98e-9 度 ≈ 0.44 mm ⇒ 远在容差内；
+    /// 而**若误用赤道半径 6378137**，偏差是 3.02e-6 度 ⇒ 超容差、会红。
+    /// 即：这个容差既容得下实现差异，又拦得住半径写错。
+    function _nearDeg(a, b) { return Math.abs(a - b) < 1e-6 }
+
+    // ---- takeoffTransitionPoint ----
+
+    /// 期望值取自**离屏探针实测**（Qt 的 `atDistanceAndAzimuth`），
+    /// **不是**照抄被测实现的输出 —— 否则这里只是把实现重写一遍。
+    function test_takeoffTransitionPoint_fourCardinals_data() {
+        return [
+            { tag: "正北", heading: 0,   lat: 40.002697961769, lon: 116.000000000000 },
+            { tag: "正东", heading: 90,  lat: 39.999999946699, lon: 116.003521938957 },
+            { tag: "正南", heading: 180, lat: 39.997302038231, lon: 116.000000000000 },
+            { tag: "正西", heading: 270, lat: 39.999999946699, lon: 115.996478061043 },
+        ]
+    }
+
+    /// 四方位落点。基准点 40°N 116°E、偏移 300 m（`vtolTransitionDistance` 的默认值）。
+    ///
+    /// ‼️ 方位语义是 **0=正北、顺时针**（与 `table_slot.heading` 同口径，见
+    /// `SiteList.vue` 的「朝向(°)」输入框；Qt 的 `atDistanceAndAzimuth` 也是这个口径）。
+    /// 若实现按数学惯例写成「0=正东、逆时针」，本组四格会**整组错位 90°** ⇒ 红。
+    function test_takeoffTransitionPoint_fourCardinals(data) {
+        var p = OpsCommon.takeoffTransitionPoint(40.0, 116.0, data.heading, 300.0)
+        verify(p !== null, data.tag + "：应返回坐标而不是 null")
+        verify(_nearDeg(p.lat, data.lat),
+               data.tag + " lat=" + p.lat + "，期望 " + data.lat)
+        verify(_nearDeg(p.lon, data.lon),
+               data.tag + " lon=" + p.lon + "，期望 " + data.lon)
+    }
+
+    /// **独立方法交叉验证**：反算距离仍应是 300 m、反算方位角仍应是输入的朝向。
+    /// 这一条不看被测函数的公式形状 ⇒ 能抓住「半径写错」「度/弧度混用」「经纬写反」
+    /// 这三类四面位用例**抓不到**的错（四面位只钉四个点，公式整体偏移可能仍落在容差外但形态相似）。
+    function test_takeoffTransitionPoint_distanceAndBearingPreserved_data() {
+        return [
+            { tag: "正北", heading: 0 },
+            { tag: "正东", heading: 90 },
+            { tag: "正南", heading: 180 },
+            { tag: "正西", heading: 270 },
+            { tag: "东北", heading: 45 },
+            { tag: "西南", heading: 225 },
+            { tag: "东南偏东", heading: 112.5 },
+        ]
+    }
+
+    function test_takeoffTransitionPoint_distanceAndBearingPreserved(data) {
+        var p = OpsCommon.takeoffTransitionPoint(40.0, 116.0, data.heading, 300.0)
+        verify(p !== null, data.tag + "：应返回坐标")
+        var d = _haversineM(40.0, 116.0, p.lat, p.lon)
+        verify(Math.abs(d - 300.0) < 0.01,
+               data.tag + "：反算距离 = " + d + " m，期望 300 m")
+        var b = _bearingDeg(40.0, 116.0, p.lat, p.lon)
+        var raw = (b - data.heading + 360) % 360
+        var diff = raw > 180 ? 360 - raw : raw      // 处理 0/360 环绕
+        verify(diff < 1e-3,
+               data.tag + "：反算方位角 = " + b + "°，期望 " + data.heading + "°")
+    }
+
+    /// 距离 0 **是合法输入**（偏移 0），必须原样返回起点，不能当成"无效"回 null。
+    function test_takeoffTransitionPoint_zeroDistanceIsIdentity() {
+        var p = OpsCommon.takeoffTransitionPoint(40.0, 116.0, 123.0, 0.0)
+        verify(p !== null, "距离 0 是合法偏移，不该回 null")
+        verify(_nearDeg(p.lat, 40.0) && _nearDeg(p.lon, 116.0),
+               "距离 0 应原样返回起点，实得 " + p.lat + "," + p.lon)
+    }
+
+    /// 高纬：同距离下经度变化明显更大（cos φ 更小）。期望值同样取自探针。
+    function test_takeoffTransitionPoint_highLatitude() {
+        var p = OpsCommon.takeoffTransitionPoint(60.0, 10.0, 90.0, 300.0)
+        verify(p !== null, "应返回坐标")
+        verify(_nearDeg(p.lat, 59.999999889978), "60°N lat=" + p.lat)
+        verify(_nearDeg(p.lon, 10.005395923526), "60°N lon=" + p.lon)
+    }
+
+    function test_takeoffTransitionPoint_missingHeadingIsNull_data() {
+        return [
+            { tag: "undefined", heading: undefined },
+            { tag: "null",      heading: null },
+            { tag: "NaN",       heading: NaN },
+            { tag: "字符串",     heading: "90" },
+            { tag: "Infinity",  heading: Infinity },
+        ]
+    }
+
+    /// ‼️ 朝向拿不到时**必须回 null**（调用方据此回落 `home`），**不能**悄悄按 0（正北）偏移。
+    /// 那正是本功能要消灭的默认行为 —— 回落 `home` 至少是"原地起飞"，静默按正北偏移
+    /// 却会让飞机朝一个**谁都没指定过**的方向飞，且界面上看不出任何异常。
+    /// 「字符串 "90"」那一格钉的是"只认数字类型"：`Number("90")` 是 90，强转就会放行。
+    function test_takeoffTransitionPoint_missingHeadingIsNull(data) {
+        verify(OpsCommon.takeoffTransitionPoint(40.0, 116.0, data.heading, 300.0) === null,
+               data.tag + "：朝向不可用时必须回 null，不能按正北偏移")
+    }
+
+    function test_takeoffTransitionPoint_invalidDistanceIsNull_data() {
+        return [
+            { tag: "undefined", dist: undefined },
+            { tag: "NaN",       dist: NaN },
+            { tag: "Infinity",  dist: Infinity },
+            { tag: "负距离",     dist: -1 },
+        ]
+    }
+
+    /// 距离不可用 ⇒ null。负距离**刻意不取绝对值**：那是调用方的错，
+    /// 静默取绝对值等于替调用方猜意图。
+    function test_takeoffTransitionPoint_invalidDistanceIsNull(data) {
+        verify(OpsCommon.takeoffTransitionPoint(40.0, 116.0, 90.0, data.dist) === null,
+               data.tag + "：距离不可用时必须回 null")
+    }
+
+    function test_takeoffTransitionPoint_invalidCoordinateIsNull() {
+        verify(OpsCommon.takeoffTransitionPoint(NaN, 116.0, 90.0, 300.0) === null, "lat=NaN")
+        verify(OpsCommon.takeoffTransitionPoint(40.0, undefined, 90.0, 300.0) === null, "lon=undefined")
+        verify(OpsCommon.takeoffTransitionPoint(91.0, 116.0, 90.0, 300.0) === null, "lat 越界")
+        verify(OpsCommon.takeoffTransitionPoint(40.0, 181.0, 90.0, 300.0) === null, "lon 越界")
+    }
+
+    /// 朝向可以是任意实数（机位朝向是人工填的 `step="any"`），归一化到 [0,360) 后等价。
+    function test_takeoffTransitionPoint_headingNormalisation() {
+        var a = OpsCommon.takeoffTransitionPoint(40.0, 116.0, 90.0, 300.0)
+        var b = OpsCommon.takeoffTransitionPoint(40.0, 116.0, 450.0, 300.0)
+        var c = OpsCommon.takeoffTransitionPoint(40.0, 116.0, -270.0, 300.0)
+        verify(a !== null && b !== null && c !== null, "三个朝向都该算出点")
+        verify(_nearDeg(a.lat, b.lat) && _nearDeg(a.lon, b.lon), "450° 应等价于 90°")
+        verify(_nearDeg(a.lat, c.lat) && _nearDeg(a.lon, c.lon), "−270° 应等价于 90°")
+    }
+
+    // ---- takeoffSlotHeading ----
+
+    /// 三字段齐备 ⇒ 原样取出朝向（**不经任何换算**：`heading` 单位就是度，
+    /// 与 `atDistanceAndAzimuth` 的方位角同口径）。
+    function test_takeoffSlotHeading_readsHeading() {
+        compare(OpsCommon.takeoffSlotHeading({
+            current_slot_lat: 40.140578, current_slot_lon: 117.121397, current_slot_heading: 90
+        }), 90)
+    }
+
+    /// ‼️ `heading === 0` 是**合法朝向**（正北），**不是**哨兵 —— 真库里 12 个机位
+    /// 的朝向只有 0 和 1.0 两种取值。把 0 当"没填"会让绝大多数机位静默回落 `home`。
+    /// 哨兵只由**坐标**判定：后端未指定机位时下发 0/0/0。
+    ///
+    /// ⚠️ 断言写成 `h === 0` 而**不是** `verify(h)`：后者对 `0` 也会红，但红的理由不对
+    /// （红在"0 是 falsy"，而不是红在"函数把 0 当哨兵了"）。本函数用 `null` 表示"没有"、
+    /// 用 `0` 表示"正北"，这条同时把这个区分钉住 —— 调用方据此必须写 `!== null`。
+    function test_takeoffSlotHeading_headingZeroIsNotASentinel() {
+        var h = OpsCommon.takeoffSlotHeading({
+            current_slot_lat: 40.140578, current_slot_lon: 117.121397, current_slot_heading: 0
+        })
+        verify(h !== null, "朝向 0（正北）是合法值，不该被当成「没填」")
+        verify(h === 0, "正北应原样返回 0，实得 " + h)
+    }
+
+    /// 哨兵：后端「未指定机位」时下发 0/0/0 ⇒ 无位姿 ⇒ 调用方回落 `home`。
+    function test_takeoffSlotHeading_sentinelIsNull() {
+        verify(OpsCommon.takeoffSlotHeading({
+            current_slot_lat: 0, current_slot_lon: 0, current_slot_heading: 0
+        }) === null, "0/0/0 是哨兵，应回 null")
+    }
+
+    /// 坐标半填（只有一个 0）也当无效：中国境内不可能出现经度或纬度为 0 的机位，
+    /// 拿它去偏移会得到一个**看似正常、实际错在地球另一边**的点。
+    function test_takeoffSlotHeading_halfZeroCoordinateIsNull() {
+        verify(OpsCommon.takeoffSlotHeading({
+            current_slot_lat: 0, current_slot_lon: 117.121397, current_slot_heading: 90
+        }) === null, "lat=0 而 lon 有效 ⇒ 数据不可用，应回 null")
+        verify(OpsCommon.takeoffSlotHeading({
+            current_slot_lat: 40.140578, current_slot_lon: 0, current_slot_heading: 90
+        }) === null, "lon=0 而 lat 有效 ⇒ 数据不可用，应回 null")
+    }
+
+    /// 字段整体缺失（后端未升级 / 老响应）⇒ null。**不能**当 0 处理。
+    function test_takeoffSlotHeading_missingFieldsIsNull() {
+        verify(OpsCommon.takeoffSlotHeading({}) === null, "空对象应回 null")
+        verify(OpsCommon.takeoffSlotHeading(null) === null, "null 应回 null")
+        verify(OpsCommon.takeoffSlotHeading(undefined) === null, "undefined 应回 null")
+        verify(OpsCommon.takeoffSlotHeading({ current_slot_lat: 40.140578 }) === null,
+               "只有 lat、没有 lon/heading ⇒ 应回 null")
+    }
+
+    /// 坐标有效但**朝向缺失** ⇒ null（回落 `home`）。理由同 `missingHeadingIsNull`：
+    /// 宁可原地起飞，也不朝一个没人指定过的方向飞。
+    function test_takeoffSlotHeading_missingHeadingIsNull() {
+        verify(OpsCommon.takeoffSlotHeading({
+            current_slot_lat: 40.140578, current_slot_lon: 117.121397
+        }) === null, "缺 heading ⇒ 应回 null")
+        verify(OpsCommon.takeoffSlotHeading({
+            current_slot_lat: 40.140578, current_slot_lon: 117.121397, current_slot_heading: NaN
+        }) === null, "heading=NaN ⇒ 应回 null")
+        verify(OpsCommon.takeoffSlotHeading({
+            current_slot_lat: 40.140578, current_slot_lon: 117.121397, current_slot_heading: "90"
+        }) === null, "heading 是字符串 ⇒ 应回 null（只认数字类型）")
+    }
+
+    /// 端到端形状：后端三字段 → 朝向 → 偏移点。把两段接起来跑一遍，
+    /// 免得两个函数各自绿、接在一起却单位不匹配（度 vs 弧度、lat/lon 顺序）。
+    function test_takeoffSlotHeading_thenTransitionPoint() {
+        var h = OpsCommon.takeoffSlotHeading({
+            current_slot_lat: 40.0, current_slot_lon: 116.0, current_slot_heading: 90
+        })
+        verify(h !== null, "朝向应可取")
+        var p = OpsCommon.takeoffTransitionPoint(40.0, 116.0, h, 300.0)
+        verify(p !== null, "偏移点应可算")
+        verify(_nearDeg(p.lat, 39.999999946699), "端到端 lat=" + p.lat)
+        verify(_nearDeg(p.lon, 116.003521938957), "端到端 lon=" + p.lon)
+    }
+
+    //----------------------------------------------------------------
+    // 「切换多旋翼是否已完成」判据
+    //----------------------------------------------------------------
+    //
+    // ‼️ 本组测试的存在理由：原实现的判据是 `Vehicle::multiRotor`，而它对 VTOL 机体
+    // **恒为 false** —— `QGCMAVLink::vehicleClass()` 是纯 switch，`MAV_TYPE_VTOL_*` 全部
+    // 归 `VehicleClassVTOL`，与 `VehicleClassMultiRotor` 不相交。于是飞机切到多旋翼之后
+    // 判据仍为假 ⇒ 必然走满 30 秒超时、回航指令永不发出（2026-09-28 实测现象）。
+    // 正确判据是「转换**已完成**」，而只有 `MAV_VTOL_STATE_MC` 一个取值代表它。
+
+    /// 五档必须分清：未定义 / 转固定翼中 / **转多旋翼中** / 多旋翼 / 固定翼。
+    ///
+    /// ‼️ 「转多旋翼中」(2) 这一格是本组的核心。若把判据写成 `!vtolInFwdFlight`
+    /// （等价于 `vtolState !== 4`），这一格会红：飞机刚开始转多旋翼时 `vtol_state`
+    /// 就已不再是 FW，会在**转换途中**就发出回航，而 PX4 此刻仍视机体为固定翼，
+    /// 回航会重新落回那个卡死的 LOITER_DOWN 格 —— 症状与修复前一模一样。
+    function test_vtolTransitionDone_stateMapping_data() {
+        return [
+            { tag: "0 未定义 ⇒ 未完成",     state: 0, expected: false },
+            { tag: "1 转固定翼中 ⇒ 未完成", state: 1, expected: false },
+            { tag: "2 转多旋翼中 ⇒ 未完成", state: 2, expected: false },
+            { tag: "3 多旋翼 ⇒ 已完成",     state: 3, expected: true  },
+            { tag: "4 固定翼 ⇒ 未完成",     state: 4, expected: false }
+        ]
+    }
+    function test_vtolTransitionDone_stateMapping(data) {
+        verify(OpsCommon.vtolTransitionDone(data.state) === data.expected, data.tag)
+    }
+
+    /// 非法 / 缺失输入 ⇒ false（不宣布完成）。
+    /// 宁可让操作员看到超时提示，也不在没有证据时宣布完成 —— 后者会发出一份
+    /// 落在错误状态机上的回航指令，且界面上一切正常、无人知道。
+    function test_vtolTransitionDone_invalidIsNotDone() {
+        verify(OpsCommon.vtolTransitionDone(undefined) === false, "undefined")
+        verify(OpsCommon.vtolTransitionDone(null) === false, "null")
+        verify(OpsCommon.vtolTransitionDone(NaN) === false, "NaN")
+        verify(OpsCommon.vtolTransitionDone("3") === false, "字符串 3 ⇒ 不算（只认数字类型）")
+        verify(OpsCommon.vtolTransitionDone(-1) === false, "负数")
+        verify(OpsCommon.vtolTransitionDone(3.5) === false, "非整数")
     }
 }
