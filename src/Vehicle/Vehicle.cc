@@ -1069,11 +1069,27 @@ void Vehicle::_handleExtendedSysState(mavlink_message_t& message)
         break;
     }
 
+    // ⚠️ 机型闸：非 VTOL 机体走不进这一块 ⇒ `_vtolState` **永远是初值 0**（`Vehicle.h:982`），
+    //    `vtolStateChanged` 也一次都不发。
+    //    当前唯一的消费方是「切换多旋翼降落」链路（`OpsView.OpsView.qml` / `TaskListPanel.qml`），
+    //    而那条链路只在 VTOL 上成立，所以这个前提眼下够用。
+    //    ‼️ 但**消费端没有对应的机型判据**（2026-09-29 审查 C1）：非 VTOL 机体上点那个按钮，
+    //    `OpsCommon.vtolTransitionDone(0)` 恒为 false ⇒ 必然走满 30 秒超时，飞机已被 Hold 拽出
+    //    航线悬停而 RTL 从未发出。用户 2026-09-29 裁定**暂只处理 VTOL**，故消费端的机型闸先不补，
+    //    只在此标注；将来要放行非 VTOL，判据应建在 `Vehicle::vtol()`（＝`QGCMAVLink::isVTOL`）上。
     if (vtol()) {
         bool vtolInFwdFlight = extendedState.vtol_state == MAV_VTOL_STATE_FW;
         if (vtolInFwdFlight != _vtolInFwdFlight) {
             _vtolInFwdFlight = vtolInFwdFlight;
             emit vtolInFwdFlightChanged(vtolInFwdFlight);
+        }
+        // 原始值另留一份：上面那个 bool 把「转多旋翼中(2)」与「多旋翼(3)」压成了同一个
+        // false，而判「切换完成了没」必须能分辨这两者 —— 转换途中发出回航，PX4 此刻仍视
+        // 机体为固定翼，回航会重新落回卡死的 LOITER_DOWN，症状与没修一样。
+        const int vtolState = static_cast<int>(extendedState.vtol_state);
+        if (vtolState != _vtolState) {
+            _vtolState = vtolState;
+            emit vtolStateChanged(vtolState);
         }
     }
 }
@@ -2493,6 +2509,51 @@ void Vehicle::setVtolInFwdFlight(bool vtolInFwdFlight)
                        vtolInFwdFlight ? MAV_VTOL_STATE_FW : MAV_VTOL_STATE_MC, // transition state
                        0, 0, 0, 0, 0, 0);                                       // param 2-7 unused
     }
+}
+
+bool Vehicle::hoverAndTransitionToMultirotor()
+{
+    // ⚠️ 机型闸：本函数**没有** `vtol()` 前置检查（2026-09-29 审查 C1）。调用方
+    //    `OpsView._switchToMultirotorThenReturn` 也没有。用户 2026-09-29 裁定**暂只处理 VTOL**
+    //    ⇒ 此处只标注、不加闸。非 VTOL 机体上调用它的后果见 `_handleExtendedSysState` 里
+    //    `if (vtol())` 那段的注记（30 秒必超时、飞机悬停在原地）。
+    //
+    // Leave RTL before the back-transition. Re-issuing RTL while already in RTL is the same
+    // navigator mode, so NavigatorMode::run() takes the on_active() branch and the RTL state
+    // machine keeps whatever state it was stuck in.
+    //
+    // ‼️ 返回 false ＝ **一个字节都没发**，调用方必须把它变成用户可见的失败，不许当成功继续。
+    //    理由：`Vehicle::setFlightMode()` 返回 void 且有两条静默失败路径（下方 `:1506/:1508`
+    //    的 `qCWarning` / `qCDebug`）。若 hold 没生效却"看着成功"，调用方就会开始等
+    //    `vtolStateChanged`，30 秒守卫被成功分支停掉，而飞机仍在 RTL 里 —— 操作员什么都看不到。
+    const QString holdMode = _firmwarePlugin->pauseFlightMode();
+
+    uint8_t  baseMode   = 0;
+    uint32_t customMode = 0;
+
+    // `setFlightModeCustom()` 只做「本固件的模式表里有没有这个名字」这一步查表，无副作用；
+    // 非 PX4 固件的 `pauseFlightMode()` 是空串，同样在这里落网。预检通过后再走 `setFlightMode()`
+    // 的完整路径（它内部还会再查一次表，代价可忽略）。
+    if (holdMode.isEmpty() || !setFlightModeCustom(holdMode, &baseMode, &customMode)) {
+        // 非 PX4 固件上 `pauseFlightMode()` 是空串。此时若继续发转换指令，飞机留在 RTL 里，
+        // 调用方重发的 RTL 又是同一个导航模式 ⇒ 原样回到卡死的那一格，且无任何可见错误。
+        qCWarning(VehicleLog) << "hoverAndTransitionToMultirotor: no Hold flight mode for this firmware; nothing sent";
+        return false;
+    }
+    setFlightMode(holdMode);
+
+    // Deliberately not setVtolInFwdFlight(): that helper early-returns unless `_vtolInFwdFlight`
+    // differs from the value asked for, and the member is recomputed from EXTENDED_SYS_STATE on
+    // every heartbeat (`_handleExtendedSysState`) — never written by the joystick. While RTL is
+    // stuck the vehicle is still in FW, so the member reads true and asking for `false` happens
+    // to work; sending the command unconditionally keeps this path independent of a cached bit
+    // the vehicle can change under us.
+    sendMavCommand(_defaultComponentId,
+                   MAV_CMD_DO_VTOL_TRANSITION,
+                   true,              // show errors
+                   MAV_VTOL_STATE_MC, // transition state
+                   0, 0, 0, 0, 0, 0); // param 2-7 unused
+    return true;
 }
 
 void Vehicle::startMavlinkLog()

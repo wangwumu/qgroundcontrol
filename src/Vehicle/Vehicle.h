@@ -167,6 +167,14 @@ public:
     Q_PROPERTY(bool                 fixedWing                   READ fixedWing                                                      NOTIFY vehicleTypeChanged)
     Q_PROPERTY(bool                 multiRotor                  READ multiRotor                                                     NOTIFY vehicleTypeChanged)
     Q_PROPERTY(bool                 vtol                        READ vtol                                                           NOTIFY vehicleTypeChanged)
+    /// 当前 VTOL 状态（`MAV_VTOL_STATE_*`），由 `EXTENDED_SYS_STATE.vtol_state` 驱动。
+    ///
+    /// ‼️ 与上面那几个 `NOTIFY vehicleTypeChanged` 的属性**根本不同**：那些读的是机体
+    ///    `MAV_TYPE`，对一个 VTOL 机体是**恒定**的（`QGCMAVLink::vehicleClass()` 把
+    ///    `MAV_TYPE_VTOL_*` 全归 `VehicleClassVTOL`，与 `VehicleClassMultiRotor` 不相交）
+    ///    ⇒ `multiRotor()` 对 VTOL 机体**恒为 false**，无论它当前在旋翼档还是固定翼档。
+    ///    本属性随转换过程变化，是唯一能回答「转换完成了没」的字段。
+    Q_PROPERTY(int                  vtolState                   READ vtolState                                                      NOTIFY vtolStateChanged)
     Q_PROPERTY(bool                 rover                       READ rover                                                          NOTIFY vehicleTypeChanged)
     Q_PROPERTY(bool                 sub                         READ sub                                                            NOTIFY vehicleTypeChanged)
     Q_PROPERTY(VehicleSupports*     supports                    READ supports                                                       CONSTANT)
@@ -513,6 +521,9 @@ public:
     bool            guidedMode                  () const;
     bool            inFwdFlight                 () const;
     bool            vtolInFwdFlight             () const { return _vtolInFwdFlight; }
+    /// 见 `vtolState` 的 Q_PROPERTY 注释。默认 `MAV_VTOL_STATE_UNDEFINED`（0）
+    /// 是**诚实的**「还不知道」—— 不要让它等于 `MAV_VTOL_STATE_MC`。
+    int             vtolState                   () const { return _vtolState; }
     uint8_t         baseMode                    () const { return _base_mode; }
     uint32_t        customMode                  () const { return _custom_mode; }
     /// Custom mode used for health/arming-check mode-group lookups: prefers the
@@ -754,6 +765,15 @@ public slots:
     void _offlineFirmwareTypeSettingChanged (QVariant varFirmwareType); // Should only be used by MissionControler to set firmware from Plan file
     void _offlineVehicleTypeSettingChanged  (QVariant varVehicleType);  // Should only be used by MissionController to set vehicle type from Plan file
     Q_INVOKABLE void sendGripperAction(GRIPPER_ACTIONS gripperOption);
+    /// Switches to Hold and commands a VTOL back-transition to multirotor.
+    /// Re-issuing RTL while already in RTL is the same navigator mode, so on_activation() never
+    /// runs and the RTL state machine is not restarted. Leaving RTL first is what makes the
+    /// later RTL re-entry take the multirotor path (MOVE_TO_LOITER -> LAND, skipping the
+    /// LOITER_DOWN state, which stalls on a 5 cm acceptance margin in fixed-wing).
+    /// @return false when nothing was sent (no Hold mode for this firmware), so the caller can
+    ///         surface a visible failure instead of waiting for a transition that will not happen.
+    ///         Also: no `vtol()` precondition — non-VTOL airframes must not call this (2026-09-29).
+    Q_INVOKABLE bool hoverAndTransitionToMultirotor();
 
 signals:
     void coordinateChanged              (QGeoCoordinate coordinate);
@@ -767,6 +787,9 @@ signals:
     void guidedModeChanged              (bool guidedMode);
     void inFwdFlightChanged             ();
     void vtolInFwdFlightChanged         (bool vtolInFwdFlight);
+    /// 载荷为 `MAV_VTOL_STATE_*` 原始值。**不要**改成 `bool`：`TRANSITION_TO_MC`(2)
+    /// 与 `MC`(3) 必须可区分，否则"正在转"会被当成"转完了"（发出回航的时机就错了）。
+    void vtolStateChanged               (int vtolState);
     void prearmErrorChanged             (const QString& prearmError);
     void soloFirmwareChanged            (bool soloFirmware);
     void defaultCruiseSpeedChanged      (double cruiseSpeed);
@@ -953,6 +976,10 @@ private:
     bool            _flying = false;
     bool            _landing = false;
     bool            _vtolInFwdFlight = false;
+    /// `MAV_VTOL_STATE_UNDEFINED`(0) ⇒ 尚未收到过 `EXTENDED_SYS_STATE`。
+    /// 保持 0 是刻意的：`vtolTransitionDone()` 只认 `MAV_VTOL_STATE_MC`，
+    /// 把初值写成 MC 会让「还没收到遥测」被误判成「已切换完成」。
+    int             _vtolState = 0;
     uint32_t        _onboardControlSensorsPresent = 0;
     uint32_t        _onboardControlSensorsEnabled = 0;
     uint32_t        _onboardControlSensorsHealth = 0;

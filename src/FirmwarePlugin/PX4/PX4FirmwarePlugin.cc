@@ -586,6 +586,12 @@ void PX4FirmwarePlugin::setGuidedMode(Vehicle* vehicle, bool guidedMode) const
     }
 }
 
+/// ‼️ 两个消费方：① FlyView 的「暂停」按钮（经 `Vehicle::pauseVehicle`）；
+/// ② Ops 的「切换多旋翼降落」在重发 RTL 前**先离开 RTL**
+/// （`Vehicle::hoverAndTransitionToMultirotor`）。
+/// ② 原先调的是一个与之**逐字相同**的独立虚函数 `holdFlightMode()`，2026-09-29 审查 I1 后合并到本函数：
+/// 那个虚函数在 PX4 之外**无人覆盖**，而调用点只判 `isEmpty()` ⇒ 在 ArduPilot 上静默 no-op
+/// （飞机留在 RTL 里、回去卡在同一格），却没有任何可见错误。
 QString PX4FirmwarePlugin::pauseFlightMode() const
 {
     return _modeEnumToString.value(PX4CustomMode::AUTO_LOITER);
