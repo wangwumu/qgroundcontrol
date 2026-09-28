@@ -1073,7 +1073,10 @@ OpsShell {
             }
             Text {
                 Layout.fillWidth: true
-                color: "#ffc107"; font.pixelSize: 12
+                // 深蓝 `#1565c0`，白底上 **5.75:1**（WCAG 及格线 4.5:1）。
+                // 原为琥珀 `#ffc107`——那是**深色卡片**上的提示色（任务卡的通知条同族），
+                // 搬到 `Dialog` 的浅色底上只剩 **1.63:1**，用户 2026-09-28 反馈"非常不明显"。
+                color: "#1565c0"; font.pixelSize: 12
                 wrapMode: Text.Wrap
                 text: opsView._landBlockReason
             }
@@ -1152,7 +1155,10 @@ OpsShell {
             spacing: 12
             Text {
                 Layout.fillWidth: true
-                color: "#ffc107"; font.pixelSize: 13
+                // 深蓝 `#1565c0`，白底上 **5.75:1**。原为琥珀 `#ffc107`（白底仅 **1.63:1**），
+                // 用户 2026-09-28 反馈"非常不明显"。理由与上方 `landBlockDialog` 那条同源：
+                // 琥珀是深色卡片上的提示色，不属于浅色的 `Dialog`。
+                color: "#1565c0"; font.pixelSize: 13
                 wrapMode: Text.Wrap
                 text: opsView._pendingConfirmHint()
             }
