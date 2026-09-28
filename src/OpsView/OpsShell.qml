@@ -110,6 +110,13 @@ Item {
     property var  _seenHandovers:  []      // 已提示过的 handover id（防重复弹框）
     property var  _selectedTaskId: -1
     property var  _confirmHandover: null   // 交接弹框当前对象
+    // 交接弹框的**位置锚点**：那条交接对应的任务卡片的**下缘**（相对本骨架）；-1 = 无锚点。
+    // ‼️ 由派生视图在 `rightPanelContent` 的 `Component` **内部**注入（`taskListPanel` 的 id 只在
+    //    那个 Component 里可见，根作用域够不到它）。入参 `taskId`，回传卡片下缘相对**本骨架**
+    //    的 y；该任务不在本视图的列表里则回传 -1。与 `TaskListPanel` 的 `canTakeoffFn` 同族：
+    //    都是"跨不出去、只能注入"的求值函数。
+    property var  _handoverAnchorFn: null
+    property real _handoverAnchorY: -1
     property int   _now:           Date.now()
     property string _handoverActionError: ""  // 交接确认/拒绝/撤回失败提示（handoverDialog 保留可重试）
     // 本站站点 id 来自登录响应 role_sites 单值（AuthController.siteId，仅内存），不再从任务反推。
@@ -1124,6 +1131,26 @@ Item {
               })
     }
 
+    /// 求一次交接弹框的锚点并记账。**两个打开点都先走这里**（`_checkinFromCard` 与
+    /// `_notifyNewPending`）——各写各的会让"哪些入口定位"失去单一口径（同 `cardBottomY` 那条
+    /// 注释的纪律）。
+    ///
+    /// ‼️ 结果落在 `[0, 骨架高]` 之外就判**无锚点**：`cardBottomYForTask` 如实回传几何，而卡片
+    ///    滚出列表可视区时那个值是**负的**或**大于列表高**的。这类坐标会把弹框推出屏幕
+    ///    （比"左上角"更糟——整个框看不见），故一律退回居中。
+    ///
+    /// ⚠️ 取值是**一次性**的（存进 `_handoverAnchorY`），与 `actionConfirmDialog` 的
+    ///    `_confirmAnchorY` 同语义：弹框开着时列表若滚动，框**不**跟着走。改成绑定就得让
+    ///    `_handoverAnchorY` 随 `_tasks` 重估，而命令式赋值又会打断绑定——两头不讨好。
+    /// ⚠️ 时序上是安全的：`_notifyNewPending` 跑在 `_poll()` 的响应回调里，此刻 `_handoverById`
+    ///    刚赋值、`tasks` 的绑定**还没重估**，读到的可能仍是上一批委托——但匹配判据是
+    ///    `task_id`，新旧委托的 `task_id` 相同、位置也相同 ⇒ 读哪一批都对。
+    function _setHandoverAnchor(taskId) {
+        var fn = _handoverAnchorFn
+        var y = (fn && taskId !== undefined && taskId !== null) ? fn(taskId) : -1
+        _handoverAnchorY = (y >= 0 && y <= opsShell.height) ? y : -1
+    }
+
     /// 卡片上的【签入】（`TaskListPanel.checkinRequested` 的唯一落点，**两个视图共用**）。
     ///
     /// ‼️ 为什么住骨架、而不是各视图各接一次：失败反馈只有一套机制——复用 `handoverDialog`
@@ -1148,6 +1175,7 @@ Item {
             // 文案与弹框内 accept 失败那句**逐字相同**：两处同因同果，分开写就会漂移。
             _handoverActionError = qsTr("操作未送达服务端，请重试；仍失败请通知对方人工处理")
             _confirmHandover = h
+            _setHandoverAnchor(h.task_id)
             handoverDialog.open()
         })
     }
@@ -1168,6 +1196,7 @@ Item {
             if (_seenHandovers.length > 200) _seenHandovers.shift()   // 防长会话无界增长（缓慢内存泄漏）
             _handoverActionError = ""
             _confirmHandover = h
+            _setHandoverAnchor(h.task_id)
             handoverDialog.open()
         }
     }
@@ -1947,7 +1976,20 @@ Item {
     Dialog {
         id: handoverDialog
         parent: opsShell
-        width: 400
+        // 宽度与右边栏一致、右边缘贴窗口右缘、上部与**那条交接对应的任务卡片**下缘对齐——
+        // 与签出确认框（`OpsView.actionConfirmDialog`）同一套规则（用户 2026-09-28 要求）。
+        // 原先没写 `x`/`y`，`Dialog` 缺省落 (0,0) ⇒ 用户报的"左上角"。
+        // ‼️ 与签出确认框唯一的差别在**锚点怎么来**：那个框只由"点卡片上的按钮"触发，坐标随
+        //    信号带回；这个框还能由**待办到达自动弹出**（`_notifyNewPending`），那一路没有触发
+        //    卡片 ⇒ 按 `task_id` 回列表里找（`_handoverAnchorFn`，视图侧注入）。两条路都收进
+        //    `_handoverAnchorY`，这里只管消费，不认识自己是被谁打开的。
+        width: opsShell.rightPanelWidth
+        x: opsShell.width - width
+        // 卡片靠下时向上收，别顶出屏幕底；无锚点（交接对应的任务不在本视图列表里，或卡片滚出
+        // 可视区）则垂直居中——兜底与 `actionConfirmDialog` 的 `_confirmAnchorY < 0` 那条一致。
+        y: opsShell._handoverAnchorY < 0
+           ? (opsShell.height - height) / 2
+           : Math.min(opsShell._handoverAnchorY + 6, opsShell.height - height - 12)
         modal: true
         title: qsTr("交接确认")
 
@@ -1956,7 +1998,13 @@ Item {
             spacing: 8
             Text {
                 Layout.fillWidth: true
-                color: "#e6edf7"; font.pixelSize: 13
+                // 深色正文 `#1f2937`，白底 **14.68:1**（WCAG 及格线 4.5:1）。
+                // 原为 `#e6edf7`——那是**深色卡片**上的正文色，本框却渲染在 `Dialog` 的**浅色底**
+                // 上（实测 `palette.window = #ffffff`，理由见 `actionConfirmDialog` 那条注释），
+                // 白底上只剩 **1.18:1**，用户 2026-09-28 实测"看不见"。
+                // ⚠️ 与本文件另几处 `#e6edf7`（深色底上的浅色文字）**不冲突**：那些是对的，
+                //    只有本框要反过来。
+                color: "#1f2937"; font.pixelSize: 13
                 wrapMode: Text.Wrap
                 text: _confirmHandover
                     ? qsTr("%1 · %2 请求把任务「%3」移交 %4")
@@ -1968,14 +2016,19 @@ Item {
             }
             Text {
                 Layout.fillWidth: true
-                color: _confirmHandover && OpsCommon.isTimeout(_confirmHandover, opsShell._now) ? "#ff3b3b" : "#ffc107"
+                // 常态深蓝 `#1565c0`（白底 **5.75:1**，与签出确认框的提示语同色）；超时转深红
+                // `#c62828`（**5.62:1**）。原为琥珀 `#ffc107`——白底只剩 **1.63:1**，即用户报的
+                // "黄字"，与 `landBlockDialog` 那次是同一个病根（琥珀是深色卡片上的提示色，
+                // 不属于浅色的 `Dialog`）。
+                color: _confirmHandover && OpsCommon.isTimeout(_confirmHandover, opsShell._now) ? "#c62828" : "#1565c0"
                 font.pixelSize: 12
                 text: _confirmHandover ? qsTr("剩余 ") + OpsCommon.remainingSec(_confirmHandover, opsShell._now) : ""
             }
             // 操作失败提示：瞬时网络失败时保留弹框供重试（配合 _seenHandovers 去重，关框即无再确认入口）
             Text {
                 Layout.fillWidth: true
-                color: "#ff6b6b"; font.pixelSize: 12
+                // 深红 `#c62828`（白底 **5.62:1**）。原为 `#ff6b6b`——白底只剩 **2.78:1**。
+                color: "#c62828"; font.pixelSize: 12
                 wrapMode: Text.Wrap
                 visible: _handoverActionError !== ""
                 text: _handoverActionError

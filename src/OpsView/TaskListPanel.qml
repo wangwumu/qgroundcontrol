@@ -34,6 +34,43 @@ ColumnLayout {
         return cardItem.mapToItem(panel, 0, cardItem.height).y
     }
 
+    // 按任务 id 求该卡片的下缘 y（同样相对本组件）；该任务当前**不在列表里则返回 `null`**。
+    //
+    // ‼️ 谁要它：交接弹框（`OpsShell.handoverDialog`）。那个框有**两个**打开点，其中"待办到达
+    //    自动弹出"那一路（`_notifyNewPending`）手里**只有一条交接数据、没有触发卡片**，只能按
+    //    `task_id` 回列表里找。用户 2026-09-28 裁定：这种情况也**贴该任务的卡片下缘**，
+    //    不退回居中。（另一个打开点 `_checkinFromCard` 同样走这里，两个入口同一条口径。）
+    //
+    // ‼️ 为什么是"遍历委托"而不是"在 `tasks` 里找下标再乘行高"：卡片高度**随内容变**
+    //    （按钮行/提示条的条数不同就不同），行高**不是常数** ⇒ 下标×行高会落到别的卡片上，
+    //    而且错得不明显（看着只像"贴得不太准"）。
+    //
+    // ⚠️ 回传的是**几何、不是"有效位置"**：委托滚出列表可视区时 `mapToItem` 会给出负值或
+    //    大于列表高的值。这里只如实回传，有效性由调用方（骨架，它才拿得到窗口高）判。
+    // ‼️ "没有这张卡"用 `null`、**不能**用 -1：调用方要把这个 y 再过一次 `mapToItem` 换算到
+    //    视图根上，而 `mapToItem(..., 0, -1)` 会得到一个**看着完全合法**的坐标（列表顶再往上
+    //    一格），弹框就会被静默贴到列表顶上。两种"负数"必须区分：`null` = 没这张卡；
+    //    负实数 = 卡在列表里、只是滚到可视区上方了。
+    function cardBottomYForTask(taskId) {
+        if (taskId === undefined || taskId === null) return null
+        var kids = taskList.contentItem ? taskList.contentItem.children : null
+        if (!kids) return null
+        for (var i = 0; i < kids.length; i++) {
+            var d = kids[i]
+            // ‼️ 判据是委托**自己声明的** `task`，读到 `undefined` 就跳过 —— 这一条同时排掉了
+            //    `contentItem.children` 里混着的非委托对象（实测 `model: [3 项]` 时
+            //    `children.length` 可以是 **4**）。
+            // ‼️‼️ **不能**在这里读 `d.modelData`：委托里的 `modelData` 是 `ListView` 经
+            //    `QQmlContext` 注入的**上下文属性**，不是委托对象的属性 ⇒ 从外部读**恒为
+            //    `undefined`**（2026-09-28 离屏探针实测：已知 `task_id=222` 的那张卡，
+            //    读 `d.modelData` 全为 undefined ⇒ 本函数恒回 `null`）。而失败形状是**静默**
+            //    的——弹框照常出现、只是永远不贴卡片。所以 delegate 上那行
+            //    `property var task: modelData` 是**本函数的必要前提**，删掉它这里不会报错。
+            if (d && d.task && d.task.task_id === taskId) return cardBottomYOf(d)
+        }
+        return null
+    }
+
     //-------------------------------------------------------------------------
     // 输入
     //-------------------------------------------------------------------------
@@ -128,6 +165,11 @@ ColumnLayout {
 
         delegate: Rectangle {
             id: card
+            // 本委托对应的数据项，**供外部按键查找委托用**（`cardBottomYForTask`）。
+            // ‼️ 为什么不能省：`modelData` 是 `ListView` 注入的**上下文属性**，只在委托**内部**
+            //    可读；外部（`contentItem.children[i].modelData`）读到的是 `undefined`，且不报错。
+            //    交接弹框要按 `task_id` 找卡片，靠的就是这一行。
+            property var task: modelData
             // 本卡的 PENDING 交接（无则 undefined）。原文在同一个 delegate 里调了 6 次
             // `_handoverFor(modelData)`，此处抽成一条绑定——纯函数、依赖不变，行为等价。
             readonly property var  _handover: OpsCommon.handoverFor(modelData, panel.handoverById)

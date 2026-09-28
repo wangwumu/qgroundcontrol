@@ -178,6 +178,17 @@ OpsShell {
             // 中段：航班列表（异常 ∪ 待我签入 置顶常驻 ∪ 选中航线的航班）
             //-----------------------------------------------------------------
             TaskListPanel {
+                // 本视图此前没有给这个面板 id（不用它的内部状态）；交接弹框的锚点要按 `task_id`
+                // 回列表里找卡片，才需要它。见下面 `Component.onCompleted`。
+                id: taskListPanel
+                // 交接弹框的位置锚点（`OpsShell._handoverAnchorFn`）。与站点视图那一份对称——同一个
+                // 弹框住骨架、两个视图各注入一次自己的求值闭包。`null` 与负数是两回事，见
+                // `TaskListPanel.cardBottomYForTask`。
+                Component.onCompleted: romView._handoverAnchorFn = function(taskId) {
+                    var y = taskListPanel.cardBottomYForTask(taskId)
+                    if (y === null) return -1
+                    return taskListPanel.mapToItem(romView, 0, y).y
+                }
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 // ⚠️ 表头承诺了置顶就**必须真的置顶**（判据见 `middleSectionTasks`），

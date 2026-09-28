@@ -1048,6 +1048,18 @@ OpsShell {
                         //    接收点里（它们同在这个 Component 内），根作用域的 `actionConfirmDialog`
                         //    够不到这个 id，故它只消费换算好的 `_confirmAnchorY`。
                         id: taskListPanel
+                        // 交接弹框的位置锚点（`OpsShell._handoverAnchorFn`）：把"按 task_id 找卡片
+                        // 下缘"的求值能力交给骨架。`taskListPanel` 的 id 只在本 `Component` 内可见
+                        // （见上一条注释），根作用域够不到 ⇒ 只能在这里注入一个闭包。
+                        // ‼️ `null` 与负数是**两回事**：`null` = 该任务不在本视图列表里（无锚点，
+                        //    交给骨架退回居中）；负数是卡在列表里、只是滚出了可视区上方，照常换算，
+                        //    由骨架按窗口高判有效性。混为一谈会让弹框贴到列表顶上（见
+                        //    `TaskListPanel.cardBottomYForTask`）。
+                        Component.onCompleted: opsView._handoverAnchorFn = function(taskId) {
+                            var y = taskListPanel.cardBottomYForTask(taskId)
+                            if (y === null) return -1
+                            return taskListPanel.mapToItem(opsView, 0, y).y
+                        }
                         Layout.fillWidth: true
                         Layout.fillHeight: true
                         tasks: OpsCommon.siteTasks(opsView._tasks, opsView._outbound, opsView._inbound,
