@@ -69,6 +69,10 @@ OpsShell {
     //   cancelHandover                            → {kind, handoverId, task}（task 可能为 undefined）
     // 标题与提示语按 kind 分派，见 `_pendingConfirmTitle` / `_pendingConfirmHint`。
     property var  _pendingAction:  null
+    // 确认框的锚点：**触发它的那张卡片的下缘**在窗口里的 y（用户 2026-09-28 要求确认框贴到卡片
+    // 下方、与右边栏同宽）。由六个 `onXxxRequested` 在 `open()` 之前写入；`-1` 表示没有锚点，
+    // 弹框兜底居中。每次点动作都会重写，所以关闭时不必清空。
+    property real _confirmAnchorY: -1
     property bool  _outbound:      true    // 站点视图勾选：出站
     property bool  _inbound:       true    // 站点视图勾选：进站
     // 右边栏重构：选中机位 / 降落拦截原因
@@ -918,6 +922,10 @@ OpsShell {
                     spacing: 0
                     // ── 上部：任务列表（吃掉机位之外的剩余高度）──
                     TaskListPanel {
+                        // ‼️ 只在**本 `Component` 内部**可见 —— 六个动作的锚点换算写在下面各自的
+                        //    接收点里（它们同在这个 Component 内），根作用域的 `actionConfirmDialog`
+                        //    够不到这个 id，故它只消费换算好的 `_confirmAnchorY`。
+                        id: taskListPanel
                         Layout.fillWidth: true
                         Layout.fillHeight: true
                         tasks: OpsCommon.siteTasks(opsView._tasks, opsView._outbound, opsView._inbound,
@@ -935,20 +943,45 @@ OpsShell {
                         takeoffBlockReasonFn: opsView._takeoffBlockReason
                         // 点整项：选中任务 + 同步点亮对应机位（骨架负责写 _selectedTaskId）
                         onTaskSelected: function(task) { opsView.selectTask(task) }
-                        onTakeoffRequested: function(task) { opsView._pendingAction = {kind:"takeoff", task:task}; actionConfirmDialog.open() }
-                        onLandRequested: function(task) { opsView._pendingAction = {kind:"land", task:task}; actionConfirmDialog.open() }
-                        onParkRequested: function(task) { opsView._pendingAction = {kind:"park", task:task}; actionConfirmDialog.open() }
+                        // ‼️ 六个动作都在 `open()` **之前**把触发卡片的下缘记进 `_confirmAnchorY`，
+                        //    确认框的 `y` 绑定它 ⇒ 弹框长在那张卡片正下方。两个坐标系的换算在这里
+                        //    做：信号给的是**卡片相对本组件**的下缘，弹框的 `y` 要的是**相对 opsView**，
+                        //    故再过一次 `mapToItem`。（`card.y` 为什么不能用：见 TaskListPanel 处注释。）
+                        onTakeoffRequested: function(task, cardBottomY) {
+                            opsView._confirmAnchorY = taskListPanel.mapToItem(opsView, 0, cardBottomY).y
+                            opsView._pendingAction = {kind:"takeoff", task:task}
+                            actionConfirmDialog.open()
+                        }
+                        onLandRequested: function(task, cardBottomY) {
+                            opsView._confirmAnchorY = taskListPanel.mapToItem(opsView, 0, cardBottomY).y
+                            opsView._pendingAction = {kind:"land", task:task}
+                            actionConfirmDialog.open()
+                        }
+                        onParkRequested: function(task, cardBottomY) {
+                            opsView._confirmAnchorY = taskListPanel.mapToItem(opsView, 0, cardBottomY).y
+                            opsView._pendingAction = {kind:"park", task:task}
+                            actionConfirmDialog.open()
+                        }
                         onAssignSlotRequested: function(task) { opsView._assignSlotError = ""; opsView._assignSlotTask = task; slotDialog.open() }
                         onHandoverProposed: function(taskId, phase) { opsView._proposeHandover(taskId, phase) }
                         // 用户 2026-09-23：「执行"签出"、"取消"、"回航"都需要弹窗确认」。
                         // ‼️ 三者都是**先落库、再下指令**——写库那步在服务端事务里（见 `_execReturn`），
                         //    前端这里只负责"别让一次误触就直接发出去"。
-                        onCheckoutRequested: function(task) { opsView._pendingAction = {kind:"checkout", task:task}; actionConfirmDialog.open() }
-                        onReturnRequested: function(task) { opsView._pendingAction = {kind:"return", task:task}; actionConfirmDialog.open() }
+                        onCheckoutRequested: function(task, cardBottomY) {
+                            opsView._confirmAnchorY = taskListPanel.mapToItem(opsView, 0, cardBottomY).y
+                            opsView._pendingAction = {kind:"checkout", task:task}
+                            actionConfirmDialog.open()
+                        }
+                        onReturnRequested: function(task, cardBottomY) {
+                            opsView._confirmAnchorY = taskListPanel.mapToItem(opsView, 0, cardBottomY).y
+                            opsView._pendingAction = {kind:"return", task:task}
+                            actionConfirmDialog.open()
+                        }
                         // 【取消】(中段卡片) 与【撤回交接】(其余阶段) 是同一个动作的两个入口，
                         // 因此共用这一个信号、也共用同一次确认。`task` 可能缺失（老调用点只传 id）——
                         // 弹窗的提示语对 task 缺失是有兜底的，见 `_pendingConfirmHint`。
-                        onHandoverCancelRequested: function(handoverId, task) {
+                        onHandoverCancelRequested: function(handoverId, task, cardBottomY) {
+                            opsView._confirmAnchorY = taskListPanel.mapToItem(opsView, 0, cardBottomY).y
                             opsView._pendingAction = {kind:"cancelHandover", handoverId:handoverId, task:task}
                             actionConfirmDialog.open()
                         }
@@ -1101,7 +1134,14 @@ OpsShell {
     Dialog {
         id: actionConfirmDialog
         parent: opsView
-        width: 460
+        // 宽度与右边栏一致、右边缘贴窗口右缘（用户 2026-09-28）。原先没写 `x`/`y`，`Dialog` 缺省
+        // 落在 (0,0) ⇒ 看起来在屏幕左上角。
+        width: opsView.rightPanelWidth
+        x: opsView.width - width
+        // 上部与**触发它的那张任务卡片**的下缘对齐，留 6px。卡片靠下时向上收，别顶出屏幕底。
+        y: opsView._confirmAnchorY < 0
+           ? (opsView.height - height) / 2
+           : Math.min(opsView._confirmAnchorY + 6, opsView.height - height - 12)
         modal: true
         // 标题与提示语都在 `_pendingConfirmTitle` / `_pendingConfirmHint` 里按 kind 分派（含"未识别"
         // 兜底）；此处保持绑定式调用，`_pendingAction` 一变两处一起重估。

@@ -27,6 +27,13 @@ ColumnLayout {
     id: panel
     spacing: 0
 
+    // 卡片下缘相对**本组件**的 y，随六个"要弹确认框"的信号回传给视图侧。
+    // ‼️ 必须走 `mapToItem`：纵向 `ListView` 会覆写 delegate 的 `x`/`y`，`card.y` 是列表内的
+    //    逻辑位置（`card.x` 恒为 0），与屏幕上的位置无关 —— 直接读它会让确认框定位到别处。
+    function cardBottomYOf(cardItem) {
+        return cardItem.mapToItem(panel, 0, cardItem.height).y
+    }
+
     //-------------------------------------------------------------------------
     // 输入
     //-------------------------------------------------------------------------
@@ -55,23 +62,31 @@ ColumnLayout {
     // 输出
     //-------------------------------------------------------------------------
     signal taskSelected(var task)
-    signal takeoffRequested(var task)
-    signal landRequested(var task)
-    signal parkRequested(var task)
+    // ‼️ 下面**六个**信号（起飞/降落/停泊/签出/回航/取消交接）各多带一个 `cardBottomY`：确认框要
+    //    贴在**触发它的那张卡片**下缘（用户 2026-09-28 要求）。视图侧算不出这个位置——纵向
+    //    `ListView` 会覆写 delegate 的 `x`/`y`，直接读 `card.y` 拿到的是**列表内的逻辑位置**，
+    //    与屏幕位置无关。所以在这里用 `mapToItem` 求卡片下缘（相对本组件），回传后由视图侧
+    //    再换算成窗口坐标。取值一律走 `cardBottomYOf()`，别在各处重写这个表达式。
+    //    ⚠️ 只给**弹这个确认框的六个**加：`taskSelected`/`assignSlotRequested` 不弹框，
+    //    `handoverProposed`/`checkinRequested` 弹的是别的东西，给它们加会让"哪些信号要定位"
+    //    失去单一口径。
+    signal takeoffRequested(var task, real cardBottomY)
+    signal landRequested(var task, real cardBottomY)
+    signal parkRequested(var task, real cardBottomY)
     signal assignSlotRequested(var task)
     signal handoverProposed(int taskId, string phase)
     // `task` 是可选的第二个载荷（用户 2026-09-23 要求取消/撤回也弹窗确认，弹窗里要写出是哪一单）。
-    // 消费端写 `function(handoverId)` 少收一个参数是合法的，RomView 因此不必跟着改。
-    signal handoverCancelRequested(int handoverId, var task)
+    // 消费端少收后面的参数是合法的，RomView 因此不必跟着改（它只收 `handoverId`）。
+    signal handoverCancelRequested(int handoverId, var task, real cardBottomY)
     // 回航（用户 2026-09-23 流程规格）：中段飞行卡片上的【回航】。与上面两条一样**只抛信号**——
     // 确认弹窗、写库、下发 RTL 都在视图/后端，本文件不碰网络也不碰载具。
-    signal returnRequested(var task)
+    signal returnRequested(var task, real cardBottomY)
     // 中段飞行的【签出】（用户规格：「飞机起飞进入 IN_FLIGHT，site_atc 中段的飞行任务卡片变为：
     // 签出、回航」；三个动作都要弹窗确认）。**刻意不复用 `handoverProposed`**：那个信号同时供
     // TAKEOFF 阶段的「申请切出」和监控员视图的「移交降落指挥」使用，而这次只有 IN_FLIGHT 这一格
     // 要加二次确认；挤进同一个信号就得靠"status 是不是 IN_FLIGHT"来分辨该不该弹窗，
     // 两处判据一旦漂移，要么该弹的不弹、要么不该弹的弹。
-    signal checkoutRequested(var task)
+    signal checkoutRequested(var task, real cardBottomY)
     // 接收方**签入**（接管）本航班：站点侧签入 LANDING、监控员侧签入 ROUTE。
     // ‼️ 一条信号服务两个相位、**不带相位参数**——相位由 `handoverId` 唯一确定，提交端点
     //    也只有一个（`POST /handovers/:id/accept`，后端自己按 `phase_to` 分支）。加一个
@@ -399,7 +414,7 @@ ColumnLayout {
                         ToolTip.visible: hovered && !enabled
                         ToolTip.delay: 300
                         ToolTip.text: panel.takeoffBlockReasonFn ? panel.takeoffBlockReasonFn(modelData) : ""
-                        onClicked: panel.takeoffRequested(modelData)
+                        onClicked: panel.takeoffRequested(modelData, panel.cardBottomYOf(card))
                     }
                     Button {
                         // 6.0-A 申请切出（签出）：起飞经航迹确认后发起 ROUTE 交接；仅巡航(FW)且有实时遥测可切出，
@@ -423,7 +438,7 @@ ColumnLayout {
                         visible: card._inFlightOutbound && !OpsCommon.checkoutPending(modelData)
                         height: 24; padding: 0
                         text: qsTr("签出")
-                        onClicked: panel.checkoutRequested(modelData)
+                        onClicked: panel.checkoutRequested(modelData, panel.cardBottomYOf(card))
                     }
                     Button {
                         // 取消：占据签出那一格（同位置换文案/换动作），撤回自己提的那条 PENDING 交接。
@@ -433,7 +448,7 @@ ColumnLayout {
                         enabled: OpsCommon.handoverId(card._handover) !== undefined
                         height: 24; padding: 0
                         text: qsTr("取消")
-                        onClicked: panel.handoverCancelRequested(OpsCommon.handoverId(card._handover), modelData)
+                        onClicked: panel.handoverCancelRequested(OpsCommon.handoverId(card._handover), modelData, panel.cardBottomYOf(card))
                     }
                     Button {
                         // 回航：任何状态下都在（用户规格：「选择签出，则……"回航"保留」）。
@@ -443,7 +458,7 @@ ColumnLayout {
                         visible: card._inFlightOutbound
                         height: 24; padding: 0
                         text: qsTr("回航")
-                        onClicked: panel.returnRequested(modelData)
+                        onClicked: panel.returnRequested(modelData, panel.cardBottomYOf(card))
                     }
                     // ── 站点视图：进站（accept 交接走 handoverDialog，此处无行内确认按钮）──
                     Button {
@@ -455,7 +470,7 @@ ColumnLayout {
                         enabled: modelData.landing_slot_id ? true : false
                         height: 24; padding: 0
                         text: qsTr("发出降落指令")
-                        onClicked: panel.landRequested(modelData)
+                        onClicked: panel.landRequested(modelData, panel.cardBottomYOf(card))
                     }
                     Button {
                         // 指定机位：签入(LANDING)后可预占（后端 AssignSlot 门控 IN_FLIGHT+ACCEPTED LANDING 或 LANDING）
@@ -478,7 +493,7 @@ ColumnLayout {
                         text: card._onGround ? qsTr("停泊")
                               : (OpsCommon.hasLiveTelemetry(card._uav)
                                  ? qsTr("停泊（待落地）") : qsTr("停泊（无遥测）"))
-                        onClicked: panel.parkRequested(modelData)
+                        onClicked: panel.parkRequested(modelData, panel.cardBottomYOf(card))
                     }
                     // ── 接收方：签入（两个视图共用一格）──
                     Button {
@@ -539,7 +554,7 @@ ColumnLayout {
                         // ‼️ 走 `handoverId()` 而不是写死 `.handover_id`：交接现在有两个来源，
                         // 字段名按各自接口的文档约定不同（任务上的用 `id`、pending 项用 `handover_id`），
                         // 写死一个名字就会在换源时静默变 `undefined`。
-                        onClicked: panel.handoverCancelRequested(OpsCommon.handoverId(card._handover), modelData)
+                        onClicked: panel.handoverCancelRequested(OpsCommon.handoverId(card._handover), modelData, panel.cardBottomYOf(card))
                     }
                 }
             }
