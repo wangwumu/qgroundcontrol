@@ -276,7 +276,7 @@ OpsShell {
     function _pendingConfirmTitle() {
         switch (_pendingAction ? _pendingAction.kind : "") {
         case "takeoff":        return qsTr("起飞确认")
-        case "land":           return qsTr("降落确认")
+        case "land":           return qsTr("切换多旋翼降落确认")
         case "park":           return qsTr("停泊确认")
         case "checkout":       return qsTr("签出确认")
         case "cancelHandover": return qsTr("取消签出确认")
@@ -290,7 +290,7 @@ OpsShell {
         var h = ""
         switch (a.kind) {
         case "takeoff":        h = qsTr("将发出起飞指令：无人机升空后沿该航线飞行"); break
-        case "land":           h = qsTr("将发出降落指令：任务进入降落(LANDING)，引导无人机在本场着陆"); break
+        case "land":           h = qsTr("将发出降落指令：先切换为多旋翼并原地盘旋，随后返回起飞点、降落回原机位（不可撤销）"); break
         case "park":           h = qsTr("将终结本任务并对无人机下电停泊（不可撤销）"); break
         // ⚠️ 一条 qsTr 只放**一个字符串字面量**：写成 `qsTr("甲" + "乙")` 时 lupdate 抽不出来，
         // 译文表里永远缺这一条，界面上就它一个不跟着语言走。
@@ -377,9 +377,88 @@ OpsShell {
         //
         // 硬编码的 20 m 一并去掉：高度由**航线的第一个航点**决定（用户 2026-09-23
         // 裁定 e），已在 Task 1/2 里写进 mission 的起飞项。
+        //
+        // ‼️ 起飞前先清掉**上一次飞行**的轨迹（用户 2026-09-29 要求）。
+        //    ⚠️ 别把它当成"多余的一行"删掉：清空的**唯一**发生点是 `start()` 的**第一句**
+        //    （`TrajectoryPoints.cc:45-49`），而 `start()` 由 `_updateArmed(true)` 调
+        //    （`Vehicle.cc:1246`；`start()` 在 `:1253`、`stop()` 在 `:1259`）。`stop()` 本身
+        //    **不清空**已采集的点（`TrajectoryPoints.cc:51-54`）。
+        //    ⇒ **常规路径**（未解锁 → `startMission()` 解锁 → `start()` → `clear()`）旧点本来
+        //      就会被清，本行在那一格是冗余的；
+        //    ⇒ 但**按下起飞时飞机已处于解锁态**时，`_updateArmed` 的 arm 分支不会跑、
+        //      `start()` 不被调用，旧点会在本次飞行里被继续追加 —— **那一格只有本行能清**。
+        //    （2026-09-29 自纠：我原先写的根因「`stop()` 不清 ⇒ 本次必然接着上次画」是错的，
+        //      症状另有原因，尚未定位。）
+        //    顺序不能反：`startMission()` 会解锁，解锁才触发 `start()`，故必须**先清后启**。
+        //    `clear()` 是 public slot（`TrajectoryPoints.h:24`），它发的 `pointsCleared`
+        //    （`:29`）已由 `OpsShell.qml` 的轨迹线接管 ⇒ 地图立刻清空，本处不必再管绘制。
+        v.trajectoryPoints.clear()
         v.startMission()
     }
-    function _guidedLand(task) {
+    //---- 切换多旋翼降落（用户 2026-09-28）----
+    // ⚠️ **本段整段没有机型判据**（2026-09-29 审查 C1）：`_execLand`、
+    //    `_switchToMultirotorThenReturn`、以及列表里那个降落按钮
+    //    （`TaskListPanel.qml` 的「切换多旋翼降落」）**都不看 `v.vtol`**。
+    //    而 `Vehicle::_vtolState` 在非 VTOL 机体上恒为初值 0（见 `Vehicle.cc` 里
+    //    `_handleExtendedSysState` 的 `if (vtol())` 那段注记）⇒ `OpsCommon.vtolTransitionDone(0)`
+    //    恒为 false ⇒ 必然走满 30 秒超时，飞机已被 Hold 拽出航线悬停，而 RTL 从未发出。
+    //    用户 2026-09-29 裁定**暂只处理 VTOL** ⇒ 这里只标注、不加闸。将来要放行非 VTOL，
+    //    判据须同时落在**按钮的 `visible`/`enabled`**（用户可见的第一道）与 `_execLand` 的入口上。
+    // 从按下按钮到发出回航之间的在途载具。用 `property` 而不是 JS 变量：`Connections.target`
+    // 要绑它，而 QML 里给 JS 变量赋值不会发出变更信号。
+    // ⚠️ 这是**单槽位**：多机并发切换的行为见 `_switchToMultirotorThenReturn` 里那道拒绝闸。
+    property var _mcSwitchVehicle: null
+    // 等待转换完成的超时。机型脚本的 `VT_F_TRANS_DUR` 是 10 秒，这里留三倍余量。
+    readonly property int _mcSwitchTimeoutMs: 30000
+
+    Connections {
+        target: opsView._mcSwitchVehicle
+        // ‼️ 必须听 `vtolStateChanged`，**不能**听 `vehicleTypeChanged`：后者的全仓**唯一发射点**
+        //    是 `Vehicle.cc:492` 的 `_offlineVehicleTypeSettingChanged`（离线机型设置，即 Plan 文件
+        //    里带的机型），而 `_vehicleType` 全仓也只有 `:491` 那一个写入点 —— **心跳根本不碰它**
+        //    （`_handleHeartbeat` 在 `:1308`，不写 `_vehicleType`）⇒ 飞行中它一次都不会发，
+        //    无论飞机切得多成功，都必然走满 30 秒超时。
+        //    （2026-09-29 审查 A4 修正：原注释写「只在心跳报的 `MAV_TYPE` 变化时才发」是错的。）
+        function onVtolStateChanged() { opsView._mcCheckTransitionComplete() }
+    }
+    Timer {
+        id: mcSwitchTimer
+        interval: _mcSwitchTimeoutMs
+        onTriggered: {
+            var v = _mcSwitchVehicle
+            if (!v) return
+            _mcSwitchVehicle = null
+            // 不能静默：此刻飞机既没回航也没降落，还在原地盘旋，操作员必须知道指令没发出去。
+            QGroundControl.showMessageDialog(opsView, qsTr("切换多旋翼未完成"),
+                qsTr("已发出切换指令，但无人机在 %1 秒内未报告转换完成，回航指令未发出。无人机当前在原地盘旋，请检查链路后重试。")
+                    .arg(Math.round(_mcSwitchTimeoutMs / 1000)))
+        }
+    }
+    /// 转换完成（或本来就已是多旋翼）⇒ 重新发出回航。
+    /// `_poll()` 与 `_execReturn` 同一理由：库里的状态没变，但卡片要跟上。
+    function _mcCheckTransitionComplete() {
+        var v = _mcSwitchVehicle
+        // 判据是「转换**已完成**」＝ `MAV_VTOL_STATE_MC`，**不是**「机型是多旋翼」：
+        // `Vehicle::multiRotor()` 读心跳报的 `MAV_TYPE`，经 `QGCMAVLink::vehicleClass()`
+        // 的纯 switch 把 `MAV_TYPE_VTOL_*` 全归到 `VehicleClassVTOL`，与多旋翼类不相交
+        // ⇒ 对 VTOL 机体**恒为 false**，切成功了也判不出来（这正是 30 秒必超时的原因）。
+        // 也不能用 `!vtolInFwdFlight`：那个 bool 在「转多旋翼中」(2) 就已经是 false ⇒ 会在
+        // 转换途中就发回航，而 PX4 此刻仍视机体为固定翼，回航会重新落回卡死的 LOITER_DOWN。
+        if (!v || !OpsCommon.vtolTransitionDone(v.vtolState)) return
+        mcSwitchTimer.stop()
+        _mcSwitchVehicle = null
+        v.guidedModeRTL(false)
+        _poll()
+    }
+    /// 切换多旋翼降落：脱离回航 → 转为多旋翼 → 重新发出回航。
+    ///
+    /// ‼️ 为什么不只是「切多旋翼 + 重发回航」：`MAV_CMD_DO_VTOL_TRANSITION` 只做机体转换，
+    /// **不换导航模式**。飞机已在回航中时，重发回航是**同一个**导航模式——PX4 的
+    /// `NavigatorMode::run()` 只在"从非激活转激活"时调 `on_activation()`，同模式走 `on_active()`
+    /// 分支，回航状态机原样不动，仍停在卡死的 `LOITER_DOWN` 格（固定翼进圈判定余量只剩 5 cm）。
+    /// 先切 Hold 把导航模式挪开，重新发出的回航才会重建状态机；此时 `vehicle_type` 已是
+    /// ROTARY_WING，回航走「MOVE_TO_LOITER → LAND」，绕开卡死点，落点仍是 home＝原机位。
+    function _switchToMultirotorThenReturn(task) {
         var v = _vehicleForTask(task)
         if (!v) {
             QGroundControl.showMessageDialog(opsView, qsTr("降落指令未发出"),
@@ -387,18 +466,56 @@ OpsShell {
                     .arg(task && task.device_id ? task.device_id : "—"))
             return
         }
-        v.guidedModeLand()
+        // ‼️ 一次只等一架（2026-09-29 审查 C3）：`_mcSwitchVehicle` 是**单槽位**，第二架点降落会
+        //    顶掉第一架的待切换态 —— `Connections.target` 改指向第二架、`mcSwitchTimer.restart()`
+        //    又把计时器重置 ⇒ 第一架转换完成后**没有任何处理器在听**、超时也不再触发
+        //    ⇒ 那一架永远悬停在原地，且全程**没有任何可见错误**。
+        //    修法是**拒绝并发并给出可见原因**，而不是把槽位换成按 deviceID 的 map：后者要在 QML 里
+        //    用 `Instantiator` 动态建 `Connections`/`Timer`，是纯动态结构，而 `cmake --build` 对 QML
+        //    语义零覆盖、离屏测试也够不到这段 —— 验证手段太弱。真正的多机并发切换留待后续单独做。
+        if (_mcSwitchVehicle && _mcSwitchVehicle !== v) {
+            QGroundControl.showMessageDialog(opsView, qsTr("已有一架无人机在切换中"),
+                qsTr("另一架无人机的「切换多旋翼降落」仍在进行中，请等它完成或超时后再操作本架。"))
+            return
+        }
+        _mcSwitchVehicle = v
+        // ‼️ 必须看返回值（2026-09-29 审查 C1'）：`hoverAndTransitionToMultirotor()` 在「本固件
+        //    没有 Hold 模式」时**一个字节都不发**并回 false。若当成功继续下去，下面的 30 秒守卫
+        //    会被"成功"分支停掉，而飞机仍在 RTL 里卡着 —— 操作员什么都看不到，症状与修之前一样。
+        if (!v.hoverAndTransitionToMultirotor()) {
+            _mcSwitchVehicle = null
+            QGroundControl.showMessageDialog(opsView, qsTr("切换多旋翼指令未发出"),
+                qsTr("本固件没有对应的悬停飞行模式，无法先脱离回航，切换指令未下发。无人机仍在回航中，请改用其它方式处置。"))
+            return
+        }
+        // 本来就已是多旋翼时 `vtolStateChanged` 不会再发（状态没变），先自己查一遍；
+        // 查完仍未完成，才等信号或超时。
+        _mcCheckTransitionComplete()
+        if (_mcSwitchVehicle) mcSwitchTimer.restart()
     }
-    // 发出降落指令（6.0-E，LANDING 唯一写路径）：机位空闲校验 → POST /tasks/:id/land（DB→LANDING）→ 引导降落。
+    // 切换多旋翼降落（6.0-E 的按钮，LANDING 唯一写路径）：机位空闲校验 → POST /tasks/:id/land
+    //（DB→LANDING）→ 脱离回航、转多旋翼、重新发出回航（见 `_switchToMultirotorThenReturn`）。
+    // ⚠️ 本函数**没有机型判据**（2026-09-29 审查 C1）：只看 `assign_slot_id` 与后端校验结果，
+    //    非 VTOL 机体同样会走完全程。用户 2026-09-29 裁定**暂只处理 VTOL** ⇒ 只标注、不加闸。
     function _execLand(task) {
         if (!task) return
-        if (!task.landing_slot_id) { console.warn("OpsView 发出降落指令：未指定降落机位"); return }
+        // ‼️ 判据必须是 `assign_slot_id`（实际指派的降落机位），**不是** `landing_slot_id`
+        //（那是落地后的快照、此刻恒空）。用后者等于**恒真地拦住每一次调用**，且失败形状是静默的：
+        // 按钮看着能点，点下去什么都不发生，`console.warn` 用户在界面上看不见。
+        //（2026-09-28 修；列表按钮的 `enabled` 是同一根因的另一处，两处必须同口径。）
+        // 纵深防御：`enabled` 已挡住绝大多数情况，但本函数是 LANDING 的唯一写路径入口，
+        // 留这道闸以防将来新增调用点绕过按钮——此时**必须给出可见原因**，不许静默返回。
+        if (!task.assign_slot_id) {
+            _landBlockReason = qsTr("该任务尚未指派降落机位，无法执行降落")
+            landBlockDialog.open()
+            return
+        }
         var tid = task.task_id
         _get("/api/tasks/" + tid + "/landing-slot-check", function(status, data) {
             if (status === 200 && data && data.free === true) {
                 _post("/api/tasks/" + tid + "/land", null, function(landStatus, data) {
                     if (landStatus === 200) {
-                        _guidedLand(task)
+                        _switchToMultirotorThenReturn(task)
                         _poll()   // 任务→LANDING 后立即刷新列表（按钮转 指定机位/停泊）
                     } else {
                         // 透传服务端业务原因（如机位占用/状态已变），避免只显 "HTTP 409" 无法处置
@@ -594,7 +711,7 @@ OpsShell {
         //    **原地改内容**，**不发 `_routeSyncsChanged`** ⇒ 读它的绑定**不重估**。
         //
         //    而 Task 4 的 `_canTakeoff` 会通过 `_routeSyncs[task.task_id]` 建立绑定依赖，
-        //    那个绑定是**起飞按钮的 `enabled`**（`TaskListPanel.qml:270`：
+        //    那个绑定是**起飞按钮的 `enabled`**（`TaskListPanel.qml:451`：
         //    `enabled: panel.canTakeoffFn ? panel.canTakeoffFn(modelData) : false`），
         //    它由「函数调用」间接读 —— QML 的依赖捕获跟着整个调用栈走，**所以能建立**。
         //
@@ -687,7 +804,7 @@ OpsShell {
     ///
     /// ‼️ `onInitialConnectComplete` 这个处理器名**不是笔误**：`Vehicle` 的
     ///    `initialConnectComplete` 属性用的 NOTIFY 信号就叫 `initialConnectComplete`
-    ///    （`Vehicle.h:214`，没有 `Changed` 后缀——QGC 的非标准命名）。
+    ///    （`Vehicle.h:222`，没有 `Changed` 后缀——QGC 的非标准命名）。
     ///    处理器名 = `on` + 信号名首字母大写。
     Repeater {
         model: QGroundControl.multiVehicleManager.vehicles

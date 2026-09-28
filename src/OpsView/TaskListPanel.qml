@@ -186,9 +186,9 @@ ColumnLayout {
             //    所以必须同时有这条提示，否则就是"警示条喊着待办、却无处下手"的反面——
             //    "什么都没有、也不说为什么"。两个缺口是同一件事的两半，要一起补。
             // ‼️ 第一个参数传 `panel.isRouteMonitor`，**不是** `!panel.showSiteActions`。
-            //    两个属性在**当前接线**下取值恰好相反（`OpsView.qml:927` 硬编码
+            //    两个属性在**当前接线**下取值恰好相反（`OpsView.qml:1072` 硬编码
             //    `isRouteMonitor: false`、`RomView.qml` 硬编码 `showSiteActions: false`），
-            //    但语义不同：`showSiteActions` 还叠了 `_isSiteATC`（`OpsView.qml:926`）
+            //    但语义不同：`showSiteActions` 还叠了 `_isSiteATC`（`OpsView.qml:1071`）
             //    ——"不是站点按钮组"并不等于"我是监控员"。用语义正确的那个，将来站点视图
             //    真接上双身份时才不会把"我是谁"和"这张卡给我哪套按钮"混成一个判据。
             readonly property string _checkinNotice:
@@ -417,6 +417,11 @@ ColumnLayout {
                         onClicked: panel.takeoffRequested(modelData, panel.cardBottomYOf(card))
                     }
                     Button {
+                        // ⚠️ **机型依赖是隐含的**（2026-09-29 审查 C1）：`_vtolFwd` 读
+                        //    `vtolInFwdFlight`，而该属性在非 VTOL 机体上恒为 `false`
+                        //    （`Vehicle.cc` 的 `if (vtol())` 把它连同 `vtolState` 一起关在机型闸内）
+                        //    ⇒ 这个按钮在非 VTOL 机型上**永远置灰**。当前属预期（本模块只服务 VTOL），
+                        //    但它不是显式判据，故在此标注。
                         // 6.0-A 申请切出（签出）：起飞经航迹确认后发起 ROUTE 交接；仅巡航(FW)且有实时遥测可切出，
                         // 无遥测置灰（6.0-C 失联不签发；DB 在 Propose ROUTE 时落 IN_FLIGHT=责任里程碑）。
                         visible: panel.showSiteActions && modelData.status === "TAKEOFF"
@@ -462,14 +467,26 @@ ColumnLayout {
                     }
                     // ── 站点视图：进站（accept 交接走 handoverDialog，此处无行内确认按钮）──
                     Button {
-                        // 6.0-E 发出降落指令：仅已签入(LANDING)（landing_accepted）且 DB 仍 IN_FLIGHT 时出现；
-                        // 点按→红绿确认→机位校验→POST /tasks/:id/land（LANDING 唯一写路径）→引导降落。
+                        // ⚠️ **机型闸没有**（2026-09-29 审查 C1）：`visible` 与 `enabled` 都不看该载具是不是
+                        //    VTOL。非 VTOL 机体上点它会一路走到 30 秒超时 —— 飞机已被 Hold 拽出航线悬停，
+                        //    而 RTL 从未发出。见 `OpsView.qml` 里「切换多旋翼降落」那段的头注。
+                        //    用户 2026-09-29 裁定**暂只处理 VTOL** ⇒ 只标注、不加闸。
+                        //    将来加闸的取值点：`card._uav ? card._uav.vtol : false`（`card` 已持有该载具）。
+                        // 6.0-E 切换多旋翼降落：仅已签入(LANDING)（landing_accepted）且 DB 仍 IN_FLIGHT 时出现；
+                        // 点按→红绿确认→机位校验→POST /tasks/:id/land（LANDING 唯一写路径）→脱离回航、
+                        // 转多旋翼、重新发出回航（落点仍是原机位）。见 `OpsView._switchToMultirotorThenReturn`。
                         visible: panel.showSiteActions
                                  && OpsCommon.isInbound(modelData, panel.mySiteId, panel.handoverById)
                                  && modelData.status === "IN_FLIGHT" && OpsCommon.landingAccepted(modelData)
-                        enabled: modelData.landing_slot_id ? true : false
+                        // 可点判据 = **实际指派的降落机位**（`assign_slot_id`，与后端 Land/CheckLandingSlot
+                        // 同一子查询口径）。‼️ 不能用 `landing_slot_id`：那是**落地后的快照**（只有 `Park` 写，
+                        // 写时状态已 COMPLETED），飞行/回航阶段**恒为 NULL** ⇒ 按钮**永远点不了**。
+                        //（2026-09-28 修。这是"判据字段在真实数据里恒为默认值"那类缺陷，编译/qmllint/离屏全发现不了。）
+                        // 机位是否空闲、机场是否已核准**不在列表里预判**——那是会过期的快照，
+                        // 由点击后的 `/landing-slot-check` 判定，否则会弹出错误的阻止理由。
+                        enabled: modelData.assign_slot_id ? true : false
                         height: 24; padding: 0
-                        text: qsTr("发出降落指令")
+                        text: qsTr("切换多旋翼降落")
                         onClicked: panel.landRequested(modelData, panel.cardBottomYOf(card))
                     }
                     Button {

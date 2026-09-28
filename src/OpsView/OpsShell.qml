@@ -1408,14 +1408,23 @@ Item {
             }
 
             //-----------------------------------------------------------------
-            // 轨迹线 —— 全部**已建链**载具各一条（**两个视图共用**，不加 `routeLayersEnabled` 闸）
+            // 轨迹线 —— 全部**已建链**载具各一条（**仅站点视图**）
+            // ‼️ 2026-09-29 起吃 `routeLayersEnabled` 闸（用户要求：「在 RomView 中，只显示箭头，
+            //    不显示轨迹」）：监控员视图看的是**航线与航班态势**，飞机在哪由 L3 的箭头 marker
+            //    表达就够，历史轨迹属于站点侧的联调信息。
+            //    ⚠️ 判据方向：与本层**同向**的是另两个**站点视图**层——航路（`_taskGeom`）与
+            //    无人机 marker（`_tasks`），同为 `routeLayersEnabled ? [] : …`；**反向**的是
+            //    L1/L2/L3 三层（航线 / 选中点亮 / 航班 marker），写成 `? … : []`（监控员视图吃）。
+            //    ⚠️ 闸用**清空 model**、不用 `visible: false`：本文件对"这个视图不要这一层"一律
+            //    这么写（其余五处同款），因为 `MapItemView` 的委托是**直接注册进地图**的，
+            //    `visible` 管不到它们（详见 L1 上方那段长注释）。
             // ‼️ 数据源是 `QGroundControl.multiVehicleManager.vehicles`（**真实** MAVLink 载具），
             //    不是 `_tasks` / `_routeDevices`——那两个是后端 REST 的投影、按 2 s 轮询跳变；
             //    轨迹是**逐帧**的东西，只有载具侧的 `TrajectoryPoints` 有它。
             //    ⇒ 这也正是「OpsView 里飞机轨迹不出现」的根因：本文件此前**从未引用过**
             //      `trajectoryPoints`（全文件零引用）。
             // ‼️ `TrajectoryPoints` 是**纯内存、不落库**的（`Vehicle.h:155`，`CONSTANT` 属性），
-            //    且**只在解锁(armed)期间记录**：`Vehicle::_updateArmed`（`Vehicle.cc:1230`）
+            //    且**只在解锁(armed)期间记录**：`Vehicle::_updateArmed`（`Vehicle.cc:1246`）
             //    在转 armed 时 `start()`、转 disarmed 时 `stop()` ⇒ 未起飞的载具这条线天然是空的，
             //    **不要**在这里再加一道"是否在飞"的判据。抽稀也由它自己做
             //    （2 m / 1.5°，`TrajectoryPoints.h:40-41`）。
@@ -1429,7 +1438,7 @@ Item {
             //    `MapPolyline` 不会被注册进地图（`path` 有值、`pathLength()` 正确、QML 零报错，
             //    就是一条线都不画）。
             MapItemView {
-                model: QGroundControl.multiVehicleManager.vehicles
+                model: opsShell.routeLayersEnabled ? [] : QGroundControl.multiVehicleManager.vehicles
                 delegate: MapPolyline {
                     id: trajLine
                     line.width: 3

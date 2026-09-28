@@ -420,7 +420,7 @@ function landingNotice(task, isReceiver) {
 // （`landing_accepted`），飞机已经进入本站的降落流程（`isInbound` 为真）⇒ 它不再是出站航班。
 // 少了这一条，同一张卡会**同时**满足出站与进站，而 `siteTasks` 是 `if / else if`（出站优先）
 // ⇒ 用户看到的是"回航之后卡片没去进站、按钮还是出站那一套"，真正该露出来的
-// 【发出降落指令】永远露不出来。
+// 【切换多旋翼降落】永远露不出来。
 // ⚠️ 第三个参数 `handoverById` 自 2026-09-23 起**本函数不再使用**（判据改读任务上的
 // `checkout_state`），保留在签名里只是让四个调用点保持同一形状；将来清理时可删，多传无副作用。
 function isOutbound(task, mySiteId, handoverById) {

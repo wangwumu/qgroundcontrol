@@ -21,7 +21,18 @@ Item {
     property bool _vehicleWasArmed:                 false
     property bool _vehicleInMissionFlightMode:      _activeVehicle ? (_activeVehicle.flightMode === _activeVehicle.missionFlightMode) : false
     property bool _vehicleWasInMissionFlightMode:   false
-    property bool _showMissionCompleteDialog:       _vehicleWasArmed && _vehicleWasInMissionFlightMode &&
+    // ‼️ 联网运营模式下**不弹**（用户 2026-09-29 要求）。本弹窗问的是「从飞机上移除 / 在飞机上
+    //    保留飞行计划」——那是**单机版**的取舍：计划由本机规划、由本机决定去留。运营模式下
+    //    飞行计划由后端下发与管理，这里没有问用户的余地。
+    //    判据 `AuthController.standaloneMode` 与其它界面裁剪是**同一个属性**（写法对照
+    //    `SelectViewDropdown.qml:80/97/112/129` 四处同款 `visible:`）。
+    // ⚠️ 闸**只在这里**加。不要去 `FlyViewWidgetLayer.qml` 的实例化处加 `visible`：
+    //    `QGCPopupDialogFactory` 会把这个弹窗 reparent 到 `Overlay.overlay`，它**不受**父项
+    //    可见性链约束，那样改是假修（`QGCPopupDialogFactory.qml:5-7` 注释）。
+    // ⚠️ 本属性是**弹窗真正开不开**的判据（`on_VehicleArmedChanged` 里那道 `if`），不是显示开关，
+    //    所以这一处就能盖住唯一那条 `open()` 调用，没有第二个入口。
+    property bool _showMissionCompleteDialog:       AuthController.standaloneMode &&
+                                                    _vehicleWasArmed && _vehicleWasInMissionFlightMode &&
                                                     (missionController.containsItems || geoFenceController.containsItems || rallyPointController.containsItems ||
                                                      (_activeVehicle ? _activeVehicle.cameraTriggerPoints.count !== 0 : false))
 
