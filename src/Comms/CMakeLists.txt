@@ -8,6 +8,8 @@
 # ----------------------------------------------------------------------------
 target_sources(${CMAKE_PROJECT_NAME}
     PRIVATE
+        FlightEventLogger.cc
+        FlightEventLogger.h
         LinkConfiguration.cc
         LinkConfiguration.h
         LinkInterface.cc

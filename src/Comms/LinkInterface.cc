@@ -5,6 +5,7 @@
 #include "QGCApplication.h"
 #include "QGCLoggingCategory.h"
 #include "SigningController.h"
+#include "FlightEventLogger.h"
 #include "Crypto/CryptoCodec.h"
 #include "Crypto/CryptoController.h"
 #include "Crypto/CryptoLinkLogger.h"
@@ -118,6 +119,10 @@ void LinkInterface::sendMessageThreadSafe(mavlink_message_t &message)
         if (crypto->state() != MAVLinkCrypto::CryptoController::State::Active) {
             // 加密已启用但链路未就绪：不发明文（全加密链路上接收端会丢弃明文帧）。
             qCWarning(LinkInterfaceLog) << "crypto enabled, link not Active, dropping msgid" << message.msgid;
+            // 帧被丢了就没发出去 —— 事件日志必须记「丢弃」而不是记「已发」，
+            // 否则事后对着日志会以为命令下达到了飞控。
+            FlightEventLogger::instance()->logLinkEvent(
+                tr("发送被丢弃：加密已启用但链路未就绪（命令编号 %1）").arg(message.msgid));
             return;
         }
         MAVLinkCrypto::Key key;
@@ -139,11 +144,17 @@ void LinkInterface::sendMessageThreadSafe(mavlink_message_t &message)
                     reinterpret_cast<const char*>(encBuffer), encLen,
                     reinterpret_cast<const char*>(buffer), len, true);
                 writeBytesThreadSafe(reinterpret_cast<const char*>(encBuffer), encLen);
+                // 发送侧事件日志挂在这里而**不是函数入口**：入口处还有「加密未就绪」「加密失败」
+                // 两条 return，在入口记会把没发出去的帧记成已发出 —— 事后对着日志会以为命令到了飞控。
+                // 此处 message 仍是明文（encryptFrame 不修改它），读得出发的是什么命令。
+                FlightEventLogger::instance()->logFrame(FlightEventLogger::Direction::ToVehicle, message);
                 return;
             }
             // 加密失败：丢弃帧，不回退明文（回退明文会被接收端丢弃，且违反全加密不变量）
             qCWarning(LinkInterfaceLog) << "encryptFrame failed for msgid" << message.msgid
                                         << "counter" << counter << "device" << crypto->activeDeviceID();
+            FlightEventLogger::instance()->logLinkEvent(
+                tr("发送被丢弃：帧加密失败（命令编号 %1）").arg(message.msgid));
             // 无线上密文帧：以明文记录（encrypted=false，避免把明文当密文读 counter 产生垃圾值）
             MAVLinkCrypto::CryptoLinkLogger::instance()->logOutgoing(
                 message.msgid, crypto->activeDeviceID(), false,
@@ -161,6 +172,7 @@ void LinkInterface::sendMessageThreadSafe(mavlink_message_t &message)
         MAVLinkCrypto::CryptoLinkLogger::deviceIDFromFrameBytes(reinterpret_cast<const char*>(buffer), len),
         false, reinterpret_cast<const char*>(buffer), len, nullptr, 0, true);
     writeBytesThreadSafe(reinterpret_cast<const char *>(buffer), len);
+    FlightEventLogger::instance()->logFrame(FlightEventLogger::Direction::ToVehicle, message);
 }
 
 void LinkInterface::sendPlaintextMessageThreadSafe(const mavlink_message_t& message)
@@ -173,6 +185,8 @@ void LinkInterface::sendPlaintextMessageThreadSafe(const mavlink_message_t& mess
         message.msgid, QGC_REGISTRATION_DEVICE_ID_DEFAULT, false,
         reinterpret_cast<const char*>(buffer), len, nullptr, 0, true);
     writeBytesThreadSafe(reinterpret_cast<const char*>(buffer), len);
+    // 第二个发送咽喉：80005 登记保活走这里，绕过 sendMessageThreadSafe，漏挂就整条看不见。
+    FlightEventLogger::instance()->logFrame(FlightEventLogger::Direction::ToVehicle, message);
 }
 
 void LinkInterface::removeVehicleReference()

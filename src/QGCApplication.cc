@@ -23,6 +23,7 @@
 #include "AudioOutput.h"
 #include "AuthController.h"
 #include "ColoredSvgImageProvider.h"
+#include "FlightEventLogger.h"
 #include "FollowMe.h"
 #include "GraphicsSetup.h"
 #include "JoystickManager.h"
@@ -368,6 +369,16 @@ bool QGCApplication::_initQmlRootWindow()
 
 void QGCApplication::_initForNormalAppBoot()
 {
+    // 飞行事件日志在这里开：刻意**不放在 init()** —— init() 在跑单测时也会走到，
+    // 那会让每次 ctest 都在用户的 AppDataLocation 里留下一份日志。
+    // 放在本函数第一句，是为了把启动过程中的界面提示也收进去（它们多在下面的初始化里发）。
+    if (!FlightEventLogger::instance()->start()) {
+        // start() 失败时 filePath() 可能为空（连文件名都没取到），所以不报路径，
+        // 只报「这次运行没有事件日志」——不能让它静默地少一个排障手段。
+        qCWarning(QGCApplicationLog) << "flight event log could not be started; running without it";
+        showAppMessage(tr("飞行事件日志无法创建，本次运行不会记录命令、应答与报警。"));
+    }
+
     (void) _initVideo();
 
     (void) _initQmlRootWindow();
@@ -514,6 +525,12 @@ void QGCApplication::showCriticalVehicleMessage(const QString& message)
 void QGCApplication::showAppMessage(const QString& message, const QString& title)
 {
     const QString dialogTitle = title.isEmpty() ? applicationName() : title;
+
+    // 界面事件单点：所有 QGC 侧的提示（含 QGC::showAppMessage 静态版转发的、以及
+    // QML 对话框之外的那些）都从这里过。记在对话框分支**之前** —— 单测/无 UI 时
+    // 下面会直接 return，那正是最需要留痕的场景。
+    FlightEventLogger::instance()->logLocalEvent(
+        QStringLiteral("[%1] %2").arg(dialogTitle, message));
 
     if (runningUnitTests()) {
         // Logged under QGCAppMessageLog so tests can assert expected dialogs via

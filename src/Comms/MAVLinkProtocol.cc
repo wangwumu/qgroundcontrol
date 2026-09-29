@@ -13,6 +13,7 @@
 #include "AppMessages.h"
 #include "AppSettings.h"
 #include "AuthController.h"
+#include "FlightEventLogger.h"
 #include "LinkManager.h"
 #include "MAVLinkLib.h"
 #include "LinkInterface.h"
@@ -493,6 +494,13 @@ void MAVLinkProtocol::_forwardSupport(const mavlink_message_t& message)
 
 void MAVLinkProtocol::_logData(LinkInterface* link, const mavlink_message_t& message)
 {
+    // 飞行事件日志：**刻意放在下面那个 _tempLogFile 闸之外**。原始帧日志会因为一次写盘失败
+    // 被 _logSuspendError 永久停掉，而那一时刻恰恰是最需要事件日志的时候。
+    // SETUP_SIGNING 携带密钥材料（MAVLink spec §Logging 要求剔除），进任何日志都不行。
+    if (message.msgid != MAVLINK_MSG_ID_SETUP_SIGNING) {
+        FlightEventLogger::instance()->logFrame(FlightEventLogger::Direction::FromVehicle, message);
+    }
+
     if (!_logSuspendError && !_logSuspendReplay && _tempLogFile->isOpen()) {
         // MAVLink spec §Logging: omit SETUP_SIGNING (contains secret key)
         if (message.msgid != MAVLINK_MSG_ID_SETUP_SIGNING) {
