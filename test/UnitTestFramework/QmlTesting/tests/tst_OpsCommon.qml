@@ -1712,4 +1712,135 @@ TestCase {
         verify(OpsCommon.vtolTransitionDone(-1) === false, "负数")
         verify(OpsCommon.vtolTransitionDone(3.5) === false, "非整数")
     }
+
+    //----------------------------------------------------------------
+    // 「是否已飞抵接机机位」判据
+    //----------------------------------------------------------------
+    //
+    // 用户 2026-09-29 裁定：降落落点从 `home`（= 起飞点）改为**接机机位坐标**，
+    // 方案 A = `guidedModeGotoLocation(机位坐标)` → **到达** → `guidedModeLand()`。
+    // 本函数就是那个中间环节的判据 —— 它回 true 的那一刻，程序会发出「降落」。
+    //
+    // ‼️ 所以本函数的**假阳性**代价是不对称的：说"到了"而其实没到 ⇒ 飞机在多旋翼模式下
+    // `AUTO.LAND` **原地降落**（`PX4-Autopilot/src/modules/navigator/land.cpp` 里唯一的
+    // `DO_REPOSITION` 是"中止降落"用的，不是水平接近）⇒ 落在机位之外的任意位置，
+    // 违反用户 2026-09-28 定的红线「除非要坠机了，否则飞机只能在机位上降落」。
+    // 反之"没到"的代价只是多盘旋几秒，最后走超时提示。**故一切存疑输入一律回 false。**
+
+    /// 基本几何：0 距离、界内、界外、以及**经纬两轴都偏离**的斜向点。
+    ///
+    /// ‼️ 斜向那一格（tag「斜向」）不是凑数：只测"纯纬度偏离"或"纯经度偏离"的话，
+    ///    把两轴距离取 `max` 而不是 `sqrt(a²+b²)` 的实现**照样全绿**，
+    ///    而它在 45° 方向的判定圈会大出 √2 倍。
+    function test_reachedSlot_data() {
+        // (40, 117) 处：纬度 1° = 111194.9 m，经度 1° = 111194.9 × cos40° ≈ 85176.3 m
+        return [
+            { tag: "机位正上方 ⇒ 已抵达",       la: 40.0, lo: 117.0, sla: 40.0, slo: 117.0, r: 1.0,   expected: true  },
+            { tag: "纯纬度偏 0.0005°(≈55.6m) 圈 60m ⇒ 已抵达", la: 40.0005, lo: 117.0, sla: 40.0, slo: 117.0, r: 60.0, expected: true  },
+            { tag: "纯纬度偏 0.0005°(≈55.6m) 圈 50m ⇒ 未抵达", la: 40.0005, lo: 117.0, sla: 40.0, slo: 117.0, r: 50.0, expected: false },
+            // 斜向：纬 55.6 m + 经 42.6 m ⇒ 直线 ≈ 70.0 m。取 max 的实现会算成 55.6 m ⇒ 圈 65m 时误报"已抵达"。
+            { tag: "斜向偏(≈70.0m) 圈 65m ⇒ 未抵达", la: 40.0005, lo: 117.0005, sla: 40.0, slo: 117.0, r: 65.0, expected: false },
+            { tag: "斜向偏(≈70.0m) 圈 75m ⇒ 已抵达", la: 40.0005, lo: 117.0005, sla: 40.0, slo: 117.0, r: 75.0, expected: true  }
+        ]
+    }
+    function test_reachedSlot(data) {
+        verify(OpsCommon.reachedSlot(data.la, data.lo, data.sla, data.slo, data.r) === data.expected,
+               data.tag)
+    }
+
+    /// **边界包含性**用独立复算锁死：距离由本文件的 `_distM`（另一处手写的 haversine）算出，
+    /// 生产函数取同一个地球半径 ⇒ 两次算的必须是同一个数。
+    ///
+    /// ‼️ 为什么不用"正好等于半径"去测：那要靠浮点逐位相等，改一次实现就红一次，
+    ///    最后一定被人加容差加到失去意义。用 `d × 1.001` / `d × 0.999` 两侧夹逼，
+    ///    既钉住"半径是可抵达范围"（含边界），又不依赖最后一位。
+    /// ‼️ 这一格同时是**距离公式分叉**的探测器：生产函数若改用地平面近似、
+    ///    或忘了经度的 `cos(lat)` 缩放，`0.999d` 那一侧就可能翻成 true。
+    function test_reachedSlot_boundarySides() {
+        var la1 = 40.0005, lo1 = 117.0005
+        var la2 = 40.0, lo2 = 117.0
+        var d = _distM(la1, lo1, la2, lo2)
+        verify(d > 10, "前置：两点距离 = " + d + " m，夹具本身要足以分辨（否则两侧夹逼无意义）")
+        verify(OpsCommon.reachedSlot(la1, lo1, la2, lo2, d * 1.001) === true,
+               "半径略大于距离 ⇒ 已抵达（" + d + " m）")
+        verify(OpsCommon.reachedSlot(la1, lo1, la2, lo2, d * 0.999) === false,
+               "半径略小于距离 ⇒ 未抵达（" + d + " m）")
+        // **正边界**：半径恰好等于距离。两侧夹逼（上面两行）**测不出** `<=` 被写成 `<`，
+        // 因为两侧都留了 0.1% 的余量。这一行专门钉住边界**含**等号。
+        // ⚠️ 它是浮点逐位相等 ⇒ 只在 `_greatCircleM` 与 `_distM` 是同一个算式时成立；
+        //    那正是本节要的（两处距离公式一旦分叉，两行一起红）。
+        verify(OpsCommon.reachedSlot(la1, lo1, la2, lo2, d) === true,
+               "半径恰好等于距离 ⇒ 已抵达（边界含等号）")
+    }
+
+    /// **经度必须按纬度缩放**：同样的 `0.001°` 经度差，在赤道是 111.19 m，在 40°N 只有 85.18 m。
+    /// 圈取 100 m ⇒ 40°N 判"已抵达"、赤道判"未抵达"。
+    ///
+    /// ‼️ 把经纬度当平面直角坐标（漏掉 `cos(lat)`）的实现在本格会**两格全绿或全红**，
+    ///    而它在 40°N 会把判定圈在东西方向拉大成 111 m —— 比机位间距还大，
+    ///    于是飞机会在离机位 100 m 处就宣布抵达并原地降落。
+    function test_reachedSlot_longitudeScalesWithLatitude() {
+        // 40°N：0.001° 经度 ≈ 85.18 m
+        verify(OpsCommon.reachedSlot(40.0, 117.001, 40.0, 117.0, 100.0) === true,
+               "40°N 的 0.001° 经度 ≈ 85.18 m，应在 100 m 圈内")
+        // 赤道：同样的 0.001° 经度 ≈ 111.19 m
+        verify(OpsCommon.reachedSlot(0.001, 117.001, 0.001, 117.0, 100.0) === false,
+               "赤道的 0.001° 经度 ≈ 111.19 m，应在 100 m 圈外")
+    }
+
+    /// **一切存疑输入 ⇒ false**（不宣布抵达）。
+    ///
+    /// ‼️ 本格最重要的三行是 `slotLat / slotLon = 0`：后端 `opsOverviewItem` 的
+    ///    「无可用接机机位」哨兵**就是 0/0**（机位未指派、或机位已软删 —— 见
+    ///    `ops_overview_assign_slot_coord_test.go`）。少了这三行，接口字段一旦漏掉/改名，
+    ///    `undefined` 会参与算术得 NaN，而 **NaN 的比较恒假** ⇒ 结论碰巧也是 false。
+    ///    但那是靠巧合，不是靠代码：换一个算术顺序就可能翻成 true，
+    ///    而那意味着**飞机飞向 (0, 0)**（几内亚湾）或"原地降落"。
+    ///
+    /// ‼️ `radiusM <= 0` 也回 false 而不是"半径 0 表示必须精确重合"：
+    ///    后者在 GPS 噪声下**永不成立** ⇒ 飞机永远盘旋到超时，而界面上
+    ///    显示的是"正在飞往机位"，与真实故障无法区分。宁可立刻判"未抵达"。
+    function test_reachedSlot_invalidIsNotReached() {
+        var la = 40.0, lo = 117.0
+        // ‼️ 下面三格**必须让两点重合**（距离恰为 0）——这是唯一能打到哨兵检查上的形状。
+        //    第一版写的是"机位在 (0,117)、目标在 (40,117)"（相距 4400 km）：那种写法下
+        //    **距离判据自己就回 false**，断言靠的是距离而不是哨兵检查 ⇒
+        //    变异实测（把 `isValidWaypoint(...)` 整行删掉）**四格全绿**，那几格是空的。
+        //    ‼️ 这正是「探针要打在生产判据上」：一个恒假的断言看起来在测，其实什么都没测。
+        //
+        //    重合形状也正是**真实故障形状**：飞机没拿到 GPS 定位时坐标为 0/0，
+        //    而接机机位未指派时后端哨兵也是 0/0 ⇒ 距离算出来是 **0** ⇒
+        //    少了哨兵检查就会宣布"已抵达"并发出 `AUTO.LAND`（**原地降落**）。
+        verify(OpsCommon.reachedSlot(0, 0, 0, 0, 100) === false,
+               "机位与目标同为 0/0（未定位 + 后端哨兵）⇒ 距离 0，只有哨兵检查拦得住")
+        verify(OpsCommon.reachedSlot(0, 117.0, 0, 117.0, 100) === false,
+               "两点重合于**纬度 0** ⇒ 距离 0，只有哨兵检查拦得住")
+        verify(OpsCommon.reachedSlot(40.0, 0, 40.0, 0, 100) === false,
+               "两点重合于**经度 0** ⇒ 距离 0，只有哨兵检查拦得住")
+        // 下面两格是"哨兵"这个契约的**命名**（飞机在真实坐标上）。⚠️ 诚实地说：
+        // 这两格**同时**被距离判据覆盖（(0,0) 与 (40,117) 相距 4400 km），
+        // 所以它们不是 load-bearing 的 —— 真正扛住哨兵契约的是上面三格。
+        verify(OpsCommon.reachedSlot(la, lo, 0, 0, 100) === false,
+               "接机机位 0/0（后端哨兵「无可用接机机位」）")
+        verify(OpsCommon.reachedSlot(la, lo, 0, 117.0, 100) === false,
+               "接机机位纬度 0（后端哨兵）")
+
+        verify(OpsCommon.reachedSlot(NaN, lo, la, lo, 100) === false, "机位纬度 NaN")
+        verify(OpsCommon.reachedSlot(la, NaN, la, lo, 100) === false, "机位经度 NaN")
+        verify(OpsCommon.reachedSlot(la, lo, NaN, lo, 100) === false, "目标纬度 NaN")
+        verify(OpsCommon.reachedSlot(la, lo, la, NaN, 100) === false, "目标经度 NaN")
+        verify(OpsCommon.reachedSlot(undefined, lo, la, lo, 100) === false, "机位纬度 undefined")
+        verify(OpsCommon.reachedSlot(null, lo, la, lo, 100) === false, "机位纬度 null")
+        verify(OpsCommon.reachedSlot(la, lo, undefined, lo, 100) === false, "目标纬度 undefined")
+        verify(OpsCommon.reachedSlot(la, lo, null, lo, 100) === false, "目标纬度 null")
+        verify(OpsCommon.reachedSlot("40.0", lo, la, lo, 100) === false, "字符串纬度 ⇒ 只认数字类型")
+        verify(OpsCommon.reachedSlot(la, lo, la, lo, "100") === false, "字符串半径 ⇒ 只认数字类型")
+
+        verify(OpsCommon.reachedSlot(la, lo, la, lo, 0) === false, "半径 0")
+        verify(OpsCommon.reachedSlot(la, lo, la, lo, -1) === false, "半径负数")
+        verify(OpsCommon.reachedSlot(la, lo, la, lo, NaN) === false, "半径 NaN")
+        verify(OpsCommon.reachedSlot(la, lo, la, lo, undefined) === false, "半径 undefined")
+        verify(OpsCommon.reachedSlot(la, lo, la, lo, Infinity) === false, "半径 Infinity")
+        verify(OpsCommon.reachedSlot(Infinity, lo, la, lo, 100) === false, "机位纬度 Infinity")
+    }
 }

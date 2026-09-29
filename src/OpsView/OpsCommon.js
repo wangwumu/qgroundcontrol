@@ -1428,3 +1428,37 @@ function takeoffTransitionPoint(lat, lon, headingDeg, distM) {
 function vtolTransitionDone(vtolState) {
     return typeof vtolState === "number" && vtolState === MAV_VTOL_STATE_MC
 }
+
+/// 飞机是否已飞抵**接机机位**（方案 A 的到达判定）。回的必是布尔。
+///
+/// 用户 2026-09-29 裁定：降落落点从 `home`（= 起飞点）改为**接机机位坐标**，走
+/// `guidedModeGotoLocation(机位坐标)` → **本函数回 true** → `guidedModeLand()`。
+/// ⇒ 本函数回 true 的那一刻，程序会**发出降落**。
+///
+/// ‼️ 所以假阳性的代价是不对称的：说"到了"而其实没到 ⇒ 飞机在多旋翼模式下 `AUTO.LAND`
+///    是**原地降落**（`PX4-Autopilot/src/modules/navigator/land.cpp` 里唯一的
+///    `DO_REPOSITION` 是"中止降落"用的，不是水平接近）⇒ 落在机位之外的任意位置，
+///    违反用户 2026-09-28 定的红线「除非要坠机了，否则飞机只能在机位上降落」。
+///    反之"没到"的代价只是多盘旋几秒，最后走超时提示。
+///    ⇒ **一切存疑输入一律回 `false`**（同一个理由贯穿 `vtolTransitionDone`、本函数、
+///      以及后端的 `assign_slot_lat/lon` 三字段哨兵）。
+///
+/// `slotLat`/`slotLon` 直接吃后端 `opsOverviewItem.assign_slot_lat/lon`：
+/// **0/0 是「无可用接机机位」的哨兵**（未指派，或机位已软删 —— 见后端
+/// `ops_overview_assign_slot_coord_test.go`），由 `isValidWaypoint` 拦下。
+/// ‼️ 别改成"按 `assign_slot_id != null` 判有没有落点"：机位软删时那个 id **仍在**
+///    而坐标是 0/0 —— 那样判会让飞机带着目标 (0, 0) 起飞。
+///
+/// `radiusM <= 0` 也回 `false`，而**不是**"半径 0 表示必须精确重合"：后者在 GPS 噪声下
+/// 永不成立 ⇒ 飞机一直盘旋到超时，而界面上显示"正在飞往机位"，与真实故障无法区分。
+///
+/// 距离口径与本站范围圈**同一个函数**（`_greatCircleM`，R=6371000）：不另写一份，
+/// 免得"圈画得下但到不了"这种两套公式才有的形状。
+function reachedSlot(lat, lon, slotLat, slotLon, radiusM) {
+    if (!_finiteNumber(lat) || !_finiteNumber(lon)) return false
+    if (!_finiteNumber(slotLat) || !_finiteNumber(slotLon)) return false
+    if (!_finiteNumber(radiusM) || radiusM <= 0) return false
+    // 0 哨兵与越界值一并拦下（与包围盒/范围圈同一口径，见 `isValidWaypoint`）。
+    if (!isValidWaypoint(lat, lon) || !isValidWaypoint(slotLat, slotLon)) return false
+    return _greatCircleM(lat, lon, slotLat, slotLon) <= radiusM
+}
