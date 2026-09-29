@@ -169,7 +169,8 @@ private:
 
     mutable QMutex _mutex;
     QFile          _file;
-    /// 键＝msgid（流与 msgid 一对一：streamOf 的映射是常量）。
-    QHash<uint32_t, StreamState> _streams;
+    /// 键＝方向 << 32 | msgid。**方向必须进键**：同一条报文两个方向都有（心跳最典型），
+    /// 只按 msgid 存会让两条流互相顶掉对方的取值 ⇒ 去重失效、每条都当「变了」写出去。
+    QHash<uint64_t, StreamState> _streams;
     QDateTime      _lastHeartbeatAt;
 };

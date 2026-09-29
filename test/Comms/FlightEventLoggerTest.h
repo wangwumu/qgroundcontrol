@@ -31,6 +31,7 @@ private slots:
     void _firstStreamValueIsWritten_test();
     void _unchangedStreamValueIsSkipped_test();
     void _changedStreamValueIsWrittenWithElapsed_test();
+    void _streamDedupIsPerDirection_test();
     void _alertStreamIsNeverDeduplicated_test();
     void _statusFramesRenderReadableState_test();
 

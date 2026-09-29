@@ -461,4 +461,57 @@ void FlightEventLoggerTest::_logFrameWritesToFileAndDeduplicates_test()
     QVERIFY2(dataLines[2].contains(QStringLiteral("距上次变化 3.0 秒")), qPrintable(dataLines[2]));
 }
 
+void FlightEventLoggerTest::_streamDedupIsPerDirection_test()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    FlightEventLogger* logger = FlightEventLogger::instance();
+    QVERIFY(logger->start(dir.path()));
+    const QString path = logger->filePath();
+
+    const QDateTime t0(QDate(2026, 9, 29), QTime(10, 0, 0), QTimeZone::UTC);
+
+    const auto heartbeat = [](uint32_t mode) {
+        mavlink_message_t m{};
+        (void) mavlink_msg_heartbeat_pack(1, 1, &m, MAV_TYPE_FIXED_WING, MAV_AUTOPILOT_PX4,
+                                          0, mode, MAV_STATE_ACTIVE);
+        return m;
+    };
+
+    // QGC 自己每秒发一条 GCS 心跳，飞行器也每秒回一条：同 msgid、不同取值。
+    // 去重状态若只按 msgid 存，两条流会互相顶掉对方的取值 ⇒ 每条心跳都判成「变了」，
+    // 去重彻底失效。这不是假想：真机端到端实测到每次心跳各写一行、并伴以
+    // 「距上次变化 0.0 秒」（见 memory 里防重放水位按方向分列的同型教训）。
+    QVERIFY(logger->logFrame(Direction::FromVehicle, heartbeat(2), t0));             // 该方向首次 → 写
+    QVERIFY(logger->logFrame(Direction::ToVehicle, heartbeat(9), t0.addSecs(1)));    // 另一方向首次 → 也写
+    QVERIFY(!logger->logFrame(Direction::FromVehicle, heartbeat(2), t0.addSecs(2))); // 本方向未变 → 不写
+    QVERIFY(!logger->logFrame(Direction::ToVehicle, heartbeat(9), t0.addSecs(3)));   // 本方向未变 → 不写
+    QVERIFY(!logger->logFrame(Direction::FromVehicle, heartbeat(2), t0.addSecs(4))); // 仍未变 → 不写
+
+    logger->stop();
+
+    QFile f(path);
+    QVERIFY(f.open(QIODevice::ReadOnly));
+    QStringList dataLines;
+    for (const QByteArray& raw : f.readAll().split('\n')) {
+        const QString line = QString::fromUtf8(raw);
+        if (!line.isEmpty() && !line.startsWith(QLatin1Char('#'))) {
+            dataLines << line;
+        }
+    }
+    f.close();
+
+    // 5 帧进去、2 行出来。
+    QCOMPARE(dataLines.size(), 2);
+    QVERIFY2(dataLines[0].contains(FlightEventLogger::directionLabel(Direction::FromVehicle)),
+             qPrintable(dataLines[0]));
+    QVERIFY2(dataLines[1].contains(FlightEventLogger::directionLabel(Direction::ToVehicle)),
+             qPrintable(dataLines[1]));
+    // 两个方向各自的首次都不带「距上次变化」：首次没有「上次」。若两条流共用一个槽位，
+    // 后写的那个方向会被算成「距另一条流 1.0 秒」。
+    QVERIFY2(!dataLines[0].contains(QStringLiteral("距上次变化")), qPrintable(dataLines[0]));
+    QVERIFY2(!dataLines[1].contains(QStringLiteral("距上次变化")), qPrintable(dataLines[1]));
+}
+
 UT_REGISTER_TEST(FlightEventLoggerTest, TestLabel::Unit)

@@ -458,8 +458,11 @@ bool FlightEventLogger::logFrame(Direction direction, const mavlink_message_t& m
 
     QString note;
     if (stream != Stream::None) {
-        const StreamDecision decision =
-            decideStreamWrite(_streams[static_cast<uint32_t>(message.msgid)], body.toUtf8(), now);
+        // 方向必须进键：QGC 自己每秒发一条 GCS 心跳、飞行器也每秒回一条，两者 msgid 相同、
+        // 取值不同。只按 msgid 存会让两条流互相顶掉对方的取值，于是每条心跳都判成「变了」，
+        // 去重彻底失效（真机端到端实测：1 Hz 心跳每次各写一行，且备注恒为「距上次变化 0.0 秒」）。
+        const uint64_t key = (static_cast<uint64_t>(direction) << 32) | message.msgid;
+        const StreamDecision decision = decideStreamWrite(_streams[key], body.toUtf8(), now);
         if (!decision.write) {
             return wrote;
         }
