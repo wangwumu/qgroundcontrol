@@ -670,7 +670,7 @@ function groupTasksByRoute(tasks, routeOrder) {
     return out
 }
 
-// 中段（航班列表）的行集合（§4.1 中段）= 第 1 节 ∪ 第 2 节：
+// 中段（航班列表）的**两节切分**（§4.1 中段）= 第 1 节 ∪ 第 2 节（拍平版见 `middleSectionTasks`）：
 //   第 1 节 **异常航班 ∪ 待我签入**，**与是否选中航线无关、置顶常驻**。
 //          前半是裁定 ⑥ 的硬约束——用户指出过「异常飞机应该常驻在屏幕上，而我们又说选择航线，
 //          则在列表中显示该航班的航班，这个冲突了」。
@@ -686,7 +686,12 @@ function groupTasksByRoute(tasks, routeOrder) {
 // ‼️ 两节可能包含**同一个航班**（选中了一条有异常航班的航线）⇒ **必须按 `task_id` 去重**，
 //    去重后**仍留在第 1 节**（第 1 节的位置更高）。去重漏了的表现是同一条航班在列表里出现两次，
 //    看起来像"重复的数据"，不报错。
-function middleSectionTasks(tasks, selectedRouteId, handoverById) {
+//
+// ‼️ **两节分开返回**（`{first, second}`）而不是拍平：2026-09-29 用户报障「点航线，航班列表
+//    不变」——第 1 节**本就**不受航线选中过滤（上面那条硬约束），但拍平渲染让用户看不出
+//    「这几条为什么留在列表里」⇒ 读起来就是"点了航线没反应"。裁定：**补分段标题、过滤不动**。
+//    分段是**渲染层**的事，判据仍只有这一份（`middleSectionTasks` 也走这里）。
+function middleSectionSplit(tasks, selectedRouteId, handoverById) {
     // ‼️ 2026-09-24（裁定 丙-2）：第 1 节除异常之外**再收"待我签入"**（ROUTE 交接等着
     //    监控员接管），理由与 `siteTasks` 同上——超时到期这条交接就作废了。
     // ⚠️ 判据写在**调用 `isAbnormal` 的这里**、**不写进 `isAbnormal` 本身**：那个函数
@@ -694,25 +699,39 @@ function middleSectionTasks(tasks, selectedRouteId, handoverById) {
     //    往里加一条"待签入也算异常"会让地图上的飞机跟着变色。
     // ⚠️ 第 1 节**不受 `selectedRouteId` 过滤**（原有口径，异常航班常驻置顶）；"待签入"
     //    沿用同一口径。此处不会因此多收：`handoverById` 对监控员本就**只含其航线**。
-    var seen = {}, out = []
+    var seen = {}, first = [], second = []
     for (var i = 0; i < tasks.length; i++) {
         var t = tasks[i]
         if (!isAbnormal(t) && !awaitingMyCheckin(t, handoverById)) continue
         if (seen[t.task_id]) continue
         seen[t.task_id] = true
-        out.push(t)
+        first.push(t)
     }
     // 未选中（null / undefined）与"选中了某条"共用下面这一轮循环，只差**过不过滤 route_id**：
-    // 早返回式的写法（`if (未选中) return out`）会让"全收"与"按航线收"变成两段各自演化的代码。
+    // 早返回式的写法（`if (未选中) return second`）会让"全收"与"按航线收"变成两段各自演化的代码。
     var filterByRoute = (selectedRouteId !== null && selectedRouteId !== undefined)
     for (var j = 0; j < tasks.length; j++) {
         var u = tasks[j]
         if (filterByRoute && Number(u.route_id) !== Number(selectedRouteId)) continue
         if (seen[u.task_id]) continue          // 已在异常节里：保持它在前面
         seen[u.task_id] = true
-        out.push(u)
+        second.push(u)
     }
-    return out
+    return { first: first, second: second }
+}
+
+// 中段的**行集合**（拍平版）= `middleSectionSplit` 的两节按序拼接。
+// ‼️ 保留这个函数、而不是让调用方自己拼：它是**拼接顺序的单点**——顺序写反
+//    （`second.concat(first)`）的症状是**异常航班沉到底部**，而"异常常驻置顶"正是用户
+//    裁定 ⑥ 的核心，沉底看起来只是"排序怪怪的"。
+// ⚠️ 生产调用点实测**只有 `RomView` 一处**（其 `_panelTasks`；同一视图另有一个 `_panelSplit`
+//    属性供分段渲染取 `first.length`，两者传同一组实参，而 `middleSectionSplit` 是纯函数
+//    ⇒ 调两次与调一次等价）。本条注释 2026-09-29 曾写成「调用点有多个（站点视图 /
+//    监控员视图 / 历史）」——逐处 `rg` 核实后**无一存在**，那是凭印象写的。
+//    动这个函数之前先重新数一遍调用点，别照抄上面的结论。
+function middleSectionTasks(tasks, selectedRouteId, handoverById) {
+    var s = middleSectionSplit(tasks, selectedRouteId, handoverById)
+    return s.first.concat(s.second)
 }
 
 // 从 ③ 的 `devices[]` 提取要推给 C++ 的 device_id 清单（§2.3 / §3.5.3）。

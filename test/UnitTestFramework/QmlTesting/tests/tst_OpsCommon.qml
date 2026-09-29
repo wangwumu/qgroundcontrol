@@ -804,6 +804,15 @@ TestCase {
                  event: { type: "DIVERT", status: "OPEN" } }
     }
 
+    /// 带 `route_id` 的普通在航任务。‼️ `_task`/`_abnormalTask`/`_siteTask`/`_hoTask`
+    /// **都不带 `route_id`**，而 `middleSectionSplit/Tasks` 的第 2 节判据正是
+    /// `Number(u.route_id) !== Number(selectedRouteId)` —— 拿它们当夹具的话
+    /// `Number(undefined)` 是 `NaN`，`NaN !== 7` 恒真 ⇒ 第 2 节**恒空**，
+    /// 「选中航线只留该航线的」那格会对着空数组**假绿**。
+    function _routeTask(taskId, routeId) {
+        return { task_id: taskId, status: "IN_FLIGHT", route_id: routeId, latest: null }
+    }
+
     /// ‼️ **本组最关键的一格**：判据必须只看**待办名单**，不看任务自带的事实。
     /// 场景：站点 ATC 自己提出了一条 ROUTE 交接 ⇒ `task.handover` 有值（事实），
     /// 但 `/handovers/pending` **不把他自己那条发给他**（待办名单里没有）。
@@ -881,6 +890,81 @@ TestCase {
                     99, { 4: _embeddedHo(7, "ROUTE", 16) })
         compare(filtered[0].task_id, 4,
                 "第 1 节不受 selectedRouteId 过滤——它与异常航班同为常驻置顶")
+    }
+
+    //-------------------------------------------------------------------------
+    // 中段的**分段标题**（《航线监控员主界面设计-20260922.md》§4.2）
+    //   用户 2026-09-29 报障：「点航线，航班列表不变」——第 1 节（异常 ∪ 待我签入）
+    //   本就**不受航线选中过滤**（裁定 ⑥ 的硬约束，见 `middleSectionTasks` 注释），
+    //   但那两节此前被**拍平成一个数组**渲染 ⇒ 用户看不出哪些是"因为异常才常驻"的，
+    //   整体读起来就是"点了航线列表没反应"。
+    //   裁定（用户 2026-09-29）：**补分段标题、过滤不动**（第 1 节照旧常驻，不推翻裁定 ⑥）。
+    //   ⇒ 本组钉住拆出来的**两节本身**；渲染（段头位置、空段头）由 QML 侧承担。
+    //-------------------------------------------------------------------------
+
+    /// ‼️ **重构保护格**：拆出来的两节拼回去，必须与既有 `middleSectionTasks`
+    /// **逐项同序**。`middleSectionTasks` 的调用点（`OpsCommon.siteTasks` 之外的
+    /// 视图接线）在本次改动里**不该有任何行为变化**——分段是**渲染层**的事。
+    /// 若实现成"two-section 版本重写一遍判据"，两处判据迟早漂移，而漂移的症状是
+    /// 列表与地图 marker 不一致，不报错。
+    function test_middleSectionSplit_flattensToSameOrderAsMiddleSectionTasks() {
+        var ab = _abnormalTask(1)
+        var n1 = _routeTask(2, 7)
+        var n2 = _routeTask(3, 8)
+        var all = [ab, n1, n2]
+
+        // 路径 A：分段结果拼接
+        var split = OpsCommon.middleSectionSplit(all, null, {})
+        compare(split.first.length, 1, "第 1 节只收异常/待签入")
+        compare(split.first[0].task_id, 1)
+        compare(split.second.length, 2, "第 2 节收其余在航航班")
+        compare(split.second[0].task_id, 2)
+        compare(split.second[1].task_id, 3)
+
+        // 路径 B：既有拍平函数。两条路径必须**同长同序**（阳性对照在下面那条 assert 里）
+        var flat = OpsCommon.middleSectionTasks(all, null, {})
+        var joined = split.first.concat(split.second)
+        compare(joined.length, flat.length, "两节拼起来必须与拍平结果等长")
+        for (var i = 0; i < flat.length; i++)
+            compare(joined[i].task_id, flat[i].task_id, "第 " + i + " 项次序必须一致")
+    }
+
+    /// 选中航线时**只有第 2 节**被过滤；第 1 节照旧常驻——这正是"点航线列表不变"的
+    /// 合法来源，也是分段标题要解释给用户看的那件事。
+    function test_middleSectionSplit_filtersSecondSectionOnly() {
+        var abOther = _abnormalTask(1)          // 异常航班，属于**未被选中**的航线
+        var nSel = _routeTask(2, 7)             // 选中航线的航班
+        var nOther = _routeTask(3, 8)           // 别的航线的航班
+
+        var split = OpsCommon.middleSectionSplit([abOther, nSel, nOther], 7, {})
+        compare(split.first.length, 1, "异常航班不受选中航线过滤（裁定 ⑥）")
+        compare(split.first[0].task_id, 1, "常驻的那条恰恰属于别的航线")
+        compare(split.second.length, 1, "第 2 节只留选中航线的")
+        compare(split.second[0].task_id, 2, "且留下的必须是选中航线那一条，不是别的")
+    }
+
+    /// 既异常、又属于选中航线的航班：**只出现在第 1 节**。
+    /// 漏了去重的症状是同一条航班在列表里出现两次，看起来像"重复的数据"，不报错。
+    function test_middleSectionSplit_dedupesIntoFirstSection() {
+        var both = _abnormalTask(1)
+        both.route_id = 7                       // 既是异常、又在选中航线上
+        var nSel = _routeTask(2, 7)
+
+        var split = OpsCommon.middleSectionSplit([both, nSel], 7, {})
+        compare(split.first.length, 1)
+        compare(split.first[0].task_id, 1)
+        compare(split.second.length, 1, "已在第 1 节的不得在第 2 节再出现一次")
+        compare(split.second[0].task_id, 2)
+    }
+
+    /// 「待我签入」与异常**同口径**进第 1 节——分段后它也得在置顶那一段里，
+    /// 否则"补分段标题"会把 2026-09-24 裁定 丙-2 的提示推到下面去。
+    function test_middleSectionSplit_putsAwaitingCheckinInFirstSection() {
+        var t = _hoTask(91103, "IN_FLIGHT", 1, _embeddedHo(7, "ROUTE", 16))
+        var split = OpsCommon.middleSectionSplit(
+                    [t, _routeTask(2, 7)], 7, { 91103: _embeddedHo(7, "ROUTE", 16) })
+        compare(split.first.length, 1, "待我签入必须进置顶节")
+        compare(split.first[0].task_id, 91103)
     }
 
     /// ‼️ **回归靶子**：判据**不得**塞进 `isAbnormal`。

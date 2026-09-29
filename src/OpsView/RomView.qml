@@ -102,17 +102,55 @@ OpsShell {
     //=========================================================================
     // 右栏内容（设计文档 §4.1）
     //=========================================================================
-    // 中段（航班列表）的行集合 = （异常航班 ∪ 待我签入）（置顶常驻）∪ 在航航班，按 task_id 去重。
+    // 中段（航班列表）= （异常航班 ∪ 待我签入）（置顶常驻）∪ 在航航班，按 task_id 去重。
     // ‼️ 第 2 节的口径随选中状态变（用户 2026-09-23 定）：**选中某航线 ⇒ 只列该航线的；
-    //    一条都没选中 ⇒ 列全部在航**（"所有在航无人机"）。判据细节见 `middleSectionTasks`。
-    // ‼️ 判据住 `OpsCommon.middleSectionTasks`（纯函数，可测），本视图只传实参——
+    //    一条都没选中 ⇒ 列全部在航**（"所有在航无人机"）。
+    // ‼️ 判据住 `OpsCommon.middleSectionSplit`（纯函数，可测），本视图只传实参——
     //    写成这里的 inline function 的话，QML 测试基础设施**测不到**它（§2.3）。
     // ‼️ 第三个实参 `_handoverById` 是 2026-09-24 裁定 丙-2 加的：置顶判据问的是
     //    「该谁动手」⇒ 必须走**待办**口径（`/handovers/pending`，按角色过滤），
     //    不能用任务自带的 `handover`（那是**事实**口径）。见 `awaitingMyCheckin`。
+    //
+    // ‼️ **两节分开取**（2026-09-29）：用户报障「点航线，航班列表不变」——第 1 节本就
+    //    不受航线选中过滤（裁定 ⑥ 的硬约束），拍平渲染让用户看不出「这几条为什么留下」，
+    //    读起来就是"点了没反应"。裁定：**补分段标题、过滤不动**。
+    //    段头需要知道**分界点在哪**（= 第 1 节的条数），拍平后的数组里没有这个信息。
+    //
+    // ⚠️ 这里对**同一组实参**调了两次（`middleSectionSplit` 与 `middleSectionTasks`）——
+    //    这不是两份判据：后者内部调用的就是前者（见 `OpsCommon.js`），两个结果是同一个
+    //    纯函数在同一次数据上算出来的。分成两个属性是为了让 `tasks` 那个模型仍走
+    //    `middleSectionTasks`（**拼接顺序的单点**：写反成 `second.concat(first)` 会让
+    //    异常航班沉底，而"异常常驻置顶"正是裁定 ⑥ 的核心）。这一条由 `tst_OpsCommon.qml`
+    //    的 `test_middleSectionSplit_flattensToSameOrderAsMiddleSectionTasks` 钉住。
+    readonly property var _panelSplit: OpsCommon.middleSectionSplit(romView._routeTasks,
+                                                                    romView._selectedRouteId,
+                                                                    romView._handoverById)
     readonly property var _panelTasks: OpsCommon.middleSectionTasks(romView._routeTasks,
                                                                    romView._selectedRouteId,
                                                                    romView._handoverById)
+
+    // 选中航线的显示名（段头 2 的文案用）。未选中、或名册里还没有这条 ⇒ 空串。
+    // ‼️ 取自 `_routeCache`（① 的全量名册）而**不是** `_routeTasks`：选中的航线可能
+    //    **一条航班都没有**——那正是段头 2 挂在委托上挂不出来、要靠 footer 补的场景
+    //    ⇒ 从 tasks 里取名字会在最需要它的那一刻恰好取不到。
+    readonly property string _selectedRouteName: {
+        var id = romView._selectedRouteId
+        if (id === null || id === undefined) return ""
+        var r = romView._routeCache[String(id)]
+        return (r && r.route_name) ? r.route_name : ""
+    }
+    // 第 1 节段头。文案取自设计文档 §4.1 的「⚠ 异常（置顶常驻）」，并补上 2026-09-24
+    // 裁定 丙-2 加进来的第二类（待我签入）——两类都在这一节里，标题只写"异常"会漏一类。
+    readonly property string _sectionTitleFirst: qsTr("异常 / 待我签入（置顶常驻）")
+    // 第 2 节段头。未选中航线时这一节是**全部在航航班**（用户 2026-09-23 定），
+    // 段落标题必须跟着换，否则标题写着"选中航线"而列表里有别的航线的飞机。
+    // ⚠️ 名册还没到（`_routeCache` 为空）时**不拼 id**：界面不出现裸标识符。
+    readonly property string _sectionTitleSecond: {
+        var id = romView._selectedRouteId
+        if (id === null || id === undefined) return qsTr("全部在航航班")
+        var nm = romView._selectedRouteName
+        return nm !== "" ? qsTr("选中航线 %1 的航班").arg(nm) : qsTr("选中航线的航班")
+    }
     // 陈旧提示条上的时刻（③ 上次**成功**的时刻）
     readonly property string _routeUpdatedText: romView._routeUpdatedAt
                                                ? Qt.formatTime(romView._routeUpdatedAt, "hh:mm:ss") : "—"
@@ -191,10 +229,20 @@ OpsShell {
                 }
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                // ⚠️ 表头承诺了置顶就**必须真的置顶**（判据见 `middleSectionTasks`），
+                // ⚠️ 表头承诺了置顶就**必须真的置顶**（判据见 `middleSectionSplit`），
                 //    反过来第 1 节**每一条都得自带徽标说明自己为什么在顶上**：
                 //    异常航班走 `abnormalLabel`，待签入走 `_awaitingMe` 那条警示条。
-                headerText: qsTr("航班列表 · 异常/待签入置顶")
+                // ⚠️ 表头**不再**写「异常/待签入置顶」（2026-09-29）：那句承诺现在由**段头 1**
+                //    逐字承担，两处各写一遍就是同一句话的两个副本，改一处漏一处的症状是
+                //    "表头写着置顶、段落标题却写着别的"。
+                headerText: qsTr("航班列表")
+                // 分段标题（§4.1 中段的两节）。`sectionBreak` 是**唯一**的分界来源——
+                // 面板的段头位置与 `footer`（第 2 节为空时那条空段头）共用它。
+                sectionBreak: romView._panelSplit.first.length
+                sectionTitleFirst: romView._sectionTitleFirst
+                sectionTitleSecond: romView._sectionTitleSecond
+                // 「性质」= 本站相对航线的角色。监控员没有 `site_id` ⇒ 恒回「—」⇒ 隐藏。
+                showTaskNature: false
                 tasks: romView._panelTasks
                 handoverById: romView._handoverById
                 nowMs: romView._now
