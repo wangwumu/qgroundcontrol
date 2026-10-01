@@ -124,16 +124,16 @@ OpsShell {
         // 补扫入口①：视图加载时，飞机可能**早已**连好（握手信号早发过、等不到）。
         _syncRoutesForAlreadyConnected()
     }
-    // 补扫入口②：任务列表到位后。`_tasks` 是骨架的属性（`OpsShell.qml:97`），
+    // 补扫入口②：任务列表到位后。`_tasks` 是骨架的属性（`OpsShell._tasks`），
     // 本文件是 `OpsShell` 的派生类，可以直接给它写信号处理器。
     // ⚠️ QML 对下划线开头属性的处理器命名是 `on_` + **保持首字符、第二个字母大写**
     //    （先例：`on_ActiveVehicleChanged` / `on_FlightModeChanged`）。
     // ⚠️ 这个处理器**多久**触发一次［2026-09-23 Task 3 评审订正：原文写"**不是** 2s 心跳"，
     //    在联机现场**不成立**］：
-    //    `_tasks` 的赋值**带内容指纹守卫**（`OpsShell.qml:543`：`json !== _tasksJson` 才赋），
-    //    但该指纹是 `JSON.stringify(data)`、**含每个任务的 `latest` 遥测**（`ops.go:243`
-    //    `item.Latest = h.fetchLatestTelemetry(r.uavID)`）；而 `OpsShell.qml:540-541`
-    //    的注释**自己就写着**「这一层**挡不住遥测**（`data` 带 `latest`，飞机一动就变）」。
+    //    `_tasks` 的赋值**带内容指纹守卫**（`OpsShell._fetchOverview` 里 `json !== _tasksJson` 才赋），
+    //    但该指纹是 `JSON.stringify(data)`、**含每个任务的 `latest` 遥测**（`handlers/ops.go` 里
+    //    `item.Latest = h.fetchLatestTelemetry(r.uavID)` 那一处 —— **按符号定位，别按行号**）；而 `OpsShell._fetchOverview` 里
+    //    那段注释**自己就写着**「这一层**挡不住遥测**（`data` 带 `latest`，飞机一动就变）」。
     //    ⇒ **遥测链活着时，本处理器约每 2s 触发一次**；只有遥测不再产生新行（链路断/静止）
     //      时载荷才真的静止。
     //    ⇒ 入口①**仍然不可省**：它覆盖的是"**视图加载那一刻**飞机与任务就都已在位、
@@ -1027,9 +1027,10 @@ OpsShell {
         //
         //    为什么必须有这道闸（2026-09-23 真库实测，**不是假想**）：
         //    `/ops/overview` 的 WHERE 是
-        //    `t.deleted_at IS NULL AND COALESCE(t.uav_id,0) <> 0`（uavm 仓
-        //    `gcs_server/handlers/ops.go:180`）—— **没有 status 过滤**；而 `device_id`
-        //    来自 `JOIN table_uav`（`:167`）⇒ **历史任务也带着 device_id**。
+        //    `t.deleted_at IS NULL AND COALESCE(t.uav_id,0) <> 0`（uavm 仓 `gcs_server/handlers/ops.go`
+        //    的 `OpsHandler.Overview` 里那条**共享 WHERE** —— 按符号定位：
+        //    `rg -n 'COALESCE(t.uav_id,0) <> 0'`，**别按行号**）—— **没有 status 过滤**；而 `device_id`
+        //    来自同一条 SQL 的 `JOIN table_uav` ⇒ **历史任务也带着 device_id**。
         //
         //    真库当前就有：`device_id=91002` 挂着 **2 个**任务 —— `91102:READY`（活跃）
         //    与 `91104:CANCELED`（历史）。两者 `device_id` 相同 ⇒ 都会匹配。
@@ -1068,7 +1069,7 @@ OpsShell {
         //    **原地改内容**，**不发 `_routeSyncsChanged`** ⇒ 读它的绑定**不重估**。
         //
         //    而 Task 4 的 `_canTakeoff` 会通过 `_routeSyncs[task.task_id]` 建立绑定依赖，
-        //    那个绑定是**起飞按钮的 `enabled`**（`TaskListPanel.qml:451`：
+        //    那个绑定是**起飞按钮的 `enabled`**（`TaskListPanel` 里那行
         //    `enabled: panel.canTakeoffFn ? panel.canTakeoffFn(modelData) : false`），
         //    它由「函数调用」间接读 —— QML 的依赖捕获跟着整个调用栈走，**所以能建立**。
         //
@@ -1079,11 +1080,11 @@ OpsShell {
         //    ⇒ 首次求值时 `_routeSyncs` 还是空的 `({})`，`sync` 是 `undefined`，
         //    **那次求值没有建立对任何 sync 属性的依赖**。
         //    ⇒ 若这里不发信号，按钮会**一直灰着**，只能等 `_tasks` 指纹变化
-        //    （而它有内容指纹守卫，`OpsShell.qml:543-545`；飞机静止时可能很久不变）
+        //    （而它有内容指纹守卫，`OpsShell._fetchOverview`；飞机静止时可能很久不变）
         //    或 `multiVehicleManager.vehicles` 变化才偶然重估。
         //    ⇒ 用户看到的是"航线早就传完了，起飞按钮却一直不亮"—— 正是裁定 (a) 要消灭的现象。
         //
-        //    先例同源：`OpsShell.qml:543-545` 的 `_tasks = data` 也是**整体替换**
+        //    先例同源：`OpsShell._fetchOverview` 的 `_tasks = data` 也是**整体替换**
         //    （那边是为了让委托重建，这边是为了让绑定重估；同一个 QML 语义）。
         // ‼️ **必须是新对象**［2026-09-23 Task 3 评审订正］：`_routeSyncs = _routeSyncs`
         //    （把同一个引用赋回去）在 QML 里**不发 `Changed` 信号** —— `property var`

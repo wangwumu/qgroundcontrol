@@ -105,62 +105,67 @@ OpsShell {
     // 中段（航班列表）= （异常航班 ∪ 待我签入）（置顶常驻）∪ 在航航班，按 task_id 去重。
     // ‼️ 第 2 节的口径随选中状态变（用户 2026-09-23 定）：**选中某航线 ⇒ 只列该航线的；
     //    一条都没选中 ⇒ 列全部在航**（"所有在航无人机"）。
-    // ‼️ 判据住 `OpsCommon.middleSectionSplit`（纯函数，可测），本视图只传实参——
+    // ‼️ 判据住 `OpsCommon.middleSectionTasks`（纯函数，可测），本视图只传实参——
     //    写成这里的 inline function 的话，QML 测试基础设施**测不到**它（§2.3）。
     // ‼️ 第三个实参 `_handoverById` 是 2026-09-24 裁定 丙-2 加的：置顶判据问的是
     //    「该谁动手」⇒ 必须走**待办**口径（`/handovers/pending`，按角色过滤），
     //    不能用任务自带的 `handover`（那是**事实**口径）。见 `awaitingMyCheckin`。
-    //
-    // ‼️ **两节分开取**（2026-09-29）：用户报障「点航线，航班列表不变」——第 1 节本就
-    //    不受航线选中过滤（裁定 ⑥ 的硬约束），拍平渲染让用户看不出「这几条为什么留下」，
-    //    读起来就是"点了没反应"。裁定：**补分段标题、过滤不动**。
-    //    段头需要知道**分界点在哪**（= 第 1 节的条数），拍平后的数组里没有这个信息。
-    //
-    // ⚠️ 这里对**同一组实参**调了两次（`middleSectionSplit` 与 `middleSectionTasks`）——
-    //    这不是两份判据：后者内部调用的就是前者（见 `OpsCommon.js`），两个结果是同一个
-    //    纯函数在同一次数据上算出来的。分成两个属性是为了让 `tasks` 那个模型仍走
-    //    `middleSectionTasks`（**拼接顺序的单点**：写反成 `second.concat(first)` 会让
-    //    异常航班沉底，而"异常常驻置顶"正是裁定 ⑥ 的核心）。这一条由 `tst_OpsCommon.qml`
-    //    的 `test_middleSectionSplit_flattensToSameOrderAsMiddleSectionTasks` 钉住。
-    readonly property var _panelSplit: OpsCommon.middleSectionSplit(romView._routeTasks,
-                                                                    romView._selectedRouteId,
-                                                                    romView._handoverById)
+    // ‼️ 这里**只取拍平后的单一数组**。2026-09-29 曾另有一个 `_panelSplit`（调
+    //    `middleSectionSplit`）专供"两节分开渲染"的分段标题用，同日段头被用户裁定删除
+    //    ⇒ `_panelSplit` 一并删掉：它**唯一**的消费点就是传 `sectionBreak`。
+    //    ⚠️ 删 `_panelSplit` **不影响** `_panelTasks` 的取值：写反成 `second.concat(first)`
+    //      会让异常航班沉底，而"异常常驻置顶"正是裁定 ⑥ 的核心 —— 这一条由
+    //      `tst_OpsCommon.qml` 的
+    //      `test_middleSectionSplit_flattensToSameOrderAsMiddleSectionTasks` 钉住。
+    //    ⚠️ 分节**行为**也没有消失：`middleSectionTasks` 内部调的就是 `middleSectionSplit`，
+    //      第 1 节照旧不受航线选中过滤。删掉的只是"把两节分开渲染"，不是分节本身。
     readonly property var _panelTasks: OpsCommon.middleSectionTasks(romView._routeTasks,
                                                                    romView._selectedRouteId,
                                                                    romView._handoverById)
-
-    // 选中航线的显示名（段头 2 的文案用）。未选中、或名册里还没有这条 ⇒ 空串。
-    // ‼️ 取自 `_routeCache`（① 的全量名册）而**不是** `_routeTasks`：选中的航线可能
-    //    **一条航班都没有**——那正是段头 2 挂在委托上挂不出来、要靠 footer 补的场景
-    //    ⇒ 从 tasks 里取名字会在最需要它的那一刻恰好取不到。
-    readonly property string _selectedRouteName: {
-        var id = romView._selectedRouteId
-        if (id === null || id === undefined) return ""
-        var r = romView._routeCache[String(id)]
-        return (r && r.route_name) ? r.route_name : ""
-    }
-    // 第 1 节段头。文案取自设计文档 §4.1 的「⚠ 异常（置顶常驻）」，并补上 2026-09-24
-    // 裁定 丙-2 加进来的第二类（待我签入）——两类都在这一节里，标题只写"异常"会漏一类。
-    readonly property string _sectionTitleFirst: qsTr("异常 / 待我签入（置顶常驻）")
-    // 第 2 节段头。未选中航线时这一节是**全部在航航班**（用户 2026-09-23 定），
-    // 段落标题必须跟着换，否则标题写着"选中航线"而列表里有别的航线的飞机。
-    // ⚠️ 名册还没到（`_routeCache` 为空）时**不拼 id**：界面不出现裸标识符。
-    readonly property string _sectionTitleSecond: {
-        var id = romView._selectedRouteId
-        if (id === null || id === undefined) return qsTr("全部在航航班")
-        var nm = romView._selectedRouteName
-        return nm !== "" ? qsTr("选中航线 %1 的航班").arg(nm) : qsTr("选中航线的航班")
-    }
+    // 段头 1（「异常 / 待我签入（置顶常驻）」）、段头 2（「全部在航航班」/「选中航线 XX 的
+    // 航班」）与它们依赖的 `_selectedRouteName` 全部已删：用户 2026-09-29 裁定「两行段头全删」。
+    // ⚠️ 后果（用户明示接受）：置顶节为什么置顶、以及第 2 节当前是不是"选中航线的航班"，
+    //    界面上都不再有文字解释。
     // 陈旧提示条上的时刻（③ 上次**成功**的时刻）
     readonly property string _routeUpdatedText: romView._routeUpdatedAt
                                                ? Qt.formatTime(romView._routeUpdatedAt, "hh:mm:ss") : "—"
+
+    // 右栏三段的**固定比例**（用户 2026-09-29 终裁：航线 : 航班 : 告警 = 40 : 50 : 10）。
+    // ‼️ 三者之和必须恰好是 1.0：`ColumnLayout` 先按 `preferredHeight` 分配、再按
+    //    `fillHeight` 摊差额，和不等于 1 时实际比例就不再是这里写的数——症状是
+    //    "改了系数界面没变"，**不报错**。
+    readonly property real _ratioRoute: 0.4
+    readonly property real _ratioTask:  0.5
+    readonly property real _ratioAlert: 0.1
+    // 三段轮廓线的颜色。取比卡片描边（`#2a3a55`）亮一档的蓝灰：轮廓是**区域**的边界，
+    // 与区域内卡片的边界同色会让两层框糊在一起，反而看不出分了几块。
+    readonly property color _sectionOutlineColor: "#3d5175"
+    // 轮廓线内缘到卡片之间的左右留白（用户 2026-09-29：「轮廓线里左右边界留 2-3 个像素即可，
+    // 航线卡片和航班卡片也是如此」）。
+    // 实际水平留白 = 面板的 `anchors.margins`（= 2，见下三处）**加上**这两个数 ⇒ 这里取 0，
+    // 让"离框几像素"只有一个决定者。两处各留一点会**相加**，且改一处看不出预期效果。
+    // ‼️ 只在本视图覆盖，**不动骨架的 `_taskCardMargin` / `_taskCardRightGap`**：
+    //    前者被站点视图的机位边距 `_slotMargin` 反过来绑着（用户 2026-09-18「机位间隔参照
+    //    任务列表中两个卡片的间隔」）⇒ 改它会连锁改动站点视图的**机位图版式**，那与本次报障无关。
+    //    RomView 本来就在逐处显式传这两个参数，覆写是它既有的接线方式。
+    // ⚠️ 骨架那个 `_taskCardRightGap: 20` 的注释写着「来历不明的右侧留白，只保持原值」，
+    //    并记着用户曾要求"不能挤到右侧的滚动条"。本次用户明确要求压缩它，故本视图不再保留那 20。
+    //    该注释里已实测过「本模块没有任何 ScrollBar」，压到 0 不会挤到谁。
+    readonly property real _panelCardMargin: 0
+    readonly property real _panelCardRightGap: 0
 
     // 槽 ①（commandBarExtras）本视图不填，见文件头注释。
     rightPanelContent: Component {
         ColumnLayout {
             id: romRight
             anchors.fill: parent
-            spacing: 0
+            // 段与段之间的分隔（用户 2026-09-29：「两个功能段的轮廓线之间应该有几个像素的分隔」）。
+            // ‼️ 原值 0 ⇒ 相邻两框的 1px 边框**贴在一起**，看起来是一条 2px 的粗线，
+            //    读起来不像"两段之间"、像"这一段的框画重了"。
+            // ⚠️ `ColumnLayout.spacing` 的两处间隙（6×2 = 12）是**从总高里扣**的：
+            //    三段 `preferredHeight` 之和是右栏高的 100%，扣掉 12 之后按比例缩到 98.5%。
+            //    比例关系不变，只是每段各少约 5px——这正是要的"分隔"。
+            spacing: 6
 
             //-----------------------------------------------------------------
             // 数据陈旧 / 加载失败 提示条（§2.4）。成功一次即自动消失。
@@ -189,99 +194,150 @@ OpsShell {
             }
 
             //-----------------------------------------------------------------
+            // 三段各包一层 `Rectangle` 只做一件事：**画轮廓线**
+            //（用户 2026-09-29：「可以把各部分的标题去掉……可以使用轮廓线把各部分分别勾勒出来」）。
+            // ⚠️ 边框**不写进三个面板内部**：那三个面板是站点视图共用的（`OpsView.qml` 也在用），
+            //    框是"右栏怎么排版"的决定，属于使用方。面板内部加框会让站点视图跟着多两条线。
+            // ‼️ 高度全部是**固定比例**（见 `_ratioRoute` 等三个常量），不让内容撑：
+            //    内容一变（告警来一条、航班少一条）三段就互相挤，整个右栏跟着跳。
+            //    代价是内容少的段留白——这是用户在"固定比例 / 随内容"两选项里**明示选定**的取舍。
+            // ‼️ 三个 `fillHeight` 都得是 true：`ColumnLayout` 先按 `preferredHeight` 分配，
+            //    再把差额按 `fillHeight` 摊平；缺了它，三段之和凑不满右栏时底部会空一条。
+            // ‼️ 旧代码里上段的 `Layout.maximumHeight: romRight.height * 0.5` 已删。它是
+            //    "上段最多占一半"，而中段**只有** `fillHeight`、没有最小高度 ⇒ 航线一多就把
+            //    航班列表挤到只剩一张卡（正是 2026-09-29 报障里中段只剩一张卡的成因之一）。
+            //    份额写死之后这个挤法不再可能。
+            //-----------------------------------------------------------------
+
             // 上段：航线列表（常驻）。
             // ‼️ 「常驻」= **不看该航线有没有航班**（裁定 ③）——数据源是 ① 的缓存，
             //    不是 ③ 的轮询结果。
-            //-----------------------------------------------------------------
-            RouteListPanel {
-                id: routeListPanel
-                Layout.fillWidth: true
-                // 最多占右栏内容区的一半，超出滚动：常驻段**不能无界增长**，否则航线多的
-                // 监控员会把中段的航班列表挤没。上限写**使用方**（这里）而不是面板内部——
-                // 面板内部自己写 `height * 系数` 会与使用方给的高度形成自引用绑定。
-                Layout.maximumHeight: romRight.height * 0.5
-                headerText: qsTr("负责航线")
-                routes: romView._routeRows
-                ready: romView._routeCacheReady
-                selectedRouteId: romView._selectedRouteId
-                // 选中航线（骨架里 toggle：再点一次取消）；地图的 L2 由骨架按同一状态点亮
-                onRouteSelected: function(routeId) { romView.selectRoute(routeId) }
-                // 与中段同一个面板参数，两段的卡片因此天然同宽同距
-                cardMargin: romView._taskCardMargin
-                cardRightGap: romView._taskCardRightGap
-                cardGap: romView._taskCardGap
-            }
-
-            //-----------------------------------------------------------------
-            // 中段：航班列表（异常 ∪ 待我签入 置顶常驻 ∪ 选中航线的航班）
-            //-----------------------------------------------------------------
-            TaskListPanel {
-                // 本视图此前没有给这个面板 id（不用它的内部状态）；交接弹框的锚点要按 `task_id`
-                // 回列表里找卡片，才需要它。见下面 `Component.onCompleted`。
-                id: taskListPanel
-                // 交接弹框的位置锚点（`OpsShell._handoverAnchorFn`）。与站点视图那一份对称——同一个
-                // 弹框住骨架、两个视图各注入一次自己的求值闭包。`null` 与负数是两回事，见
-                // `TaskListPanel.cardBottomYForTask`。
-                Component.onCompleted: romView._handoverAnchorFn = function(taskId) {
-                    var y = taskListPanel.cardBottomYForTask(taskId)
-                    if (y === null) return -1
-                    return taskListPanel.mapToItem(romView, 0, y).y
-                }
+            Rectangle {
+                id: routeSectionBox
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                // ⚠️ 表头承诺了置顶就**必须真的置顶**（判据见 `middleSectionSplit`），
-                //    反过来第 1 节**每一条都得自带徽标说明自己为什么在顶上**：
-                //    异常航班走 `abnormalLabel`，待签入走 `_awaitingMe` 那条警示条。
-                // ⚠️ 表头**不再**写「异常/待签入置顶」（2026-09-29）：那句承诺现在由**段头 1**
-                //    逐字承担，两处各写一遍就是同一句话的两个副本，改一处漏一处的症状是
-                //    "表头写着置顶、段落标题却写着别的"。
-                headerText: qsTr("航班列表")
-                // 分段标题（§4.1 中段的两节）。`sectionBreak` 是**唯一**的分界来源——
-                // 面板的段头位置与 `footer`（第 2 节为空时那条空段头）共用它。
-                sectionBreak: romView._panelSplit.first.length
-                sectionTitleFirst: romView._sectionTitleFirst
-                sectionTitleSecond: romView._sectionTitleSecond
-                // 「性质」= 本站相对航线的角色。监控员没有 `site_id` ⇒ 恒回「—」⇒ 隐藏。
-                showTaskNature: false
-                tasks: romView._panelTasks
-                handoverById: romView._handoverById
-                nowMs: romView._now
-                mySiteId: romView._mySiteId
-                selectedTaskId: romView._selectedTaskId
-                // 站点专属动作组（起飞/降落/停泊/指定机位）在监控员视图**不出现**；
-                // 监控员自己的动作是"移交降落指挥"，由 isRouteMonitor 开（见 TaskListPanel:247）
-                showSiteActions: false
-                isRouteMonitor: romView._isRouteMon
-                // 与站点视图同一个面板、同一份左空位与间距——两个"决定者"会得到两种疏密。
-                // 这几个数全部来自骨架，视图侧只绑不算，故两个视图天然同值。
-                cardMargin: romView._taskCardMargin
-                cardRightGap: romView._taskCardRightGap
-                cardGap: romView._taskCardGap
-                // 点整项由骨架写 _selectedTaskId 并发 taskSelected（机位同步是站点视图的事）
-                onTaskSelected: function(task) { romView.selectTask(task) }
-                onHandoverProposed: function(taskId, phase) { romView._proposeHandover(taskId, phase) }
-                onHandoverCancelRequested: function(handoverId) { romView._cancelHandover(handoverId) }
-                // 【签入】接管本航班（ROUTE 相位）。**不弹窗**（同族先例见 OpsView 那一处注释）；
-                // 失败反馈走 `_checkinFromCard`——它住在骨架里，本视图因此不必自备错误提示机制
-                // （本视图除了下面那条陈旧提示条之外没有任何弹窗设施）。
-                // ⚠️ `task` 要收：`_checkinFromCard` 用它回查待办名单，决定失败后还有没有可重试
-                //    的对象。上面那条 `handoverCancelRequested` 少收一个参数是合法的（QML 允许
-                //    处理器少声明实参），但那是因为它不需要；不要照抄成习惯。
-                onCheckinRequested: function(handoverId, task) { romView._checkinFromCard(handoverId, task) }
+                Layout.preferredHeight: romRight.height * romView._ratioRoute
+                Layout.leftMargin: 6
+                Layout.rightMargin: 6
+                color: "transparent"
+                border.color: romView._sectionOutlineColor
+                border.width: 1
+                radius: 4
+
+                RouteListPanel {
+                    id: routeListPanel
+                    anchors.fill: parent
+                    anchors.margins: 2
+                    routes: romView._routeRows
+                    ready: romView._routeCacheReady
+                    selectedRouteId: romView._selectedRouteId
+                    // 选中航线（骨架里 toggle：再点一次取消）；地图的 L2 由骨架按同一状态点亮
+                    onRouteSelected: function(routeId) { romView.selectRoute(routeId) }
+                    // 与中段同一个面板参数，两段的卡片因此天然同宽同距
+                    // （留白取本视图的 `_panelCardMargin` / `_panelCardRightGap` = 0，见其定义）
+                    cardMargin: romView._panelCardMargin
+                    cardRightGap: romView._panelCardRightGap
+                    cardGap: romView._taskCardGap
+                }
             }
 
-            //-----------------------------------------------------------------
+            // 中段：航班列表（异常 ∪ 待我签入 置顶常驻 ∪ 选中航线的航班）
+            Rectangle {
+                id: taskSectionBox
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                Layout.preferredHeight: romRight.height * romView._ratioTask
+                Layout.leftMargin: 6
+                Layout.rightMargin: 6
+                color: "transparent"
+                border.color: romView._sectionOutlineColor
+                border.width: 1
+                radius: 4
+
+                TaskListPanel {
+                    id: taskListPanel
+                    anchors.fill: parent
+                    anchors.margins: 2
+                    // 本视图此前没有给这个面板 id（不用它的内部状态）；交接弹框的锚点要按 `task_id`
+                    // 回列表里找卡片，才需要它。见下面 `Component.onCompleted`。
+                    // 交接弹框的位置锚点（`OpsShell._handoverAnchorFn`）。与站点视图那一份对称——同一个
+                    // 弹框住骨架、两个视图各注入一次自己的求值闭包。`null` 与负数是两回事，见
+                    // `TaskListPanel.cardBottomYForTask`。
+                    Component.onCompleted: romView._handoverAnchorFn = function(taskId) {
+                        var y = taskListPanel.cardBottomYForTask(taskId)
+                        if (y === null) return -1
+                        return taskListPanel.mapToItem(romView, 0, y).y
+                    }
+                    // ⚠️ 置顶**必须真的置顶**（判据见 `middleSectionSplit`），反过来第 1 节
+                    //    **每一条都得自带徽标说明自己为什么在顶上**：异常航班走 `abnormalLabel`，
+                    //    待签入走 `_awaitingMe` 那条警示条。
+                    // ‼️ 表头 `headerText` 已删（用户 2026-09-29：「可以把各部分的标题去掉，
+                    //    使用的都是专业培训的熟练人员」）。段头 1 逐字承担的那句置顶承诺也随之
+                    //    只剩徽标本身——不再有文字解释，这是用户明示接受的代价。
+                    // 分段标题（`sectionBreak` / `sectionTitleFirst` / `sectionTitleSecond`）
+                    // 不再传：用户 2026-09-29 裁定「两行段头全删」。`_panelTasks` 本身仍是
+                    // `middleSectionTasks` 的输出，两节的**拼接顺序**（异常 ∪ 待签入 在前）
+                    // 一字未动——删的是渲染，不是分节。
+                    // 「性质」= 本站相对航线的角色。监控员没有 `site_id` ⇒ 恒回「—」⇒ 隐藏。
+                    showTaskNature: false
+                    tasks: romView._panelTasks
+                    handoverById: romView._handoverById
+                    nowMs: romView._now
+                    mySiteId: romView._mySiteId
+                    selectedTaskId: romView._selectedTaskId
+                    // 站点专属动作组（起飞/降落/停泊/指定机位）在监控员视图**不出现**；
+                    // 监控员自己的动作是"移交降落指挥"，由 isRouteMonitor 开（见 TaskListPanel:247）
+                    showSiteActions: false
+                    isRouteMonitor: romView._isRouteMon
+                    // 与站点视图同一个面板，但留白**不共用**：本站的框是 RomView 独有的，
+                    // 卡片要贴着框走（`_panelCardMargin` / `_panelCardRightGap` = 0 + 面板
+                    // `anchors.margins` 2 ⇒ 离框 2px）；站点视图没有框，仍用骨架的 10 / 20。
+                    // ⚠️ 两个视图各自决定留白，改一处**不会**影响另一处——这正是本次要的
+                    //   （骨架那份还牵着机位图边距，动不得）。
+                    cardMargin: romView._panelCardMargin
+                    cardRightGap: romView._panelCardRightGap
+                    cardGap: romView._taskCardGap
+                    // 点整项由骨架写 _selectedTaskId 并发 taskSelected（机位同步是站点视图的事）
+                    onTaskSelected: function(task) { romView.selectTask(task) }
+                    onHandoverProposed: function(taskId, phase) { romView._proposeHandover(taskId, phase) }
+                    onHandoverCancelRequested: function(handoverId) { romView._cancelHandover(handoverId) }
+                    // 【签入】接管本航班（ROUTE 相位）。**不弹窗**（同族先例见 OpsView 那一处注释）；
+                    // 失败反馈走 `_checkinFromCard`——它住在骨架里，本视图因此不必自备错误提示机制
+                    // （本视图除了下面那条陈旧提示条之外没有任何弹窗设施）。
+                    // ⚠️ `task` 要收：`_checkinFromCard` 用它回查待办名单，决定失败后还有没有可重试
+                    //    的对象。上面那条 `handoverCancelRequested` 少收一个参数是合法的（QML 允许
+                    //    处理器少声明实参），但那是因为它不需要；不要照抄成习惯。
+                    onCheckinRequested: function(handoverId, task) { romView._checkinFromCard(handoverId, task) }
+                }
+            }
+
             // 下段：机载告警（§6）
-            //-----------------------------------------------------------------
             // ‼️ **不要**把 `devices` 当成"该显示哪些告警"的判据：飞机落地转 PARKED 后会从
             //    `devices[]` 里消失，但它此刻若还在发 `STATUSTEXT`，那一行恰恰最该被看见。
             //    `devices` 在这里**只用来把 `device_id` 翻译成 `uav_no` 与 `task_no`**（§6.2 步骤 4）。
-            // ‼️ 高度由面板内部固定（§6.3"下段固定高度、内部滚动"），此处**不写**
-            //    `fillHeight`——写了中段就没了兜底，告警一多就会把航班列表挤扁。
-            AlertListPanel {
+            // ‼️ 高度份额由**这里**的 `_ratioAlert` 给（10%），面板内部那个写死的
+            //    `_listHeight := ScreenTools.defaultFontPixelHeight * 15` 已删：
+            //    两个地方各定一次高度，改一处看不出效果（面板内部那个会赢），改错了也不报错。
+            // ⚠️ 10% 在 971px 高的窗口上约 77px，扣掉内边距与实际行高（约 15–18px/行）
+            //    大致只装得下一行半 ⇒ **两条告警就要滚动**。这是用户选定固定比例时已知的代价。
+            Rectangle {
+                id: alertSectionBox
                 Layout.fillWidth: true
-                headerText: qsTr("机载告警")
-                devices: romView._routeDevices
+                Layout.fillHeight: true
+                Layout.preferredHeight: romRight.height * romView._ratioAlert
+                Layout.leftMargin: 6
+                Layout.rightMargin: 6
+                Layout.bottomMargin: 6
+                color: "transparent"
+                border.color: romView._sectionOutlineColor
+                border.width: 1
+                radius: 4
+
+                AlertListPanel {
+                    anchors.fill: parent
+                    anchors.margins: 2
+                    devices: romView._routeDevices
+                }
             }
         }
     }

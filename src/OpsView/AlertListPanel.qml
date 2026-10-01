@@ -35,7 +35,6 @@ ColumnLayout {
     // 输入
     //-------------------------------------------------------------------------
     property var devices: []            // ③ 的 `devices[]`（只用于补 `uav_no` / `task_no`）
-    property string headerText: ""
     property int perVehicleLimit: 20    // 每架载具最多取最近多少条（§6.2 步骤 2）
     property int rowLimit: 100          // 合并后的总行数上限（截断**最旧**的）
 
@@ -126,35 +125,27 @@ ColumnLayout {
     }
 
     //-------------------------------------------------------------------------
-    // 固定高度（§6.3："下段固定高度、内部滚动"）
+    // 条数行
     //-------------------------------------------------------------------------
-    // ‼️ 高度**不跟内容走**：告警随时会增加，右栏下段若跟着长，中段的航班列表会被
-    //    一行一行地挤扁（上段有 `Layout.maximumHeight` 兜底，中段没有——它是
-    //    `fillHeight`，只会把空间让出去）。多出来的行靠内部滚动看。
-    //    改这个系数就是改"下段占右栏多高"。
-    readonly property real _listHeight: ScreenTools.defaultFontPixelHeight * 15
-
-    //-------------------------------------------------------------------------
-    // 标题行
-    //-------------------------------------------------------------------------
+    // ‼️ 标题（`headerText`）已删（用户 2026-09-29「可以把各部分的标题去掉」），
+    //    **条数留着**：下段高度固定、多出来的行靠内部滚动，用户无从知道下面还压着多少条。
+    //    这一行现在只剩一个右对齐的数字。
+    // ‼️ 本段的高度**不再在这里定**（原先的 `_listHeight := defaultFontPixelHeight * 15`
+    //    已删）：份额由使用方 `RomView` 用 `Layout.preferredHeight`（`_ratioAlert` = 10%）
+    //    给外框、本面板 `anchors.fill` 吃下。两个地方各定一次高度时，**面板内部那个会赢**，
+    //    改使用方看不出效果，且不报错。
+    // ⚠️ 左右留白取 0（原 12）：与下面的告警卡片**同一个左缘**。数字比卡片多缩进 10px
+    //    在一列窄框里看得出来。实际离框距离由使用方的 `anchors.margins`(2) 给。
     RowLayout {
         Layout.fillWidth: true
-        Layout.leftMargin: 12
-        Layout.rightMargin: 12
-        Layout.topMargin: 10
+        Layout.leftMargin: 0
+        Layout.rightMargin: 0
+        Layout.topMargin: 6
         Layout.bottomMargin: 4
         spacing: 6
 
-        Text {
-            Layout.alignment: Qt.AlignVCenter
-            visible: panel.headerText !== ""
-            color: "#8fa1bd"; font.pixelSize: 12; font.bold: true
-            text: panel.headerText
-        }
-
         Item { Layout.fillWidth: true }
 
-        // 条数：固定高度 + 内部滚动时，用户无从知道下面还压着多少条。
         Text {
             Layout.alignment: Qt.AlignVCenter
             color: "#5f7391"; font.pixelSize: 11
@@ -165,11 +156,14 @@ ColumnLayout {
     //-------------------------------------------------------------------------
     // 列表 + 空态（空态与列表**叠放**：ListView 占满容器，空态居中盖在上面）
     //-------------------------------------------------------------------------
+    // ⚠️ 左右留白取 0（原 10）：本面板**只**被 RomView 用，那里的卡片要贴着轮廓线走
+    //    （用户 2026-09-29：「轮廓线里左右边界留 2-3 个像素即可」）。实际离框距离由使用方
+    //    的 `anchors.margins`(2) 给——两处各留一点会**相加**，所以这里必须留 0。
     Item {
         Layout.fillWidth: true
-        Layout.preferredHeight: panel._listHeight
-        Layout.leftMargin: 10
-        Layout.rightMargin: 10
+        Layout.fillHeight: true
+        Layout.leftMargin: 0
+        Layout.rightMargin: 0
         Layout.bottomMargin: 8
 
         ListView {

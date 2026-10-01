@@ -34,35 +34,24 @@ ColumnLayout {
     property real cardMargin: 10        // 与任务卡同一个左空位，两段天然对齐
     property real cardRightGap: 20
     property real cardGap: OpsCommon.taskCardGap
-    property string headerText: ""
 
     //-------------------------------------------------------------------------
     // 输出
     //-------------------------------------------------------------------------
     signal routeSelected(var routeId)
 
-    //-------------------------------------------------------------------------
-    // 标题行
-    //-------------------------------------------------------------------------
-    Text {
-        Layout.fillWidth: true
-        Layout.leftMargin: 12
-        Layout.topMargin: 10
-        visible: panel.headerText !== ""
-        color: "#8fa1bd"; font.pixelSize: 12; font.bold: true
-        text: panel.headerText
-    }
-
     ListView {
         id: routeList
         Layout.fillWidth: true
         Layout.fillHeight: true
-        // ‼️ 高度**由内容决定**（`contentHeight`），**不在本文件里设上限**：上限是"占右栏多少"
-        //    的布局决定，属于使用方的排版，由 RomView 用 `Layout.maximumHeight` 给
-        //    （本文件若自己写 `height * 系数`，会与使用方给的高度形成**自引用绑定**）。
-        //    内在高度交给布局 ⇒ "只有 4 条航线"时上段只占 4 行，不会把中段挤到底部。
-        Layout.preferredHeight: contentHeight
-        Layout.topMargin: panel.headerText !== "" ? 4 : 0
+        // ‼️ 高度**不再由内容决定**（用户 2026-09-29 终选"仍然用固定比例"）：本段占右栏多少
+        //    是**使用方**的排版决定 —— `RomView` 用 `Layout.preferredHeight` 给外框定份额、
+        //    本面板 `anchors.fill` 吃下。只有 4 条航线时上段照样占 40%，空的那截留白。
+        //    ⚠️ 本文件**不得**自己写 `height * 系数`：那会与使用方给的高度形成**自引用绑定**。
+        //    （原先这里另有一行 `Layout.preferredHeight: contentHeight` 与一句"高度由内容
+        //      决定"，随固定比例一并删除。）
+        // 标题行（`headerText`）已删：用户 2026-09-29「可以把各部分的标题去掉，使用的都是
+        // 专业培训的熟练人员」。
         clip: true
         model: panel.routes
         // 左空位（委托宽度里已为它预留，见 delegate）

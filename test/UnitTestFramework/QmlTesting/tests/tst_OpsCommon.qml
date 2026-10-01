@@ -1163,9 +1163,12 @@ TestCase {
     }
 
     function test_routeMissionItems_emptyReturnsEmpty() {
-        compare(OpsCommon.routeMissionItems([]).length, 0, "空数组应回空")
-        compare(OpsCommon.routeMissionItems(null).length, 0, "null 应回空")
-        compare(OpsCommon.routeMissionItems(undefined).length, 0, "undefined 应回空")
+        // ‼️ NRRSM 后签名多了第 4 参 `cruiseAGL`，**缺它一律回 `[]`**（见 `OpsCommon.js`）。
+        //    既有各格测的是 wps 侧的口径 ⇒ 一律显式补上后继实参，否则本组会**为错误的理由**通过
+        //    （全部回 `[]`，看不出 wps 守卫有没有坏）。
+        compare(OpsCommon.routeMissionItems([], undefined, undefined, 0).length, 0, "空数组应回空")
+        compare(OpsCommon.routeMissionItems(null, undefined, undefined, 0).length, 0, "null 应回空")
+        compare(OpsCommon.routeMissionItems(undefined, undefined, undefined, 0).length, 0, "undefined 应回空")
     }
 
     /// ‼️ 本用例钉死整条链路的**量纲**：高度原样透传 + `frame = 0`（AMSL）。
@@ -1177,7 +1180,8 @@ TestCase {
     /// 阴性对照：把 `frame` 写成 `3`（QGC `MissionItem` 的**默认值**，相对 home）
     /// ⇒ 463 会被当成"离地 463 米"⇒ 本用例必红。
     function test_routeMissionItems_altitudeIsAmslWithGlobalFrame() {
-        var items = OpsCommon.routeMissionItems([_wp(39.7488, 116.1434, 463.0, 16)])
+        // ‼️ `cruiseAGL = 0`（未设定）⇒ 高度与加参前**逐字相同** ⇒ 本格照旧断"原样透传"。
+        var items = OpsCommon.routeMissionItems([_wp(39.7488, 116.1434, 463.0, 16)], undefined, undefined, 0)
         compare(items.length, 1)
         compare(items[0].alt, 463.0, "高度必须原样透传，不得做任何转换")
         compare(items[0].frame, 0,
@@ -1194,12 +1198,13 @@ TestCase {
     /// "非终点 / 非 VTOL"两支。
     /// ⚠️ 85 **不是** 21 —— 本用例顺带钉住"不许有人图省事直接返回设计域那个 21"。
     function test_routeMissionItems_siteWaypointBecomesPlainWaypoint() {
-        var items = OpsCommon.routeMissionItems([_wp(39.748823, 116.143486, 50.0, 21)], false)
+        var items = OpsCommon.routeMissionItems([_wp(39.748823, 116.143486, 50.0, 21)], false, undefined, 0)
         compare(items.length, 1)
         compare(items[0].command, 16, "非 VTOL ⇒ 站点航点必须映射成 NAV_WAYPOINT(16)")
-        // 省略第二/第三个实参同样按"非 VTOL / 无终点"处理：默认值必须是 fail-closed
-        // 的那一侧（漏掉降落＝飞机可见地盘旋；多发一个降落＝飞机真的落下去，不可撤销）。
-        compare(OpsCommon.routeMissionItems([_wp(39.748823, 116.143486, 50.0, 21)])[0].command, 16,
+        // 省略第二/第三个实参（显式传 `undefined`）同样按"非 VTOL / 无终点"处理：默认值必须是
+        // fail-closed 的那一侧（漏掉降落＝飞机可见地盘旋；多发一个降落＝飞机真的落下去，不可撤销）。
+        // （第 4 参 `cruiseAGL` 不可省 —— 省了会整体回 `[]`，本格就会为错误的理由通过。）
+        compare(OpsCommon.routeMissionItems([_wp(39.748823, 116.143486, 50.0, 21)], undefined, undefined, 0)[0].command, 16,
                 "不传 isVtol ⇒ 默认按非 VTOL，绝不默认启用垂起着陆")
     }
 
@@ -1257,7 +1262,7 @@ TestCase {
     /// 本条是本次改动的**主判据**：VTOL 飞机在终点**转为多旋翼着陆**，
     /// 而不是像固定翼那样绕终点一直盘旋（用户实测的故障现象）。
     function test_routeMissionItems_vtolEndStationBecomesVtolLand() {
-        var items = OpsCommon.routeMissionItems(_routeWithEnd(), true, _rt003EndId)
+        var items = OpsCommon.routeMissionItems(_routeWithEnd(), true, _rt003EndId, 0)
         compare(items.length, 3, "三点都要下发：降落是**映射**终点那一点，不是**替换**它")
         compare(items[0].command, 16, "中途站点(21)不是终点 ⇒ 保持 16")
         compare(items[1].command, 16, "中途普通航点 ⇒ 保持 16")
@@ -1278,12 +1283,29 @@ TestCase {
     /// 而任务的目的地是保定市政府（id=5）—— 正是用户红线上"只能在机位上降落"那类事故，
     /// 且界面上看不出任何异常。
     ///
-    /// ⚠️ 这条用例之所以必须有：**反例 RT-SITL01** 的 `start_waypoint_id` /
-    ///    `end_waypoint_id` **恰好也在** `table_route_waypoint` 里，于是"最后一项"在
-    ///    那条航线上**恰好**对 —— 只拿 SITL 那条航线当样本的验证会给出一个假绿的 ✓。
+    /// ⚠️ 这条用例之所以必须有：**反例 RT-006**（云端权威库航线 id 23）的
+    ///    `start_waypoint_id` / `end_waypoint_id` **恰好也在** `table_route_waypoint` 里
+    ///    （两行 → wp1 / wp2，wp2 排在末位），于是"最后一项"在
+    ///    那条航线上**恰好**对 —— 只拿它当样本的验证会给出一个假绿的 ✓。
+    ///    ⚠️ **出处等级**：本注释里所有「云端权威库」读数**不是本任务测的**，是
+    ///       **控制方（编排者）2026-10-01 只读实测**；采集口径 = `ssh root@39.97.235.226`、
+    ///       库 `/opt/uavm/var/db_uavm.db`、**只读**打开（`file:...?mode=ro&immutable=1`）、
+    ///       范围 `table_route` 中 `deleted_at IS NULL` 的全量 7 条。
+    ///       **本任务（QGC 仓）无云端凭据，未独立复核。**
+    ///    ⚠️ 出处更正（修复轮 2 / 3）：本注释原先引的反例是 **`RT-SITL01`**。
+    ///       **该航线在权威库里存在**（航线 id 24，`route_code='RT-SITL01'`，
+    ///       `route_name='SITL 苏黎世调试航线'`）—— **变的是它的数据**：
+    ///       权威库现行值为 `start_waypoint_id=NULL` / `end_waypoint_id=NULL`，
+    ///       且 `table_route_waypoint` **零行**；另据同一次控制方读数，该行
+    ///       `deleted_at='2026-10-01 00:58:29'` ⇒ **它已被软删除**。
+    ///       （‼️ 只登记"同时存在"这两类事实，**不推断**「被软删 ⇒ 关联行被清空」的因果。）
+    ///       而原注释引的 `start=26` / `end=28`、三行 `wp 26/27/28`，在
+    ///       **2026-09-26 的本机 `db_uavm.db` 陈旧副本**里**逐字可复现**
+    ///       ⇒ 那组数字取自该副本，**09-26 之后数据被改动过**，样本已不可用。
+    ///       **结论不变**（"按位置推断终点"照样被推翻），样本已换成权威库现行的 **RT-006**（id 23）。
     function test_routeMissionItems_vtolLastItemIsNotTheEnd() {
         var wps = _routeMidStationLast()
-        var items = OpsCommon.routeMissionItems(wps, true, _rt003EndId)
+        var items = OpsCommon.routeMissionItems(wps, true, _rt003EndId, 0)
         compare(items.length, 2)
         compare(items[1].command, 16,
                 "列表最后一项是**中途**的良乡区政府(id=3)，而航线终点是 id=5 ⇒ 不得变 85")
@@ -1296,17 +1318,17 @@ TestCase {
     /// 而不是"改错了但看起来在工作"。解封条件见 `_endWaypointIndex` 的注释。
     function test_routeMissionItems_vtolEndMissingProducesNoLand() {
         var wps = _routeMidStationLast()
-        compare(OpsCommon.routeMissionItems(wps, true)[1].command, 16,
+        compare(OpsCommon.routeMissionItems(wps, true, undefined, 0)[1].command, 16,
                 "不传 endWaypointId ⇒ 指认不出终点 ⇒ 一概 16")
-        compare(OpsCommon.routeMissionItems(wps, true, undefined)[1].command, 16, "undefined ⇒ 16")
-        compare(OpsCommon.routeMissionItems(wps, true, null)[1].command, 16, "null ⇒ 16")
+        compare(OpsCommon.routeMissionItems(wps, true, undefined, 0)[1].command, 16, "undefined ⇒ 16")
+        compare(OpsCommon.routeMissionItems(wps, true, null, 0)[1].command, 16, "null ⇒ 16")
         // 端点值本身也按类型收：`"5"` 不是 number，`0` / 负数不是合法 id。
-        compare(OpsCommon.routeMissionItems(wps, true, "5")[1].command, 16,
+        compare(OpsCommon.routeMissionItems(wps, true, "5", 0)[1].command, 16,
                 "字符串 \"5\" 不是 number ⇒ 不指认（按类型收，与其余字段同口径）")
-        compare(OpsCommon.routeMissionItems(wps, true, 0)[1].command, 16, "0 不是合法航点 id")
-        compare(OpsCommon.routeMissionItems(wps, true, -1)[1].command, 16, "负数不是合法航点 id")
+        compare(OpsCommon.routeMissionItems(wps, true, 0, 0)[1].command, 16, "0 不是合法航点 id")
+        compare(OpsCommon.routeMissionItems(wps, true, -1, 0)[1].command, 16, "负数不是合法航点 id")
         // 阳性对照：没有这一条，上面六条对一个"永远返回 16"的实现**全是绿的**。
-        compare(OpsCommon.routeMissionItems(_routeWithEnd(), true, _rt003EndId)[2].command, 85,
+        compare(OpsCommon.routeMissionItems(_routeWithEnd(), true, _rt003EndId, 0)[2].command, 85,
                 "阳性对照：终点站确实在列表里时，必须能指认出来并映射成 85")
     }
 
@@ -1320,7 +1342,7 @@ TestCase {
         var wps = [_wp(40.117950, 116.424789, 50.0, 21, 2),   // 始发站（站点）
                    _wp(39.748823, 116.143486, 50.0, 21, 3),   // 中途（站点）
                    _wp(38.874500, 115.464500, 30.0, 21, 5)]   // 终点站（站点）
-        var items = OpsCommon.routeMissionItems(wps, true, 5)
+        var items = OpsCommon.routeMissionItems(wps, true, 5, 0)
         compare(items.length, 3)
         compare(items[0].command, 16,
                 "始发站也是站点(command=21)，但**不是终点** ⇒ 必须仍是普通航点(16)")
@@ -1333,7 +1355,7 @@ TestCase {
     function test_routeMissionItems_vtolEndPlainWaypointStaysWaypoint() {
         var wps = [_wp(39.748800, 116.143400, 50.0, 21, 3),
                    _wp(39.748823, 116.143486, 50.0, 16, 5)]
-        var items = OpsCommon.routeMissionItems(wps, true, 5)
+        var items = OpsCommon.routeMissionItems(wps, true, 5, 0)
         compare(items.length, 2)
         compare(items[1].command, 16, "终点站是普通航点 ⇒ 不得自动补一条降落指令")
     }
@@ -1344,7 +1366,7 @@ TestCase {
     /// 必须先显式推翻本用例，而不是悄悄改掉。
     function test_routeMissionItems_vtolSinglePointIsLand() {
         var single = [_wp(39.748823, 116.143486, 50.0, 21, 7)]
-        var items = OpsCommon.routeMissionItems(single, true, 7)
+        var items = OpsCommon.routeMissionItems(single, true, 7, 0)
         compare(items.length, 1)
         compare(items[0].command, 85, "单点航线的那个点就是航线终点 ⇒ 它就是降落点")
         // 起飞高度取**首点**高度，与"首点是不是降落点"无关 ⇒ 不得被本次改动波及。
@@ -1359,7 +1381,7 @@ TestCase {
     function test_routeMissionItems_vtolAmbiguousEndProducesNoLand() {
         var wps = [_wp(39.748800, 116.143400, 50.0, 21, 5),
                    _wp(39.748823, 116.143486, 50.0, 21, 5)]   // 同一个 id 出现两次
-        var items = OpsCommon.routeMissionItems(wps, true, 5)
+        var items = OpsCommon.routeMissionItems(wps, true, 5, 0)
         compare(items.length, 2)
         compare(items[0].command, 16, "终点 id 有歧义 ⇒ 第 0 点不得变成降落")
         compare(items[1].command, 16, "终点 id 有歧义 ⇒ 第 1 点也不得变成降落")
@@ -1375,15 +1397,15 @@ TestCase {
     function test_routeMissionItems_vtolFlagRequiresStrictBoolean() {
         var wps = _routeWithEnd()
         var end = _rt003EndId
-        compare(OpsCommon.routeMissionItems(wps, 1, end)[2].command, 16, "数值 1 不是 true ⇒ 不启用")
-        compare(OpsCommon.routeMissionItems(wps, "true", end)[2].command, 16,
+        compare(OpsCommon.routeMissionItems(wps, 1, end, 0)[2].command, 16, "数值 1 不是 true ⇒ 不启用")
+        compare(OpsCommon.routeMissionItems(wps, "true", end, 0)[2].command, 16,
                 "字符串 \"true\" 不是 true ⇒ 不启用")
-        compare(OpsCommon.routeMissionItems(wps, "false", end)[2].command, 16,
+        compare(OpsCommon.routeMissionItems(wps, "false", end, 0)[2].command, 16,
                 "字符串 \"false\" 在 JS 里是真值 ⇒ 更不能靠强转放行")
-        compare(OpsCommon.routeMissionItems(wps, null, end)[2].command, 16, "null ⇒ 不启用")
-        compare(OpsCommon.routeMissionItems(wps, undefined, end)[2].command, 16, "undefined ⇒ 不启用")
+        compare(OpsCommon.routeMissionItems(wps, null, end, 0)[2].command, 16, "null ⇒ 不启用")
+        compare(OpsCommon.routeMissionItems(wps, undefined, end, 0)[2].command, 16, "undefined ⇒ 不启用")
         // 阳性对照：没有这一条，上面五条对一个"永远返回 16"的实现**全是绿的**。
-        compare(OpsCommon.routeMissionItems(wps, true, end)[2].command, 85,
+        compare(OpsCommon.routeMissionItems(wps, true, end, 0)[2].command, 85,
                 "阳性对照：真布尔 true 必须启用垂起着陆")
     }
 
@@ -1392,7 +1414,7 @@ TestCase {
     ///    看不出少了哪一个。这里是 fail-closed：宁可起飞按钮不亮。
     function test_routeMissionItems_unknownCommandVoidsWholeRoute() {
         var wps = [_wp(39.7488, 116.1434, 50.0, 16), _wp(39.7489, 116.1435, 50.0, 99)]
-        compare(OpsCommon.routeMissionItems(wps).length, 0,
+        compare(OpsCommon.routeMissionItems(wps, undefined, undefined, 0).length, 0,
                 "含未知 command 时应整体作废，而不是静默跳过那一点")
     }
 
@@ -1401,19 +1423,19 @@ TestCase {
     ///（不是"两轴同时为 0"）。(0,0) 是"没有定位"的常见缺省值。
     function test_routeMissionItems_invalidCoordinateVoidsWholeRoute() {
         var good = _wp(39.7488, 116.1434, 50.0, 16)
-        compare(OpsCommon.routeMissionItems([good, _wp(0, 0, 50.0, 16)]).length, 0, "(0,0) 应作废")
-        compare(OpsCommon.routeMissionItems([good, _wp(NaN, 116.1, 50.0, 16)]).length, 0, "NaN 纬度应作废")
-        compare(OpsCommon.routeMissionItems([good, _wp(39.7, 116.1, NaN, 16)]).length, 0, "NaN 高度应作废")
-        compare(OpsCommon.routeMissionItems([good, null]).length, 0, "null 元素应作废")
+        compare(OpsCommon.routeMissionItems([good, _wp(0, 0, 50.0, 16)], undefined, undefined, 0).length, 0, "(0,0) 应作废")
+        compare(OpsCommon.routeMissionItems([good, _wp(NaN, 116.1, 50.0, 16)], undefined, undefined, 0).length, 0, "NaN 纬度应作废")
+        compare(OpsCommon.routeMissionItems([good, _wp(39.7, 116.1, NaN, 16)], undefined, undefined, 0).length, 0, "NaN 高度应作废")
+        compare(OpsCommon.routeMissionItems([good, null], undefined, undefined, 0).length, 0, "null 元素应作废")
         // 单轴为 0：只挡"两轴同时为 0"的实现会在这里放行，把飞机送到赤道 / 本初子午线。
-        compare(OpsCommon.routeMissionItems([good, _wp(0, 116.1, 50.0, 16)]).length, 0,
+        compare(OpsCommon.routeMissionItems([good, _wp(0, 116.1, 50.0, 16)], undefined, undefined, 0).length, 0,
                 "纬度单轴为 0 应作废（判据是「任一轴为 0」，不是「两轴同时为 0」）")
-        compare(OpsCommon.routeMissionItems([good, _wp(39.7, 0, 50.0, 16)]).length, 0,
+        compare(OpsCommon.routeMissionItems([good, _wp(39.7, 0, 50.0, 16)], undefined, undefined, 0).length, 0,
                 "经度单轴为 0 应作废")
         // 真缺键（不是显式 NaN）——后端可空列 / 字段缺失的实际形态。
-        compare(OpsCommon.routeMissionItems([good, { lat: 39.7, lon: 116.1, command: 16 }]).length, 0,
+        compare(OpsCommon.routeMissionItems([good, { lat: 39.7, lon: 116.1, command: 16 }], undefined, undefined, 0).length, 0,
                 "真缺 altitude 键应作废")
-        compare(OpsCommon.routeMissionItems([good, { lat: 39.7, lon: 116.1, altitude: 50.0 }]).length, 0,
+        compare(OpsCommon.routeMissionItems([good, { lat: 39.7, lon: 116.1, altitude: 50.0 }], undefined, undefined, 0).length, 0,
                 "真缺 command 键应作废")
     }
 
@@ -1433,8 +1455,8 @@ TestCase {
         verify(isNaN(OpsCommon.takeoffAltitude(nullAlt)), "首点 altitude 为 null ⇒ 起飞高度必须是 NaN")
         verify(isNaN(OpsCommon.takeoffAltitude(emptyAlt)), "首点 altitude 为空串 ⇒ 起飞高度必须是 NaN")
         verify(OpsCommon.takeoffAltitude(nullAlt) !== 0, "强转成 0 就等于放行了一次 AMSL 0 米起飞")
-        compare(OpsCommon.routeMissionItems(nullAlt).length, 0, "altitude 为 null 应作废")
-        compare(OpsCommon.routeMissionItems(emptyAlt).length, 0, "altitude 为空串应作废")
+        compare(OpsCommon.routeMissionItems(nullAlt, undefined, undefined, 0).length, 0, "altitude 为 null 应作废")
+        compare(OpsCommon.routeMissionItems(emptyAlt, undefined, undefined, 0).length, 0, "altitude 为空串应作废")
     }
 
     /// ‼️ **类型闸**：`lat` / `lon` / `altitude` 三处**统一**只接受 JSON number。
@@ -1445,26 +1467,26 @@ TestCase {
     function test_routeMissionItems_nonNumberTypesVoidWholeRoute() {
         var good = _wp(39.7488, 116.1434, 50.0, 16)
         var badAlt = function (v) { return [_wp(39.7, 116.1, v, 16), good] }
-        compare(OpsCommon.routeMissionItems(badAlt(" ")).length, 0,
+        compare(OpsCommon.routeMissionItems(badAlt(" "), undefined, undefined, 0).length, 0,
                 "空白串：Number 结果为 0 ⇒ 必须按类型拒绝")
-        compare(OpsCommon.routeMissionItems(badAlt("\t")).length, 0,
+        compare(OpsCommon.routeMissionItems(badAlt("\t"), undefined, undefined, 0).length, 0,
                 "制表符串：Number 结果为 0 ⇒ 必须按类型拒绝")
-        compare(OpsCommon.routeMissionItems(badAlt("0")).length, 0,
+        compare(OpsCommon.routeMissionItems(badAlt("0"), undefined, undefined, 0).length, 0,
                 "字符串 0：Number 结果为 0 ⇒ 必须按类型拒绝")
-        compare(OpsCommon.routeMissionItems(badAlt("50")).length, 0,
+        compare(OpsCommon.routeMissionItems(badAlt("50"), undefined, undefined, 0).length, 0,
                 "数值字符串 50：能转成合法数，但类型不对 ⇒ 同样拒绝（不得靠能转成数放行）")
-        compare(OpsCommon.routeMissionItems(badAlt(false)).length, 0,
+        compare(OpsCommon.routeMissionItems(badAlt(false), undefined, undefined, 0).length, 0,
                 "布尔 false：Number(false) === 0 ⇒ 必须拒绝")
-        compare(OpsCommon.routeMissionItems(badAlt([])).length, 0,
+        compare(OpsCommon.routeMissionItems(badAlt([]), undefined, undefined, 0).length, 0,
                 "空数组：Number([]) === 0 ⇒ 必须拒绝")
         // lat / lon 同样按类型收 —— 三处口径必须一致。只改 altitude 就是再造一次
         // 「同一件事三处三种口径」（`isValidWaypoint` 上方那段注释记录的教训）。
-        compare(OpsCommon.routeMissionItems([_wp("39.7", 116.1, 50.0, 16), good]).length, 0,
+        compare(OpsCommon.routeMissionItems([_wp("39.7", 116.1, 50.0, 16), good], undefined, undefined, 0).length, 0,
                 "lat 为数值字符串 ⇒ 必须拒绝（不得靠 isValidWaypoint 侥幸兜住）")
-        compare(OpsCommon.routeMissionItems([_wp(39.7, "116.1", 50.0, 16), good]).length, 0,
+        compare(OpsCommon.routeMissionItems([_wp(39.7, "116.1", 50.0, 16), good], undefined, undefined, 0).length, 0,
                 "lon 为数值字符串 ⇒ 必须拒绝")
         // fail-closed 与位置无关：坏点在末位同样整体作废。
-        compare(OpsCommon.routeMissionItems([good, _wp(39.7, 116.1, [], 16)]).length, 0,
+        compare(OpsCommon.routeMissionItems([good, _wp(39.7, 116.1, [], 16)], undefined, undefined, 0).length, 0,
                 "坏点在末位也应整体作废")
     }
 
@@ -1474,7 +1496,9 @@ TestCase {
     /// 本用例的意义：日后若有人把 `0` 也一并拒掉，必须**显式推翻**这个裁量 —— 会有人变红。
     function test_routeMissionItems_numericZeroAltitudeIsDeliberatelyAllowed() {
         var wps = [_wp(39.7, 116.1, 0, 16)]
-        var items = OpsCommon.routeMissionItems(wps)
+        // `cruiseAGL = 0`：本格钉的是 **wps 侧**的 0 被放行；巡航高度侧的 0 同样合法
+        // （见新增的 `test_routeMissionItems_zeroCruiseIsIdentity`），两者都不得被拒。
+        var items = OpsCommon.routeMissionItems(wps, undefined, undefined, 0)
         compare(items.length, 1, "数值 0 是合法 number ⇒ 本函数**有意放行**（见 routeMissionItems 内注释）")
         compare(items[0].alt, 0, "高度原样透传，不做任何转换")
         compare(OpsCommon.takeoffAltitude(wps), 0,
@@ -1484,10 +1508,114 @@ TestCase {
     /// 顺序即输入顺序（调用方已按 `seq` 取好），且**不掺任何私货** ——
     /// 本函数不生成起飞项（起飞点的坐标是"飞机当前 home"，运行时才知道）。
     function test_routeMissionItems_preservesOrderAndAddsNoTakeoff() {
-        var items = OpsCommon.routeMissionItems(_route20())
+        var items = OpsCommon.routeMissionItems(_route20(), undefined, undefined, 0)
         compare(items.length, 2, "不该额外插入起飞项——起飞项由调用方在拿到 home 之后插")
         verify(Math.abs(items[0].lat - 39.748800) < 1e-9, "第 0 点顺序错了")
         verify(Math.abs(items[1].lat - 39.748823) < 1e-9, "第 1 点顺序错了")
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // NRRSM D7（2026-10-01）：中间项加 `cruiseAGL`
+    //
+    // 组装式：**中间项 = 该航点地面海拔 + 本架次飞行高度（AGL）**（设计稿 §5.2 规则表第 2 行）。
+    //   · 本函数的**第 0 项是航线的第一个中间航点** —— 起飞项是调用方自己插的
+    //     `NAV_TAKEOFF`，**不在产出里** ⇒ 第 0 项**也要**加（最容易被写错的一格）。
+    //   · **末项不加**（原样透传），随后由 `applyLandingAltitude` 覆盖成降落高度。
+    //   · `cruiseAGL === 0`（未设定）⇒ 输出与加参前**逐字相同**；不可用 ⇒ 整条作废（回 `[]`）。
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// 四个航点、高度**两两不同**且都 > 0。
+    /// ‼️ 首点(100) 与末点(400) 刻意不等 —— 否则"首末互换"的实现也会全绿。
+    function _routeFourAlt() {
+        return [_wp(39.748800, 116.143400, 100.0, 16),
+                _wp(39.748900, 116.143500, 200.0, 16),
+                _wp(39.749000, 116.143600, 300.0, 16),
+                _wp(39.749100, 116.143700, 400.0, 16)]
+    }
+
+    /// 三点版（brief「首项 / 末项」两条用例的形状）。
+    function _routeThreeAlt() {
+        return [_wp(39.748800, 116.143400, 100.0, 16),
+                _wp(39.748900, 116.143500, 200.0, 16),
+                _wp(39.749000, 116.143600, 300.0, 16)]
+    }
+
+    /// ‼️ **首项也要加** —— 裁定一的阳性判据，也是本任务最容易被写错的一格。
+    /// 若实现写成 `i > 0`（只给 1..n-2 加），本格必红：首个中间航点会比其余中间点低
+    /// `cruiseAGL` 米，而**界面上完全看不出来**。
+    function test_routeMissionItems_firstItemAlsoGetsCruise() {
+        var wps = _routeThreeAlt()
+        var out = OpsCommon.routeMissionItems(wps, undefined, undefined, 30)
+        compare(out.length, 3)
+        compare(out[0].alt, 130.0, "首个中间航点**也要**加 30；等于 100.0 就是写成了 `i > 0`")
+        verify(out[0].alt !== wps[0].altitude, "「没加」的那种实现正好产出这个值")
+    }
+
+    /// 其余中间项都加（四点 ⇒ 下标 1、2 都加）。
+    function test_routeMissionItems_middleItemsAllGetCruise() {
+        var wps = _routeFourAlt()
+        var out = OpsCommon.routeMissionItems(wps, undefined, undefined, 30)
+        compare(out.length, 4)
+        compare(out[1].alt, 230.0)
+        compare(out[2].alt, 330.0)
+    }
+
+    /// 末项**不加**（原样透传），由 `applyLandingAltitude` 覆盖成降落高度。
+    /// 写成"全部加"会让末项先高一个 `cruiseAGL` ⇒ 本格是唯一能看出"组装式多加了末项"的地方。
+    function test_routeMissionItems_lastItemKeepsRawAltitude() {
+        var wps = _routeThreeAlt()
+        var out = OpsCommon.routeMissionItems(wps, undefined, undefined, 30)
+        compare(out[out.length - 1].alt, 300.0, "末项原样透传，不得加 cruiseAGL")
+        verify(out[out.length - 1].alt !== wps[wps.length - 1].altitude + 30,
+               "300.0 + 30 是「末项也加了」的实现会产出的值")
+    }
+
+    /// `cruiseAGL === 0` 是**合法输入**（本仓口径：`0` = 未设定）⇒ 输出与加参前**逐字相同**。
+    /// 「`0` 该不该起飞」是闸的事（`takeoffAGL > 0`），不是本函数的事。
+    function test_routeMissionItems_zeroCruiseIsIdentity() {
+        var wps = _routeFourAlt()
+        var out = OpsCommon.routeMissionItems(wps, undefined, undefined, 0)
+        compare(out.length, 4)
+        compare(out[0].alt, 100.0)
+        compare(out[1].alt, 200.0)
+        compare(out[2].alt, 300.0)
+        compare(out[3].alt, 400.0)
+    }
+
+    /// ‼️ `cruiseAGL` 不可用 ⇒ **整条航线作废（回 `[]`）**，**不是**"按 0 处理"。
+    /// 静默按 0 = 少一个偏移、零报错 —— 正是本函数要杀的那类缺陷；回 `[]` 让调用方
+    /// 看到**响亮**的失败。
+    function test_routeMissionItems_unusableCruiseVoidsRoute() {
+        var wps = _routeThreeAlt()
+        compare(OpsCommon.routeMissionItems(wps).length, 0, "不传第 4 参 ⇒ 空数组（不是按 0 处理）")
+        compare(OpsCommon.routeMissionItems(wps, undefined, undefined, undefined).length, 0, "undefined ⇒ 空数组")
+        compare(OpsCommon.routeMissionItems(wps, undefined, undefined, NaN).length, 0, "NaN ⇒ 空数组")
+        compare(OpsCommon.routeMissionItems(wps, undefined, undefined, "30").length, 0,
+                "字符串 \"30\" ⇒ 空数组（按类型收，与其余字段同口径）")
+        // ‼️ 阳性对照：没有这一条，上面四条对一个"永远回 `[]`"的实现**全是绿的**。
+        compare(OpsCommon.routeMissionItems(wps, undefined, undefined, 30).length, 3,
+                "阳性对照：可用的 cruiseAGL 必须产出非空航线")
+    }
+
+    /// 负数是**业务校验**的事（后端 `TaskList.vue` 已有 `cruise_alt_agl < 0 ⇒ 报错`），
+    /// 本函数是**纯算术** ⇒ 照常参与计算，不做额外拒绝。这一格是钉子，不是疏漏。
+    function test_routeMissionItems_negativeCruiseParticipatesInArithmetic() {
+        var wps = _routeThreeAlt()
+        var out = OpsCommon.routeMissionItems(wps, undefined, undefined, -5)
+        compare(out.length, 3, "负数不得被拒（被拒会回 []）")
+        compare(out[0].alt, 95.0, "首个中间航点 100 + (-5) = 95")
+        compare(out[2].alt, 300.0, "末项仍原样透传")
+    }
+
+    /// `frame` 不随加法改变：加法已在末端合成 **AMSL**，参考系仍是 `MAV_FRAME_GLOBAL(0)`。
+    /// 这一格防的是"顺手把 frame 改成相对高度系(3)"—— 那会让每个航点都偏高一个 home 高程，
+    /// 而任务卡上显示的高度看着完全正常。
+    function test_routeMissionItems_frameStaysGlobalWithCruise() {
+        var out = OpsCommon.routeMissionItems(_routeFourAlt(), undefined, undefined, 30)
+        compare(out.length, 4)
+        for (var i = 0; i < out.length; i++) {
+            compare(out[i].frame, 0, "第 " + i + " 项 frame 必须仍是 MAV_FRAME_GLOBAL(0)")
+        }
     }
 
     /// 起飞高度 = **第一个航点的高度**（用户 2026-09-23 裁定 e）。
@@ -1926,5 +2054,747 @@ TestCase {
         verify(OpsCommon.reachedSlot(la, lo, la, lo, undefined) === false, "半径 undefined")
         verify(OpsCommon.reachedSlot(la, lo, la, lo, Infinity) === false, "半径 Infinity")
         verify(OpsCommon.reachedSlot(Infinity, lo, la, lo, 100) === false, "机位纬度 Infinity")
+    }
+
+    //-------------------------------------------------------------------------
+    // 航线列表的显示顺序：**有告警的航线置顶**
+    //   用户 2026-09-29 要求：「如果有航班告警，则航线列表、航班列表中告警对应的
+    //   航线、航班置顶」。航班侧（`middleSectionSplit` 第 1 节）**现状即符合，不动**；
+    //   航线侧此前**没有任何排序** —— `_routeRows` 按 `_routeOrder` 的自然顺序 push。
+    //   判据住 `OpsCommon` 而不写在骨架里：骨架里那个 `readonly property var` 表达式
+    //   QML 测试够不着，纯函数才钉得住（与 `groupTasksByRoute` 同一条理由）。
+    //-------------------------------------------------------------------------
+
+    /// `_routeRows` 里一项的最小形状：置顶只看 `has_abnormal`
+    /// （它由 `g.some(OpsCommon.isAbnormal)` 算出，见 `OpsShell.qml` 的 `_routeRows`）。
+    function _route(routeId, hasAbnormal) {
+        return { route_id: routeId, route_code: "R" + routeId, has_abnormal: hasAbnormal }
+    }
+
+    /// 有告警的置顶，且**稳定**：组内保持原自然顺序（不是按告警数、也不是倒序）。
+    function test_routesAbnormalFirst_stablePartition() {
+        var r1 = _route(1, false)
+        var r2 = _route(2, true)
+        var r3 = _route(3, false)
+        var r4 = _route(4, true)
+        var out = OpsCommon.routesAbnormalFirst([r1, r2, r3, r4])
+        compare(out.length, 4, "置顶不得多收或少收行")
+        compare(out[0].route_id, 2, "有告警的排最前，且组内保持原顺序（2 在 4 之前）")
+        compare(out[1].route_id, 4)
+        compare(out[2].route_id, 1, "无告警的跟在后面，组内同样保持原顺序（1 在 3 之前）")
+        compare(out[3].route_id, 3)
+    }
+
+    /// ‼️ **阴性对照**：一条告警都没有时**逐项同序**。
+    /// 没有这一格，一个「把所有行倒过来」或「按 route_id 排序」的实现也能让上一格绿。
+    function test_routesAbnormalFirst_noAbnormalKeepsOrder() {
+        var all = [_route(3, false), _route(1, false), _route(2, false)]
+        var out = OpsCommon.routesAbnormalFirst(all)
+        compare(out.length, all.length)
+        for (var i = 0; i < all.length; i++)
+            compare(out[i].route_id, all[i].route_id, "无告警时第 " + i + " 项不得动")
+    }
+
+    /// ‼️ 判据是**真值即告警**，两边的误写各有症状、都不报错：
+    ///   ⓐ `!== false`（"不是明确的 false 就算告警"）⇒ **缺键 / null 的行全被判成告警**
+    ///     ⇒ 整张表都在置顶组里、顺序反而不变，看起来只是"排序没生效"；
+    ///   ⓑ `=== true` ⇒ 真值 `1` / 非空串被静默漏掉，该置顶的不置顶。
+    /// 本格用阳性（`1` 必须置顶）与阴性（缺键 / `null` / `0` 必须不置顶）把两边都钉死。
+    function test_routesAbnormalFirst_truthyIsAbnormalFalsyIsNot() {
+        var absent = { route_id: 1 }                                        // 缺 has_abnormal 键
+        var nul = { route_id: 2, has_abnormal: null }
+        var zero = { route_id: 3, has_abnormal: 0 }
+        var one = { route_id: 4, has_abnormal: 1 }
+        var real = { route_id: 5, has_abnormal: true }
+        var out = OpsCommon.routesAbnormalFirst([absent, nul, zero, one, real])
+        compare(out.length, 5, "置顶不得多收或少收行")
+        compare(out[0].route_id, 4, "真值 1 也算告警（按 `=== true` 写会把这条静默漏掉）")
+        compare(out[1].route_id, 5, "真 bool true 算告警，且组内保持原顺序（4 在 5 之前）")
+        compare(out[2].route_id, 1, "缺键不算告警，且不得把它排到置顶组里去")
+        compare(out[3].route_id, 2, "null 不算告警")
+        compare(out[4].route_id, 3, "0 不算告警")
+    }
+
+    /// 空 / `null` / `undefined` 入参不得抛错；夹带的空项**不得被吞掉**
+    /// （吞掉 ⇒ 列表行数会在有告警时凭空少一行，且只在告警时出现）。
+    /// 返回 `undefined` 会让 QML 侧的 `routes:` 绑定报错，所以必须返回数组。
+    function test_routesAbnormalFirst_emptyAndJunk() {
+        compare(OpsCommon.routesAbnormalFirst(null).length, 0, "null ⇒ 空数组")
+        compare(OpsCommon.routesAbnormalFirst(undefined).length, 0, "undefined ⇒ 空数组")
+        compare(OpsCommon.routesAbnormalFirst([]).length, 0, "空数组 ⇒ 空数组")
+        var out = OpsCommon.routesAbnormalFirst([null, _route(1, true), undefined])
+        compare(out.length, 3, "夹带的空项不得被吞掉")
+        compare(out[0].route_id, 1, "空项不算告警，真告警那条照样置顶")
+    }
+
+    //-------------------------------------------------------------------------
+    // 规则 1（用户 2026-09-29 原话）：「航线列表中列出当前有执行任务的航线」
+    //   ⇒ 一条**当前没有航班**的航线不进右栏列表。此前 `_routeRows` 对名册里每条航线
+    //   都 push 一行（哪怕一条航班都没有，界面上就是 `active_count: 0` 的空行）。
+    //   判据住 `OpsCommon` 而不写在骨架里：`_routeRows` 那个 `readonly property var`
+    //   表达式 QML 测试够不着（同 `routesAbnormalFirst` 的理由）。
+    //-------------------------------------------------------------------------
+
+    /// `_routeRows` 里一项的最小形状：收窄只看 `tasks`（其余字段原样透传）。
+    function _routeWithTasks(routeId, tasks) {
+        return { route_id: routeId, route_code: "R" + routeId, tasks: tasks }
+    }
+
+    /// 差分点 + 阳性对照。‼️ 两格缺一不可：只断言"空的不在"的话，
+    /// 一个 `return []` 的实现也全绿——而它会让右栏变成空的。
+    function test_routesWithTasks_dropsRoutesWithoutTasks() {
+        var out = OpsCommon.routesWithTasks([
+            _routeWithTasks(1, [{ task_id: 101 }]),
+            _routeWithTasks(2, []),
+            _routeWithTasks(3, [{ task_id: 103 }, { task_id: 104 }])
+        ])
+        compare(out.length, 2, "有航班的 2 条留下，没航班的 1 条剔除")
+        compare(out[0].route_id, 1, "阳性对照：有航班的必须留下")
+        compare(out[1].route_id, 3, "阳性对照：多航班的也必须留下")
+    }
+
+    /// 保留项的相对顺序**逐项不动**（本函数只管收窄，排序是 `routesAbnormalFirst` 的事）。
+    /// ‼️ 输入刻意用**降序**：若实现里顺手写了 `sort`（按 route_id 或按航班数），
+    /// 上一格的 `[1, 3]` 恰好也是升序 ⇒ 测不出来，只会表现成"排序好像生效了"。
+    function test_routesWithTasks_keepsRelativeOrder() {
+        var out = OpsCommon.routesWithTasks([
+            _routeWithTasks(9, [{ task_id: 1 }]),
+            _routeWithTasks(4, []),
+            _routeWithTasks(7, [{ task_id: 2 }]),
+            _routeWithTasks(5, [{ task_id: 3 }])
+        ])
+        compare(out.length, 3)
+        compare(out[0].route_id, 9, "第 0 项不得被排序挪走")
+        compare(out[1].route_id, 7, "第 1 项不得被排序挪走")
+        compare(out[2].route_id, 5, "第 2 项不得被排序挪走")
+    }
+
+    /// `tasks` 不是"非空数组"一律**剔除**；只有真数组且长度 > 0 才算有航班。
+    ///
+    /// 判据写 `Array.isArray(t) && t.length > 0`（fail-closed，与本仓守卫取向一致）。
+    /// 写成 `t.length > 0` 的漏网口子：真值 `{}` 的 `.length` 是 `undefined`，
+    /// `undefined > 0` 恰好也是 false ⇒ 这格抓不到 `{}`，但字符串 `"ab"` 会溜进去
+    /// ——数据源一旦从数组变成字符串（接口改形状），列表会多出一行渲染不出卡片的航线。
+    /// 写成 `t != null`（"有 tasks 键就算有航班"）⇒ `[]` 也算 ⇒ 规则 1 整个失效。
+    function test_routesWithTasks_onlyNonEmptyArrayCounts() {
+        var out = OpsCommon.routesWithTasks([
+            _routeWithTasks(1, undefined),
+            _routeWithTasks(2, null),
+            _routeWithTasks(3, []),
+            _routeWithTasks(4, ""),
+            _routeWithTasks(5, "ab"),
+            _routeWithTasks(6, {}),
+            _routeWithTasks(7, 0),
+            _routeWithTasks(8, { task_id: 1 }),
+            _routeWithTasks(9, [{ task_id: 9 }])
+        ])
+        compare(out.length, 1, "只有第 9 条是真·非空数组")
+        compare(out[0].route_id, 9)
+    }
+
+    /// 缺 `tasks` 键（不是 `null`，是**根本没有这个键**）同样剔除。
+    /// 单独一格：`_routeRows` 里 `tasks` 恒存在，但别的调用点（或将来重构）可能漏传，
+    /// 而漏传的症状是"整张表少了一半行"，不是报错。
+    function test_routesWithTasks_missingTasksKeyIsDropped() {
+        var out = OpsCommon.routesWithTasks([
+            { route_id: 1, route_code: "R1" },
+            _routeWithTasks(2, [{ task_id: 2 }])
+        ])
+        compare(out.length, 1, "缺 tasks 键的整行剔除")
+        compare(out[0].route_id, 2)
+    }
+
+    /// 空 / `null` / `undefined` 入参不得抛错，且**必须返回数组**
+    /// （返回 `undefined` 会让 QML 侧的 `routes:` 绑定报错）。夹带的空项不得被吞掉
+    /// ——"吞掉"在这里是**对**的（它就是"没有航班"），所以本格只钉"不抛错 + 返回数组"。
+    function test_routesWithTasks_emptyAndJunkInput() {
+        compare(OpsCommon.routesWithTasks(null).length, 0, "null ⇒ 空数组")
+        compare(OpsCommon.routesWithTasks(undefined).length, 0, "undefined ⇒ 空数组")
+        compare(OpsCommon.routesWithTasks([]).length, 0, "空数组 ⇒ 空数组")
+        var out = OpsCommon.routesWithTasks([null, undefined, _routeWithTasks(1, [{ task_id: 1 }])])
+        compare(out.length, 1, "夹带的空项不得抛错（它没有 tasks ⇒ 按无航班剔除）")
+        compare(out[0].route_id, 1, "同一批里的真航班照样留下")
+    }
+
+    /// 纯函数：**不得修改入参**。`_routeRows` 的入参 `out` 是当场构造的，
+    /// 但函数被别处复用后"就地 splice"会让调用方看到一张被掏空的表，且不报错。
+    function test_routesWithTasks_doesNotMutateInput() {
+        var rows = [
+            _routeWithTasks(1, [{ task_id: 1 }]),
+            _routeWithTasks(2, []),
+            _routeWithTasks(3, [{ task_id: 3 }])
+        ]
+        var out = OpsCommon.routesWithTasks(rows)
+        compare(rows.length, 3, "入参数组长度不得被改动")
+        compare(rows[0].route_id, 1, "入参第 0 项不得被改动")
+        compare(rows[1].route_id, 2, "入参第 1 项（被剔除的那条）仍须留在入参里")
+        compare(rows[2].route_id, 3)
+        verify(out !== rows, "必须返回新数组，不得返回入参本身")
+    }
+
+    //-------------------------------------------------------------------------
+    // NRRSM（2026-09-30 / D7 2026-10-01）：航线的**六个原始高度量 + 两个合成量**
+    //
+    // 三层高度：**地面海拔（MSL）** / **站点最低安全高度（AGL）** / **架次飞行高度（AGL）**。
+    // 两个合成量 `takeoffAGL` / `landingAGL` 是**闸的判据项**（`> 0`）—— 注意判据是 AGL 量，
+    // **不是**"组装后的 AMSL"：地面海拔会把 `0` 救活（站点地面海拔 100 米、两个高度都没设 ⇒
+    // AMSL 100 > 0 ⇒ 闸放行 ⇒ 飞机贴地 100 米飞）。
+    //-------------------------------------------------------------------------
+
+    /// 六个量**两两不同**的 route 响应体。
+    /// ‼️ 两两不同是**必须的**：若有重复，把 `takeoffClearAGL` 读成 `takeoffAltAGL` 之类的
+    ///    键名写错也会全绿 —— 那是"断言等于在断常量"那一类假绿。
+    /// 两侧刻意各有一个"大者"：起飞侧航线值(150) > 站点值(80)，降落侧站点值(200) > 航线值(120)
+    /// ⇒ 一条夹具同时覆盖 `Math.max` 的两个分支。
+    function _routeAltSix() {
+        return {
+            takeoff_alt_agl: 150,
+            takeoff_site_clear_alt_agl: 80,
+            takeoff_ground_msl: 100,
+            landing_alt_agl: 120,
+            landing_site_clear_alt_agl: 200,
+            landing_ground_msl: 50
+        }
+    }
+
+    /// 六个原始量**逐一对号**（每个键各等于各自那个数）。
+    function test_routeAltitudeBounds_picksEachOfSixRawFields() {
+        var b = OpsCommon.routeAltitudeBounds(_routeAltSix())
+        compare(b.takeoffAltAGL, 150)
+        compare(b.takeoffClearAGL, 80)
+        compare(b.takeoffGroundMSL, 100)
+        compare(b.landingAltAGL, 120)
+        compare(b.landingClearAGL, 200)
+        compare(b.landingGroundMSL, 50)
+    }
+
+    /// 合成量取两侧**大者**（D6 硬下限的生效值），起飞/降落各验一次
+    /// ⇒ `Math.max` 的两个分支都覆盖到。
+    function test_routeAltitudeBounds_compositeTakesMax() {
+        var b = OpsCommon.routeAltitudeBounds(_routeAltSix())
+        compare(b.takeoffAGL, 150, "起飞侧：航线值 150 > 站点安全高度 80 ⇒ 取 150")
+        compare(b.landingAGL, 200, "降落侧：站点安全高度 200 > 航线值 120 ⇒ 取 200")
+    }
+
+    /// ‼️ 上一格的夹具**区分不出「起飞侧只取航线值」**：那里 `takeoffAltAGL(150)` 本来就大于
+    ///    `takeoffClearAGL(80)`，漏掉后者的实现照样得 150（已实测：把 `takeoffAGL` 写成
+    ///    `orZero(takeoffAltAGL)` 时，上一格**全绿**）。
+    ///    本格把**两侧的支配者反过来**（起飞侧站点值大、降落侧航线值大）⇒ 与上一格合起来，
+    ///    `Math.max` 的**四种支配组合**全被覆盖，"漏掉某一个操作数"必红。
+    function test_routeAltitudeBounds_compositeTakesMaxOnBothSidesEitherWay() {
+        var b = OpsCommon.routeAltitudeBounds({
+            takeoff_alt_agl: 60, takeoff_site_clear_alt_agl: 140,
+            landing_alt_agl: 300, landing_site_clear_alt_agl: 40
+        })
+        compare(b.takeoffAGL, 140, "起飞侧：站点安全高度 140 > 航线值 60 ⇒ 取 140")
+        compare(b.landingAGL, 300, "降落侧：航线值 300 > 站点安全高度 40 ⇒ 取 300")
+        // 阳性对照：原始量各自可读 —— 免得上面两条靠"实现里写死的常量"通过。
+        compare(b.takeoffAltAGL, 60)
+        compare(b.takeoffClearAGL, 140)
+        compare(b.landingAltAGL, 300)
+        compare(b.landingClearAGL, 40)
+    }
+
+    /// 两侧都是 `0`（未设定 / 未勘测）⇒ 合成量是 **`0`**，不是 `null`、也不是 `NaN`。
+    /// ‼️ `0` 正是闸的"拦住"值：合成量恒为有限数字，调用方才能写值域判据 `> 0`。
+    function test_routeAltitudeBounds_bothZeroCompositesToZero() {
+        var b = OpsCommon.routeAltitudeBounds({
+            takeoff_alt_agl: 0, takeoff_site_clear_alt_agl: 0,
+            landing_alt_agl: 0, landing_site_clear_alt_agl: 0
+        })
+        compare(b.takeoffAGL, 0)
+        compare(b.landingAGL, 0)
+        compare(typeof b.takeoffAGL, "number", "必须是数字 0，而不是 null / NaN")
+        compare(typeof b.landingAGL, "number")
+    }
+
+    /// 键缺失（后端没发这个字段）⇒ 六个原始量回 `null`（**类型层不可用**），
+    /// **但两个合成量仍是 `0`**（`null` 不外传），且**不抛异常**。
+    function test_routeAltitudeBounds_missingKeysCompositeToZero() {
+        var b = OpsCommon.routeAltitudeBounds({})
+        compare(b.takeoffAltAGL, null)
+        compare(b.takeoffClearAGL, null)
+        compare(b.takeoffGroundMSL, null)
+        compare(b.landingAltAGL, null)
+        compare(b.landingClearAGL, null)
+        compare(b.landingGroundMSL, null)
+        compare(b.takeoffAGL, 0)
+        compare(b.landingAGL, 0)
+        compare(typeof b.takeoffAGL, "number")
+        compare(typeof b.landingAGL, "number")
+    }
+
+    /// `route` 为 `null` / `undefined` ⇒ **不抛异常**，合成量都是 `0`。
+    /// （抛异常会让整条起飞流程炸在回调里，而界面上只看到"没反应"。）
+    function test_routeAltitudeBounds_nullRouteDoesNotThrow() {
+        var n = OpsCommon.routeAltitudeBounds(null)
+        compare(n.takeoffAGL, 0)
+        compare(n.landingAGL, 0)
+        var u = OpsCommon.routeAltitudeBounds(undefined)
+        compare(u.takeoffAGL, 0)
+        compare(u.landingAGL, 0)
+    }
+
+    /// ‼️ **「键缺失」与「键在、但值非法」必须分开钉住**（补遗 §4）。
+    /// 两者都回 `null`，但成因不同：前者是后端没发这个字段，后者是发了非 JSON number。
+    /// 若只测其中一种，另一种的实现写错会被静默掩盖 —— 尤其"夹具键名与读键不一致"时，
+    /// 用例会**为错误的理由通过**（键缺失 ⇒ `pick(undefined)` ⇒ `null`，看上去一样）。
+    function test_routeAltitudeBounds_distinguishesMissingKeyFromInvalidValue() {
+        // ① 键缺失 ⇒ null
+        compare(OpsCommon.routeAltitudeBounds({}).takeoffAltAGL, null, "键缺失 ⇒ null")
+        // ② 键在、值非法（字符串 / NaN）⇒ 同样 null
+        var invalid = OpsCommon.routeAltitudeBounds({ takeoff_alt_agl: "500", landing_alt_agl: NaN })
+        compare(invalid.takeoffAltAGL, null, "字符串 500 不认 —— 后端给的一定是 JSON number")
+        compare(invalid.landingAltAGL, null, "NaN 不认")
+        compare(invalid.takeoffAGL, 0, "值非法 ⇒ 合成量仍是 0（不得是 NaN）")
+        compare(typeof invalid.landingAGL, "number")
+        // ‼️ 阳性对照：没有这两条，上面几句对一个"永远回 null / 永远回 0"的实现**全是绿的**。
+        var ok = OpsCommon.routeAltitudeBounds({ takeoff_alt_agl: 150, landing_alt_agl: 120 })
+        compare(ok.takeoffAltAGL, 150, "阳性对照：值合法必须逐字取到")
+        compare(ok.landingAltAGL, 120, "阳性对照：值合法必须逐字取到")
+    }
+
+    function test_applyLandingAltitude_replacesLastItemOnly() {
+        // ‼️ 末项的四个字段（lat/lon/command/frame）取值**必须与入参可区分** ——
+        //    若夹具末项取 `command: 16 / lat: 47.3 / frame: 0`，断言就等于在断常量：
+        //    把实现改成 `command: MAV_CMD_NAV_WAYPOINT`（= 16）/ `lat: 47.3` / `frame: 0`
+        //    照样全绿 ⇒ 末项真为 85（垂起着陆）时会被静默降级成普通航点。
+        var items = [
+            { command: 16, lat: 47.1, lon: 8.1, alt: 463.0, frame: 0 },
+            { command: 16, lat: 47.2, lon: 8.2, alt: 410.0, frame: 0 },
+            { command: 85, lat: 48.9, lon: 9.9, alt: 405.0, frame: 3 }
+        ]
+        var out = OpsCommon.applyLandingAltitude(items, 500.0)
+        compare(out.length, 3)
+        compare(out[0].alt, 463.0)   // 中间航点高度**原样**
+        compare(out[1].alt, 410.0)
+        compare(out[2].alt, 500.0)   // 末项换成航线降落高度
+        compare(out[2].lat, 48.9)    // 坐标不动
+        compare(out[2].lon, 9.9)
+        compare(out[2].command, 85)  // command 不动 —— 被"规范化"成 16 必须红
+        compare(out[2].frame, 3)     // frame 不动
+    }
+
+    function test_applyLandingAltitude_doesNotMutateInput() {
+        // ‼️ 纯函数不得改入参：调用方可能还要用原始 items（比如算 waypointCount）。
+        var items = [ { command: 16, lat: 1, lon: 2, alt: 10, frame: 0 },
+                      { command: 16, lat: 3, lon: 4, alt: 20, frame: 0 } ]
+        var out = OpsCommon.applyLandingAltitude(items, 999)
+        compare(items[1].alt, 20)
+        verify(out !== items, "必须返回新数组，不得返回入参本身")
+        // ‼️ 阳性对照（修复轮 4 / 复审发现 ⑤ 的遗留）：上面两条对**恒回 `[]`** 的实现**全绿**
+        //    —— `[]` 既不改入参、`[] !== items` 又对任何实现都真 ⇒ 必须有一条落在 `out`
+        //    **内容**上的正断言，否则本格钉不住那种实现。
+        compare(out.length, 2, "阳性对照：两元素入参 ⇒ 两元素出参（恒回 [] 会在这里红）")
+        compare(out[1].alt, 999, "阳性对照：末项必须被 999 覆盖（只断「不改入参」钉不住恒回 []）")
+    }
+
+    /// 单点序列**也要被覆盖**（修复轮 2 / 发现 ①）。
+    /// ‼️ 旧守卫是 `items.length < 2`，理由写的是"只有一个点时它既是起飞又是降落，语义不清"——
+    ///    **该前提在 A1 之后已不成立**：起飞项**不在 `items` 里**（由 `OpsRouteSync.qml` 用
+    ///    `insertTakeoffItem` 单独插进 plan 第 0 位），`items` 就是航点序列，
+    ///    其末项**恒为降落站点航点**（行为 1 追加来的，或行为 2 本来就在末位）。
+    ///    ⇒ 单点序列是**正常编辑可得到的形状**，不是畸形输入。
+    /// ⚠️ 本格是**上一轮那条用例的翻版**：它原先断言 `out[0].alt === 10`（旧行为）。
+    ///    旧行为会让末项**停在该航点地面海拔**、不加 `max(landing_alt_agl, clear_alt_agl)`
+    ///    ⇒ 飞机被指令到**贴地**飞，而两道闸读的是 AGL 项 ⇒ **全绿放行**。
+    function test_applyLandingAltitude_singleItemIsCovered() {
+        var items = [ { command: 16, lat: 1, lon: 2, alt: 10, frame: 0 } ]
+        var out = OpsCommon.applyLandingAltitude(items, 999)
+        compare(out[0].alt, 999, "单点也必须被覆盖（旧的 `length < 2` 会让它停在 10）")
+        compare(items[0].alt, 10, "不改入参")
+        verify(out !== items, "必须返回新数组")
+        compare(OpsCommon.applyLandingAltitude([], 999).length, 0, "空数组才「没事可做」")
+        compare(OpsCommon.applyLandingAltitude(null, 999), null, "null 原样返回")
+    }
+
+    /// 发现 ① 的**端到端串联**：单点 `wps`（该点即终点）走完
+    /// `appendLandingWaypoint → routeMissionItems → applyLandingAltitude` 后，
+    /// 末项高度必须是 `assembledAltitude(地面海拔, max(landing_alt_agl, 站点安全高度))`。
+    /// ‼️ 改动前（`applyLandingAltitude` 的 `length < 2` 早退）本格的末项会停在 **30**（地面海拔）
+    ///    而不是 **230** —— 那正是"判据 ⑥ 在单点形状上静默失效"。
+    function test_singleWaypointChain_lastAltitudeIsAssembled() {
+        var groundMSL = 30.0
+        var wps = [_wp(38.874500, 115.464500, groundMSL, 21, 5)]   // 唯一一点，且它就是终点
+        var landed = OpsCommon.appendLandingWaypoint(wps, 5, 38.8745, 115.4645, groundMSL)
+        compare(landed.length, 1, "单点且该点即终点 ⇒ 行为 2，长度仍是 1")
+        var items = OpsCommon.routeMissionItems(landed, true, undefined, 30)
+        compare(items.length, 1, "一个航点 ⇒ 一项")
+        compare(items[0].alt, groundMSL, "唯一一项既是首项又是末项 ⇒ 不加 cruise，原样透传地面海拔")
+        var landingAGL = OpsCommon.nrrsmEffectiveAGL(120, 200)   // D6 硬下限：站点安全高度 200 更大
+        compare(landingAGL, 200, "硬下限取站点值")
+        var final = OpsCommon.applyLandingAltitude(items,
+            OpsCommon.assembledAltitude(groundMSL, landingAGL))
+        compare(final.length, 1, "单点序列也必须进入覆盖分支（旧守卫会在这里早退）")
+        compare(final[0].alt, 230.0, "末项 = 地面海拔 30 + max(120, 200) = 230（改动前是 30）")
+    }
+
+    function test_applyLandingAltitude_unusableAltitudeIsUnchanged() {
+        var items = [ { command: 16, lat: 1, lon: 2, alt: 10, frame: 0 },
+                      { command: 16, lat: 3, lon: 4, alt: 20, frame: 0 } ]
+        compare(OpsCommon.applyLandingAltitude(items, null)[1].alt, 20)
+        compare(OpsCommon.applyLandingAltitude(items, NaN)[1].alt, 20)
+        compare(OpsCommon.applyLandingAltitude(items, "500")[1].alt, 20)
+        compare(OpsCommon.applyLandingAltitude([], 500).length, 0)
+        compare(OpsCommon.applyLandingAltitude(null, 500), null)
+    }
+
+    //-------------------------------------------------------------------------
+    // A1（2026-10-01）：把「降落站点对应的航点」追加为 mission 末项
+    //
+    // 用户 A1 原话：「qgc发给px4的航线中**没有降落点**，是由一系列航点组成。A1 就是**最后一个
+    // 航点**（同时也是降落站点所在位置，**经纬度由降落站点对应的航点的经纬度定**，……）」。
+    // 「降落站点对应的航点」= `table_route.end_waypoint_id` 所指的那个航点。
+    // ‼️ 裁定 R-A1：末项是**普通航点**，**不产生 85 NAV_VTOL_LAND** —— 追加项的 `command: 21`
+    //    是**设计域**的「站点」标记，经 `_designCommandToMavCmd(21, false, …)` 映射成 `16`。
+    //-------------------------------------------------------------------------
+
+    /// 真库**固定航线**的形状：返回列表**非空**、且终点航点**不在**其中（⇒ 行为 1：追加）。
+    /// 依据：**云端权威库** 2026-10-01 把全部 7 条航线逐一核算 —— 落到行为 1 的是 **1 / 20 / 21** 三条。
+    /// ⚠️ 别再写「1/20/21/22」：**22 的 `table_route_waypoint` 是零行** ⇒ 它先撞**行为 7（空序列）**，
+    ///    **根本到不了追加分支**（那一条走 `appendLandingWaypoint` 回 `[]`，不是本夹具的形状）。
+    /// （本机 `db_uavm.db` 是陈旧副本、连 NRRSM 的列都没有，**不能**拿它当判据。）
+    /// ⚠️ **出处等级**：上面这组读数**不是本任务测的**，是**控制方（编排者）2026-10-01 只读实测**；
+    ///    采集口径 = `ssh root@39.97.235.226`、库 `/opt/uavm/var/db_uavm.db`、**只读**打开
+    ///    （`file:...?mode=ro&immutable=1`）、范围 `table_route` 中 `deleted_at IS NULL` 的全量 7 条。
+    ///    **本任务（QGC 仓）无云端凭据，未独立复核。**
+    function _wpsWithoutEnd() {
+        return [_wp(39.748823, 116.143486, 50.0, 21, 3),
+                _wp(39.748800, 116.143400, 50.0, 16, 4)]
+    }
+
+    /// 真库**QGC 上传航线**的形状：终点航点**恰为末项**（⇒ 行为 2：原样返回）。
+    /// 依据：云端真库 2026-10-01 复核 —— 航线 4/5/23 的 `last_wp == end_waypoint_id`。
+    /// ⚠️ **出处等级**：「云端真库 4/5/23」这条读数**不是本任务测的**，是**控制方（编排者）2026-10-01 只读实测**；
+    ///    采集口径 = `ssh root@39.97.235.226`、库 `/opt/uavm/var/db_uavm.db`、**只读**打开
+    ///    （`file:...?mode=ro&immutable=1`）、范围 `table_route` 中 `deleted_at IS NULL` 的全量 7 条。
+    ///    **本任务（QGC 仓）无云端凭据，未独立复核。**
+    function _wpsWithEndLast() {
+        return [_wp(39.748800, 116.143400, 50.0, 16, 4),
+                _wp(38.874500, 115.464500, 30.0, 21, 5)]
+    }
+
+    /// 危险形状：终点航点**在列表里但不是末项**（⇒ 行为 3：作废，fail-closed）。
+    function _wpsWithEndFirst() {
+        return [_wp(38.874500, 115.464500, 30.0, 21, 5),
+                _wp(39.748800, 116.143400, 50.0, 16, 4)]
+    }
+
+    /// 行为 1 + 反向用例：追加项**落在末尾**，且**坐标取自入参**（不是列表里任何一点）。
+    /// ‼️ 只断 `length + 1` 的实现**照样绿** —— 那钉不住「坐标取的是降落站点航点」。
+    function test_appendLandingWaypoint_appendsEndAtTail() {
+        var out = OpsCommon.appendLandingWaypoint(_wpsWithoutEnd(), 5, 48.1, 11.5, 413.0)
+        compare(out.length, 3, "列表里没有终点站 ⇒ 追加一项，长度 +1")
+        compare(out[2].id, 5, "追加项必须是终点航点 id")
+        compare(out[2].lat, 48.1, "纬度必须取自入参 endLat（取列表里任何一点都会 < 40）")
+        compare(out[2].lon, 11.5, "经度必须取自入参 endLon")
+        compare(out[2].altitude, 413.0, "地面海拔取自入参 endGroundMSL")
+        compare(out[2].command, 21, "设计域「站点」标记 21（≠ MAVLink NAV_LAND(21)）")
+        compare(out[0].id, 3, "原列表第 0 项保持不动")
+        compare(out[1].id, 4, "原列表第 1 项保持不动")
+    }
+
+    /// 反向用例：**不原地改入参**（纯函数）。
+    function test_appendLandingWaypoint_doesNotMutateInput() {
+        var wps = _wpsWithoutEnd()
+        var out = OpsCommon.appendLandingWaypoint(wps, 5, 48.1, 11.5, 413.0)
+        compare(wps.length, 2, "入参数组长度不得被改动")
+        compare(wps[0].id, 3, "入参第 0 项不得被改动")
+        compare(wps[1].id, 4, "入参第 1 项不得被改动")
+        verify(out !== wps, "必须返回新数组，不得返回入参本身")
+        // ‼️ 下面两条必须落在 `out` 的**内容**上：上面四条全部落在入参 `wps` 或恒真式上，
+        //    把 `appendLandingWaypoint` 变形成**恒回 `[]`** 时它们全过
+        //    （`[] !== wps` 对任何实现都真）⇒ 该格照样全绿，钉不住任何东西。
+        //    入参 2 元素（id 3 / 4）、列表里没有终点 ⇒ 期望追加成 3 项且末项 id 为 5。
+        compare(out.length, 3, "列表里没有终点 ⇒ out 必须为 3 项（恒回 [] 会在此变红）")
+        compare(out[2].id, 5, "追加项必须是终点航点 id（只钉长度钉不住「追加的是终点」）")
+    }
+
+    /// 行为 2：末项**恰好**就是终点 ⇒ 原样返回，**不重复追加**。
+    /// 真库 4/5/23 就是这个形状；重复追加会让飞机到终点后再多飞一段回头路。
+    /// ‼️ 与下一格（行为 3）只差一个顺序 —— 合成一格的话，写反了也测不出来。
+    function test_appendLandingWaypoint_endAlreadyLastIsNotDuplicated() {
+        var out = OpsCommon.appendLandingWaypoint(_wpsWithEndLast(), 5, 38.8745, 115.4645, 30.0)
+        compare(out.length, 2, "末项已经是终点 ⇒ 长度不得变（重复追加会让飞机多飞一段）")
+        compare(out[0].id, 4, "首项不动")
+        compare(out[1].id, 5, "末项仍是终点航点")
+        compare(OpsCommon.appendLandingWaypoint(_wpsWithEndLast(), 5, 38.8745, 115.4645, 30.0).length, 2,
+                "幂等：再调一次长度仍是 2")
+    }
+
+    /// 裁定 B（2026-10-01，修复轮 1）：末项**已经是终点**时，`endLat` / `endLon` /
+    /// `endGroundMSL` **三者同时不可用**也**照样原样返回** —— 那一档走的是 `wps.slice()`，
+    /// 这三个值在这条路上一次都不被读到。要求它们可用＝守卫过宽：会把云端真库 4 / 5 / 23
+    /// 那三条**本来能发**的航线，因为一个**与它们正确性无关**的后端字段而拒掉，换不到任何安全性。
+    /// ⚠️ **出处等级**：「云端真库 4 / 5 / 23」这条读数**不是本任务测的**，是**控制方（编排者）2026-10-01 只读实测**；
+    ///    采集口径 = `ssh root@39.97.235.226`、库 `/opt/uavm/var/db_uavm.db`、**只读**打开
+    ///    （`file:...?mode=ro&immutable=1`）、范围 `table_route` 中 `deleted_at IS NULL` 的全量 7 条。
+    ///    **本任务（QGC 仓）无云端凭据，未独立复核。**
+    /// 末项坐标真的坏掉时，下游 `routeMissionItems` 会逐点校验 `lat` / `lon` / `altitude`
+    /// 并回 `[]`（见 `test_appendLandingWaypoint_appendedItemBecomesPlainWaypoint` 同族的
+    /// `routeMissionItems` 用例）⇒ 报的是**更贴近真相**的那句话。
+    /// ‼️ 这一格是钉裁定 B 的**关键格**：把三道守卫挪回行为 2 **之前**（即读法 A），本格必红；
+    ///    而"正常入参下原样返回"那种格（见上一格）在**两种实现下都绿**，钉不住这里。
+    function test_appendLandingWaypoint_endAlreadyLastIgnoresUnusedInputs() {
+        var out = OpsCommon.appendLandingWaypoint(_wpsWithEndLast(), 5, 0, 0, NaN)
+        compare(out.length, 2, "末项已是终点 ⇒ 三个仅追加分支消费的入参全不可用，也应原样返回")
+        compare(out[0].id, 4, "首项不动")
+        compare(out[1].id, 5, "末项仍是终点航点")
+        compare(OpsCommon.appendLandingWaypoint(_wpsWithEndLast(), 5, 0, 0, NaN).length, 2, "幂等")
+        compare(OpsCommon.appendLandingWaypoint(_wpsWithEndLast(), 5, undefined, undefined, "x").length, 2,
+                "undefined / 字符串同样不影响这一档")
+    }
+
+    /// 反向格：`endWaypointId` **本身**不可用 ⇒ 即使末项 id 与它"长得一样"，也回 `[]`
+    /// （行为 4 是**先**判的 ⇒ 它必须在行为 2 **之前**拦掉）。
+    /// ‼️ 挑 `"5"`（字符串）与 `NaN` 是有意的：把行为 2 写成宽松比较 `last.id == endWaypointId`、
+    ///    或把它提到行为 4 之前的实现，都会在本格红。
+    function test_appendLandingWaypoint_invalidEndIdBeatsEndAlreadyLast() {
+        var wps = _wpsWithEndLast()
+        compare(OpsCommon.appendLandingWaypoint(wps, "5", 0, 0, NaN).length, 0,
+                "字符串「5」≠ number 5 ⇒ 作废（宽松 == 会把它误当成末项）")
+        compare(OpsCommon.appendLandingWaypoint(wps, NaN, 0, 0, NaN).length, 0,
+                "NaN ⇒ 作废（即使末项 id 是 5）")
+        compare(OpsCommon.appendLandingWaypoint(wps, null, 0, 0, NaN).length, 0, "null ⇒ 作废")
+        compare(OpsCommon.appendLandingWaypoint(wps, 0, 0, 0, NaN).length, 0, "0 ⇒ 作废（「没有终点」哨兵）")
+        // 阳性对照：同一个 wps、只把 id 换成合法的 5 ⇒ 必须原样返回（长度 2）。
+        // 缺了它，上面几条对一个「永远回 []」的实现**全是绿的**。
+        compare(OpsCommon.appendLandingWaypoint(wps, 5, 0, 0, NaN).length, 2,
+                "阳性对照：id 合法 ⇒ 走行为 2，长度仍 2")
+    }
+
+    /// 行为 3：**在列表里但不是末项** ⇒ 回 `[]`（fail-closed）。
+    /// 追加会绕回、不追加则末项不是降落点 —— 两条路都会飞出一条用户没画过的路径。
+    /// 代价（已上报控制方）：**云端权威库全量 7 条里面没有一条**落到行为 3
+    ///（落点：1/20/21 → 行为 1；4/5/23 → 行为 2；22 → 行为 7），但一旦出现，**同步会整个失败**
+    /// （界面文案 = 「该航线未设定可用的降落站点，无法下发」）。
+    /// ⚠️ **出处等级**：那句「全量 7 条里面没有一条落到行为 3」**不是本任务测的**，是
+    ///    **控制方（编排者）2026-10-01 只读实测**；采集口径 = `ssh root@39.97.235.226`、
+    ///    库 `/opt/uavm/var/db_uavm.db`、**只读**打开（`file:...?mode=ro&immutable=1`）、
+    ///    范围 `table_route` 中 `deleted_at IS NULL` 的全量 7 条。
+    ///    **本任务（QGC 仓）无云端凭据，未独立复核。**
+    function test_appendLandingWaypoint_endInMiddleVoidsRoute() {
+        compare(OpsCommon.appendLandingWaypoint(_wpsWithEndFirst(), 5, 38.8745, 115.4645, 30.0).length, 0,
+                "终点不是末项 ⇒ 整条作废（不得追加、也不得原样返回）")
+        // ‼️ 阳性对照（修复轮 2 / 发现 ⑤）：本格是该行为的**唯一覆盖格**，而上面全是否定断言
+        //    ⇒ 一个**恒回 `[]`** 的实现单看它**全绿**。同一个夹具、只把"终点在列表里但非末项"
+        //    换成"终点恰为末项"（末项 id = 4）⇒ 必须**非空**。
+        var out = OpsCommon.appendLandingWaypoint(_wpsWithEndFirst(), 4, 39.7488, 116.1434, 50.0)
+        compare(out.length, 2, "阳性对照：终点移到末项 ⇒ 必须原样返回（长度 2），否则本格钉不住")
+    }
+
+    /// 行为 4：`endWaypointId` 不是合法 id（口径与 `_endWaypointIndex` **逐字相同**）⇒ `[]`。
+    function test_appendLandingWaypoint_invalidEndIdVoidsRoute() {
+        compare(OpsCommon.appendLandingWaypoint(_wpsWithoutEnd(), undefined, 48.1, 11.5, 413.0).length, 0,
+                "undefined ⇒ 作废")
+        compare(OpsCommon.appendLandingWaypoint(_wpsWithoutEnd(), null, 48.1, 11.5, 413.0).length, 0,
+                "null ⇒ 作废（可空列被后端置 NULL 的常态）")
+        compare(OpsCommon.appendLandingWaypoint(_wpsWithoutEnd(), "5", 48.1, 11.5, 413.0).length, 0,
+                "字符串「5」⇒ 作废（只认 JSON number）")
+        compare(OpsCommon.appendLandingWaypoint(_wpsWithoutEnd(), 0, 48.1, 11.5, 413.0).length, 0,
+                "0 ⇒ 作废（0 是「没有终点」的哨兵）")
+        compare(OpsCommon.appendLandingWaypoint(_wpsWithoutEnd(), -1, 48.1, 11.5, 413.0).length, 0,
+                "负数 ⇒ 作废")
+        compare(OpsCommon.appendLandingWaypoint(_wpsWithoutEnd(), NaN, 48.1, 11.5, 413.0).length, 0,
+                "NaN ⇒ 作废（NaN 是 number 但不是有限数）")
+        // ‼️ 阳性对照（修复轮 2 / 发现 ⑤）：本格全是否定断言 ⇒ 恒回 `[]` 的实现全绿。
+        //    同一个 wps、只把 id 换成合法的 5 ⇒ 必须追加成功。
+        compare(OpsCommon.appendLandingWaypoint(_wpsWithoutEnd(), 5, 48.1, 11.5, 413.0).length, 3,
+                "阳性对照：id 合法必须追加成功（否则本格钉不住恒回 [] 的实现）")
+    }
+
+    /// 行为 5：终点坐标过不了单点定义 `isValidWaypoint`（**任一轴为 0 即无效**）⇒ `[]`。
+    /// 后端在**没有终点航点**时把两键 `COALESCE` 成 `0` ⇒ 这一条同时也是「后端没给终点」的闸。
+    function test_appendLandingWaypoint_invalidEndCoordsVoidsRoute() {
+        compare(OpsCommon.appendLandingWaypoint(_wpsWithoutEnd(), 5, 0, 11.5, 413.0).length, 0,
+                "纬度 0（后端 COALESCE 的哨兵）⇒ 作废")
+        compare(OpsCommon.appendLandingWaypoint(_wpsWithoutEnd(), 5, 48.1, 0, 413.0).length, 0,
+                "经度 0 ⇒ 作废")
+        compare(OpsCommon.appendLandingWaypoint(_wpsWithoutEnd(), 5, NaN, 11.5, 413.0).length, 0,
+                "NaN 纬度 ⇒ 作废")
+        compare(OpsCommon.appendLandingWaypoint(_wpsWithoutEnd(), 5, undefined, 11.5, 413.0).length, 0,
+                "undefined 纬度 ⇒ 作废")
+        compare(OpsCommon.appendLandingWaypoint(_wpsWithoutEnd(), 5, null, 11.5, 413.0).length, 0,
+                "null 纬度 ⇒ 作废")
+        // 阳性对照：同样的入参、只把坐标换成合法值 ⇒ 必须成功。
+        // 缺了它，上面几条对一个「永远回 []」的实现**全是绿的**。
+        compare(OpsCommon.appendLandingWaypoint(_wpsWithoutEnd(), 5, 48.1, 11.5, 413.0).length, 3,
+                "阳性对照：坐标合法必须追加成功")
+    }
+
+    /// 行为 6：`endGroundMSL` 非有限数 ⇒ `[]`（它随后会进组装式算术，NaN 会污染末项高度）。
+    function test_appendLandingWaypoint_nonFiniteGroundMSLVoidsRoute() {
+        compare(OpsCommon.appendLandingWaypoint(_wpsWithoutEnd(), 5, 48.1, 11.5, NaN).length, 0, "NaN ⇒ 作废")
+        compare(OpsCommon.appendLandingWaypoint(_wpsWithoutEnd(), 5, 48.1, 11.5, undefined).length, 0,
+                "undefined ⇒ 作废")
+        compare(OpsCommon.appendLandingWaypoint(_wpsWithoutEnd(), 5, 48.1, 11.5, "413").length, 0,
+                "字符串 ⇒ 作废（只认 JSON number）")
+        // 阳性对照：地面海拔为 0 是合法值（站点在海拔 0 米），**不得**被当成「缺」。
+        compare(OpsCommon.appendLandingWaypoint(_wpsWithoutEnd(), 5, 48.1, 11.5, 0).length, 3,
+                "阳性对照：地面海拔 0 合法（不是「缺」）")
+    }
+
+    /// 行为 7：`wps` 为空 / 非数组 ⇒ `[]`。
+    /// ‼️ **注意调用方**：`OpsRouteSync.qml` 在调本函数**之前**已用**另一句文案**
+    ///（「航线没有可用航点，无法下发」）把空序列拦下了 —— 本函数回 `[]` 与它**不同因**，
+    /// 所以两句话必须在那一侧分开（否则「航线一个航点都没有」会被报成「降落站点不可用」，
+    /// 把用户指向错误的方向；该坑 `OpsRouteSync.qml` 的 `start()` 里「未设定飞行高度」
+    /// 那道拒发闸的注释已明文警告过）。
+    function test_appendLandingWaypoint_emptyWpsVoidsRoute() {
+        compare(OpsCommon.appendLandingWaypoint([], 5, 48.1, 11.5, 413.0).length, 0, "空数组 ⇒ 作废")
+        compare(OpsCommon.appendLandingWaypoint(null, 5, 48.1, 11.5, 413.0).length, 0, "null ⇒ 作废")
+        compare(OpsCommon.appendLandingWaypoint(undefined, 5, 48.1, 11.5, 413.0).length, 0, "undefined ⇒ 作废")
+        compare(OpsCommon.appendLandingWaypoint("x", 5, 48.1, 11.5, 413.0).length, 0, "非数组 ⇒ 作废")
+        // ‼️ 阳性对照（修复轮 2 / 发现 ⑤）：本格全是否定断言 ⇒ 恒回 `[]` 的实现全绿。
+        //    只把第一个实参换成非空数组、其余**逐字不动** ⇒ 必须追加成功。
+        compare(OpsCommon.appendLandingWaypoint(_wpsWithoutEnd(), 5, 48.1, 11.5, 413.0).length, 3,
+                "阳性对照：同一组入参、只把 wps 换成非空数组 ⇒ 必须追加成功")
+    }
+
+    /// 端到端形状：追加项经 `routeMissionItems` 后必须是 **`16 NAV_WAYPOINT`**，且**不带 85**
+    /// —— 这是裁定 R-A1 的主判据（末项是普通航点，不产生 `NAV_VTOL_LAND`）。
+    function test_appendLandingWaypoint_appendedItemBecomesPlainWaypoint() {
+        var landed = OpsCommon.appendLandingWaypoint(_wpsWithoutEnd(), 5, 48.1, 11.5, 413.0)
+        var items = OpsCommon.routeMissionItems(landed, true, undefined, 30)
+        compare(items.length, 3, "三点都要下发")
+        compare(items[2].command, 16, "追加项是**普通航点** 16 —— 出现 85 即违反裁定 R-A1")
+        for (var i = 0; i < items.length; i++) {
+            verify(items[i].command !== 85, "R-A1：本链路不产生 NAV_VTOL_LAND(85)")
+        }
+        // 追加项是**末项** ⇒ `routeMissionItems` 对它原样透传 altitude（不加 cruise），
+        // 随后再由 `applyLandingAltitude` 覆盖成降落端组装式 AMSL（判据 6）。
+        compare(items[2].alt, 413.0, "末项在 routeMissionItems 里原样透传 altitude")
+        compare(items[0].alt, 80.0, "中间项仍组装成「该航点地面海拔 + cruiseAGL」= 50 + 30")
+    }
+
+    //-------------------------------------------------------------------------
+    // A2（2026-10-01）：判据 5 / 6 的**最后一跳** —— 组装式高度
+    //-------------------------------------------------------------------------
+
+    function test_assembledAltitude_addsGroundPlusAgl() {
+        compare(OpsCommon.assembledAltitude(413, 50), 463, "判据 5/6 的字面算式：413 + 50")
+        compare(OpsCommon.assembledAltitude(413, 100), 513,
+                "只改第二个加数 ⇒ 463→513；写成「groundMSL + 常量」或漏掉 agl 必红")
+        compare(OpsCommon.assembledAltitude(0, 50), 50, "站点地面海拔 0 是合法值，不得被当成「缺」")
+        compare(OpsCommon.assembledAltitude(100, 0), 100, "AGL 为 0 时地面海拔照旧透传（本函数只做算术）")
+    }
+
+    function test_assembledAltitude_nonFiniteIsNaN() {
+        verify(isNaN(OpsCommon.assembledAltitude(undefined, 50)), "undefined 地面海拔 ⇒ NaN")
+        verify(isNaN(OpsCommon.assembledAltitude(413, undefined)), "undefined AGL ⇒ NaN")
+        verify(isNaN(OpsCommon.assembledAltitude(NaN, 50)), "NaN ⇒ NaN")
+        verify(isNaN(OpsCommon.assembledAltitude(413, NaN)), "NaN AGL ⇒ NaN")
+        verify(isNaN(OpsCommon.assembledAltitude(null, 50)), "null ⇒ NaN（null 不是「缺」，是类型不符）")
+        verify(isNaN(OpsCommon.assembledAltitude("413", 50)), "字符串 ⇒ NaN")
+        verify(OpsCommon.assembledAltitude(undefined, 50) !== 0,
+               "必须是 NaN 而不是 0 —— 0 会让下游闸的 !(x > 0) 失效（未设定被当成有效高度）")
+        // ‼️ 阳性对照（修复轮 2 / 发现 ⑤）：上面全是否定断言 ⇒ 一个**恒回 NaN** 的实现
+        //    单看本格**全绿**。下面这一条把它挡住。
+        verify(!isNaN(OpsCommon.assembledAltitude(413, 50)),
+               "阳性对照：合法输入必须得数（否则本格对恒回 NaN 的实现全绿）")
+    }
+
+    //-------------------------------------------------------------------------
+    // B7（2026-10-01）：D6 硬下限的单点定义
+    //-------------------------------------------------------------------------
+
+    function test_nrrsmEffectiveAGL_takesMaxOfBothSides() {
+        compare(OpsCommon.nrrsmEffectiveAGL(150, 80), 150, "航线值大 ⇒ 取航线值")
+        compare(OpsCommon.nrrsmEffectiveAGL(60, 140), 140, "站点值大 ⇒ 取站点值")
+        compare(OpsCommon.nrrsmEffectiveAGL(100, 100), 100, "相等 ⇒ 取该值")
+        compare(OpsCommon.nrrsmEffectiveAGL(0, 0), 0, "两侧都是 0（未设定）⇒ 0")
+    }
+
+    function test_nrrsmEffectiveAGL_unusableInputsCountAsZero() {
+        compare(OpsCommon.nrrsmEffectiveAGL(null, null), 0, "两侧都不可用 ⇒ 0（不是 NaN）")
+        compare(OpsCommon.nrrsmEffectiveAGL(null, 50), 50, "null 按 0 计 ⇒ 取另一侧")
+        compare(OpsCommon.nrrsmEffectiveAGL(NaN, 50), 50, "NaN 按 0 计 ⇒ 取另一侧")
+        compare(OpsCommon.nrrsmEffectiveAGL(undefined, undefined), 0, "undefined 按 0 计")
+        compare(typeof OpsCommon.nrrsmEffectiveAGL(NaN, NaN), "number",
+                "恒为有限数字 —— null / NaN 不外传")
+    }
+
+    /// 新增的三个终点航点量：键名 + `pick` 口径（键缺失 / 非数字 ⇒ `null`）。
+    function test_routeAltitudeBounds_picksEndWaypointFields() {
+        var b = OpsCommon.routeAltitudeBounds({
+            end_waypoint_id: 5, end_waypoint_lat: 38.8745, end_waypoint_lon: 115.4645
+        })
+        compare(b.endWaypointId, 5, "键名 endWaypointId ← route.end_waypoint_id")
+        compare(b.endLat, 38.8745, "键名 endLat ← route.end_waypoint_lat")
+        compare(b.endLon, 115.4645, "键名 endLon ← route.end_waypoint_lon")
+        // 键缺失 ⇒ null（与六个高度原始量同口径）
+        var missing = OpsCommon.routeAltitudeBounds({})
+        compare(missing.endWaypointId, null, "键缺失 ⇒ null")
+        compare(missing.endLat, null)
+        compare(missing.endLon, null)
+        // 后端在**没有终点航点**时把经纬度 COALESCE 成 0 ⇒ `pick(0)` 回**数字 0**（不是 null）
+        var noEnd = OpsCommon.routeAltitudeBounds({ end_waypoint_id: null, end_waypoint_lat: 0, end_waypoint_lon: 0 })
+        compare(noEnd.endWaypointId, null, "可空列 NULL ⇒ pick 回 null")
+        compare(noEnd.endLat, 0, "COALESCE 后的 0 是**数字 0**，不是 null")
+        compare(noEnd.endLon, 0)
+    }
+
+    /// 扩键之后，既有的六个高度量 + 两个合成量**逐字不变**（回归护栏），
+    /// 且合成量必须与单点定义 `nrrsmEffectiveAGL` **完全一致**（B7 的承重点）。
+    function test_routeAltitudeBounds_existingKeysUnchangedAfterA1() {
+        var b = OpsCommon.routeAltitudeBounds(_routeAltSix())
+        compare(b.takeoffAGL, 150, "合成量仍取两侧大者")
+        compare(b.landingAGL, 200)
+        compare(b.takeoffGroundMSL, 100, "原始量仍在")
+        compare(b.landingGroundMSL, 50)
+        compare(b.takeoffAGL, OpsCommon.nrrsmEffectiveAGL(b.takeoffAltAGL, b.takeoffClearAGL),
+                "bounds 的合成量必须与单点定义 nrrsmEffectiveAGL 完全一致")
+        compare(b.landingAGL, OpsCommon.nrrsmEffectiveAGL(b.landingAltAGL, b.landingClearAGL),
+                "bounds 的合成量必须与单点定义 nrrsmEffectiveAGL 完全一致")
+    }
+
+    //-------------------------------------------------------------------------
+    // W1（2026-10-01）：NRRSM「一个 AGL 米值是否已设定」的可测谓词
+    //
+    // ‼️ `0` 在本系统里是「未设定」的**编码**，不是「贴地飞」这个合法高度 ——
+    //    判据 4/7 下 `cruise_alt_agl = 0` 会算出「飞行高度 = 航点地面海拔」，
+    //    也就是降到**地形高度平飞**。起飞/降落两端同理。
+    //    「三道高度闸收敛到同一个谓词」的**唯一承重点就在本组**（`OpsRouteSync.qml`
+    //    全仓零测试 ⇒ 那边改了没有测试会红）。
+    //
+    // ‼️ 每一格**单独一个测试函数**（不是把七条 `compare` 塞进一个函数）：
+    //    QtTest 里一格里第一处 `compare` 失败即中止该格，合并成一格的话
+    //    变异只能数出「打到没打到」，分辨不出**打到哪几格** —— 而红格清单正是判据。
+    //-------------------------------------------------------------------------
+
+    /// 格 1 · 阳性对照 —— 只写「0 被拒」时，`return false` 这种常数实现**也全绿**。
+    function test_nrrsmUsableAGL_positiveNumberIsUsable() {
+        compare(OpsCommon.nrrsmUsableAGL(50), true, "50 ⇒ 已设定")
+        compare(typeof OpsCommon.nrrsmUsableAGL(50), "boolean", "必须是真布尔，不是 1/0")
+    }
+
+    /// 格 2 · 核心：`0` = 未设定（判据 4 的编码）。
+    function test_nrrsmUsableAGL_zeroIsNotUsable() {
+        compare(OpsCommon.nrrsmUsableAGL(0), false, "0 ⇒ 未设定，不是「贴地飞」")
+    }
+
+    /// 格 3 · 负值。
+    function test_nrrsmUsableAGL_negativeIsNotUsable() {
+        compare(OpsCommon.nrrsmUsableAGL(-1), false, "负值 ⇒ 不可用")
+    }
+
+    /// 格 4 · QML `property real` 的缺省值就是 `NaN`（没取到值时的形态）。
+    function test_nrrsmUsableAGL_nanIsNotUsable() {
+        compare(OpsCommon.nrrsmUsableAGL(NaN), false, "NaN ⇒ 不可用")
+    }
+
+    /// 格 5 · 键缺失。
+    function test_nrrsmUsableAGL_undefinedIsNotUsable() {
+        compare(OpsCommon.nrrsmUsableAGL(undefined), false, "undefined ⇒ 不可用")
+    }
+
+    /// 格 6 · 类型判据 —— 只写 `v > 0` 的实现会**静默放行**字符串 `"50"`（JS 里 `"50" > 0` 为真）。
+    function test_nrrsmUsableAGL_numericStringIsNotUsable() {
+        compare(OpsCommon.nrrsmUsableAGL("50"), false, "字符串 \"50\" ⇒ 不可用（类型判据，不是装饰）")
+    }
+
+    /// 格 7 · 有限性。
+    function test_nrrsmUsableAGL_infinityIsNotUsable() {
+        compare(OpsCommon.nrrsmUsableAGL(Infinity), false, "Infinity ⇒ 不可用（有限性）")
     }
 }

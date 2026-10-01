@@ -724,14 +724,71 @@ function middleSectionSplit(tasks, selectedRouteId, handoverById) {
 // ‼️ 保留这个函数、而不是让调用方自己拼：它是**拼接顺序的单点**——顺序写反
 //    （`second.concat(first)`）的症状是**异常航班沉到底部**，而"异常常驻置顶"正是用户
 //    裁定 ⑥ 的核心，沉底看起来只是"排序怪怪的"。
-// ⚠️ 生产调用点实测**只有 `RomView` 一处**（其 `_panelTasks`；同一视图另有一个 `_panelSplit`
-//    属性供分段渲染取 `first.length`，两者传同一组实参，而 `middleSectionSplit` 是纯函数
-//    ⇒ 调两次与调一次等价）。本条注释 2026-09-29 曾写成「调用点有多个（站点视图 /
-//    监控员视图 / 历史）」——逐处 `rg` 核实后**无一存在**，那是凭印象写的。
+// ⚠️ 生产调用点实测**只有 `RomView._panelTasks` 一处**。本条注释 2026-09-29 曾写成
+//    「调用点有多个（站点视图 / 监控员视图 / 历史）」——逐处 `rg` 核实后**无一存在**，
+//    那是凭印象写的。同日那个供分段标题取 `first.length` 的 `_panelSplit` 也已随段头
+//    删除（用户裁定「两行段头全删」）⇒ `middleSectionSplit` 现在**只**被本函数调用。
+//    ⚠️ 但**不要**因此把 `middleSectionSplit` 并回本函数：两节的分法（第 1 节不受航线
+//      过滤）是裁定 ⑥ 的落点，留着它才有一条能单独测的边界。
 //    动这个函数之前先重新数一遍调用点，别照抄上面的结论。
 function middleSectionTasks(tasks, selectedRouteId, handoverById) {
     var s = middleSectionSplit(tasks, selectedRouteId, handoverById)
     return s.first.concat(s.second)
+}
+
+// 航线列表面板的显示顺序：**有告警的航线置顶**，组内保持原自然顺序（稳定分区）。
+// 用户 2026-09-29 要求：「如果有航班告警，则航线列表、航班列表中告警对应的航线、
+// 航班置顶」。航班侧由 `middleSectionSplit` 的第 1 节承担（现状即符合，本函数不碰）。
+// ‼️ 判据 = **真值即告警**（`!!r.has_abnormal`），该字段由 `OpsShell._routeRows` 用
+//    `g.some(isAbnormal)` 算出，是真 bool。ⓐ 写成 `r.has_abnormal !== false`
+//    （"不是明确的 false 就算告警"）的后果不是"多置顶几条"，而是**缺键的行全被判成
+//    告警** ⇒ 整张表都在置顶组里、顺序反而不变，症状只是"排序没生效"，不报错。
+//    ⓑ 反过来写成 `=== true` 则会把真值 1 / 非空串静默漏掉（不置顶），同样不报错。
+// ‼️ 稳定分区而非重新排序：`_routeOrder` 是后端给的**名册顺序**，客户熟悉它；
+//    组内一旦按告警数 / route_id 之类重排，用户看到的顺序会随告警多少而整体错位。
+// ⚠️ 生产调用点**只有 `OpsShell._routeRows` 一处**
+//    （`return OpsCommon.routesAbnormalFirst(OpsCommon.routesWithTasks(out))` —— 2026-10-01 逐字核对）。
+//    动它之前先现场复跑 `rg -n 'routesAbnormalFirst' src/ test/` 重新数一遍。
+// ⚠️ 纯函数、不就地排序：`_routeRows` 是 `readonly property var` 绑定，入参那个数组
+//    可能正被别的绑定持有；`sort()` 原地改会让无关视图跟着变，且**没有报错**。
+function routesAbnormalFirst(routes) {
+    if (!routes || !routes.length) return []
+    var top = [], rest = []
+    for (var i = 0; i < routes.length; i++) {
+        var r = routes[i]
+        if (r && r.has_abnormal) top.push(r)
+        else rest.push(r)
+    }
+    return top.concat(rest)
+}
+
+// 规则 1（用户 2026-09-29 原话）：「航线列表中列出当前有执行任务的航线」
+// ⇒ 只保留**当前有航班**的航线行，没有航班的整行不进右栏列表。
+//
+// 此前 `_routeRows` 对名册里每条航线都 push 一行，哪怕它一条航班都没有——
+// 界面上就是一行 `active_count: 0` 的空行。名册（`table_route_monitor`）是**长期绑定**，
+// 而"当前有没有航班"是 2s 一变的状态，两者本来就不同寿命。
+//
+// ‼️ 判据 `Array.isArray(t) && t.length > 0`，**不是** `t.length > 0`、更不是 `t != null`：
+//   · `t != null` ⇒ `[]` 也算有航班 ⇒ 本规则整个失效；
+//   · `t.length > 0` ⇒ 数据源从数组变成别的真值（如字符串）时，`.length` 恰好也是个正数
+//     ⇒ 多出一行渲染不出卡片的航线，且不报错；
+//   · `{}` 的 `.length` 是 `undefined`，`undefined > 0` 为 false ⇒ 两条写法都拦住它，
+//     所以**光靠 `{}` 试不出这个洞**（本函数单测里 `"ab"` 那一格才是抓它的）。
+//
+// ⚠️ 只管收窄，**不管排序**——顺序是 `routesAbnormalFirst` 的事，两个函数串起来用：
+//   `routesAbnormalFirst(routesWithTasks(rows))`。先收窄再置顶，与先置顶再收窄等价
+//   （收窄是纯筛选、不改相对顺序），但把收窄放里层少一次遍历。
+function routesWithTasks(routes) {
+    if (!routes || !routes.length) return []
+    var out = []
+    for (var i = 0; i < routes.length; i++) {
+        var r = routes[i]
+        if (!r) continue
+        if (!Array.isArray(r.tasks) || r.tasks.length === 0) continue
+        out.push(r)
+    }
+    return out
 }
 
 // 从 ③ 的 `devices[]` 提取要推给 C++ 的 device_id 清单（§2.3 / §3.5.3）。
@@ -1203,6 +1260,14 @@ var MAV_VTOL_STATE_TRANSITION_TO_MC = 2
 ///    `MAV_CMD_NAV_VTOL_LAND(85)` —— 飞机在终点**转多旋翼着陆**，而不是像固定翼
 ///    那样绕终点一直盘旋（用户实测的故障现象）。用户不用额外操作，画完航线就带降落。
 ///
+/// ❌ **【2026-10-01 裁定 R-A1：`isEnd === true` 这一支在生产路径上永不可达】**
+///    `OpsRouteSync.qml` 调用 `routeMissionItems` 时第三个实参（`endWaypointId`）**刻意传
+///    `undefined`** ⇒ `_endWaypointIndex` 恒回 `-1` ⇒ 没有 `i === endIdx` 的点 ⇒
+///    `isEnd` 恒为 `false` ⇒ 本函数的 21 分支**恒走 `return MAV_CMD_NAV_WAYPOINT`**。
+///    依据是用户 A1 原话「是由一系列航点组成」+ 运行红线「除非要坠机了，否则飞机只能在
+///    机位上降落」（85 会落在**站点航点**上，坐标 ≠ 机位坐标）。详见 `_endWaypointIndex`。
+///    ⚠️ 本行**只是说明可达性**，不是说要把 `isEnd` 那一支删掉 —— 留着以便将来若 R-A1 被推翻时恢复。
+///
 /// 未知值一律 `null`（fail-closed），由调用方把整条航线作废。
 ///
 /// @param c      设计域 command（`16` 普通航点 / `21` 站点）
@@ -1236,21 +1301,67 @@ function _designCommandToMavCmd(c, isEnd, isVtol) {
 ///    插一个 home 点（`command=-1`）；**唯独不读** `table_route.start_waypoint_id` /
 ///    `end_waypoint_id` 这两列 ⇒ 始发站 / 终点站**不在返回列表里**。
 ///    （2026-09-29 审查 A5 修正：原注释写「只读 `table_route_waypoint` 一张表」——错，
-///      它还读 `plan_data`。⚠️ 这个过简的措辞是从后端照抄的，`ops.go:584-586` 亦然。）
-///    对照：`ops.go` 的 `buildTaskWaypoints`（`:414`）才额外把这两列读进来拼在首尾
-///    （该口径差记在 `ops.go:584-586`；原注释引 `545-548`，是 2026-09-29 审查 A3 修正的错行号）。
-///  · 实测样本 **RT-003**（真库）：`start=2` 北七家镇政府 / `end=5` 保定市政府，
+///      它还读 `plan_data`。⚠️ 这个过简的措辞是从后端照抄的，`handlers/ops.go` 的
+///      `MyRouteWaypoints` 一带亦然 —— **按函数名定位，别按行号**。）
+///    对照：`handlers/ops.go` 的 `buildTaskWaypoints` 才额外把这两列读进来拼在首尾
+///    （该口径差记在 `handlers/ops.go` 的 `MyRouteWaypoints` 函数头注释里，写着「已知且本次不修
+///     的口径差」—— **按函数名 / 那句话定位，别按行号**；原注释引 `ops.go` 两个行号区间，
+///     是 2026-09-29 审查 A3 修正的错行号，本轮 2026-10-01 把行号定位本身也去掉）。
+///
+/// ⚠️ **本段以下所有「云端权威库」读数的出处等级**：它们不是本任务测的，是
+///    **控制方（编排者）2026-10-01 只读实测**；采集口径 = `ssh root@39.97.235.226`、
+///    库 `/opt/uavm/var/db_uavm.db`、**只读**打开（`file:...?mode=ro&immutable=1`）、
+///    范围 = `table_route` 中 `deleted_at IS NULL` 的**全量 7 条**（口径可当场重跑，见
+///    **计划工作区**里的 `~/uavm/uavm/.superpowers/sdd/新航线设定方式-实施计划-20260930/cloud-readings-20261001.txt`
+///    的逐字原始输出；该文件在**计划工作区根**，**不在 `src/` 或 `test/` 下的任何相对路径上**）。
+///    **本任务（QGC 仓）无云端凭据，未独立复核** —— 读成"实现者查过云端"即是误读。
+///  · 实测样本 **RT-003**（**云端权威库**，2026-10-01 逐条复核；本机 `db_uavm.db` 是
+///    2026-09-26 的陈旧副本、**连 NRRSM 的列都没有**，别拿它当判据）：
+///    `start=2` 北七家镇政府 / `end=5` 保定市政府，
 ///    而返回列表只有 `seq=0 → wp3` 良乡区政府(cmd 21) 与 `seq=1 → wp4` 房山镇政府(cmd 16)
 ///    ⇒ 列表"最后一项"是**中途点**。按它打 85 ⇒ **飞机在房山镇政府降落**，
 ///    而任务的目的地是保定市政府 —— 正是用户红线上"只能在机位上降落"那一类事故。
-///  · 反例 **RT-SITL01**：`start=26` / `end=28` **恰好也在** `table_route_waypoint` 里
-///    （seq 0/1/2 → wp 26/27/28）⇒ "最后一项"在那条航线上**恰好**对。
-///    ⚠️ **这正是该推断能在 SITL 上验出"能用"的原因**，也是它最危险的地方：
-///    拿 SITL 那条航线当判据的样本，会得到一个假绿的 ✓。
+///  · 反例 **RT-006**（云端权威库航线 id 23，2026-10-01 复核）：`start=1` / `end=2`
+///    **恰好也在** `table_route_waypoint` 里（两行 → wp1 / wp2，且 wp2 排在末位）
+///    ⇒ "最后一项"在那条航线上**恰好**对。
+///    ⚠️ **这正是该推断最危险的地方**：拿这条航线当判据的样本，会得到一个假绿的 ✓。
+///    ⚠️ 出处更正（修复轮 2 / 3）：本节原先引的反例是 **`RT-SITL01`**。
+///       **该航线在权威库里存在**（航线 id 24，`route_code='RT-SITL01'`，
+///       `route_name='SITL 苏黎世调试航线'`）—— **变的是它的数据**：
+///       权威库现行值为 `start_waypoint_id=NULL` / `end_waypoint_id=NULL`，
+///       且 `table_route_waypoint` **零行**；另据同一次控制方读数，
+///       该行 `deleted_at='2026-10-01 00:58:29'` ⇒ **它已被软删除**。
+///       （‼️ 本句只登记"同时存在"这两类事实，**不推断**「被软删 ⇒ 关联行被清空」的因果 ——
+///         控制方没有那个因果的证据。出处等级同本段上文那条标注。）
+///       而原注释引的 `start=26` / `end=28`、三行 `wp 26/27/28`，在
+///       **2026-09-26 的本机 `db_uavm.db` 陈旧副本**里**逐字可复现**
+///       ⇒ 那组数字取自该副本，**09-26 之后数据被改动过**，样本已不可用。
+///       结论不变（"按位置推断终点"照样被推翻），样本已换成权威库现行的 **RT-006**（id 23）。
 ///
-/// ⚠️ 于是本函数在**当前**数据源下恒回 `-1`（列表里没有 `id` 等于 `endWaypointId`
-///    的点）⇒ 垂起着陆**不会触发**，行为与本改动之前完全一致。
-///    解封条件与下一步动作见 `OpsRouteSync.qml` ⑤a 的注释。
+/// ⚠️ 于是本函数在**当前调用方式**下恒回 `-1`：调用方 `routeMissionItems` 收到的第三个实参
+///    恒为 `undefined`（裁定 R-A1，见下）⇒ `endWaypointId` 不可用 ⇒ 第 0 行就回 `-1`。
+///    （**别把它写成"列表里没有 id 等于 `endWaypointId` 的点"** —— 云端 4 / 5 / 23 三条
+///     的列表里**就有**这样的点；本条恒 `-1` 的原因是**实参**，不是数据。）
+///    ⇒ 垂起着陆**不会触发**，行为与本改动之前完全一致。
+///
+/// ❌ **【2026-10-01 裁定 R-A1：不解封，且永不靠它产生 85】** —— 本节原文写的是"解封条件与
+///    下一步动作"，已被裁定**推翻**，别再把它读成"待办"：
+///    · 用户 A1 原话：「qgc发给px4的航线中**没有降落点**，是由一系列航点组成」⇒ 末项是
+///      **普通航点**；末尾那一点由 `appendLandingWaypoint`（A1）**追加**，而不是把某点打成 85。
+///    · 用户的运行红线「**除非要坠机了，否则飞机只能在机位上降落**」：85 会让 PX4 落在
+///      **站点航点**上，而站点航点坐标 **≠ 机位坐标** ⇒ 打 85 就是把飞机落在站上而不是机位上。
+///      真正的降落走的是**另一条链**（Guided goto 到接机机位）。
+///    ⇒ `OpsRouteSync.qml` 调用 `routeMissionItems` 时**第三个实参继续传 `undefined`**：
+///      那是**裁定**，不是"忘了接"。本函数因此在**生产路径上恒不被命中**。
+///
+/// ‼️ **若将来有人推翻 R-A1 去打 85**：NRRSM 的降落高度会在「85 恰好落在末项」的航线上
+///    静默失效（设计稿 `新航线设定方式-设计稿-20260930.md` §5.3 用「必须」点名了这条耦合）。
+///    **触发条件是"打 85"本身，与是否把两个判据合并无关**；届时**没有任何测试会红**。
+///    ⚠️ 会不会咬人，用**两条充要条件**自己判（别去记情形清单，清单只是举例）：
+///      · 「会打出 85」 ⟺ 该项 `command === 21` ∧ `i === endIdx` ∧ 机型为 VTOL；
+///      · 「降落高度真的被覆盖」 ⟺ 上一条成立 **且** 那个 85 正好落在 `items.length - 1` 上。
+///    ⇒ **本函数既不判断两者是否同一项，也不判断该项是不是站点**（见 `applyLandingAltitude`
+///    的注释）。逐情形实测可复跑：`final-fix3-calib.js`。
 ///
 /// @param endWaypointId 航线终点航点 id（`table_route.end_waypoint_id`）。
 ///        只认 JSON number 且 `> 0`；其余一切取值（含 `undefined` / `0` / `null`
@@ -1292,14 +1403,28 @@ function _endWaypointIndex(wps, endWaypointId) {
 /// @param endWaypointId 航线终点航点 id（`table_route.end_waypoint_id`）。只有它能在
 ///        列表里**指认出**终点；指认不出（含不传 / `undefined`）⇒ 本函数**不产生**
 ///        垂起着陆。判据与真库证据见 `_endWaypointIndex` 的注释。
-/// @return `[{command, lat, lon, alt, frame}]`；任一输入不可用 ⇒ `[]`
-function routeMissionItems(wps, isVtol, endWaypointId) {
+/// @param cruiseAGL 本架次飞行高度（**AGL，米**）。中间项按其「该航点地面海拔 + `cruiseAGL`」
+///        组装（设计稿 §5.2 规则表第 2 行）。**数值 `0` 是合法输入**（本仓口径：`0` = 未设定）
+///        ⇒ 输出与加本参数之前**逐字相同**；「`0` 该不该起飞」是**闸**的事（`takeoffAGL > 0`），
+///        不是本函数的事 —— 本函数只做算术。
+///        ‼️ 不可用（`undefined` / `NaN` / 非数字）⇒ **整条航线作废（回 `[]`）**，与下面
+///        「任何一点不可用 ⇒ 整条航线作废」同一取向：把不可用的 `cruiseAGL` 静默当 `0`
+///        正是本函数要杀的那种「少一个偏移、零报错」缺陷；回 `[]` 让调用方看到**响亮**的失败。
+/// @return `[{command, lat, lon, alt, frame}]`；任一输入（含 `cruiseAGL`）不可用 ⇒ `[]`
+function routeMissionItems(wps, isVtol, endWaypointId, cruiseAGL) {
     if (!wps || !wps.length) return []
+    // ‼️ `cruiseAGL` 不可用 ⇒ 整条航线作废（回 `[]`），**不是**"按 0 处理"。
+    //    判据形式与下面各点同口径：按类型 + 有限性收。负数是**业务校验**的事
+    //    （后端 `cruise_alt_agl < 0 ⇒ 报错`），本函数**不做额外拒绝**、照常参与算术。
+    if (typeof cruiseAGL !== "number" || !isFinite(cruiseAGL)) return []
     // ‼️ 「哪一点是终点」由**航线自己的终点航点 id** 指定，不许按"列表最后一项"推断
     //    （真库实测推翻了那个推断，证据见 `_endWaypointIndex`）。
     //    当前数据源下恒为 `-1` ⇒ 垂起着陆不触发，行为与改动前一致。
     var endIdx = _endWaypointIndex(wps, endWaypointId)
     var out = []
+    // ‼️ 「末项」的下标。它同时是「要不要给这一点加 `cruiseAGL`」的分界（见下方注释）。
+    //    口径与 `applyLandingAltitude` 的 `items.length - 1` **一致**：都是"出参的最后一项"。
+    var lastIdx = wps.length - 1
     for (var i = 0; i < wps.length; i++) {
         var w = wps[i]
         if (!w) return []
@@ -1327,8 +1452,117 @@ function routeMissionItems(wps, isVtol, endWaypointId) {
         // 且口径是"任一轴为 0 即无效"，比原先自写的"两轴同时为 0"更严。
         if (!isValidWaypoint(lat, lon)) return []
         if (!isFinite(alt)) return []
-        out.push({ command: mavCmd, lat: lat, lon: lon, alt: alt, frame: MAV_FRAME_GLOBAL })
+        // 中间项 = 该航点地面海拔 + 本架次飞行高度（设计稿 §5.2 规则表第 2 行）。
+        // ‼️ 条件是 `i < lastIdx`（即出参里"不是最后一项"），**不是** `0 < i`。
+        //    「起飞项」是 QGC 自己插的 `NAV_TAKEOFF`，**不在本函数的产出里** ⇒
+        //    本函数的**第 0 项是航线的第一个中间航点**，它**要**加 `cruiseAGL`。
+        //    写成 `i > 0` 会让首个中间航点少一个巡航高度偏移 —— 整条航线的第一个点
+        //    比其余中间点低 `cruiseAGL` 米，**界面上完全看不出来**。
+        //    「末项」保持原样（`alt` 逐字不变），由 `applyLandingAltitude` 覆盖成
+        //    降落站点地面海拔 + max(...)。
+        var missionAlt = (i < lastIdx) ? alt + cruiseAGL : alt
+        out.push({ command: mavCmd, lat: lat, lon: lon, alt: missionAlt, frame: MAV_FRAME_GLOBAL })
     }
+    return out
+}
+
+/// 把「**降落站点对应的航点**」追加为航点序列的**末项**（NRRSM A1，2026-10-01）。
+///
+/// 用户 A1 原话：「qgc发给px4的航线中**没有降落点**，是由一系列航点组成。A1 就是**最后一个航点**
+/// （同时也是降落站点所在位置，**经纬度由降落站点对应的航点的经纬度定**，高度由
+/// `max(table_route.landing_alt_agl, table_site.clear_alt_agl) + table_waypoint.altitude`
+/// （降落站点对应航点）定）」。
+/// 「降落站点对应的航点」= `table_route.end_waypoint_id` 所指的那一个航点
+/// （既有派生链 `handlers/task.go` 的 `landingSiteOfRouteEnd` 已确认两者同一，
+/// 见后端 `route_end_site_test.go` 的 `TestRouteEndSiteMatchesTaskDerivation`）。
+///
+/// ‼️ **这是一条普通航点，不产生 `85 NAV_VTOL_LAND`**（裁定 R-A1，2026-10-01）：
+///    用户原话是「是由一系列航点组成」；而 85 会让 PX4 落在**站点航点**上，
+///    与用户红线「除非要坠机了，否则飞机只能在机位上降落」冲突 —— 真正的降落走的是
+///    **另一条链**（Guided goto 到接机机位），**站点航点坐标 ≠ 机位坐标**。
+///    所以本函数产出的追加项 `command` 取**设计域的 `21`（"站点"标记）**，它在
+///    `_designCommandToMavCmd(21, false, …)` 下映射成 `16 NAV_WAYPOINT` —— 正是要的落点。
+///    ⚠️ 设计域的 `21` 与 MAVLink 的 `NAV_LAND(21)` **数值巧合、语义无关**（见 `_designCommandToMavCmd`）。
+///
+/// 为什么必须追加：`GET /api/routes/:id/waypoints`（后端 `route.go` 的 `ListWaypoints`）
+/// **不返回起降点** ⇒ 固定航线的 mission 现在结束在一个**中途点**上，而不是降落站点。
+///
+/// ‼️ **覆盖声明按"形状"写，不按航线号写**（航线号会随库漂移，且读的人会把它当覆盖证明）：
+///    · 走**行为 1（追加分支）**的样本形状 =「返回列表**非空**、且终点**不在**其中」；
+///    · 走**行为 2（原样返回）**的样本形状 =「终点**在**列表里且**恰为末项**」；
+///    · 返回列表**为空**的航线会先被**行为 7** 拦成 `[]`，**根本不经过追加分支**
+///      —— 别把它算进行为 1 的覆盖里。
+///    ⚠️ 出处（2026-10-01 **云端权威库**逐条复核；本机 `db_uavm.db` 是 2026-09-26 的陈旧副本、
+///       连 NRRSM 的列都没有，**别拿它当判据**）：非空且终点不在其中的有 1 / 20 / 21；
+///       终点恰为末项的有 4 / 5 / 23；返回列表为空的有一条（零行）。
+///    ⚠️ **出处等级**：上面这些读数**不是本任务测的**，是**控制方（编排者）2026-10-01
+///       只读实测**；采集口径 = `ssh root@39.97.235.226`、库 `/opt/uavm/var/db_uavm.db`、
+///       **只读**打开（`file:...?mode=ro&immutable=1`）、范围 `table_route` 中
+///       `deleted_at IS NULL` 的全量 7 条。**本任务（QGC 仓）无云端凭据，未独立复核。**
+///
+/// 失败一律回 `[]`（**整条作废，fail-closed**）—— 与 `routeMissionItems` 同一取向：
+/// 把不可用的输入静默按 0 / 跳过处理，会让飞机飞出一条用户没画过的路径，而界面上零报错。
+/// ‼️ 但"要看哪些输入"是**可计算**的：只有**会被本函数用到的**输入不可用才作废。
+///    `endLat` / `endLon` / `endGroundMSL` **只在追加分支被读到** ⇒ 它们不参与
+///    「末项已是终点」那一档的判定（裁定 B，2026-10-01）。签名里出现 ≠ 会被用到。
+///
+/// @param wps 航点数组（`GET /api/routes/:id/waypoints` 的响应，调用方已摘掉 `command === -1` 的 home 项）
+/// @param endWaypointId 航线终点航点 id（`route.end_waypoint_id`）。只认 JSON number 且 `> 0`
+///        ——口径与 `_endWaypointIndex` **逐字相同**。
+/// @param endLat 终点航点纬度（`route.end_waypoint_lat`）—— 仅追加分支消费
+/// @param endLon 终点航点经度（`route.end_waypoint_lon`）—— 仅追加分支消费
+/// @param endGroundMSL 终点航点的**地面海拔**（`route.landing_ground_msl`，MSL 米）
+///        —— 仅追加分支消费
+/// @return 新数组（**不原地改入参**）。判据 =「**会被本函数用到的**输入不可用 ⇒ `[]`」
+///        （整条作废，fail-closed）；**不是**「签名里出现过的每个参数」。
+function appendLandingWaypoint(wps, endWaypointId, endLat, endLon, endGroundMSL) {
+    // 行为 7：空 / 非数组 ⇒ 作废。
+    if (!Array.isArray(wps) || !wps.length) return []
+    // 行为 4：与 `_endWaypointIndex` 逐字同口径（只认 JSON number 且 `> 0`）。
+    if (typeof endWaypointId !== "number" || !isFinite(endWaypointId) || endWaypointId <= 0) return []
+    // 行为 2：末项**恰好**就是终点 ⇒ 原样返回（浅拷贝），**不重复追加**。
+    //  云端真库 4 / 5 / 23 就是这个形状；重复追加会让飞机到终点后再多飞一段回头路。
+    //  ⚠️ 出处等级：「云端真库 4 / 5 / 23」这条读数**不是本任务测的**，是**控制方（编排者）2026-10-01 只读实测**；
+    //     采集口径 = `ssh root@39.97.235.226`、库 `/opt/uavm/var/db_uavm.db`、**只读**打开
+    //     （`file:...?mode=ro&immutable=1`）、范围 `table_route` 中 `deleted_at IS NULL` 的全量 7 条。
+    //     **本任务（QGC 仓）无云端凭据，未独立复核。**
+    //  ‼️ **本档不读 `endLat` / `endLon` / `endGroundMSL`** —— 点已经在列表里，那三个值
+    //     在这条路上一次都用不到。要求它们也可用＝守卫过宽，会平白砍掉本来能发的航线
+    //     （裁定 B：真相是"**会被用到的**输入不可用才作废"）。末项坐标真坏掉时，
+    //     下游 `routeMissionItems` 会逐点校验 `lat` / `lon` / `altitude` 并回 `[]`
+    //     （`isValidWaypoint` 口径），由那边报**更贴近真相**的那句话。
+    //  行为 3 的判据也必须在坐标校验**之前** —— 见本函数末尾的"顺序是承重点"注。
+    var last = wps[wps.length - 1]
+    if (last && typeof last.id === "number" && last.id === endWaypointId) return wps.slice()
+    // 行为 3：终点**在列表里但不是末项** ⇒ 作废（fail-closed）。
+    //  追加会**绕回**、不追加则末项不是降落点 —— 两条路都会飞出一条用户没画过的路径，
+    //  所以选"响亮地失败"。
+    //  ‼️ 出处（2026-10-01，**云端权威库全量**、7 条航线逐一核算落点）：行为 1 = 1 / 20 / 21；
+    //     行为 2 = 4 / 5 / 23；行为 7 = 22（零行）；**无一落到行为 3**。
+    //     写"不存在"必须能指到**哪台机、哪个库、多大范围** —— 本句指的是云端权威库全量 7 条，
+    //     不是"我没见过"。库一变这句就可能过期，届时以现场复跑为准。
+    //  ⚠️ 出处等级：上面这组读数**不是本任务测的**，是**控制方（编排者）2026-10-01 只读实测**；
+    //     采集口径 = `ssh root@39.97.235.226`、库 `/opt/uavm/var/db_uavm.db`、**只读**打开
+    //     （`file:...?mode=ro&immutable=1`）、范围 `table_route` 中 `deleted_at IS NULL` 的全量 7 条。
+    //     **本任务（QGC 仓）无云端凭据，未独立复核。**
+    for (var i = 0; i < wps.length; i++) {
+        var w = wps[i]
+        if (w && typeof w.id === "number" && w.id === endWaypointId) return []
+    }
+    // ⛔ 以上是「终点已经在 `wps` 里」的两档；以下是**追加分支**（终点不在序列里）。
+    //    ↑ 顺序是承重点：把下面两道守卫挪到行为 2 之前，4 / 5 / 23 那三条本来能发的
+    //      航线会因一个与它们正确性无关的后端字段而拒发。
+    // 行为 5：坐标复用本文件的单点定义 `isValidWaypoint`。后端在**没有终点航点**时把
+    //  `end_waypoint_lat` / `end_waypoint_lon` 两键 `COALESCE` 成 `0`，而它的口径是
+    //  "任一轴为 0 即无效" ⇒ 这一条同时也是"后端没给终点"的第二道闸。
+    //  ‼️ 先 `Number()` 收敛：`null` ⇒ `0`、`undefined` ⇒ `NaN`，两者都过不了 `isValidWaypoint`。
+    var lat = Number(endLat), lon = Number(endLon)
+    if (!isValidWaypoint(lat, lon)) return []
+    // 行为 6：地面海拔必须是有限的 JSON number（字符串 / `null` / `NaN` 一律作废）。
+    if (typeof endGroundMSL !== "number" || !isFinite(endGroundMSL)) return []
+    // 行为 1：追加为**末项**。入参不被修改（`slice()` 后再 push）。
+    var out = wps.slice()
+    out.push({ id: endWaypointId, lat: lat, lon: lon, altitude: endGroundMSL, command: 21 })
     return out
 }
 
@@ -1337,15 +1571,308 @@ function routeMissionItems(wps, isVtol, endWaypointId) {
 /// 航线不可用 ⇒ `NaN`（**不是 0**）：回 0 会让飞机起飞到"AMSL 0 米"，
 /// 而那个数字在界面上看不出错。
 /// ‼️ 但**数值 0 是本函数有意放行的**（理由见 `routeMissionItems` 内注释）⇒ 调用方
-///    **只判 `isNaN` 是拦不住起飞的**，必须用值域判据。真实调用方
-///    `OpsRouteSync.qml` 用的是 `!(takeoffAlt > 0)`（`NaN > 0` 为 false ⇒ 取反为真 ⇒ 拦住）。
+///    **只判 `isNaN` 是拦不住起飞的**，必须用值域判据。本函数**当前的**调用方只有用例；
+///    历史上 `OpsRouteSync.qml` 用的是 `!(takeoffAlt > 0)`（`NaN > 0` 为 false ⇒ 取反为真 ⇒ 拦住），
+///    那道闸现在读的是航线的 `takeoff_alt_agl`，但**判据形状一字未改** —— 形状是本条的承重点。
+/// ⚠️ NRRSM（2026-09-30）：本函数的语义（取**首个中间航点**的高度）在 NRRSM 下**已不是**起飞高度 ——
+///    起飞项高度改由航线的 `takeoff_alt_agl` 提供（见 `routeAltitudeBounds`）。**别再往新代码里接。**
+///    ⏱️ 时点说明（2026-09-30 fix round 2 重写）：**产线调用点已归零** —— `src/` 之内除本定义处
+///    以外**没有任何调用**（"调用"＝标识符后紧跟左括弧的形态），调用方只剩单测
+///    `test/UnitTestFramework/QmlTesting/tests/tst_OpsCommon.qml`。
+///    `OpsRouteSync.qml` 里那道旧闸已换成读航线 `takeoff_alt_agl` 的两道同形闸（起飞 / 降落各一）。
+///    ⚠️ **核验时请搜"调用形态"，不要搜裸标识符** —— 裸标识符会把**引用它的注释**一并数进来：
+///    本文件里 `routeMissionItems` 的注释就引了它（讲 `0` 为何被放行那一段），本注释自己也曾引它
+///    ⇒ 任何"只剩定义处"式的结论都会被注释自己证伪。
+///    （fix round 1 正是这么错了一次：判据的表达式不得出现在它自己统计的语料里。）
+///    保留实现与既有用例，**仅供回退**。
 function takeoffAltitude(wps) {
-    // ‼️ **有意不传 `isVtol` / `endWaypointId`**：垂起着陆只改**终点站那一点**的
+    // ‼️ **有意不接 `isVtol` / `endWaypointId`**（下面显式传 `false` / `null`）：垂起着陆只改**终点站那一点**的
     //    `command`，既不改变航线是否可用（`length`），也不碰**首点**的高度
     //    ⇒ 本函数与机型、与终点在哪都无关。
     //    传了也不会错，但那会让下一个人以为"起飞高度跟机型/终点有关"。
-    var items = routeMissionItems(wps)
+    // ‼️ 显式传 `0` 是**刻意**的：本函数在 NRRSM 下已不是"起飞高度"（见其函数头注释），
+    //    保留仅为回退。传 `0` 让它的输出与改动前**逐字相同** —— 别在这里传真值，
+    //    那会让一个已作废的函数看起来还在产线上。
+    //    （`false` / `null` 与原先的隐式 `undefined` 语义等价：`isVtol` 只认真布尔 `true`，
+    //     `endWaypointId` 只认 JSON number 且 `> 0`。显式写出来是为了让"这里没接线"看得见。）
+    var items = routeMissionItems(wps, false, null, 0)
     return items.length ? items[0].alt : NaN
+}
+
+/// NRRSM **D6 硬下限**（`生效值 = max(航线值, 站点最低安全高度)`）的**单点定义**（B7，2026-10-01）。
+///
+/// 起飞侧 / 降落侧各调一次，两处都是它的**调用点**，本仓内不再有第二份 `Math.max` 实现：
+///   · `routeAltitudeBounds` 的两个合成键 `takeoffAGL` / `landingAGL`；
+///   · `OpsRouteSync.qml` 的两个绑定 `_takeoffAGL` / `_landingAGL`。
+/// 要核对当前有哪些调用点，**现场复跑**（别记计数 —— 计数会被下一轮增删当场证伪）：
+///   在 QGC 仓根跑 `rg -n 'nrrsmEffectiveAGL' src/`。
+///
+/// `orZero` 把 `null` / `NaN` / 非数字**一律按 `0` 计**：合成量因此**恒为有限数字**，
+/// `null` 不外传（调用方的闸写的是值域判据 `!(x > 0)`，遇 `null` 会走 JS 隐式转换 ——
+/// 结论碰巧一样，但那是巧合，不是代码）。
+/// ⇒ 两个输入都不可用 ⇒ 合成 `0` ⇒ 闸拦住 ⇒ fail-closed；这与「填了 0（未勘测）」
+///   在闸上**同义**，所以合并成 `0` 不损失分辨力。
+///
+/// ⚠️ **本仓之外还有一处同一规则**（不是本函数的调用点，故意各自独立）：
+///    后端 `gcs_server/handlers/route.go` 的 `nrrsmEffectiveLandingAGL` —— 它只喂
+///    `max_cruise_alt_agl` 的反解与梯度判，**不参与航点飞行高度的组装**。
+///
+/// @param routeAGL     航线侧的 AGL 值（起飞 = `takeoff_alt_agl`；降落 = `landing_alt_agl`）
+/// @param siteClearAGL 该端站点的最低安全高度（AGL）
+/// @return 两侧大者；任一不可用按 `0` 计 ⇒ 恒为有限数字
+function nrrsmEffectiveAGL(routeAGL, siteClearAGL) {
+    function orZero(v) { return (typeof v === "number" && isFinite(v)) ? v : 0 }
+    return Math.max(orZero(routeAGL), orZero(siteClearAGL))
+}
+
+/// NRRSM **「一个 AGL 米值是否已设定」的单点定义**（W1，2026-10-01）。
+///
+/// ‼️ `0` 在本系统里是「未设定」的**编码**，不是「贴地飞」这个合法高度 ——
+///    判据 4（`table_flight_task.cruise_alt_agl` = 离地飞行高度，AGL 米，`0` = 未设定）
+///    与判据 7（飞行高度 = `table_waypoint.altitude + cruise_alt_agl`）下，
+///    `cruise_alt_agl = 0` 算出的「飞行高度」就是**航点地面海拔本身** ——
+///    也就是飞机降到**地形高度平飞**。起飞端 / 降落端同（同一份「AGL 米，`0` = 未设定」语义）。
+///    ⇒ 这不是防御性编程：云端实测 `table_flight_task.cruise_alt_agl` **存量 100% 为 `0`**。
+///
+/// **三道高度闸共用这一个谓词**（`OpsRouteSync.qml` 的 `start()` 里：起飞 / 降落 / 飞行），
+/// 别再各写各的 `> 0` —— 同一件事有两个判据 ⇒ 下一轮改一处漏一处，且两道之间未必等价。
+/// ⚠️ 判的**只是「AGL 项」**。**地面海拔项不要用本谓词** —— 它的 `> 0` 那一步会把
+///    `0`（海平面）/ 负数的**合法**地面海拔误拒；地面海拔项用 `nrrsmFiniteGroundMSL`（紧随其后）。
+///
+/// 判据**三步缺一不可**（按类型 → 有限性 → 值域收）：
+///   · **非 number ⇒ `false`**（含字符串 `"50"` / `undefined` / `null` / 布尔）。
+///     ‼️ 少了这一步，`return v > 0` 这种实现会**静默放行**字符串 `"50"`
+///     —— JS 里 `"50" > 0` 为真（`undefined > 0` 为假只是巧合，不是判据）。
+///   · **非有限 ⇒ `false`**（`NaN` / `±Infinity`）。`NaN` 尤其重要：QML 的 `property real`
+///     缺省值就是它，而 `!isFinite` 与 `!(x > 0)` 都能拦住 `NaN`，但拦不住 `Infinity`
+///     （`Infinity > 0` 为真 ⇒ 会把一个荒谬的巡航高度放进航线）。
+///   · **`<= 0` ⇒ `false`**。**边界是 `<= 0` 不是 `< 0`**：`0` 正是「未设定」的编码。
+///
+/// ⚠️ 本函数**只**回答「这个值可用吗」，**不做**任何取默认值的动作：把不可用值折成 `0`
+/// 或某个缺省高度，正是本条要杀的症状（下游闸会被折出来的合法值架空）。
+///
+/// @param v 待判的 AGL 值（米）
+/// @return 真布尔（`true` / `false`）。非 number / 非有限 / `<= 0` 一律 `false`
+function nrrsmUsableAGL(v) {
+    if (typeof v !== "number") return false
+    if (!isFinite(v)) return false
+    return v > 0
+}
+
+/// NRRSM **地面海拔项**的可用性谓词（I2，2026-10-01）。与 `nrrsmUsableAGL` **并列**，
+/// 但判据**刻意比它宽**：本函数**只判「是不是有限数」**，**不判值域**。
+///
+/// ‼️ **不许拿 `nrrsmUsableAGL` 代替本函数**：它的最后一步是 `v > 0`，而**站点地面海拔
+///    可以是 `0`（海平面）甚至负数（低于海平面）**，那都是**合法**取值 —— 复用会把这类
+///    合法航线一并拒掉。起飞侧 / 降落侧都可能落在海平面机场上，这不是假想输入。
+///
+/// 为什么需要它：`assembledAltitude(groundMSL, agl)` 有**两个**输入项，而三道高度闸
+/// （`nrrsmUsableAGL`）判的都只是 **AGL 项** ⇒ 地面海拔项此前**两侧都没有闸**，三个消费点
+/// （末项 `applyLandingAltitude`、起飞项 `_applyAltitude`、`_statusText` 的两个 `arg`）
+/// **全部无守卫且完全静默**（末项会退回"中间项口径"，即按**巡航高度**飞向降落点）。
+///
+/// 判据两步（缺一不可）：
+///   · **非 number ⇒ `false`**（含字符串 / `undefined` / `null` / 布尔 = 键缺失或类型不符）；
+///   · **非有限 ⇒ `false`**（`NaN` / `±Infinity`）。QML 侧"键缺失"由 `routeAltitudeBounds`
+///     的 `null` 落成 `NaN`，正是靠这一步拦住（fail-closed）。
+///
+/// ⚠️ 与 `nrrsmUsableAGL` 一样，本函数**只**回答「这个值可用吗」，**不做**任何取默认值的动作。
+///
+/// @param v 待判的**地面海拔**（MSL，米）
+/// @return 真布尔（`true` / `false`）。非 number / 非有限一律 `false`
+function nrrsmFiniteGroundMSL(v) {
+    if (typeof v !== "number") return false
+    if (!isFinite(v)) return false
+    return true
+}
+
+/// NRRSM **判据 5 / 6 的最后一跳**（A2，2026-10-01）：**组装式高度** =
+/// 该端**站点航点地面海拔** + 该端 **AGL 生效值**。
+///   · 起飞项 = `assembledAltitude(_takeoffGroundMSL, _takeoffAGL)`   // 判据 5
+///   · 降落项 = `assembledAltitude(_landingGroundMSL, _landingAGL)`   // 判据 6
+/// 它就是用户七条语义里第 5 / 6 条的字面算式
+/// （`max(takeoff_alt_agl, clear_alt_agl) + waypoint.altitude`，其中 `waypoint.altitude`
+///  是**该端站点航点的地面海拔（MSL）**）。收成单点定义，是为了让这一跳**有测试**：
+///  改动前它以裸算式散在 `OpsRouteSync.qml` 的多个使用点上，而该文件**全仓零测试**。
+///
+/// ‼️ 两个加数**单位不同**（MSL 与 AGL），**同名互换不会报错、只会静默算错**，别混用。
+/// ‼️ 任一加数非有限数 ⇒ **`NaN`（不是 `0`）**：`0` 会让下游闸的 `!(x > 0)` 失效
+///    —— 那正是"未设定却被当成有效高度"的症状。
+/// ‼️ **数值 `0` 是合法加数**（`assembledAltitude(0, 50) === 50`）：站点地面海拔为 0 是真实取值，
+///    不是"缺"。类型不符（`null` / `undefined` / 字符串 / `NaN`）才回 `NaN`。
+///
+/// @param groundMSL 该端站点航点的**地面海拔（MSL，米）**
+/// @param agl       该端 **AGL 生效值**（米；见 `nrrsmEffectiveAGL`）
+/// @return `groundMSL + agl`；任一非有限数 ⇒ `NaN`
+function assembledAltitude(groundMSL, agl) {
+    if (typeof groundMSL !== "number" || !isFinite(groundMSL)) return NaN
+    if (typeof agl !== "number" || !isFinite(agl)) return NaN
+    return groundMSL + agl
+}
+
+/// NRRSM（2026-09-30）：取航线的六个起降相关高度原始量 + 三个终点航点量，
+/// 并合成两个 D6 生效值。
+/// ‼️ **别在本注释里找键数**（"共 N 键"这类计数会被同文件任何一次增删静默腐化，
+///    且会被读成**穷举**）：**键集以本函数 `return` 的字面量为准** ——
+///    下面那份清单若与 `return` 不符，**以 `return` 为准**。
+///
+/// 入参 `route` 是 `GET /api/routes/<id>` 的响应体（**不是** `/waypoints` —— 那是航点数组，
+/// 不含航线级字段）。
+///
+/// 任一项不是有限数 ⇒ 该项回 **`null`**，不是 `0`、也不是 `NaN`。这里的 `null` 只表示
+/// **类型层不可用**（字段缺失 / 非数字）。
+/// ‼️ **别把它读成「后端没给」**：后端把「未设定」也发成 `0`（读出口用的是
+///    `COALESCE(takeoff_alt_agl,0)` / `COALESCE(landing_alt_agl,0)`，且模型里这两个字段是
+///    不带 `omitempty` 的 `float64`）⇒ 两个键**永远存在、永远是 JSON number**，
+///    **调用方区分不出「没给」与「填了 0」—— 两者都是 `0`**。
+///    所以闸**必须**把 `0` 也判为不可用：用值域判据 `!(x > 0)`，**不能**写成 `isNaN(x)`
+///    或 `x === null`（那会把 `0` 放行）。另注 `0` 是 falsy，`!x` 会再混一次。
+function routeAltitudeBounds(route) {
+    // ‼️ 键**分三类**（2026-10-01 A1/B7）：六个高度原始量 + 三个终点航点量 + 两个合成量。
+    //    **键集以本函数末尾 `return` 的字面量为准**；下面这份清单若与 `return` 不符，
+    //    **以 `return` 为准**（"共 N 键"这类计数会被下一次增删静默腐化，别按它核）。
+    //    六个高度原始量（来源就是 `GET /api/routes/<id>` 的同名响应键），**值单位各不相同、别混用**：
+    //      · `takeoffAltAGL`     ← `route.takeoff_alt_agl`                航线起飞高度（**AGL，米**）
+    //      · `takeoffClearAGL`   ← `route.takeoff_site_clear_alt_agl`     **起飞站点**最低安全高度（**AGL，米**；0=未勘测）
+    //      · `takeoffGroundMSL`  ← `route.takeoff_ground_msl`             `G_t`，起飞站点**地面海拔**（**MSL，米**）
+    //      · `landingAltAGL`     ← `route.landing_alt_agl`                航线降落高度（**AGL，米**）
+    //      · `landingClearAGL`   ← `route.landing_site_clear_alt_agl`     **降落站点**最低安全高度（**AGL，米**）
+    //      · `landingGroundMSL`  ← `route.landing_ground_msl`             `G_l`，降落站点**地面海拔**（**MSL，米**）
+    //    三个终点航点量（2026-10-01 A1；**不是**高度，单位是 id / 度）：
+    //      · `endWaypointId`     ← `route.end_waypoint_id`                航线终点航点 id（**只认 number > 0**）
+    //      · `endLat`            ← `route.end_waypoint_lat`              该航点纬度（**WGS84 度**）
+    //      · `endLon`            ← `route.end_waypoint_lon`              该航点经度（**WGS84 度**）
+    //      ‼️ 后端在**没有终点航点**时把后两键 `COALESCE` 成 `0`（键仍存在）
+    //         ⇒ 它们经 `pick` 后是**数字 0**、不是 `null`；在 `appendLandingWaypoint` 的
+    //         **追加分支**里由 `isValidWaypoint`（任一轴为 0 即无效）拦下 ⇒ 整条作废（fail-closed）。
+    //         （「末项已是终点」那一档**不读**这两键 —— 见 `appendLandingWaypoint` 与裁定 B。）
+    //    两个合成量（D6 硬下限的生效值，各取两侧大者）：
+    //      · `takeoffAGL = max(takeoffAltAGL, takeoffClearAGL)`
+    //      · `landingAGL = max(landingAltAGL, landingClearAGL)`
+    //    ‼️ **闸的判据项是这两个 AGL 合成量**（`takeoffAGL > 0` / `landingAGL > 0`），
+    //       **不是**"组装后的 AMSL"：地面海拔会把 `0` 救活 —— 某站点地面海拔 100 米、而航线
+    //       起飞高度与站点安全高度**都没设**（都是 0）时，合成的 AMSL 是 100 > 0 ⇒ 闸放行 ⇒
+    //       飞机被指令到**贴地 100 米**飞，而这**正是 NRRSM 要杀的症状**。
+    //    ‼️ 合成时 `null` 一律按 `0` 计 ⇒ 两个合成量**恒为有限数字**，`null` 不外传。
+    //       两个输入都是 `null`（后端没给键）⇒ 合成 0 ⇒ 闸拦住 ⇒ fail-closed；
+    //       这与「填了 0（未勘测）」在闸上**同义**，所以合并成 0 不损失分辨力。
+    //       （别让 `null` 传播出去：调用方的闸写 `!(x > 0)`，遇 `null` 会走
+    //       `null > 0 === false` ⇒ 取反为真 ⇒ 拦住 —— 结论碰巧一样，但那是靠 JS 的
+    //       隐式转换，不是靠代码。）
+    //    ‼️ D6 合成规则（`max` 那一步）的**单点定义是 `nrrsmEffectiveAGL`**（见其函数头注释）。
+    //       本函数这两个键、以及 `OpsRouteSync.qml` 的两个绑定，**都只是它的调用点** ——
+    //       改 D6 只改那一个函数，别在这里就地重写 `Math.max`。
+    //       要核对当前有哪些调用点，**现场复跑**：在 QGC 仓根跑 `rg -n 'nrrsmEffectiveAGL' src/`。
+    //       （⚠️ 本函数这两个键在**生产路径上零读取** —— `OpsRouteSync.qml` 取走的是合成前的
+    //        两个原始量，它自己按同一单点定义合成。读这两个键的目前只有单测 `tst_OpsCommon.qml`。）
+    function pick(v) {
+        if (typeof v !== "number" || !isFinite(v)) return null
+        return v
+    }
+    // `pick` 回 `null` 表示**类型层不可用**。合成交给 `nrrsmEffectiveAGL`（D6 的**单点定义**）：
+    // 它内部的 `orZero` 把 `null` / `NaN` / 非数字一并按 `0` 计（口径与本函数原先那个
+    // `v === null ? 0 : v` 在**可达输入上等价** —— 这里传进去的已经过 `pick`，非数都成了 `null`）。
+    // `null` / `undefined` 入参不得抛错（`route.x` 会 TypeError）⇒ 先归零成空对象。
+    var r = route || {}
+    var takeoffAltAGL    = pick(r.takeoff_alt_agl)
+    var takeoffClearAGL  = pick(r.takeoff_site_clear_alt_agl)
+    var takeoffGroundMSL = pick(r.takeoff_ground_msl)
+    var landingAltAGL    = pick(r.landing_alt_agl)
+    var landingClearAGL  = pick(r.landing_site_clear_alt_agl)
+    var landingGroundMSL = pick(r.landing_ground_msl)
+    // 终点航点三量（A1）。`end_waypoint_id` 是**可空列**（`route.go` 有两处 UPDATE 会把它置 NULL）
+    // ⇒ `pick(null)` 回 `null` ⇒ 调用方落成 `NaN` ⇒ `appendLandingWaypoint` 作废整条（fail-closed）。
+    // 后两键后端 `COALESCE(...,0)` ⇒ 键恒存在、无终点时是**数字 0**（不是 `null`）。
+    var endWaypointId    = pick(r.end_waypoint_id)
+    var endLat           = pick(r.end_waypoint_lat)
+    var endLon           = pick(r.end_waypoint_lon)
+    return {
+        takeoffAltAGL: takeoffAltAGL,
+        takeoffClearAGL: takeoffClearAGL,
+        takeoffGroundMSL: takeoffGroundMSL,
+        landingAltAGL: landingAltAGL,
+        landingClearAGL: landingClearAGL,
+        landingGroundMSL: landingGroundMSL,
+        endWaypointId: endWaypointId,
+        endLat: endLat,
+        endLon: endLon,
+        takeoffAGL: nrrsmEffectiveAGL(takeoffAltAGL, takeoffClearAGL),
+        landingAGL: nrrsmEffectiveAGL(landingAltAGL, landingClearAGL)
+    }
+}
+
+/// NRRSM：把航线的**降落高度**盖到航点序列的**最后一项**上。
+///
+/// ‼️ 「最后一项」= `items.length - 1`，**不是** `_endWaypointIndex` 那一项。
+///    两个「末项」语义不同、这里**故意解耦**：
+///      · `_endWaypointIndex`（由 `endWaypointId` 驱动）判的是「终点站，要打 85 垂起着陆」。
+///        **裁定 R-A1（2026-10-01）之后它永不触发**：`OpsRouteSync.qml` 那次
+///        `OpsCommon.routeMissionItems(landed, vehicle.vtol, undefined, _cruiseAGL)`
+///        第三个实参**刻意传 `undefined`**（理由见 `_endWaypointIndex` 的函数头注释）；
+///      · 本函数的「最后一项」判的是「末段降落的进入点」，与 command 无关。
+///    ⇒ 两个「末项」**故意解耦**，且 R-A1 下 `_endWaypointIndex` 那一支恒为 `-1` ⇒
+///      **「本函数改哪一项」与该支无关**（恒为 `items.length - 1`，与上面那句一致）；85 由
+///      `routeMissionItems` 自己打出，**不需要**把两个判据合并。
+///    ‼️ **会不会咬人，用这两条充要条件自己判**（下面的情形清单只是**举例**，不是穷举）：
+///      · 「会打出 85」 ⟺ 该项 `command === 21` ∧ `i === endIdx` ∧ 机型为 VTOL；
+///      · 「本函数的降落高度被覆盖」 ⟺ 上一条成立 **且** 那个 85 正好落在 `items.length - 1` 上。
+///    举例（逐情形实测可复跑：`final-fix3-calib.js`）：
+///      · **「会打出 85」的充要条件成立**、`end_waypoint_id` 是数字 id 且**恰为末项**（常规）：打出 85、且就落在末项 ⇒
+///        本函数逐字保留 `last.command` ⇒ 高度被 PX4 的 `handleLanding` 覆盖 ⇒ **静默失效**；
+///      · **「会打出 85」的充要条件成立**、`end_waypoint_id` 是数字 id 但**不是末项**：打出 85，却落在**航路中途**的一点上 ⇒ 本函数的降落
+///        高度**不受影响**（红线：除非要坠机，否则飞机只能在机位上降落）；
+///      · **指认不出终点**（`undefined` / `null` / `0` / 非数字 / 不在列表里 ⇒ `endIdx === -1`）：
+///        **一个 85 都不会产生**，本函数行为照旧。⚠️ 这一档**并不罕见** ——
+///        `table_route.end_waypoint_id` 是可空列，且 `route.go` 有两处 UPDATE
+///        会在解除航点引用时把它置成 NULL；
+///      · 指认得出终点、但**该项 `command !== 21`**（后端对 `end_waypoint_id` 没有
+///        「必须指向站点」的校验）：同样**一个 85 都不会产生**。
+///      **以上各档都没有任何测试会红。**
+///
+/// **`items` 为空 ⇒ 原样返回**（没有可覆盖的末项）；不可用的 `amsl`（null / NaN / 非数字）同理。
+/// ‼️ 形参名是 `amsl`（**AMSL 组装值** = 该站点地面海拔 + `max(landing_alt_agl, clear_alt_agl)`），
+///    与起飞项那个对称的 `_applyAltitude(vi, amsl)` 同名同义。**别再叫回 `landingAltAGL`** ——
+///    那个名字在本模块另有所指（`routeAltitudeBounds` 的返回键 = 航线的 `landing_alt_agl`，
+///    **真 AGL**），两者同名不同义，读代码的人会把"组装后的绝对高度"当成"航线那个相对高度"。
+/// **不改入参**：回新数组，调用方可能还要用原始的 items。
+///
+/// ‼️ 旧守卫是 `items.length < 2`，理由写的是"只有一个点时它既是起飞又是降落，语义不清" ——
+///    **那条前提在 A1 之后已不成立**：起飞项**不在 `items` 里**（它由 `OpsRouteSync.qml`
+///    用 `MissionController::insertTakeoffItem()` 单独插进 plan 的第 0 位），
+///    `items` 就是**航点序列**，其末项**恒为降落站点航点**（行为 1 追加来的，或行为 2
+///    本来就在末位；行为 3 会先回 `[]`，到不了这里）。
+///    单点序列（`wps = [X]` 且 `X.id === endWaypointId`）因而不是畸形输入，而是
+///    **正常编辑可得到的形状**：云端权威库全量 7 条里**暂无**这个精确形状，
+///    但"列表只有一行"是**已存在的正常形状**（航线 21 的列表就只一行 wp4，
+///    既非起点也非终点 —— 云端权威库 2026-10-01 复核）⇒ 把唯一那个点选成降落站点，
+///    即可得到"一行、且该行就是 `end_waypoint_id`"。**是可达的编辑产物，不是假想输入。**
+///    ⚠️ **出处等级**：上面「全量 7 条里暂无该形状」「航线 21 只有一行」两条读数**不是本任务测的**，
+///       是**控制方（编排者）2026-10-01 只读实测**；采集口径 = `ssh root@39.97.235.226`、
+///       库 `/opt/uavm/var/db_uavm.db`、**只读**打开（`file:...?mode=ro&immutable=1`）、
+///       范围 `table_route` 中 `deleted_at IS NULL` 的全量 7 条。
+///       **本任务（QGC 仓）无云端凭据，未独立复核。**
+///    ⇒ 旧守卫下这种航线的末项高度会**停在航点地面海拔**（不加 `max(landing_alt_agl,
+///      clear_alt_agl)`）⇒ 飞机被指令到**贴地**飞；而两道闸读的是 AGL 项 ⇒ **全绿放行**。
+///      （用例 `test_singleWaypointChain_lastAltitudeIsAssembled` 与
+///       `test_applyLandingAltitude_singleItemIsCovered` 共同钉这一格：前者端到端串链断言
+///       末项 = 230、后者断言 `out[0].alt === 999` 并注明旧行为会让它停在 10。）
+/// ⚠️ `items` 必须是**普通 JS 数组**（本函数用 `items.slice()`），元素形状与
+///    `routeMissionItems` 的输出一致；重建末项时**只保留 5 个键** `{command, lat, lon, alt, frame}`
+///    ⇒ 调用方若在元素上挂了额外键，**末项的那一个会静默丢失**。
+function applyLandingAltitude(items, amsl) {
+    if (!items || !items.length) return items
+    if (typeof amsl !== "number" || !isFinite(amsl)) return items
+    var out = items.slice()
+    var n = out.length - 1
+    var last = out[n]
+    out[n] = {
+        command: last.command,
+        lat: last.lat,
+        lon: last.lon,
+        alt: amsl,
+        frame: last.frame
+    }
+    return out
 }
 
 //------------------------------------------------------------------------------

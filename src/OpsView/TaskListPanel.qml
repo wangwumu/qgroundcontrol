@@ -84,19 +84,11 @@ ColumnLayout {
     property real   cardMargin: 10              // 卡片左空位；站点视图传机位左空隙，与之对齐
     property real   cardRightGap: 20
     property real   cardGap: OpsCommon.taskCardGap
-    // 中段**分段标题**（《航线监控员主界面设计-20260922.md》§4.1 中段的「两节」）。
-    // 2026-09-29 用户报障「点航线，航班列表不变」——第 1 节本就**不受航线选中过滤**
-    // （裁定 ⑥ 的硬约束），但拍平渲染让用户看不出「这几条为什么留在列表里」⇒ 读起来
-    // 就是"点了航线没反应"。裁定：**补分段标题、过滤不动**（不推翻裁定 ⑥）。
-    // `sectionBreak` = 第 1 节的条数（= `middleSectionSplit(...).first.length`）。
-    // ‼️ 默认 **`-1` = 不分段**：站点视图不传 ⇒ 一张段头都不画，与改前逐像素相同。
-    //    （站点视图的 `tasks` 来自 `siteTasks`，没有"选中航线"这回事，分节对它无意义。）
-    // ‼️ 段头挂在**委托内部**（`index === 0` / `index === sectionBreak`），不是另起一个
-    //    列表头块：委托是唯一的定位来源，段头跟着卡片一起滚才不会被列表顶端截住，
-    //    也不会出现"段头钉住而卡片滚走"。
-    property int    sectionBreak: -1
-    property string sectionTitleFirst: ""
-    property string sectionTitleSecond: ""
+    // ‼️ 中段的分段标题（`sectionBreak` / `sectionTitleFirst` / `sectionTitleSecond`，
+    //    2026-09-29 加、同日**删**）——用户看过实际界面后的裁定：「两行段头全删」。
+    //    它们原是为「点航线，航班列表不变」这个报障加的缓解手段（拍平渲染让用户看不出
+    //    「这几条为什么留在列表里」）。删掉后那个观感问题**重新暴露**，这是用户明示接受的：
+    //    置顶节目前只剩卡片自带的 `备降`/`回航` 徽标作解释。
     // 「性质」栏 = 本站相对这条航线的角色（出站/进站，`taskNature`）。
     // ‼️ 监控员**没有 `site_id`**（`table_user_role.site_id` 为 NULL，真库实测）⇒
     //    `taskNature` 恒回「—」⇒ 这一栏对监控员**永远是空话**，不是"数据没下发"。
@@ -106,7 +98,6 @@ ColumnLayout {
     // `.count` + `.get(i)`（`vehicles[i]` / `.length` 都是 undefined）。载具在心跳超时
     // 3.5s 后被 `VehicleLinkManager` 摘掉，故"查得到"⟺"在线"（详见 `OpsCommon.hasLiveTelemetry`）。
     readonly property var vehicles: QGroundControl.multiVehicleManager.vehicles
-    property string headerText: ""              // 空串则标题行整行不占位（站点视图）
 
     // 注入的求值函数：依赖 multiVehicleManager / 机位，无法纯函数化。
     // 传 null 时按钮**置灰且提示为空**（fail-closed），不会误放行。
@@ -153,26 +144,16 @@ ColumnLayout {
     // `task` 是可选的第二个载荷，理由同 `handoverCancelRequested`（视图侧要写"是哪一单"）。
     signal checkinRequested(int handoverId, var task)
 
-    //-------------------------------------------------------------------------
-    // 可选标题（监控员视图「负责航线 · 执行中」）
-    //-------------------------------------------------------------------------
-    Text {
-        Layout.fillWidth: true
-        Layout.leftMargin: 12
-        Layout.topMargin: 10
-        visible: panel.headerText !== ""
-        color: "#8fa1bd"; font.pixelSize: 12; font.bold: true
-        text: panel.headerText
-    }
-
+    // 标题行（`headerText`）已删：用户 2026-09-29「可以把各部分的标题去掉，使用的都是
+    // 专业培训的熟练人员」。
     ListView {
         id: taskList
         Layout.fillWidth: true
         Layout.fillHeight: true
         // 横向留白一律交给委托（cardMargin / cardRightGap）单点决定：这里原本另有
         // Layout.leftMargin/rightMargin = 8，与委托的 x 叠加后同一张卡在两个视图里会得到
-        // 两种左空位（8+10 vs 10）——两个"决定者"。仅标题存在时留出与标题的间距。
-        Layout.topMargin: panel.headerText !== "" ? 4 : 0
+        // 两种左空位（8+10 vs 10）——两个"决定者"。
+        // （原先还有一行 `Layout.topMargin: headerText !== "" ? 4 : 0`，标题删掉后无对象。）
         clip: true
         model: panel.tasks
         // 左空位（委托宽度里已为它预留，见 delegate）
@@ -181,23 +162,13 @@ ColumnLayout {
         // 一张卡（选中态那道亮蓝描边尤其明显）。
         spacing: panel.cardGap
 
-        // 第 2 节**为空**时（选中了一条航线，而该航线没有别的在航航班）——一个委托都没有
-        // ⇒ 段头挂不出来（段头住在委托里，见 `_isSecondHeader`）。这条 footer 把那一句
-        // 空段头补上。
-        // ‼️ 它承载的正是用户这次报障的**关键信息**：「选中航线 XX 的航班」下面为空
-        //    = 「这条航线没有别的航班」，而不是「点了航线列表没反应」。
-        // ⚠️ `tasks.length > 0` 不能省：列表整体为空时（③ 还没回来、或一条在航都没有）
-        //    画一条悬空的段头，看起来像"有航线、只是数据没回来"，与"这条航线没航班"分不清。
-        // ‼️ 判据 `sectionBreak === tasks.length` = 「第 1 节占满 ⇒ 第 2 节为空」，
-        //    **不是**另算一遍第 2 节的长度：与 `_isSecondHeader` 保持同一个下标口径。
-        footer: Text {
-            width: taskList.width - panel.cardRightGap - panel.cardMargin
-            visible: panel.sectionTitleSecond !== "" && panel.tasks.length > 0
-                     && panel.sectionBreak === panel.tasks.length
-            color: "#7f93b3"; font.pixelSize: 11; font.bold: true
-            elide: Text.ElideRight
-            text: panel.sectionTitleSecond
-        }
+        // 分段标题（`sectionBreak` / `sectionTitleFirst` / `sectionTitleSecond`）与那条补空段头的
+        // `footer` **全部已删**：用户 2026-09-29「两行段头全删」。
+        // ⚠️ 后果（用户明示接受）：第 1 节那几条为什么在顶上不再有文字解释，只剩卡片自带的
+        //    `备降`/`回航` 徽标；选中航线的名字也不再出现在列表里。
+        // ‼️ `middleSectionSplit` **仍然生效**（置顶是行为，不是文字）：`panel.tasks` 依旧由
+        //    `middleSectionTasks` 拍平后给出，第 1 节照旧不受航线选中过滤（裁定 ⑥）。
+        //    删掉的只是"把两节分开渲染"这件事，不是分节本身。
 
         delegate: Item {
             id: cardSlot
@@ -205,46 +176,23 @@ ColumnLayout {
             // ‼️ 为什么不能省：`modelData` 是 `ListView` 注入的**上下文属性**，只在委托**内部**
             //    可读；外部（`contentItem.children[i].modelData`）读到的是 `undefined`，且不报错。
             //    交接弹框要按 `task_id` 找卡片，靠的就是这一行。
-            // ‼️‼️ 2026-09-29 分段标题把本委托从 `Rectangle` 包成 `Item` 之后，这一行**必须
-            //    留在最外层**：`cardBottomYForTask` 遍历的是 `taskList.contentItem.children`，
-            //    拿到的是**外层**对象。挪进内层的 `card` 里，那个函数会恒回 `null`——
-            //    而它的失败形状是**静默**的（弹框照常出现、只是永远不贴卡片），与上一条同一个坑。
+            // ‼️‼️ 这一行**必须留在最外层**：`cardBottomYForTask` 遍历的是
+            //    `taskList.contentItem.children`，拿到的是**外层**对象。挪进内层的 `card` 里，
+            //    那个函数会恒回 `null`——而它的失败形状是**静默**的（弹框照常出现、
+            //    只是永远不贴卡片）。
+            // ⚠️ 外层 `Item` 包装是 2026-09-29 分段标题引入的；段头删掉后它本可以还原成
+            //    `Rectangle`，但**留着**：`cardBottomYForTask` 取的是外层 `height`，
+            //    下面一行 `height: card.height` 已保证「外层底沿 = 卡片底沿」这个前提，
+            //    还原反而要动整个委托的属性归属，属于无收益的改动。
             property var task: modelData
 
-            // ── 分段标题（§4.1 中段的两节）──
-            // 段头占的高度（不可见时 0）。‼️ 外层高 = 段头 + 卡片 ⇒ **外层底沿 = 卡片底沿**，
-            // 这正是 `cardBottomYForTask` 取 `d.height` 所依赖的前提。
-            readonly property bool _headerVisible: _isFirstHeader || _isSecondHeader
-            readonly property real _headerHeight: _headerVisible ? sectionHeader.height + 6 : 0
-            // 第 1 节段头：挂在**第 0 项**上，且只在该节非空（`sectionBreak > 0`）时画。
-            readonly property bool _isFirstHeader:
-                panel.sectionTitleFirst !== "" && panel.sectionBreak > 0 && index === 0
-            // 第 2 节段头：挂在**第 2 节的首项**（下标 = 第 1 节条数）上。
-            // ‼️ 判据只比下标，**不在这里再判一次"这条是不是异常"**：`sectionBreak` 与
-            //    `panel.tasks` 出自同一份 `middleSectionSplit` 结果 ⇒ 两者恒自洽；另判一次
-            //    就是第二份判据，漂移的症状是段头插在两张卡片中间，看着只像"位置怪怪的"。
-            // ⚠️ 第 2 节**为空**时这里挂不出来（那个下标不存在）——由 `footer` 补，见其注释。
-            readonly property bool _isSecondHeader:
-                panel.sectionTitleSecond !== "" && index === panel.sectionBreak
-
             width: taskList.width - panel.cardRightGap - panel.cardMargin
-            height: _headerHeight + card.height
-
-            // 段头。⚠️ `visible` 为假时它仍留在 `y: 0` 这个位置，但外层高度已由
-            // `_headerHeight` 归零 ⇒ 不占位、也不画。
-            Text {
-                id: sectionHeader
-                width: parent.width
-                visible: cardSlot._headerVisible
-                color: "#7f93b3"; font.pixelSize: 11; font.bold: true
-                elide: Text.ElideRight
-                text: cardSlot._isFirstHeader ? panel.sectionTitleFirst : panel.sectionTitleSecond
-            }
+            height: card.height
 
             Rectangle {
                 id: card
-                // 卡片紧贴段头下沿；无段头时 `y` 为 0，与改前逐像素相同。
-                y: cardSlot._headerHeight
+                // 段头已删 ⇒ 卡片从外层顶端开始（原先这里是 `y: cardSlot._headerHeight`）。
+                y: 0
                 // 本卡的 PENDING 交接（无则 undefined）。原文在同一个 delegate 里调了 6 次
                 // `_handoverFor(modelData)`，此处抽成一条绑定——纯函数、依赖不变，行为等价。
                 readonly property var  _handover: OpsCommon.handoverFor(modelData, panel.handoverById)
@@ -303,9 +251,9 @@ ColumnLayout {
                 //    所以必须同时有这条提示，否则就是"警示条喊着待办、却无处下手"的反面——
                 //    "什么都没有、也不说为什么"。两个缺口是同一件事的两半，要一起补。
                 // ‼️ 第一个参数传 `panel.isRouteMonitor`，**不是** `!panel.showSiteActions`。
-                //    两个属性在**当前接线**下取值恰好相反（`OpsView.qml:1072` 硬编码
-                //    `isRouteMonitor: false`、`RomView.qml` 硬编码 `showSiteActions: false`），
-                //    但语义不同：`showSiteActions` 还叠了 `_isSiteATC`（`OpsView.qml:1071`）
+                //    两个属性在**当前接线**下取值恰好相反（`OpsView` 里硬编码
+                //    `isRouteMonitor: false`、`RomView` 里硬编码 `showSiteActions: false`），
+                //    但语义不同：`showSiteActions` 还叠了 `_isSiteATC`（`OpsView` 的那个属性）
                 //    ——"不是站点按钮组"并不等于"我是监控员"。用语义正确的那个，将来站点视图
                 //    真接上双身份时才不会把"我是谁"和"这张卡给我哪套按钮"混成一个判据。
                 readonly property string _checkinNotice:

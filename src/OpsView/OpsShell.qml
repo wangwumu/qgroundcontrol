@@ -226,6 +226,10 @@ Item {
         // ‼️ `groupTasksByRoute` 按 `_routeOrder` 建键 ⇒ 无航班的航线拿到的是**空数组
         //    而不是缺键**（缺键会让"这条航线没有航班"与"这条航线的数据还没回来"
         //    在界面上长得一样）。③ 里出现不在名册里的航线时两边都跳过、不新增行。
+        // ⚠️ 规则 1（见下面的收窄）落地后，空数组与缺键**在本属性里**已经产出同一结果
+        //    （都不出行）——但这不等于 `groupTasksByRoute` 那条区别失效：它仍是纯函数自己的
+        //    契约（`tst_OpsCommon.qml` 直接钉它）。本属性是它当前**唯一**的生产调用点，
+        //    要改它先现场复跑 `rg -n 'groupTasksByRoute' src/ test/` 重新数一遍。
         var grouped = OpsCommon.groupTasksByRoute(_routeTasks, _routeOrder)
         var out = []
         for (var k = 0; k < _routeOrder.length; k++) {
@@ -244,7 +248,68 @@ Item {
                 tasks:        g
             })
         }
-        return out
+        // 有告警的航线置顶（用户 2026-09-29 要求）：纯函数，稳定分区，组内保持名册顺序。
+        // ‼️ 只改**本属性的输出顺序**，不动 `_routeOrder`：地图图层吃的是 `_routeGeom`
+        //    （按 `_routeOrder` 建、只含几何），所以置顶**不会**让地图跟着抖。
+        //
+        // 规则 1（用户 2026-09-29 原话）：「航线列表中列出当前有执行任务的航线」
+        // ⇒ 外挂一层收窄，**没有航班的航线不出行**。名册（`table_route_monitor`）是长期绑定，
+        //    "当前有没有航班"是 2s 一变的状态，两者本就不同寿命——收窄后右栏只显示此刻真在飞的东西。
+        // ⚠️ 只改本属性 ⇒ **地图不受影响**（L1/L2 吃 `_routeGeom`，见上面的注释）。
+        // ⚠️ 先收窄再置顶：收窄是纯筛选、不改相对顺序，与置顶交换次序等价。
+        return OpsCommon.routesAbnormalFirst(OpsCommon.routesWithTasks(out))
+    }
+
+    // 规则 1 的**配套清理**：选中的那条航线若因"没有航班"而从列表消失，必须把选中清掉。
+    //
+    // ‼️ 少了它就是一个**关不掉的过滤**，而且三处症状都指向别的地方：
+    //    ① `_selectedRouteId` 同时是**航班列表的过滤器**（`romView._panelTasks`）⇒
+    //       航班列表被一条屏幕上已经不存在的航线过滤 ⇒ 空列表；
+    //    ② 列表里没有那一行 ⇒ **用户没有任何点回来取消的入口**（取消靠再点同一行，
+    //       而那一行已经不在列表里了）；
+    //    ③ 地图却**仍然**点亮/聚焦那条航线（`routeRowsLit/Dimmed` 吃 `_routeGeom`，
+    //       不吃 ③ —— 这是刻意的，见 `_routeGeom` 声明处）⇒ 用户看到"地图亮着一条航线，
+    //       但列表里没有它，航班列表还是空的"，看起来像数据没拉到。
+    //
+    // ⚠️ 走 `clearRouteSelection()` 而不是在这里裸写 `_selectedRouteId = null`：它是
+    //    "取消选中"的**唯一落点**（三处取消路径都汇到那里，见该函数注释），
+    //    本处理器是**第四条**路径。裸写会漏掉 `routeSelected(null)` 信号与视野回套
+    //    （`_requestRoutesFit()`），于是"因无航班而消失"与"用户手动取消"的几何结果不同。
+    //
+    // ⚠️ 安全性：`_routeRows` 的表达式**不读** `_selectedRouteId`（上面的注释列了它读的三个
+    //    属性）⇒ 这里写 `_selectedRouteId` 不会让 `_routeRows` 重估、不会绑成环。
+    // ⚠️ 首次求值时 `_selectedRouteId` 是 null ⇒ 立刻返回；此时 `clearRouteSelection` 尚未
+    //    进入可用状态也不会被调到。
+    // ⚠️ 命中时每轮询都跑一遍 O(航线数) 的线性查找：几十行的量级，可忽略；换来的是
+    //    "不必给 `_routeRows` 再加一个反向依赖"。
+    // ‼️ 只能用 `Connections`，且函数名必须是 `on_RouteRowsChanged` —— 下划线**要保留**，
+    //    再把紧跟其后的首字母大写。**裸写 handler 于属性旁会让整个 OpsShell.qml 加载失败**，
+    //    症状是 QGC 起不来、控制台只有一行 `Cannot assign to non-existent property`
+    //    （2026-09-29 实际发生过一次）。
+    //
+    // 实测（Qt 6.11.1 `qml` 工具，下面列出的各种组合 + 阳性对照，同时看 加载/执行/warning 三项）：
+    //   · `property var foo` + `onFooChanged`                     ⇒ 可加载、执行、无 warning（基线）
+    //   · `property var _foo` + `on_fooChanged` / `onFooChanged`  ⇒ **整个文件加载失败**
+    //   · `Connections { … function on_FooChanged() }`            ⇒ **执行、无 warning** ✅ 正确写法
+    //   · `Connections { … function on_fooChanged() }`            ⇒ 执行，但有 warning
+    //        「is not a properly capitalized signal handler name」
+    //   · `Connections { … function onFooChanged() }`             ⇒ 加载成功但 **handler 不执行**
+    // 即：以 `_` 开头的属性，裸处理器名 = `on` + 属性名（**下划线保留，下划线后的首字母大写**）+ `Changed`；
+    // 上面两个失败变体分别少了"下划线后首字母大写"与"下划线本身"。
+    // 同仓 `FlyViewMap.qml:33` 声明 `property var _activeVehicleCoordinate`、`:184` 裸写
+    // `on_ActiveVehicleCoordinateChanged`，声明与处理器在同一文件里共存 ⇒ 这类**不是**
+    // C++ `Q_PROPERTY`，别把本节两个失败变体推广成"裸处理器一律不行"。
+    // `Connections` 里少一个下划线是"**不报错也不执行**"——最难查的一种，所以三个变体都留在这里备查。
+    Connections {
+        target: opsShell
+        function on_RouteRowsChanged() {
+            if (opsShell._selectedRouteId === null) return
+            var rows = opsShell._routeRows
+            for (var i = 0; i < rows.length; i++) {
+                if (Number(rows[i].route_id) === Number(opsShell._selectedRouteId)) return
+            }
+            opsShell.clearRouteSelection()
+        }
     }
 
     /// ‼️ **供 L1/L2 的 `model` 用：把航线按「是否选中」拆成两个互斥列表。**
@@ -304,9 +369,13 @@ Item {
     // 任务卡片**右**侧留白：就是原代码 `width: ListView.view.width - 20` 里那个 20。
     // ‼️ 加左空位**不得吃掉它**（用户明确要求"不能挤到右侧的滚动条"）⇒ 左空位是从卡片**宽度**里
     // 减出来的，不是把卡片整体右移；右边缘位置因此一个像素都不变。
-    // ⚠️ 实测本模块**没有任何 ScrollBar**（`ScrollBar` 在其中零命中；QGC 用 Qt `Basic`
-    // 风格，该风格也不会给 ListView 自动附加滚动条），所以这 20 到底是给谁留的无法从代码确认
-    // ——按"来历不明的右侧留白"对待，只保持原值、不替它编一个用途。
+    // ⚠️ 实测本模块**没有声明任何 ScrollBar 组件** —— 判据
+    // `rg -l 'ScrollBar\s*\{' src/OpsView/` 零命中；同尺在 `Rectangle` / `Item` 上各命中 7 个文件
+    // ⇒ 尺子有效，且本文件确实 `import QtQuick.Controls`（类型可用、只是没人用）。
+    // ‼️ 判据**不能**写成「`ScrollBar` 零命中」—— 本条注释自己就含这个词，那样写是**自证伪**
+    //    （搜它必然搜到本行）。QGC 用 Qt `Basic` 风格，该风格也不会给 ListView 自动附加滚动条，
+    // 所以这 20 到底是给谁留的无法从代码确认 —— 按"来历不明的右侧留白"对待，
+    // 只保持原值、不替它编一个用途。
     property real  _taskCardRightGap: 20
     // 任务卡片**左**空位。原在 `OpsView.qml` 上定义成 `_taskCardMargin: _slotMargin`（机位边距
     // 派生出来的），因为当时监控员视图只是同一实例里的一个分支，借用得到；拆成两个视图后那根
@@ -1181,9 +1250,38 @@ Item {
     }
 
     // 选中任务：**唯一写点**（地图 marker 与列表点击都走它），写状态与发信号成对出现。
+    //
+    // ‼️ 2026-09-29 用户裁定：点航班卡片要「在地图区域点亮该航班」，而地图的点亮机制是
+    //    **按航线**走的（`routeRowsLit` / `routeRowsDimmed`），`_selectedRouteId` 同时还是
+    //    航班列表的过滤器 ⇒ 于是这里**一并选中该航班所属航线**：地图点亮该航线、列表收缩到
+    //    该航线、仪表切到该航班。收窄列表这个副作用用户明确接受（选的就是这个方案）。
+    //
+    // ⚠️ 三条不能这么写的地方（都不是风格问题，各自有具体的坏结果）：
+    //    ① **不能改调 `selectRoute()`**：它是 **toggle** 语义（点同一行取消选中）。同一条航线上
+    //       点第二张航班卡会命中 toggle 分支 ⇒ 把刚点亮的航线**取消**掉，地图反而全暗，
+    //       而列表则收缩到……什么都不剩。症状是"点第二条航班界面就空了"，不报错。
+    //    ② **不能顺手调 `_fitRouteToViewport()`**：`selectRoute` 里会套视野，但点卡片是
+    //       **列表内**操作，用户可能刚把地图缩放到某处看细节，套视野会把它拽走。只点亮，不动视野。
+    //    ③ **必须带 `routeLayersEnabled` 闸**：`_selectedRouteId` 不是 RomView 私有的，
+    //       本文件后半那层飞机 marker 的可见性（`OpsCommon.visibleForSelection`）也吃它。
+    //       站点视图（`routeLayersEnabled === false`）没有航线列表面板 ⇒ **没有点回来取消的入口**，
+    //       在这里写进去就是个关不掉的过滤。今日该 marker 层的 model 已被
+    //       `routeLayersEnabled ? … : []` 挡成空数组（所以站点视图眼下看不出差别），加这道闸
+    //       是防将来接线一变就静默漏进去。
+    //    ⚠️ 值真变时才写、才发信号：`_selectedRouteId` 一动，`romView._panelTasks` 就整表重算。
     function selectTask(task) {
         if (!task) return
         _selectedTaskId = task.task_id
+        if (routeLayersEnabled) {
+            var rid = task.route_id
+            // `route_id` 缺失/为 null 时**保持现状**：写成 null 等于"清空选中"，而点一张
+            // 查不到航线的卡片就把地图点亮清掉，是用户看不懂的连带动作。
+            if (rid !== undefined && rid !== null &&
+                (_selectedRouteId === null || Number(_selectedRouteId) !== Number(rid))) {
+                _selectedRouteId = rid
+                opsShell.routeSelected(_selectedRouteId)
+            }
+        }
         opsShell.taskSelected(task)
     }
 
