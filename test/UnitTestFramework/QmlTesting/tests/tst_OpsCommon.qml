@@ -1133,6 +1133,139 @@ TestCase {
     }
 
     //-------------------------------------------------------------------------
+    // 站点视图**地图 marker** 的配色（用户 2026-10-02 裁定：「出站用黄色（用最醒目换色），
+    // 入站用绿色（最醒目的绿色）」＋「告警优先，其余黄/绿」＋「SEC_NONE 沿用按状态着色」）
+    //-------------------------------------------------------------------------
+
+    /// 两色的**正面断言**：出站取黄、进站取绿。数值写成字面量而不是读
+    /// `OpsCommon.OUTBOUND_MARKER_COLOR`——读常量的话，把常量改成任意颜色都照样全绿，
+    /// 等于这格只验了"函数返回了它自己那个常量"。
+    function test_siteMarkerColor_outboundYellowInboundGreen() {
+        var out = _siteTask(3, "TAKEOFF", 1, 3, undefined)
+        compare(OpsCommon.siteSection(out, true, true, 1, {}), 2, "夹具前提：出站 ⇒ 落段 2")
+        compare(OpsCommon.siteMarkerColor(out, true, true, 1, {}, 0, false), "#ffd400",
+                "出站 ⇒ 醒目的黄")
+
+        var inb = _inboundTask(4, "IN_FLIGHT", 3, 1, "IN_FLIGHT")
+        compare(OpsCommon.siteSection(inb, true, true, 1, {}), 3, "夹具前提：未接引进站 ⇒ 落段 3")
+        compare(OpsCommon.siteMarkerColor(inb, true, true, 1, {}, 0, false), "#00e676",
+                "进站 ⇒ 醒目的绿")
+    }
+
+    /// ‼️ 「两个绿**刻意不同色**」是本组唯一的判据：`statusColor` 的"已停稳绿" `#2ecc71`
+    /// 说的是**状态**，本案的 `#00e676` 说的是**归属**。这一格用一条**同时**满足两边的任务
+    /// （`LANDING` ＋ 降落本站 ＋ 已落地）把两个分支摆在一起：若有人为了"统一色板"把进站绿
+    /// 改成 `#2ecc71`，本格立刻红——而界面上"停稳了"与"归本站"从此再也分不开。
+    /// ⚠️ 同一夹具在**未**落地时必须是进站绿：否则"已落地优先"那半句没有判据。
+    function test_siteMarkerColor_landedGreenIsNotTheInboundGreen() {
+        var landed = _inboundTask(5, "LANDING", 3, 1, "LANDING")
+        compare(OpsCommon.siteSection(landed, true, true, 1, {}), 3, "夹具前提：进站卡（落段 3）")
+
+        compare(OpsCommon.siteMarkerColor(landed, true, true, 1, {}, 0, true), "#2ecc71",
+                "已落地 ⇒ 取「已停稳」绿")
+        compare(OpsCommon.siteMarkerColor(landed, true, true, 1, {}, 0, false), "#00e676",
+                "同一条任务尚未落地 ⇒ 取「归本站」绿")
+        verify(OpsCommon.siteMarkerColor(landed, true, true, 1, {}, 0, true)
+               !== OpsCommon.siteMarkerColor(landed, true, true, 1, {}, 0, false),
+               "两个绿必须**不同色**：同色会把「停稳了」读成「归本站」")
+        verify("#00e676" !== "#2ecc71" && "#ffd400" !== "#2ecc71",
+               "常量前提：本组三色互不相同（上面两格才可能失败）")
+    }
+
+    /// ‼️ **告警优先**（用户裁定）不是修饰语：这一格拿一条"否则会涂成出站黄"的任务
+    /// （本站起飞、非终态）＋一个**已过期**的交接 ⇒ 必须是超时红。
+    /// 少了这一格，"黄绿盖掉超时红"也能全绿——那等于把"接手窗口正在关闭"从地图上删掉。
+    /// ⚠️ 夹具必须**同时**满足黄的那一支，否则本格是靠"反正它也进不了黄绿分支"过关的。
+    function test_siteMarkerColor_timeoutRedBeatsOutboundYellow() {
+        var t = _siteTask(7, "TAKEOFF", 1, 3, undefined)
+        compare(OpsCommon.siteMarkerColor(t, true, true, 1, {}, 0, false), "#ffd400",
+                "夹具前提：无交接时它就是出站黄")
+        var h = { 7: { task_id: 7, phase_to: "ROUTE", deadline_at: "2026-09-23 00:00:00" } }
+        compare(OpsCommon.siteMarkerColor(t, true, true, 1, h, Date.parse("2026-09-23T01:00:00Z"), false),
+                "#ff3b3b", "交接已超时 ⇒ 红，**优先于**出站黄")
+    }
+
+    /// 第二档告警：任务中止 / 异常。夹具是"否则会涂进站绿"的那种 ⇒ 这一格钉的是**优先关系**。
+    ///
+    /// ‼️ `ABORT` 与 `FAILED` 是**载重**的那两档，`ABORTED` 不是——三者**不是一回事**：
+    ///    · `ABORTED` ∈ `FINISHED_TASK_STATUSES` ⇒ 既非出站也非进站 ⇒ 落 `SEC_NONE` ⇒
+    ///      兜底的 `statusColor` 本来就给红。**删掉中止那一档，它照样红。**
+    ///    · `ABORT` / `FAILED` **不在**那个终态集合里 ⇒ 这条"降落本站 + 飞机 `IN_FLIGHT`"
+    ///      的任务会被判成**进站** ⇒ 删掉中止那一档它立刻变**进站绿**。
+    ///    本格第一行就是钉这个前提（落段 3）：夹具若用 `ABORTED`，"中止优先"这条断言
+    ///    会因为夹具压根进不了黄绿分支而**假绿**——这正是它第一版写成 `ABORTED` 时的实况。
+    ///    （同族坑：`ABORT` / `ABORTED` 是**两个字面量**。）
+    function test_siteMarkerColor_abortRedBeatsInboundGreen() {
+        var stat = ["ABORT", "FAILED"]
+        for (var i = 0; i < stat.length; i++) {
+            var t = _inboundTask(6, stat[i], 3, 1, "IN_FLIGHT")
+            compare(OpsCommon.siteSection(t, true, true, 1, {}), 3,
+                    "夹具前提（" + stat[i] + "）：落段 3，否则它压根不会涂进站绿、本格假绿")
+            verify(OpsCommon.sectionIsInbound(3, t, 1, {}), "夹具前提（" + stat[i] + "）：进站那一支为真")
+            compare(OpsCommon.siteMarkerColor(t, true, true, 1, {}, 0, false), "#ff3b3b",
+                    stat[i] + " ⇒ 红，**优先于**进站绿")
+        }
+
+        // 阴性对照：`ABORTED` 走的是**兜底**那条路，不是中止那一档。两处都得是红——
+        // 少了这一格，"中止档只收 `ABORT`/`FAILED`"与"收全三个"不可区分。
+        var aborted = _inboundTask(7, "ABORTED", 3, 1, "IN_FLIGHT")
+        compare(OpsCommon.siteSection(aborted, true, true, 1, {}), -1,
+                "夹具前提：`ABORTED` 是终态 ⇒ 未入列（它变红靠兜底，不靠中止那一档）")
+        compare(OpsCommon.siteMarkerColor(aborted, true, true, 1, {}, 0, false), "#ff3b3b",
+                "`ABORTED` ⇒ 同样红（经 `SEC_NONE` 兜底）")
+    }
+
+    /// ‼️ 第三类 `SEC_NONE`（两个勾选框都没勾到它）**沿用现状的状态色**（用户裁定）。
+    /// 判据直接与 `statusColor` 对拍——这正是"沿用"二字的字面含义；改成涂灰/涂透明
+    /// 都会红。夹具取 `IN_FLIGHT`（状态色 `#ffc107`，与出站黄 `#ffd400` **不同字面**），
+    /// 否则"回落成出站黄"也能蒙混过关。
+    /// ⚠️ 两格都要：只勾一侧时另一侧的任务同样落 `SEC_NONE`。
+    function test_siteMarkerColor_noneFallsBackToStatusColor() {
+        var out = _siteTask(8, "IN_FLIGHT", 1, 3, undefined)
+        var inb = _inboundTask(9, "IN_FLIGHT", 3, 1, "IN_FLIGHT")
+
+        compare(OpsCommon.siteSection(out, false, false, 1, {}), -1, "夹具前提：两侧都不勾 ⇒ 未入列")
+        compare(OpsCommon.siteMarkerColor(out, false, false, 1, {}, 0, false),
+                OpsCommon.statusColor(out, 0, {}, false), "未入列 ⇒ 沿用状态色")
+        compare(OpsCommon.siteMarkerColor(out, false, false, 1, {}, 0, false), "#ffc107",
+                "并且确实是**状态色**（`IN_FLIGHT` 的黄），不是出站黄")
+
+        compare(OpsCommon.siteSection(inb, true, false, 1, {}), -1, "夹具前提：只勾出站 ⇒ 进站卡未入列")
+        compare(OpsCommon.siteMarkerColor(inb, true, false, 1, {}, 0, false),
+                OpsCommon.statusColor(inb, 0, {}, false), "只勾出站 ⇒ 到站飞机不得被涂成进站绿")
+    }
+
+    /// ‼️ 勾选框那**两个实参必须真的被读**。少了这一格，把实现写成"永远按出站处理"
+    /// （忽略 `outbound`/`inbound`）也能让上面几格里的出站部分全绿——
+    /// 而用户取消勾选"进站"之后，到站飞机在**列表里消失、地图上却仍是绿的**。
+    /// 判据：同一条进站任务，两勾 ⇒ 进站绿；不勾进站 ⇒ 不再是进站绿。
+    function test_siteMarkerColor_checkboxArgsAreActuallyRead() {
+        var inb = _inboundTask(10, "IN_FLIGHT", 3, 1, "IN_FLIGHT")
+        compare(OpsCommon.siteMarkerColor(inb, true, true, 1, {}, 0, false), "#00e676",
+                "两勾 ⇒ 进站绿")
+        verify(OpsCommon.siteMarkerColor(inb, true, false, 1, {}, 0, false) !== "#00e676",
+               "取消勾选「进站」⇒ 该机不再取进站绿（否则那个勾选框对地图毫无作用）")
+
+        var out = _siteTask(11, "TAKEOFF", 1, 3, undefined)
+        compare(OpsCommon.siteMarkerColor(out, true, true, 1, {}, 0, false), "#ffd400",
+                "两勾 ⇒ 出站黄")
+        verify(OpsCommon.siteMarkerColor(out, false, true, 1, {}, 0, false) !== "#ffd400",
+               "取消勾选「出站」⇒ 该机不再取出站黄")
+    }
+
+    /// ‼️ 与排序位置**同源**：同站起降的航班 `isInbound` 与 `isOutbound` 同时为真，
+    /// 按既有口径（出站优先）落段 2 ⇒ 地图上必须是**出站黄**，与它排在出站那一段一致。
+    /// 少了这一格，配色改判 `isInbound` 会让"位置说一套、颜色说另一套"，而卡片那边
+    /// （`test_sectionIsInbound_matchesSortPosition`）照样全绿——两边用同一个函数才拦得住。
+    function test_siteMarkerColor_matchesSortPosition() {
+        var sameSite = _inboundTask(12, "IN_FLIGHT", 1, 1, "IN_FLIGHT")
+        verify(OpsCommon.isInbound(sameSite, 1, {}), "夹具前提：同站起降**同时**满足进站判据")
+        compare(OpsCommon.siteSection(sameSite, true, true, 1, {}), 2, "落段 2（出站优先）")
+        compare(OpsCommon.siteMarkerColor(sameSite, true, true, 1, {}, 0, false), "#ffd400",
+                "落段 2 ⇒ 出站黄（即使 isInbound 为真）：地图配色与列表排序位置必须一致")
+    }
+
+    //-------------------------------------------------------------------------
     // 进站卡片的动作闸（用户 2026-10-02 裁定③ + 第二轮裁定）
     //-------------------------------------------------------------------------
 

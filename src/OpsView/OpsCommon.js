@@ -603,6 +603,64 @@ function sectionIsInbound(section, task, mySiteId, handoverById) {
     return section === SEC_ACCEPTED || section === SEC_INBOUND
 }
 
+// 站点视图**地图 marker** 的两色（用户 2026-10-02 从三组候选里裁定这一组）。
+// ⚠️ 这三组是按**意图**挑的、由用户拍板，**不是**实测排序：`#ffd400` / `#00e676` 取"亮而不荧光"
+//    ——另两组候选 `#ffee00`/`#00ff66` 更接近纯色、`#ffb300`/`#00c853` 更暗更稳。哪个在真实
+//    底图上更醒目，要在跑起来的界面上截图对比才知道，本注释不声称做过那件事。
+// ⚠️ 与 `statusColor` 的"已落地绿" `#2ecc71` **刻意不同色**：那个绿说的是**状态**（已停稳），
+//    这个绿说的是**归属**（朝本站来）。同色会让人把"停稳了"读成"归本站"。
+var OUTBOUND_MARKER_COLOR = "#ffd400"
+var INBOUND_MARKER_COLOR = "#00e676"
+
+/// 站点视图地图 marker 的填色：**告警优先**，其余出站黄 / 进站绿。
+///
+/// ‼️ "告警优先"（用户 2026-10-02 裁定）不是修饰语：下面三档承载的是**告警与既成事实**，
+///    被黄绿盖掉就等于把它们从地图上删掉——
+///      · `isTimeout` ⇒ 交接**已超时**，接手窗口正在关闭；
+///      · `ABORT`/`ABORTED`/`FAILED` ⇒ 任务中止 / 异常；
+///      · `LANDING` 且**已落地**（本地报文）⇒ 已停稳。
+///    ⚠️ 前两档**不是**"反正会落进 `SEC_NONE` 兜底"：`ABORT` 与 `FAILED` **不在**
+///       `FINISHED_TASK_STATUSES`（那里只有 `COMPLETED`/`ABORTED`/`CANCELED`/`CANCELLED`）
+///       ⇒ 它们**不是终态**，一条降落本站、飞机 `IN_FLIGHT` 的 `ABORT` 任务会被判成
+///       **进站** ⇒ 少了这一档就会被涂成进站绿。只有 `ABORTED` 那一支能靠兜底变红。
+///       （同族坑：`ABORT` vs `ABORTED` 是两个字面量，`task-status-enum-literal-split`。）
+///    ⚠️ 判据是**逐档列举**，不是"`statusColor` 的返回值是不是某个色值"——后者会在有人调
+///       `statusColor` 的色板时**静默失效**（改一个 hex，这里的分支跟着错，没有任何报错）。
+///    ‼️ 但**取色**一律委派回 `statusColor`（不在这里写死 hex）：色板是单点的，改一次
+///       卡片与地图一起变。写死的话，"卡片说中止是橙、地图还写着红"不会有任何报错。
+///
+/// 第三类 `SEC_NONE`（出站/进站两个勾选框都没勾到它；或"飞机已 PARKED 而任务仍 IN_FLIGHT"
+/// 的人工收尾）**沿用现状的状态色**（用户 2026-10-02 裁定）：地图上"所有飞机都在"这个既有
+/// 行为不变，只是被分进两类的那些换了颜色。
+/// ⚠️ 因此本函数**不是** `statusColor` 的替代品，只是它的一个前置分支——`SEC_NONE` 那支必须
+///    原样回落，别在那边自作主张涂灰（"取消勾选后飞机变灰"是一次没人要过的行为变更）。
+///
+/// ‼️ 段号与卡片配色（`TaskListPanel._inboundCard`、`OpsView._focusMapOnInbound`）用
+///    **同一对函数、同一组实参**（`siteSection` + `sectionIsInbound`）：卡片被算进进站那一段
+///    ⟺ 地图上这架取进站色。**说的只是"落哪一支"同源**——⚠️ 两处的**取色刻意不同**
+///    （卡片边框 `#26a69a` 是既有的青绿，地图是本次裁定的 `#00e676`）：卡片是"这一行归哪类"，
+///    地图要在 24px 的箭头上从深色底里跳出来，判据不同。判据多一份拷贝，下次改口径就多一处
+///    静默漏掉的地方；**色板**则是各管各的，别为了"看起来统一"把它们并成一个常量。
+///
+/// ‼️ `nowMs` / `handoverById` / `outbound` / `inbound` / `mySiteId` 全部是**实参**：本文件是
+///    `.pragma library`，函数体内读属性**不注册绑定依赖**（见文件头部）⇒ 写成内部读取的话，
+///    用户勾选/取消勾选出站/进站时**地图颜色不跟着变**（列表变了、地图没变，且不报错），
+///    交接超时红也永远不会出现。
+function siteMarkerColor(task, outbound, inbound, mySiteId, handoverById, nowMs, landedOnGround) {
+    // ① 告警 / 既成事实优先（逐档列举，理由见上；取色委派 `statusColor`）
+    var s = task ? task.status : ""
+    if (isTimeout(handoverFor(task, handoverById), nowMs)
+        || s === "ABORT" || s === "ABORTED" || s === "FAILED"
+        || (s === "LANDING" && landedOnGround === true)) {
+        return statusColor(task, nowMs, handoverById, landedOnGround)
+    }
+    // ② 出站黄 / 进站绿
+    var sec = siteSection(task, outbound, inbound, mySiteId, handoverById)
+    if (sec === SEC_NONE) return statusColor(task, nowMs, handoverById, landedOnGround)
+    return sectionIsInbound(sec, task, mySiteId, handoverById) ? INBOUND_MARKER_COLOR
+                                                             : OUTBOUND_MARKER_COLOR
+}
+
 /// 进站卡片的**动作闸**：本站**已接管降落指挥**才可操作。
 /// 判据＝「任务已进入 `LANDING`，**或**（任务在航线中 **且** 已接引）」。
 ///

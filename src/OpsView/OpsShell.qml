@@ -121,6 +121,14 @@ Item {
     property string _handoverActionError: ""  // 交接确认/拒绝/撤回失败提示（handoverDialog 保留可重试）
     // 本站站点 id 来自登录响应 role_sites 单值（AuthController.siteId，仅内存），不再从任务反推。
     property var   _mySiteId:       AuthController.siteId
+    // 站点视图右栏的两个勾选框（出站 / 进站，默认都勾）。
+    /// ‼️ 定义在**本骨架**而不是 `OpsView`：地图那三层 `MapItemView` 在本文件里，而地图上的
+    ///    飞机 marker **不随勾选增减**（"所有飞机都在"是既有行为）——它只把**颜色**交给
+    ///    `OpsCommon.siteMarkerColor`，而那个函数要读这两个值。留一份在子类、这里再抄一份
+    ///    就会"列表按 A 过滤、地图按 B 上色"，表现只是某几架飞机颜色不对，**没有任何报错**。
+    ///    （`TaskListPanel` 那边同样要拿到同一组值，由 `OpsView` 显式传参，见那里的注释。）
+    property bool  _outbound:      true    // 站点视图勾选：出站
+    property bool  _inbound:       true    // 站点视图勾选：进站
     // 本站站点**坐标**（`GET /api/sites/:id` 的 `lat`/`lon`）。站点视图套视野的**中心锚点**。
     /// ‼️ 为什么 id 与坐标分两个属性：id 是登录响应直接给的（内存里就有），坐标要走一次接口。
     /// ‼️ 站点表**本身不存坐标**——`table_site` 只有 `waypoint_id`，坐标在关联的 `table_waypoint`。
@@ -1640,6 +1648,7 @@ Item {
             MapItemView {
                 model: opsShell.routeLayersEnabled ? [] : _tasks
                 delegate: MapQuickItem {
+                    id: siteMarker
                     // ‼️ 位置主源是**报文**，不是 `modelData.latest`（用户 2026-09-24 报障：
                     //    「飞机图标不会在 OpsView 中出现」）。`latest` 来自后端轮询的
                     //    `table_telemetry`（最多陈旧 2 s，且 `data_writer` 一旦停写就恒为旧值
@@ -1666,16 +1675,110 @@ Item {
                                 ? QtPositioning.coordinate(_pos.lat, _pos.lon)
                                 : QtPositioning.coordinate(0, 0)
                     anchorPoint: Qt.point(12, 12)
-                    sourceItem: Rectangle {
-                        width: 24; height: 24; radius: 12
-                        color: OpsCommon.statusColor(modelData, opsShell._now, opsShell._handoverById,
-                                                     OpsCommon.isLandedOnGround(_veh ? _veh.flying : undefined))
-                        border.color: "#ffffff"; border.width: 2
-                        Text {
-                            anchors.centerIn: parent
-                            color: "#ffffff"; font.pixelSize: 10; font.bold: true
-                            text: String(index + 1)
+                    // 填色：出站黄 / 进站绿，**告警优先**（用户 2026-10-02 裁定；三档告警各自的
+                    // 理由与"为什么逐档列举"见 `OpsCommon.siteMarkerColor`）。
+                    // ‼️ `opsShell._outbound` / `_inbound` / `_mySiteId` / `_now` / `_handoverById`
+                    //    必须在这个**绑定表达式里**读一次、作为实参传进去：`OpsCommon` 是
+                    //    `.pragma library`，函数体内读属性**不注册绑定依赖**（见该文件头部）⇒
+                    //    写成内部读取的话，勾选/取消勾选时**地图颜色不跟着变**、交接超时红
+                    //    永远不出现，而界面看起来完全正常。
+                    readonly property color _markerColor: OpsCommon.siteMarkerColor(
+                                                             modelData,
+                                                             opsShell._outbound, opsShell._inbound,
+                                                             opsShell._mySiteId, opsShell._handoverById,
+                                                             opsShell._now,
+                                                             OpsCommon.isLandedOnGround(_veh ? _veh.flying : undefined))
+                    // ‼️ 图标（箭头）与编号标这两块，与 L3（监控员视图）marker **逐字同款**，
+                    //    是**刻意**重复的（同上面 `_veh`/`_pos` 那两段）。不抽共用组件的理由：
+                    //    抽了就会让监控员视图跟着本次改动一起变，而本次只要求改站点视图。
+                    //    ‼️ **改一处必须改两处**——两边漂移的表现是"同一系统里两个视图的飞机
+                    //    长得不一样"，没有任何报错。
+                    sourceItem: Item {
+                        // ‼️ 本项宽度是**「图标 + 编号标」整块**，不是图标的 24：命中区要盖住两者
+                        //    （理由见下面 MouseArea）。`anchorPoint` 是 (12,12) 而图标仍从 (0,0)
+                        //    起画 ⇒ 只把本项撑宽**不会移动**图标，标注落点不受影响。
+                        width: 24 + 3 + siteLabelBox.width
+                        height: 24
+                        // 图标 = QGC 缺省的地图飞机图标（`src/FlightMap/Images/vehicleArrowOpaque.svg`，
+                        // `FirmwarePlugin.h:327` 的 `vehicleImageOpaque()`）的**两个填充三角**。
+                        // ‼️ 用 `Shape` 自绘而**不是** `Image` + `MultiEffect` 染色：后者要过 shader，
+                        //    而"多色 SVG 到底有没有被压成单色"会变成只能靠肉眼验的隐含前提
+                        //    （原图是**硬编码三色红**）。这里只取两个填充三角、去掉原来那两条深红
+                        //    描边 —— 描边是多色硬编码的，去掉才能按归属染色。
+                        //    path 坐标与上游 SVG **逐字相同**，便于日后与上游比对。
+                        // ‼️ 顶点在 (35.5, 2.118) ⇒ **机头朝正北**，故 `rotation` 就是航向本身。
+                        //    ⚠️ **不要**叠 −90°：站点机位图那个 `_airplanePath` 机头朝**右**、
+                        //    需要 −90°，两者朝向约定相反，别把那边的手法照搬过来。
+                        Item {
+                            width: 24; height: 24
+                            // ‼️ 航向旋转放在**这一层**，不放 `Shape` 上：`Shape` 内部那层
+                            //    `Scale`（72→24）与 `rotation` 谁先作用取决于 Qt 的变换合并顺序，
+                            //    "绕原点还是绕中心"会因此不同。在外层转，只绕 24×24 的中心，没有歧义。
+                            // 航向取**报文**（ATTITUDE.yaw → `Vehicle::heading`）。
+                            // ‼️ 依赖落在这里读 `_veh.heading.rawValue` 上 —— 挪进函数体就不注册
+                            //    依赖，机头会永远朝第一帧的方向（同 `_veh` 的注释）。
+                            // ⚠️ `heading` 缺失/NaN 时回 0（正北）：NaN 不是合法角度，
+                            //    不能直接传给 `rotation`（同族坑见 `qml-nan-to-int-property-becomes-1`）。
+                            rotation: {
+                                var h = _veh ? _veh.heading.rawValue : NaN
+                                return (typeof h === "number" && !isNaN(h)) ? h : 0
+                            }
+
+                            Shape {
+                                width: 72; height: 72
+                                // 原图 viewBox 是 72×72，缩到 24。用 `Scale` 而不是把 path 里的
+                                // 数字改小——改了数字就再也看不出它来自哪个图标了。
+                                transform: Scale { origin.x: 0; origin.y: 0; xScale: 1 / 3; yScale: 1 / 3 }
+
+                                ShapePath {
+                                    fillColor: siteMarker._markerColor
+                                    strokeColor: "#ffffff"
+                                    // 常态**不描边**：同样 3px 在圆点上只占周长 12.5%，在这条
+                                    // **尖三角形**上会把填充色糊掉。L3 那边为这一档做过离屏探针
+                                    // （实测「状态色只剩 19%、其余全被白边盖住」，图标看上去是
+                                    // **白的**）——本块的形状、缩放与描边宽度与它**逐字相同**，
+                                    // 故那个结论直接适用；**我没在本 marker 上重测**。
+                                    // 本站视图没有"点亮"这一态，故恒为 0
+                                    //（L3 那边是 `_vis === "lit" ? 3 : 0`，**别照搬那三档**）。
+                                    // ⚠️ `strokeWidth` 的单位是 **path 的坐标（未缩放的 72 制）**，
+                                    //    缩放 1/3 之后视觉宽度才等于它的三分之一。
+                                    strokeWidth: 0
+                                    PathSvg { path: "M35.5 2.118v51.573L1.118 70.882zM36.5 53.691V2.118l34.382 68.764z" }
+                                }
+                            }
                         }
+                        // 无人机编号标在图标右侧（自绘，**不用 ToolTip**：地图项是画在场景里的，
+                        // ToolTip 的 parent 会落到地图根而非被悬停项上，位置会漂移）
+                        // ‼️ 标的是**无人机编号**（`uav_no`）—— 用户 2026-10-02 明说"后面带无人机编号"。
+                        //    ⚠️ 与 L3 的标签**刻意不同**：那边标**航班号**（`task_no`，用户
+                        //    2026-09-23 定"地图上画的就是航班"）。两个视图标的不是同一个东西，
+                        //    别为了"统一"把这里改成 `task_no`。
+                        //    被替换掉的是原来的**序号**（`String(index + 1)`）—— 那是"列表里第几张卡"，
+                        //    与飞机本身无关，离开列表就看不懂。
+                        // ⚠️ 回退 `#device_id`：`uav_no` 在库里可空（未登记的飞机），
+                        //    而 `device_id` 一定在（后端 `opsOverviewItem.UAVDeviceID`）。
+                        Rectangle {
+                            id: siteLabelBox
+                            x: 27                        // = 图标宽 24 + 间距 3（与上面的 width 同源，别只改一处）
+                            anchors.verticalCenter: parent.verticalCenter
+                            width: siteLabel.width + 8; height: siteLabel.height + 4
+                            radius: 3
+                            color: "#cc0d1526"
+                            border.color: "#3a4a66"; border.width: 1
+                            Text {
+                                id: siteLabel
+                                anchors.centerIn: parent
+                                color: "#e6edf7"; font.pixelSize: 10; font.bold: true
+                                text: modelData.uav_no ? modelData.uav_no : ("#" + modelData.device_id)
+                            }
+                        }
+                        // ‼️ 命中区靠**撑宽 parent** 来涵盖编号标，而不是在这里写
+                        //    `width: parent.width + 3 + siteLabelBox.width`：
+                        //    原先只 `anchors.fill: parent` 填图标的 24×24，而标画在图标**之外**
+                        //    （x=27 起）⇒ **点标毫无反应**。而用户眼里那是「飞机 + 编号」一个
+                        //    整体，点在哪一半都该算点中了这架飞机。
+                        // ⚠️ 本项是最后一个子项（后声明者在上）。日后若往 sourceItem 里再加
+                        //    Button/MouseArea，必须排在**本项之前**，否则会把命中区切掉一块。
                         MouseArea {
                             anchors.fill: parent
                             onClicked: {

@@ -76,8 +76,10 @@ OpsShell {
     // 下方、与右边栏同宽）。由六个 `onXxxRequested` 在 `open()` 之前写入；`-1` 表示没有锚点，
     // 弹框兜底居中。每次点动作都会重写，所以关闭时不必清空。
     property real _confirmAnchorY: -1
-    property bool  _outbound:      true    // 站点视图勾选：出站
-    property bool  _inbound:       true    // 站点视图勾选：进站
+    // 站点视图勾选：出站 / 进站 —— ‼️ 两个属性的**定义已上移到 `OpsShell`**（基类），不再是
+    // 本文件的属性：地图上的飞机 marker 在骨架里，它上色时要读同一组值（理由见 `OpsShell`
+    // 那两行上的注释）。这里继续直接读写即可（继承），但**别在这儿再定义一遍**——
+    // 重复定义会把地图与列表分成两份各自漂移的值，且不报任何错。
     // 右边栏重构：选中机位 / 降落拦截原因
     // 本站站点 id 来自登录响应 role_sites 单值（AuthController.siteId，仅内存），不再从任务反推。
     property var   _selectedSlotId:   -1
