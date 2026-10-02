@@ -81,9 +81,24 @@ ColumnLayout {
     property int    selectedTaskId: -1
     property bool   showSiteActions: false      // 站点视图 ∧ SITE_ATC（出站/进站按钮组）
     property bool   isRouteMonitor: false       // 监控员视图（移交降落指挥）
+    // 站点视图的两个勾选框（「出站」/「进站」）。卡片**配色**要用它们：
+    // 调用方传进来的 `tasks` 已经是 `OpsCommon.siteTasks(...)` 过滤+排序过的结果，
+    // 而"这张卡属于哪一段"这件事在**面板里**必须重算一遍（拿不到段号）⇒ 得把同一个
+    // 开关一并传进来。**不传就会静默出错**：两个默认 `false` ⇒ `siteSection` 恒回 -1
+    // ⇒ 每张卡都判成"非进站"⇒ 一律涂出站色，而列表顺序仍是对的（看起来只是"颜色没生效"）。
+    // ⚠️ 监控员视图（`RomView`）不传：它走 `middleSectionTasks`，且叠在 `showSiteActions`
+    //    上的那道闸已经把它的段号按 `-1` 处理（见 `_inboundCard`）。
+    property bool   outbound: false
+    property bool   inbound: false
     property real   cardMargin: 10              // 卡片左空位；站点视图传机位左空隙，与之对齐
     property real   cardRightGap: 20
     property real   cardGap: OpsCommon.taskCardGap
+    // 进站卡的配色（用户 2026-10-02 裁定⑥：「出站任务，与入站任务使用不同颜色的边框和
+    // 背景显示」）。**只此一处定义**：卡片的 `color` 与 `border.color` 都读它——
+    // 两处各写一遍字面量的话，将来改配色漏掉一处就是"青绿底 + 蓝边框"，而它不会报错。
+    // 出站色不进属性：那是既有色值，散在 `color`/`border.color` 的 else 分支里，本次不动。
+    readonly property color inboundCardColor:       "#0f2f2c"
+    readonly property color inboundCardBorderColor: "#26a69a"
     // ‼️ 中段的分段标题（`sectionBreak` / `sectionTitleFirst` / `sectionTitleSecond`，
     //    2026-09-29 加、同日**删**）——用户看过实际界面后的裁定：「两行段头全删」。
     //    它们原是为「点航线，航班列表不变」这个报障加的缓解手段（拍平渲染让用户看不出
@@ -220,6 +235,36 @@ ColumnLayout {
                 readonly property bool _inFlightOutbound:
                     panel.showSiteActions && modelData.status === "IN_FLIGHT"
                     && OpsCommon.isOutbound(modelData, panel.mySiteId, panel.handoverById)
+                // ── 站点视图：本卡属于哪一段（配色用）──
+                // ‼️ 段号由 `OpsCommon.siteSection` 单点定义，与列表**排序**同源：列表用同一个
+                //    函数落桶 ⇒ "卡片排在进站那一段、却涂着出站的颜色"在结构上不可能出现。
+                //    这里另写一份判据的话（比如直接判 `isInbound`），同站起降的卡片就会
+                //    落在出站段却涂成青绿——**不报任何错**，只是看起来像列表错位。
+                // ⚠️ 叠 `panel.showSiteActions`：分段是站点视图的概念，监控员视图
+                //    （`RomView`，走 `middleSectionTasks`）没有段号 ⇒ 一律按 -1 处理。
+                readonly property int _section:
+                    panel.showSiteActions
+                    ? OpsCommon.siteSection(modelData, panel.outbound, panel.inbound,
+                                            panel.mySiteId, panel.handoverById)
+                    : -1
+                // 本卡用**进站配色**（青绿底 / 青绿边框，用户 2026-10-02 裁定⑥：
+                // 「出站任务，与入站任务使用不同颜色的边框和背景显示」）。
+                readonly property bool _inboundCard:
+                    OpsCommon.sectionIsInbound(_section, modelData, panel.mySiteId, panel.handoverById)
+                // ── 站点视图：进站卡片的**动作闸**（上限）──
+                // ‼️ 用户 2026-10-02 裁定③「到站任务卡片……除了选中外，不能对其做任何操作」，
+                //    以及第二轮裁定「需要『航线监控员』执行签出后，隐藏的按钮才被点亮」。
+                //    ⚠️ "点亮"**分两格**（2026-10-02 晚用户就"点亮时刻"裁定完毕，见 `inboundActionable` 头注）：
+                //       ① 监控员发起 LANDING 移交（PENDING）⇒ 亮的是【签入】（判据 `_awaitingMe`，**不**走本属性）；
+                //       ② 本站【签入】完成（`landing_accepted` 置真）⇒ 亮的是本属性门控的那两个动作按钮。
+                //       ② 不能再提前：后端 `AssignSlot`/`Land` 都硬要求 ACCEPTED 的 LANDING 交接。
+                // ⚠️ 为假 **不表示**卡片上一定没有按钮——按钮各自还叠了 `status`/`_awaitingMe` 等。
+                //    本属性是**上限**：为假时进站动作一个都不该亮。它是这么用的：
+                //    两个进站动作按钮的 `visible` 都带 `&& card._inboundActionable`。
+                readonly property bool _inboundActionable:
+                    panel.showSiteActions
+                    && OpsCommon.inboundActionable(modelData, panel.mySiteId, panel.handoverById)
+
                 // 签出提示条文案（驳回理由 / 超时说明；其余状态空串 ⇒ 不占位）。单点在 `checkoutNotice`。
                 readonly property string _checkoutNotice: OpsCommon.checkoutNotice(modelData)
                 // 这条 PENDING 交接是不是**等我动手**（我是签入方）⇒ 警示条加底色/描边。
@@ -264,10 +309,16 @@ ColumnLayout {
                 width: parent.width
                 height: taskBody.height + 12
                 radius: 4
-                color: "#16233c"
+                // ‼️ 进站卡青绿底/青绿边框、出站保持原色（用户 2026-10-02 裁定⑥）。判据单点在
+                //    `card._inboundCard`——它取的是与**列表排序同源**的那个段号 ⇒ 颜色与位置
+                //    不可能各说各话。色值本身也只定义一次：`panel.inboundCard*Color`。
+                color: _inboundCard ? panel.inboundCardColor : "#16233c"
                 border.width: 1
+                // 边框优先级：**超时红 > 选中蓝 > 段色**。选中色两段共用——"选中"是跨段同一种
+                // 状态，给它两套色会让用户以为选中了两种不同的东西。
                 border.color: _timedOut ? "#ff3b3b"
-                              : (panel.selectedTaskId === modelData.task_id ? "#2f6bd8" : "#2a3a55")
+                              : (panel.selectedTaskId === modelData.task_id ? "#2f6bd8"
+                                 : (_inboundCard ? panel.inboundCardBorderColor : "#2a3a55"))
 
                 // 点整项选中任务（视图侧收到 taskSelected 后自行决定是否同步点亮机位）
                 MouseArea {
@@ -548,9 +599,17 @@ ColumnLayout {
                             // 6.0-E 切换多旋翼降落：仅已签入(LANDING)（landing_accepted）且 DB 仍 IN_FLIGHT 时出现；
                             // 点按→红绿确认→机位校验→POST /tasks/:id/land（LANDING 唯一写路径）→脱离回航、
                             // 转多旋翼、重新发出回航（落点仍是原机位）。见 `OpsView._switchToMultirotorThenReturn`。
-                            visible: panel.showSiteActions
-                                     && OpsCommon.isInbound(modelData, panel.mySiteId, panel.handoverById)
-                                     && modelData.status === "IN_FLIGHT" && OpsCommon.landingAccepted(modelData)
+                            // ‼️ 判据收敛到 `_inboundActionable`（＝本站已接管降落指挥）**叠加** `IN_FLIGHT`：
+                            //    与原判据 `isInbound && IN_FLIGHT && landingAccepted` 逐值等价
+                            //    （`_inboundActionable` 是 `LANDING || (IN_FLIGHT && landingAccepted)`，
+                            //     叠 `IN_FLIGHT` 后 `LANDING` 那半自动排除），但"已接引才可操作"
+                            //     这个不变式只剩**一个**定义点。
+                            //    ⚠️ 2026-10-02 外层闸放宽后，这个 `IN_FLIGHT` 合取项**两处都留着**：
+                            //    原先它只由 `isInbound` 的外层白名单保证，那道保证已经没了——若只在
+                            //    `OpsCommon.inboundActionable` 里去掉它，一条**还没起飞**却带着
+                            //    `landing_accepted` 的任务会冒出这个按钮。详见那边函数的头注。
+                            visible: card._inboundActionable
+                                     && modelData.status === "IN_FLIGHT"
                             // 可点判据 = **实际指派的降落机位**（`assign_slot_id`，与后端 Land/CheckLandingSlot
                             // 同一子查询口径）。‼️ 不能用 `landing_slot_id`：那是**落地后的快照**（只有 `Park` 写，
                             // 写时状态已 COMPLETED），飞行/回航阶段**恒为 NULL** ⇒ 按钮**永远点不了**。
@@ -564,10 +623,12 @@ ColumnLayout {
                         }
                         Button {
                             // 指定机位：签入(LANDING)后可预占（后端 AssignSlot 门控 IN_FLIGHT+ACCEPTED LANDING 或 LANDING）
-                            visible: panel.showSiteActions
-                                     && OpsCommon.isInbound(modelData, panel.mySiteId, panel.handoverById)
-                                     && (modelData.status === "LANDING" ||
-                                         (modelData.status === "IN_FLIGHT" && OpsCommon.landingAccepted(modelData)))
+                            // ‼️ `_inboundActionable` 的判据**逐字**取自本按钮原来那句的中段
+                            //    （`LANDING || (IN_FLIGHT && landingAccepted)`）⇒ 收敛不改变行为。
+                            //    ⚠️ 那个 `IN_FLIGHT` 原先"由 `isInbound` 的外层保证"，2026-10-02
+                            //    外层放宽后不再有保证 ⇒ 已提升为**显式**合取项（与 `_inboundActionable`
+                            //     逐字相同，正是收敛要的效果）。
+                            visible: card._inboundActionable
                             height: 24; padding: 0
                             text: qsTr("指定机位")
                             onClicked: panel.assignSlotRequested(modelData)
@@ -577,6 +638,13 @@ ColumnLayout {
                             // 失联/无载具→放行"停泊（无遥测）"；均不隐藏，供人工收尾。
                             // "已落地"＝`Vehicle::flying === false`，由加密心跳 EXT 的
                             // `landed_state == ON_GROUND` 驱动（原判据读库里的 `latest.landed` bit0）。
+                            // ‼️ 这一格**故意不**叠 `card._inboundActionable`：`LANDING` 只说明"已发降落
+                            //    指令"，而它是**两个视图、两类卡片**共用的状态。降落在**别站**、本站尚未
+                            //    签出的卡片（本站起飞→他站降落、`checkoutState !== "ACCEPTED"`）此刻也是
+                            //    `LANDING` ⇒ 它是**出站**卡，【停泊】本就该在；叠上进站闸会把它一并收掉。
+                            //    需求③约束的是"到站卡片"，不是"所有 LANDING 卡片"。
+                            // ⚠️ 对**到站本站**的 LANDING 卡片，本条与 `_inboundActionable` 天然一致
+                            //    （本站降落 ⇒ `landing_site_id === mySiteId` ⇒ 必进站），故不叠也不漏。
                             visible: panel.showSiteActions && modelData.status === "LANDING"
                             enabled: card._onGround || !OpsCommon.hasLiveTelemetry(card._uav)
                             height: 24; padding: 0

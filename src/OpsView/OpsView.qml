@@ -195,8 +195,13 @@ OpsShell {
         _fetchSlots()
         _fetchSlotsAll()
     }
-    // 选中任务（地图 marker 或列表点击都由骨架发）→ 找到停放其无人机的机位，点亮之
-    onTaskSelected: function(task) { _syncSlotForSelection(task) }
+    // 选中任务 → 找到停放其无人机的机位，点亮之；若是**到站**卡片，另把地图切到该飞机。
+    // ⚠️ 本信号的**唯一**来源是列表点击（骨架 `selectTask` 发它）；点地图 marker 走的是
+    //    `selectRoute`，**不发**这条信号——两条路各自管各自的视野，别以为这里是共用的。
+    onTaskSelected: function(task) {
+        _syncSlotForSelection(task)
+        _focusMapOnInbound(task)
+    }
 
     function _fetchSlots() {
         if (!_isSiteATC || _mySiteId <= 0) return
@@ -988,6 +993,74 @@ OpsShell {
         var s = _slotForTask(task)
         _selectedSlotId = s ? s.id : -1
     }
+    /// 选中**到站卡片**后把地图切到该飞机（用户 2026-10-02 裁定④）。用户原话
+    /// 「到站任务卡片……除了选中外，不能对其做任何操作。当然，选中后，会把地图切到该飞机上」
+    /// ——「选中后」承接的是同一段的「到站任务卡片」⇒ **只对进站任务**生效，
+    /// 出站卡片的选中行为一字不动（那正是用户 2026-09-23 裁定的「地图中心=当前登陆站点」）。
+    ///
+    /// ‼️ 判据用 **`siteSection` + `sectionIsInbound`**，与卡片**配色**（`TaskListPanel` 的
+    ///    `_inboundCard`）**逐字同一对函数、同一组实参**——用户看到的「青绿卡片」就是"选中会
+    ///    拽地图"的充要条件。
+    /// ⚠️ **不能图省事直接判 `OpsCommon.isInbound`**：那是**不看两个勾选框**的纯谓词
+    ///    （勾选框由 `siteSection` 施加）。同站起降的航班（`isOutbound` 与 `isInbound` **同时为真**，
+    ///    真库有这类场景，`route-same-station-check` 就是为它写的）**未接引**时会排在**段 2 出站**
+    ///    、涂**出站蓝**，而裸 `isInbound` 仍为真 ⇒ 点它会拽地图，与用户看到的卡色矛盾。
+    ///    更糟的是这种分叉**不报任何错**：只是某几张蓝卡片点了会动地图。
+    /// ⚠️ 与配色判据一样，这里也**不重写**一份段序逻辑：判据每多一份拷贝，下次改口径就多一处
+    ///    静默漏掉的地方（放宽 `isInbound` 时，那些漏掉的卡片点了没反应，而没有任何报错）。
+    /// ⚠️ `TaskListPanel` 那边多一道 `panel.showSiteActions ? … : -1` 闸，这里**故意不照抄**：
+    ///    那个面板被 `RomView` 以 `showSiteActions: false` 复用（同组件两种身份），少了闸就会给
+    ///    监控员视图的卡片涂错色；而本函数只在站点视图点得到——`siteViewArea` 的
+    ///    `visible: opsView._isSiteATC` 挡在前面 ⇒ 那道闸在这儿是**永不触发的死判据**。
+    ///
+    /// 落点复用「点地图上的飞机 marker」那条既有路径（`OpsShell.qml` 里 marker 的点击：
+    /// `_mapFollowFirst = false` + `_mapManualCenter = <坐标>`，本函数是**逐字同款两行**）。
+    /// ⚠️ 不说"`_mapManualCenter` 优先级最高"——骨架 `center` 绑定的**第一项**是
+    ///    `routeLayersEnabled && _mapFollowFirst && _firstTaskCoord() !== null`，在监控员视图里
+    ///    它**压在** `_mapManualCenter` 上面。本视图（`routeLayersEnabled === false`，站点视图的
+    ///    默认值）那一项恒假 ⇒ `_mapManualCenter` 才是实际生效的那一支。
+    ///    本函数**不调** `selectRoute`：marker 那条路调它，但 `selectTask` 在站点视图里
+    ///    本来就跳过 `_selectedRouteId`（同 `routeLayersEnabled` 闸），这里跟它保持一致。
+    ///
+    /// 坐标**报文源优先**（与全系统口径一致：飞机位置吃报文不吃库）：
+    ///   · 载具在线且已定位 ⇒ `vehicle.coordinate`；
+    ///   · 否则回落 `task.latest` —— 后端 `ops.go` 的 `fetchLatestTelemetry`，按
+    ///     `ORDER BY te.timestamp DESC, te.id DESC LIMIT 1` 取的**最后一帧遥测位置**，
+    ///     **无相位过滤**（不是"落地位置"）。与骨架 `_firstTaskCoord()`（开局取景）同一口径。
+    ///     ⚠️ `task.latest.lat` 同时当**真值判据**用（既有同款写法）：`lat` 恰为 0 时这一支
+    ///     也不成立 ⇒ 赤道上的真位置同样取不到。这是继承来的口径，不在这里单独"修"。
+    ///   · 两者都没有（载具掉了心跳、库里也没这一架）⇒ **不动地图**。
+    ///
+    /// 两道 `isValid` 是**防御**，不是"修一个已观测到的毛病"。2026-10-02 用探针
+    /// （`/tmp/probe_center_invalid.qml`，offscreen）实测 `Map.center` 对无效坐标的反应：
+    ///   · 标定格：`center: coordinate(31.2, 121.5)` ⇒ 读回 31.2/121.5（读回通路可用）；
+    ///   · 赋 `coordinate(NaN, NaN)` ⇒ **center 纹丝不动**（仍是 31.2/121.5），QtLocation
+    ///     **静默忽略**无效值，**不报错、不跳 (0,0)**；
+    ///   · 正对照：紧接着赋 `coordinate(22.5, 114.0)` ⇒ 读回 22.5/114.0，证明上一格
+    ///     "没变"是真的被拒，而不是这个属性被冻住了。
+    ///   ⇒ 「无效坐标会让地图跳到几内亚湾」是**假的**（我原先就是这么写的，实测推翻）。
+    /// ⚠️ **但 (0,0) 挡不住**：`QGeoCoordinate(0,0).isValid` 为 **true**（实测），是合法坐标。
+    ///   能走到 `v.coordinate === (0,0)` 的路径只有 `Vehicle::_handleHighLatency2`
+    ///   （`Vehicle.cc` 里那段 `_coordinate.setLatitude(highLatency2.latitude / 1E7)`
+    ///   **没有 fix_type 闸**，而 `_handleGpsRawInt` 那条有 `>= GPS_FIX_TYPE_3D_FIX`）。
+    ///   ‼️ 「路径存在」已 grep 确认，「**这些飞机会不会真发 HIGH_LATENCY2 且带 0**」**未实测**
+    ///   ——不据此加判据；先按现状记在这里（`task.latest` 那支因真值判据已天然排除 lat=0）。
+    function _focusMapOnInbound(task) {
+        if (!task) return
+        var sec = OpsCommon.siteSection(task, _outbound, _inbound, _mySiteId, _handoverById)
+        if (!OpsCommon.sectionIsInbound(sec, task, _mySiteId, _handoverById)) return
+        var c = null
+        var vs = QGroundControl.multiVehicleManager.vehicles
+        var v = (vs && vs.count > 0) ? OpsCommon.matchDeviceToVehicle(task, vs) : null
+        if (v && v.coordinate && v.coordinate.isValid) {
+            c = v.coordinate
+        } else if (task.latest && task.latest.lat) {
+            c = QtPositioning.coordinate(task.latest.lat, task.latest.lon)
+        }
+        if (c === null || !c.isValid) return
+        _mapFollowFirst = false
+        _mapManualCenter = c
+    }
     // 选中机位 → 反向点亮停放其无人机的任务
     function _taskForSlot(slot) {
         if (!slot || !slot.current_uav_id) return null
@@ -1427,6 +1500,12 @@ OpsShell {
                         mySiteId: opsView._mySiteId
                         selectedTaskId: opsView._selectedTaskId
                         showSiteActions: opsView._isSiteATC
+                        // 两个勾选框必须**与 `tasks` 用同一组值**：列表是 `siteTasks(..., _outbound,
+                        // _inbound, ...)` 算出来的，而卡片配色要在面板里**重算一次**段号
+                        // （拿不到段号，只拿得到过滤后的行）⇒ 传的不是同一组值就会"列表按 A 过滤、
+                        // 颜色按 B 判"，看起来只是某几张卡颜色不对，没有任何报错。
+                        outbound: opsView._outbound
+                        inbound: opsView._inbound
                         isRouteMonitor: false
                         cardMargin: opsView._taskCardMargin
                         cardRightGap: opsView._taskCardRightGap

@@ -867,6 +867,330 @@ TestCase {
                 "两个勾选框同时命中时仍只收一次")
     }
 
+    /// 终态黑名单**逐档**（与后端 `handlers/task.go` 的 `finishedTaskStatuses` 逐字对应）。
+    /// ⚠️ 两个拼写都要钉：真库 2026-10-02 实测**同时**在用——`table_flight_task` 里那条是
+    ///    `CANCELED`，而同库 `table_task_handover` 里 16 条全是 `CANCELLED`。
+    ///    只钉一个的话，另一个字面量的任务会被当成"非终态"放进 `isInbound`，**且没有任何报错**。
+    /// ⚠️ 第二半同样必要：若全是终态，一个恒真的实现也能让第一半全绿。
+    function test_isFinishedTaskStatus_blacklistIsExact() {
+        var fin = ["COMPLETED", "ABORTED", "CANCELED", "CANCELLED"]
+        for (var i = 0; i < fin.length; i++)
+            verify(OpsCommon.isFinishedTaskStatus(fin[i]) === true,
+                   fin[i] + " 是终态 ⇒ 必须为**真 bool** true")
+
+        var live = ["SCHEDULED", "READY", "TAKEOFF", "IN_FLIGHT", "LANDING", ""]
+        for (var j = 0; j < live.length; j++)
+            verify(OpsCommon.isFinishedTaskStatus(live[j]) === false,
+                   live[j] + " 不是终态 ⇒ 必须为**真 bool** false"
+                   + "（undefined 会让 isInbound 那句 return false 短路成 undefined）")
+
+        // ‼️ 这一格钉的是**两侧一致**，不是"这个判据对"：`ABORT`/`FAILED` 在 `statusLabel`
+        //    里被译成「中止」「异常」，却**不在**后端的 `finishedTaskStatuses` 里
+        //    ⇒ 两侧都把它们当**非终态**。前端单方面加进去就会与后端漂移（后端下发、前端滤掉
+        //    或反之），而漂移的症状正是本 bug 的形状："任务卡片时有时无"。
+        //    ⚠️ **未实测**：后端是否真会把这俩字面量写进 `table_flight_task.status`
+        //    （真库现有取值只有 `READY`/`CANCELED`）。若将来真出现，这是一处**静默放行**的缝。
+        verify(OpsCommon.isFinishedTaskStatus("ABORT") === false
+               && OpsCommon.isFinishedTaskStatus("FAILED") === false,
+               "与后端 finishedTaskStatuses 保持一致：ABORT/FAILED 不在黑名单里")
+    }
+
+    //-------------------------------------------------------------------------
+    // 「到站本站」的航班（2026-10-02 用户需求，逐字）
+    //   「在检索任务列表时，除了从当前站点起飞的，还要检索到站本站的飞行任务（要求该飞行
+    //     任务对应的飞机至少已经 READY_TO_TAKEOFF），到站任务卡片显示在出站任务卡片的
+    //     后面…当该飞行任务被成功接引后，该任务卡片将被置顶，如果当前站点有多个已经接引、
+    //     但是未降落的任务，那么置顶项按照接引的顺序显示」
+    //   后端（`gcs_server/handlers/ops.go` 的 `case "site":`）与前端**逐项同口径**，
+    //   本组钉的是前端这一半。两侧漂移的表现正是本 bug：**后端给了、前端滤掉了**，
+    //   而飞机遥测走另一条路照常显示 ⇒「轨迹和数据都在、任务卡片不在」。
+    //-------------------------------------------------------------------------
+
+    /// 与 `opsOverviewItem` 同形的任务项（比 `_siteTask` 多飞机状态与接引时刻）。
+    /// ‼️ `uav_status` 是本组判据的自变量：少了它 `isAirborneReady` 恒假 ⇒ 用例会
+    ///    "什么都没测到"却全绿（同 `_siteTask` 上方对 `landing_site_id` 的警告）。
+    /// `landingAcceptedAt` 给了才置 `landing_accepted`——两个字段同源（后端同一个子查询族）。
+    function _inboundTask(taskId, status, takeoffSiteId, landingSiteId, uavStatus, landingAcceptedAt) {
+        var t = _siteTask(taskId, status, takeoffSiteId, landingSiteId, undefined)
+        t.uav_status = uavStatus
+        if (landingAcceptedAt !== undefined) {
+            t.landing_accepted = true
+            t.landing_accepted_at = landingAcceptedAt
+        }
+        return t
+    }
+
+    /// 白名单**逐档**（与后端 `ops.go` 里那份逐字对应，用户 2026-09-22 裁定 2B）。
+    /// ⚠️ 两半都要：六档各自为真，**阈值之下**的档（PREFLIGHT）与未知值必须为假——
+    ///    少了后一半，一个恒真的实现也能让六档全绿。
+    /// ‼️ 取**白名单**而非"排除法"：`table_uav.status` 无 CHECK 约束，将来多一个状态时
+    ///    排除法会把新状态**静默**放行；白名单则 fail-closed（那正是这里要的）。
+    function test_isAirborneReady_whitelistIsExact() {
+        var ok = ["READY_TO_TAKEOFF", "TAKEOFF", "IN_FLIGHT", "LANDING", "RETURNING", "EMERGENCY_LANDING"]
+        for (var i = 0; i < ok.length; i++)
+            verify(OpsCommon.isAirborneReady(ok[i]), ok[i] + " 在白名单内 ⇒ 必须为 true")
+
+        var notOk = ["PREFLIGHT", "PARKED", "", "IDLE", undefined, null]
+        for (var j = 0; j < notOk.length; j++)
+            verify(OpsCommon.isAirborneReady(notOk[j]) === false,
+                   String(notOk[j]) + " 不在白名单内 ⇒ 必须是**真 bool** false"
+                   + "（undefined 会让调用点的可见性判定退回默认值 true）")
+    }
+
+    /// 本次 bug 的**正面判据**：飞机已飞到本站、监控员**还没发起移交**（零交接）。
+    /// 改前 `isInbound` 要求 `LANDING || pendingPhase(LANDING) || landingAccepted`，三项全假
+    /// ⇒ 卡片不出现，而飞机数据照常显示——用户看到的就是那个"诡异"。
+    /// ⚠️ `takeoff_site_id = 3`（他站）是**刻意**的：写成本站的话 `isOutbound` 也会命中，
+    ///    将来若有人把两个判据合成一条，"进站那半句放行了"就与"出站那半句放行了"不可区分。
+    function test_isInbound_airborneTaskAtMyLandingSite() {
+        var t = _inboundTask(91103, "IN_FLIGHT", 3, 1, "IN_FLIGHT")
+        verify(OpsCommon.isInbound(t, 1, {}),
+               "飞机 IN_FLIGHT、降落在本站、零交接 ⇒ 必须判为进站（改前为 false，正是本 bug）")
+    }
+
+    /// 收窄判据：「到站**本站**」这四个字本身要有判据。
+    /// 上面那条在**任何**一条他站起飞的航班上都成立，真正收到本站的只有 `landing_site_id`。
+    /// 少了这一格，把判据写成「凡白名单内的在飞航班一律进站」也能全绿——后果是**每个**站点的
+    /// 列表里塞满别人家的航班。
+    function test_isInbound_stillRequiresMyLandingSite() {
+        verify(!OpsCommon.isInbound(_inboundTask(91104, "IN_FLIGHT", 3, 99, "IN_FLIGHT"), 1, {}),
+               "降落在 99 站 ⇒ 对本站点而言只是路过，不得进站")
+        verify(!OpsCommon.isInbound(_inboundTask(91105, "IN_FLIGHT", 3, undefined, "IN_FLIGHT"), 1, {}),
+               "缺 landing_site_id ⇒ 不得进站")
+    }
+
+    /// ‼️ 新增的白名单分支是 **OR 并上**，不是替换——与后端同日实测的**同一形状的锁**。
+    /// 三格各钉既有分支的一项，且**飞机状态都在白名单外**（PARKED）：
+    /// 不这么做的话白名单分支会把它们一并放行，这一格就退化成"什么都没测"。
+    ///
+    /// ⚠️ 第三格是用户裁定⑤（接引后置顶）的**入口条件**：飞机接引后往往很快落地停稳
+    /// （`PARKED`，白名单外），此刻若进站判据只剩白名单一项，那张刚被置顶的卡片
+    /// 会在停稳的瞬间**整条消失**——置顶功能看起来"时好时坏"。
+    function test_isInbound_keepsExistingBranches() {
+        verify(OpsCommon.isInbound(_inboundTask(1, "LANDING", 3, 1, "PARKED"), 1, {}),
+               "任务已 LANDING ⇒ 进站（既有第一项：与飞机状态无关）")
+
+        var pending = _inboundTask(2, "IN_FLIGHT", 3, 1, "PARKED")
+        pending.handover = _embeddedHo(7, "LANDING", 8)
+        verify(OpsCommon.isInbound(pending, 1, {}),
+               "有 PENDING(LANDING) 交接 ⇒ 进站（既有第二项：监控员已发起移交、等本站签入）")
+
+        verify(OpsCommon.isInbound(_inboundTask(3, "IN_FLIGHT", 3, 1, "PARKED", "2026-10-02 09:00:00"), 1, {}),
+               "已接引 ⇒ 进站（既有第三项，也是「接引后置顶」那一段的入口）")
+    }
+
+    /// ‼️ **用户 2026-10-02 报的那条**，逐字复刻真库：
+    ///   「使用 site_atc 登录 qgc1，显示飞行任务（关联 10000385）从平谷飞北七家，
+    ///     飞机状态是 READY_TO_TAKEOFF；使用 nd_test 登录 qgc3，屏幕上没有任务列表」
+    /// 真库实测值：task **91103** / `E2E-迫降-001` / `status='READY'` / `site_id=1`（平谷）/
+    /// `landing_site_id=2`（北七家）/ uav id=6 `status='READY_TO_TAKEOFF'`，**零交接行**。
+    /// 改前外层白名单 `IN_FLIGHT`/`LANDING` 把 `'READY'` 挡在门外 ⇒ 北七家的列表**整个是空的**，
+    /// 而飞机遥测走另一条路照常显示。这正是"轨迹和数据都在、任务卡片不在"。
+    /// ⚠️ `takeoff_site_id=1 ≠ mySiteId=2` 是**刻意**的：写成本站的话出站半句也会命中，
+    ///    将来若有人把两个判据合成一条，"进站半句放行了"就与"出站半句放行了"不可区分。
+    function test_isInbound_taskNotYetAirborneAtMyLandingSite() {
+        var t = _inboundTask(91103, "READY", 1, 2, "READY_TO_TAKEOFF")
+        verify(OpsCommon.isOutbound(t, 2, {}) === false, "夹具前提：对北七家而言不是出站卡")
+        verify(OpsCommon.isInbound(t, 2, {}),
+               "任务 READY、飞机 READY_TO_TAKEOFF、降落本站、零交接 ⇒ 必须进站（改前 false，正是本 bug）")
+
+        // 阴性对照：同形状但飞机还没上电（白名单外）且零交接 ⇒ 不得进站。
+        // 少了这一格，"凡非终态的任务一律进站"也能让上一行绿 —— 那会把**每个**站点的列表
+        // 塞满停在地上、与本站无关的航班。本次放宽的是**外层状态闸**，不是四项判据。
+        verify(OpsCommon.isInbound(_inboundTask(91106, "READY", 1, 2, "PARKED"), 2, {}) === false,
+               "降落本站但飞机 PARKED、零交接 ⇒ 不得进站")
+    }
+
+    /// ‼️ **外层闸（终态黑名单）自己**的判据。夹具**只**让这一层挡得住：其余四项全真。
+    /// 少了这一格，把外层闸整个删掉也能全绿 —— `test_isInbound_keepsExistingBranches`
+    /// 里三条的 `status` 都是非终态，一个都钉不到它（同 `isAirborneReady` 上方说的
+    /// "少了后一半，一个恒真的实现也能让六档全绿"）。
+    /// ⚠️ 交接那一路尤其重要：`table_task_handover` 是**历史表**，任务飞完之后交接行**不会消失**
+    ///    ⇒ 没有这一层，一条已完成的历史任务会靠分支②或③**永久回流**到降落场的列表里。
+    function test_isInbound_dropsFinishedTask() {
+        var fin = ["COMPLETED", "ABORTED", "CANCELED", "CANCELLED"]
+        for (var i = 0; i < fin.length; i++) {
+            // 一路：飞机在白名单内（分支④为真）⇒ 只有外层闸挡得住。
+            verify(OpsCommon.isInbound(_inboundTask(92000 + i, fin[i], 1, 2, "IN_FLIGHT"), 2, {}) === false,
+                   fin[i] + " + 飞机在飞 + 降落本站 ⇒ 终态不得进站（此处只有外层闸拦得住）")
+
+            // 另一路：挂着一笔 LANDING 交接（分支②为真）⇒ 同样只有外层闸挡得住。
+            var byHo = _inboundTask(92100 + i, fin[i], 1, 2, "PARKED")
+            byHo.handover = _embeddedHo(7, "LANDING", 8)
+            verify(OpsCommon.isInbound(byHo, 2, {}) === false,
+                   fin[i] + " + 挂着 LANDING 交接 ⇒ 终态不得靠分支②回流")
+        }
+    }
+
+    /// 四段顺序（用户 2026-10-02 裁定，两处原话见本组标题）：
+    /// ① 待我签入 → ② 已接引（按**接引时刻升序**）→ ③ 出站 → ④ 未接引进站。
+    /// ⚠️ 输入顺序**刻意打乱**：照顺序喂进去的话，「按段重排」与「原样返回」不可区分。
+    function test_siteTasks_fourSegments() {
+        var awaiting = _siteTask(1, "IN_FLIGHT", 3, 1, _embeddedHo(7, "LANDING", 8))
+        var acc2 = _inboundTask(2, "IN_FLIGHT", 3, 1, "IN_FLIGHT", "2026-10-02 09:00:00")
+        var acc3 = _inboundTask(3, "IN_FLIGHT", 3, 1, "IN_FLIGHT", "2026-10-02 09:00:05")
+        var out4 = _siteTask(4, "TAKEOFF", 1, 3, undefined)
+        var in5 = _inboundTask(5, "IN_FLIGHT", 3, 1, "IN_FLIGHT")
+        var all = [out4, in5, acc3, acc2, awaiting]
+        var map = { 1: _embeddedHo(7, "LANDING", 8) }
+
+        var got = OpsCommon.siteTasks(all, true, true, 1, map)
+        compare(got.length, 5, "一条不丢、一条不重")
+        compare(got[0].task_id, 1, "① 待我签入最前（2026-09-24 裁定 丙-2 不动）")
+        compare(got[1].task_id, 2, "② 已接引：先接引的在前")
+        compare(got[2].task_id, 3, "② 后接引的在后（按接引时刻升序，不是按输入顺序）")
+        compare(got[3].task_id, 4, "③ 出站：排在**已接引之后**（接引即置顶）、未接引进站之前")
+        compare(got[4].task_id, 5, "④ 未接引进站：垫底（「到站任务卡片显示在出站任务卡片的后面」）")
+    }
+
+    /// 已接引却**没有时刻**（后端记录的那个不可达形状）⇒ 排在有时刻的**之后**。
+    /// ‼️ 直接拿 `landing_accepted_at` 当排序键、缺值当 `""`（或 `undefined`）会让它排到
+    ///    **最前**（空串/NaN 比较最小）⇒ 顺序错乱，而界面上没有任何报错，只是顺序不对。
+    function test_siteTasks_acceptedWithoutTimestampSortsLast() {
+        var noTs = _inboundTask(1, "IN_FLIGHT", 3, 1, "IN_FLIGHT", "2026-10-02 09:00:00")
+        delete noTs.landing_accepted_at           // 保留 landing_accepted = true
+        var withTs = _inboundTask(2, "IN_FLIGHT", 3, 1, "IN_FLIGHT", "2026-10-02 09:00:09")
+
+        var got = OpsCommon.siteTasks([noTs, withTs], true, true, 1, {})
+        compare(got[0].task_id, 2, "有时刻的在前；无时刻的不得因「空串最小」顶到前面")
+        compare(got[1].task_id, 1, "无时刻的排在后面（保守：缺信息的不能顶掉有信息的）")
+    }
+
+    //-------------------------------------------------------------------------
+    // 站点视图的四段：**排序与配色同源**（用户 2026-10-02 裁定②⑤⑥）
+    //   段号是契约：`siteTasks` 按 0→1→2→3 拼接，卡片配色也按段号判
+    //   ⇒ 两处共用 `siteSection`，不可能出现"排在进站段却涂出站色"。
+    //-------------------------------------------------------------------------
+
+    /// 四段的段号本身。数值写成**字面量**：改常量值会让这组一起红，那是提醒
+    /// "段号被排序与配色同时依赖"，改之前得两处一起看。
+    function test_siteSection_fourSegments() {
+        var landing = _embeddedHo(7, "LANDING", 8)
+
+        compare(OpsCommon.siteSection(_siteTask(1, "IN_FLIGHT", 3, 1, landing), true, true, 1, { 1: landing }),
+                0, "待我签入 ⇒ 段 0（最前，2026-09-24 裁定 丙-2）")
+
+        compare(OpsCommon.siteSection(_inboundTask(2, "IN_FLIGHT", 3, 1, "IN_FLIGHT", "2026-10-02 09:00:00"),
+                                      true, true, 1, {}),
+                1, "已接引 ⇒ 段 1（置顶）")
+
+        compare(OpsCommon.siteSection(_siteTask(3, "TAKEOFF", 1, 3, undefined), true, true, 1, {}),
+                2, "出站 ⇒ 段 2")
+
+        compare(OpsCommon.siteSection(_inboundTask(4, "IN_FLIGHT", 3, 1, "IN_FLIGHT"), true, true, 1, {}),
+                3, "未接引进站 ⇒ 段 3（垫底，裁定②「显示在出站任务卡片的后面」）")
+    }
+
+    /// 勾选框的收窄要有判据：两个勾选框各自关掉时，对应那一侧不得入列。
+    /// 少了这一格，把 `siteSection` 写成"凡进站一律收"也能全绿——后果是
+    /// 用户取消勾选"进站"之后到站卡片还在列表里。
+    function test_siteSection_noneWhenThatBoxIsUnchecked() {
+        compare(OpsCommon.siteSection(_siteTask(1, "TAKEOFF", 1, 3, undefined), false, true, 1, {}), -1,
+                "出站卡片：只勾「进站」时不得入列")
+        compare(OpsCommon.siteSection(_inboundTask(2, "IN_FLIGHT", 3, 1, "IN_FLIGHT"), true, false, 1, {}), -1,
+                "进站卡片：只勾「出站」时不得入列")
+    }
+
+    /// ‼️ 配色判据必须与**排序位置**一致。三格分别是段 1 / 段 3 / 段 2，第三格是关键：
+    /// 同站起降的卡片 `isInbound` 与 `isOutbound` **同时为真**，按既有口径（出站优先）
+    /// 落段 2 ⇒ 必须取**出站色**。若配色改判 `isInbound` 就会涂成进站色，
+    /// 而它排在出站那一段——"位置说一套、颜色说另一套"。
+    function test_sectionIsInbound_matchesSortPosition() {
+        var acc = _inboundTask(1, "IN_FLIGHT", 3, 1, "IN_FLIGHT", "2026-10-02 09:00:00")
+        compare(OpsCommon.siteSection(acc, true, true, 1, {}), 1, "夹具前提：落段 1")
+        verify(OpsCommon.sectionIsInbound(1, acc, 1, {}), "段 1 ⇒ 进站色")
+
+        var uncon = _inboundTask(2, "IN_FLIGHT", 3, 1, "IN_FLIGHT")
+        compare(OpsCommon.siteSection(uncon, true, true, 1, {}), 3, "夹具前提：落段 3")
+        verify(OpsCommon.sectionIsInbound(3, uncon, 1, {}), "段 3 ⇒ 进站色")
+
+        var sameSite = _inboundTask(3, "IN_FLIGHT", 1, 1, "IN_FLIGHT")
+        verify(OpsCommon.isInbound(sameSite, 1, {}), "夹具前提：同站起降**同时**满足进站判据")
+        compare(OpsCommon.siteSection(sameSite, true, true, 1, {}), 2, "同站起降未接引 ⇒ 落段 2（出站优先）")
+        verify(!OpsCommon.sectionIsInbound(2, sameSite, 1, {}),
+               "落段 2 ⇒ 取**出站色**（即使 isInbound 为真）：配色与排序位置必须一致")
+
+        verify(!OpsCommon.sectionIsInbound(-1, uncon, 1, {}), "未入列（-1）⇒ 不得判成进站色")
+    }
+
+    /// 段 0（待我签入）**两种相位都可能**：站点视图收到的是 LANDING 待办（进站卡），
+    /// 监控员视图是 ROUTE 待办（出站卡）。判据同一条、相位不同 ⇒ 配色不由段号决定，
+    /// 追问一次 `isInbound`。
+    /// ⚠️ 少了第二格，"段 0 恒为进站色"也能全绿——那会让监控员视图里每一张待签入卡
+    /// 都涂成青绿（把 `/handovers/pending` 的角色过滤当成永不变的事实）。
+    function test_sectionIsInbound_awaitingFollowsPhase() {
+        var lh = _embeddedHo(7, "LANDING", 8)
+        var incoming = _siteTask(1, "IN_FLIGHT", 3, 1, lh)
+        compare(OpsCommon.siteSection(incoming, true, true, 1, { 1: lh }), 0, "夹具前提：落段 0")
+        verify(OpsCommon.sectionIsInbound(0, incoming, 1, { 1: lh }),
+               "LANDING 待办 ⇒ 进站卡 ⇒ 进站色")
+
+        var rh = _embeddedHo(9, "ROUTE", 16)
+        var outgoing = _siteTask(2, "IN_FLIGHT", 1, 3, rh)
+        compare(OpsCommon.siteSection(outgoing, true, true, 1, { 2: rh }), 0, "夹具前提：也落段 0")
+        verify(!OpsCommon.sectionIsInbound(0, outgoing, 1, { 2: rh }),
+               "ROUTE 待办 ⇒ 出站卡 ⇒ 出站色（段号相同、相位不同）")
+    }
+
+    //-------------------------------------------------------------------------
+    // 进站卡片的动作闸（用户 2026-10-02 裁定③ + 第二轮裁定）
+    //-------------------------------------------------------------------------
+
+    /// ‼️ **需求③的正面判据**：本次新增的那一类卡片（到站本站、飞机在飞、零交接）上
+    /// **没有任何进站动作**。这一格必须过，因为改前那张卡片根本不出现——
+    /// 它是随 `isInbound` 放宽一起被"带进来"的，动作闸不能跟着一起放宽。
+    /// ⚠️ 断言写 `=== false` 而不是 `!...`：`undefined` 会让 QML 的 `visible` 退回
+    ///    默认值 **true**（每一张卡都冒出按钮），而 `!undefined` 是 true，会**假绿**。
+    function test_inboundActionable_falseForNewlyVisibleAirborneCard() {
+        var t = _inboundTask(91103, "IN_FLIGHT", 3, 1, "IN_FLIGHT")
+        verify(OpsCommon.isInbound(t, 1, {}),
+               "夹具前提：这类卡片确实进站（不成立的话本格退化成「什么都没测」）")
+        verify(OpsCommon.inboundActionable(t, 1, {}) === false,
+               "已进站但**未接引** ⇒ 动作闸必须给出真 bool false")
+    }
+
+    /// 「隐藏的按钮被点亮」的两个时刻（用户第二轮裁定：监控员签出、本站签入后才点亮）。
+    /// 第四格是阴性对照：不在本站降落的在飞航班，飞机状态再"在飞"也不得可操作。
+    function test_inboundActionable_trueOnceLandedHandedOver() {
+        verify(OpsCommon.inboundActionable(
+                   _inboundTask(1, "IN_FLIGHT", 3, 1, "IN_FLIGHT", "2026-10-02 09:00:00"), 1, {}),
+               "已接引 ⇒ 可操作（签出→签入完成的那一刻点亮）")
+
+        verify(OpsCommon.inboundActionable(_inboundTask(2, "LANDING", 3, 1, "LANDING"), 1, {}),
+               "任务已进入 LANDING ⇒ 可操作（与飞机状态无关）")
+
+        verify(OpsCommon.inboundActionable(
+                   _inboundTask(3, "IN_FLIGHT", 3, 1, "PARKED", "2026-10-02 09:00:00"), 1, {}),
+               "接引后飞机已停稳（PARKED，白名单外）⇒ 仍可操作（置顶卡片不得因此失效）")
+
+        // ‼️ 这一格是 `inboundActionable` 里**「必须先进站」那一层**的**唯一**判据：
+        //    它的 `status` 是 `LANDING` ⇒ `LANDING || landingAccepted` 那一半为**真**，
+        //    只靠"降落在 99 站"把它挡下来 ⇒ 删掉那一层，本格立刻红。
+        // ⚠️ 实测过：本格原写成"降落在 99 站 + 未接引 + 白名单内的飞机"，
+        //    删掉那一层**全绿**——因为三项恰好都不满足，那一层被架空而无人发现。
+        //    要判一个守卫，夹具必须**只**让它一个人挡得住（同"两层守卫都能拒同一请求"那形状）。
+        // ⚠️ 可达性：本站起飞、他站降落、本站尚未签出的卡片此刻正是这个形状
+        //    （它在列表里是**出站**卡）——不是为测试构造出来的。
+        verify(OpsCommon.inboundActionable(_inboundTask(4, "LANDING", 3, 99, "LANDING"), 1, {}) === false,
+               "降落在 99 站 ⇒ 对本站不是进站卡，动作闸必须为 false（哪怕它已是 LANDING）")
+    }
+
+    /// ⚠️ 2026-10-02 外层闸放宽**新开**的一格：任务**还没起飞**、却带着 `landing_accepted`
+    ///    （例如被人工复位过）。`isInbound` 会放它进来（非终态 ∧ 降落本站 ∧ 已接引），
+    ///    但卡上**不得**出现降落动作——对一架停在地上的飞机发降落指令没有意义。
+    ///    ‼️ 本格钉的是 `inboundActionable` 里那个 `status === "IN_FLIGHT"` 合取项：它在改前
+    ///    是**冗余**的（由外层白名单保证），外层一放宽就不再等价 ⇒ **删掉它本格即红**。
+    /// ⚠️ 真库当前 **0 行**（结构上可达，未实测到实例）。写成本格不是因为观测到了它，
+    ///    而是因为那个合取项当初被删的理由（"外层保证 IN_FLIGHT"）已被本次改动作废。
+    function test_inboundActionable_notAirborneEvenIfAccepted() {
+        var t = _inboundTask(91107, "READY", 1, 2, "READY_TO_TAKEOFF", "2026-10-02 09:00:00")
+        verify(OpsCommon.isInbound(t, 2, {}),
+               "夹具前提：它确实进站（不成立的话本格退化成「什么都没测」）")
+        verify(OpsCommon.landingAccepted(t), "夹具前提：`landing_accepted` 确实为真")
+        verify(OpsCommon.inboundActionable(t, 2, {}) === false,
+               "任务 READY（还没起飞）⇒ 动作闸必须给出**真 bool** false，哪怕已接引")
+    }
+
     /// 监控员视图：待我签入同样进第 1 节（置顶节），且异常航班的位置不受影响。
     /// 阴性对照同上——名单为空时不得重排。
     function test_middleSectionTasks_putsAwaitingFirstOnlyWhenListed() {

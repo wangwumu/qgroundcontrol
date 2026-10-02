@@ -59,6 +59,36 @@ function statusLabel(s) {
     }
 }
 
+// 终态任务状态——`statusLabel` 上面那段注释列的**就是这四个字面量**，与后端
+// `gcs_server/handlers/task.go` 的 `finishedTaskStatuses` **逐字对应**。
+//
+// ‼️ QGC 侧唯一用途：给「到站本站」那半句做**外层闸**（见 `isInbound`）。取**黑名单**
+//    （排除终态）而非白名单（只收 IN_FLIGHT/LANDING），方向是**刻意**的——仓内已成文的原则：
+//    「过滤是给人看的，宁多勿漏」。两个方向的错法**不对称**：
+//      · 白名单漏掉一个中间状态 ⇒ 卡片**静默消失**（用户看到"任务列表里没有它"，而飞机遥测
+//        走的是另一条路、照常显示 ⇒ 表现为"轨迹和数据都在、任务卡片不在"）；
+//      · 黑名单误放行 ⇒ 多一张卡，看得见、改得动。
+//    2026-10-02 实测代价：外层原是白名单，把任务 91103（`status='READY'`、飞机
+//    `READY_TO_TAKEOFF`、降落本站）整条挡在门外——而它**正是本次需求要收的那一类**
+//    ⇒ 里层刚加的白名单分支被**外层**架空。见 `isInbound` 上方那段"两道闸串联"。
+//
+// ⚠️ `CANCELED` 与 `CANCELLED` **两个拼写都要**：`table_flight_task` 写 `CANCELED`，
+//    而 `arrival_schedule` / `table_task_handover` 写 `CANCELLED`
+//    （[[task-status-enum-literal-split]]）。只留一个 ⇒ 另一个字面量的任务被当成"非终态"
+//    回流进列表，**且没有任何报错**。真库 2026-10-02 实测：交接表里 16 条全是 `CANCELLED`，
+//    任务表里那条是 `CANCELED` —— 两个拼写**同时在用**，不是历史遗留。
+//
+// ⚠️ 本函数对 `null`/`undefined` 是 **fail-open**（判为"非终态"），后端
+//    `NULL NOT IN (...)` 求值为 `NULL`（不为真）是 **fail-closed**。两侧在这里**不一致**，
+//    但不可达：`table_flight_task.status` 是 `TEXT NOT NULL DEFAULT 'SCHEDULED'`
+//    （`PRAGMA table_info` 实测），NULL 写不进去。写在这里是因为"不可达"是**当前 schema**
+//    的事实，schema 一改这条缝就会张开口。
+var FINISHED_TASK_STATUSES = ["COMPLETED", "ABORTED", "CANCELED", "CANCELLED"]
+
+/// 该任务状态是否为终态。‼️ 返回**真 bool**：返回 `undefined` 会让 `isInbound` 里那句
+/// `if (...) return false` 短路求值成 `undefined` 而不是 `false`。
+function isFinishedTaskStatus(s) { return FINISHED_TASK_STATUSES.indexOf(s) >= 0 }
+
 // 交接目标阶段 → 中文
 function phaseToLabel(p) { return p === "ROUTE" ? "航线监控" : p === "LANDING" ? "降落指挥" : p }
 
@@ -184,6 +214,25 @@ function pendingPhase(task, phase, handoverById) {
 }
 
 function landingAccepted(task) { return !!(task && task.landing_accepted) }
+
+// 飞机**至少已 READY_TO_TAKEOFF**（用户 2026-09-22 裁定 2B 的白名单），与
+// `gcs_server/handlers/ops.go` 里那份**逐字对应**（`RouteTasks` 与 `view=site` 两处同源）。
+//
+// ‼️ QGC 侧唯一用途：判定「**到站本站**的航班」算不算进站（见 `isInbound` 第四项）。
+//    ⚠️ 原文写"在飞航班"，2026-10-02 起不准了：本条同时放行**还没起飞、正停在他站机位上**
+//    的任务（`t.status='READY'` + 飞机 `READY_TO_TAKEOFF`，即用户当日报的那条 91103）。
+//    改前站点视图只认「移交过 LANDING 交接」，于是飞机已经飞到本站、监控员还没发起移交的
+//    那一段，卡片**根本不出现**；而飞机遥测走的是另一条路（加密心跳 EXT 重建的合成遥测 →
+//    `multiVehicleManager`）照常显示 ⇒ 用户看到的是「轨迹和数据都在、任务卡片不在」。
+//    那不是"少写了一个过滤条件"，是两条数据路的口径差。
+//
+// ‼️ 取**白名单**而非"排除法"：`table_uav.status` 无 CHECK 约束，将来多一个状态时排除法会
+//    把它**静默**放行（多显示一张不该显示的卡片）；白名单则 fail-closed。
+//    两侧名单必须一起改——漂移时没有任何东西会报错，只表现为某些航班卡片时有时无。
+function isAirborneReady(uavStatus) {
+    return ["READY_TO_TAKEOFF", "TAKEOFF", "IN_FLIGHT", "LANDING", "RETURNING", "EMERGENCY_LANDING"]
+        .indexOf(uavStatus) >= 0
+}
 
 // ‼️ 判定函数一律返回**真 bool**（`!!` 不可省）：返回 undefined 会让调用点的 `A && B`
 // 短路求值成 undefined，而 QML 把 undefined 当成「这个绑定没有值」，属性退回**默认值**——
@@ -433,29 +482,197 @@ function isOutbound(task, mySiteId, handoverById) {
            && !landingAccepted(task)
 }
 
-// 入场=本站=降落点：PENDING(LANDING) 待确认 / landing_accepted 已签入待发降落指令 / LANDING 已发降落指令。
+// 入场=本站=降落点。四项 **OR**（与 `gcs_server/handlers/ops.go` 的 `view=site` 进站半句
+// **逐项对应**）：
+//   ① 已发降落指令（`status === "LANDING"`）
+//   ② 有 PENDING(LANDING) 交接——监控员已发起移交、等本站【签入】
+//   ③ 已接引（`landing_accepted`）——用户 2026-10-02 裁定⑤「接引后置顶」那一段的入口
+//   ④ **飞机至少 READY_TO_TAKEOFF**（`isAirborneReady`）——2026-10-02 新增，本次 bug 的正面判据
+//
+// ‼️ ④ 是 **OR 并上**，不是替换 ①②③。替换会收窄成"只看飞机状态"，而飞机接引后往往很快
+//    落地停稳（`PARKED`，白名单外）⇒ **刚被置顶的卡片在停稳那一刻整条消失**（置顶"时好时坏"），
+//    且 `status === "LANDING"` 那条也一起丢。
+//    ⚠️ 这形状的破坏面**不在**正常路径上：后端 2026-10-02 实测过——把交接分支换成白名单，
+//    六格白名单用例与三条交接用例里**只有「PREFLIGHT + 交接」那一格红**，因为它需要
+//    "任务状态不在飞、但交接存在"这个结构锁才构造得出来。故两侧各留一格（本文件
+//    `test_isInbound_keepsExistingBranches`，后端 `TestOverviewSiteInboundKeepsHandoverBranch`）。
+//
+// ‼️ 外层闸是**终态黑名单**（`isFinishedTaskStatus`），**不是** `IN_FLIGHT/LANDING` 白名单。
+//    改前是白名单，与四项**取交集**——那道更窄的闸把里层整个架空了：任务 91103
+//    （`status='READY'`、飞机 `READY_TO_TAKEOFF`、降落本站）根本走不到四项判定，卡片不出现，
+//    而飞机遥测走另一条路照常显示。用户 2026-10-02 报的就是这个："应该显示 10000385 对应的任务"。
+//    ⚠️ 里层的注释、单测、变异测试当时**全部照绿**——没有任何东西在测"外层放它过去了吗"。
+//    这就是那条教训的形状：**两道闸串联时，只有更窄的那道有判据**。
+//
+// ⚠️ 这一层**必须留**（不能删了"交给四项自己判"）：四项里的 ② 只问"有没有 PENDING(LANDING)
+//    交接"，**不看任务状态**。而交接行在任务飞完之后**不会消失**（`table_task_handover` 是
+//    历史表）⇒ 少这一层，一条 `COMPLETED` 的历史任务会靠 ② 或 ③ 永久回流到降落场的列表里。
+//    本文件与后端各有一格钉这个（`test_isInbound_dropsFinishedTask` /
+//    `TestOverviewSiteDropsFinishedTask`）；夹具**只**让这一层挡得住，其余四项全真。
+//
+// ⚠️ 放宽这一层**同时放宽了分支②③的定义域**（不只是新增的 ④）。这是一处**已知副作用**：
+//    任务还没起飞、却挂着一笔已 `CANCELLED`/`REJECTED` 的降落交接 ⇒ 现在也会出现在降落场
+//    的列表里。它是否合意**尚未经用户裁定**；当前真库实测**多出 0 行**（全库 17 条 LANDING
+//    交接**全部**属于任务 91103，而它本来就靠 ④ 进来）。方向上这符合 2026-09-25 那条既有
+//    口径「看得见 ⟺ 移交过（不论结局）」，但那是针对**在飞**航班定的，别当成已授权。
+//
+// ⚠️ 放宽这一层还**作废了一个等价关系**：原先"不是 LANDING ⟺ 是 IN_FLIGHT"成立，靠的正是
+//    这道白名单 ⇒ 见 `inboundActionable` 上方那段（那里有一个合取项被加回来）。
 function isInbound(task, mySiteId, handoverById) {
-    return task.landing_site_id !== undefined && task.landing_site_id !== null &&
-           Number(task.landing_site_id) === Number(mySiteId) &&
-           (task.status === "LANDING" || pendingPhase(task, "LANDING", handoverById) || landingAccepted(task))
+    if (!task) return false
+    if (task.landing_site_id === undefined || task.landing_site_id === null) return false
+    if (Number(task.landing_site_id) !== Number(mySiteId)) return false
+    if (isFinishedTaskStatus(task.status)) return false
+    return task.status === "LANDING"
+           || pendingPhase(task, "LANDING", handoverById)
+           || landingAccepted(task)
+           || isAirborneReady(task.uav_status)
 }
 
-// 站点视图的行集合：出站/进站两个勾选框分别过滤
-// ‼️ 2026-09-24（裁定 丙-2）：**待我签入的排在最前**。超时是硬性的（10 秒一轮的
-//    `scanTimeout`，期限默认 5 分钟），而这条交接混在几十条航班里就是一行 11px 小字
-//    ⇒ 排序是「让人来得及动手」的最后一道手段。判据单点在 `awaitingMyCheckin`。
-// ⚠️ 是**分桶再拼接**，不是排序函数：一条任务只出现一次（原先 outbound/inbound
-//    是 `else if`，改成 `||` 后仍是"收一次"，语义未变），拼接后桶内**保持原顺序**。
+// ---- 站点视图的四段（用户 2026-10-02 裁定）：排序与配色**同源** ----
+// 取值：0=待我签入 1=已接引 2=出站 3=未接引进站 -1=两个勾选框都不收它。
+// ‼️ **单点定义**：`siteTasks` 用它落桶（决定顺序），QML 用 `sectionIsInbound` 判配色。
+//    两处各写一份判据的话，"卡片排在进站那一段、却涂着出站的颜色"在结构上就会出现，
+//    而它**不会报任何错**——只是看起来像列表错位，没人能凭现象找到这里。
+// 定义在前是因为 `var` 的**赋值**不 hoist：文件顶层若在赋值之前调用 `siteTasks`，
+// 五个常量全是 `undefined`，`switch` 一个都匹配不上 ⇒ 整个列表静默变空。
+var SEC_AWAITING = 0, SEC_ACCEPTED = 1, SEC_OUTBOUND = 2, SEC_INBOUND = 3, SEC_NONE = -1
+
+// 站点视图的行集合：出站/进站两个勾选框分别过滤，然后**分四段**拼接。
+//
+// 段的顺序（用户 2026-10-02 裁定，两处原话）：
+//   ① 待**我**签入（`awaitingMyCheckin`，2026-09-24 裁定 丙-2）：超时是硬性的（10 秒一轮的
+//      `scanTimeout`，期限默认 5 分钟），而这条交接混在几十条航班里就是一行 11px 小字
+//      ⇒ 排序是「让人来得及动手」的最后一道手段。
+//   ② **已接引**（`isInbound && landingAccepted`）：「当该飞行任务被成功接引后，该任务卡片
+//      将被置顶」+「如果当前站点有多个已经接引、但是未降落的任务，那么置顶项按照接引的
+//      顺序显示」⇒ 段内按 `landing_accepted_at` 升序（`sortedByAcceptedAt`）。
+//   ③ 出站（`isOutbound`）。
+//   ④ **未接引的进站**（`isInbound && !landingAccepted`）：「到站任务卡片显示在出站任务卡片的后面」。
+//
+// ⚠️ ② 与③ 的先后是**用户明确指定**的：原话「原则上有签入的航班的话应该优先降落，暂缓起飞。
+//    所以入站签入的靠前放」。同站起降的航班两条都真（`isOutbound` 与 `isInbound` 可同时成立），
+//    被 ③ 收走——与改前一致（改前也是出站优先，`else if`）。
+//
+// ⚠️ 是**分桶再拼接**，不是排序函数：一条任务只落一段（`if / else if` 链），不会重复出现。
+//    段内**保持输入顺序**；只有 ② 段额外排序——那是用户点名要的顺序。
+// ⚠️ 「已接引但**未降落**」这个限定不必另判：后端 `view=site` 的外层是**终态黑名单**
+//    （与 `isFinishedTaskStatus` 同源），飞完的任务根本不下发到客户端 ⇒ ② 段收到的 `status`
+//    只可能是非终态，`COMPLETED` 之类顶不到最前。
+//    ‼️ 这段注释改前写的是「**若将来**后端放宽了外层状态，② 段就会把已完成的任务也顶到最前，
+//    而这里不会有任何报错」——2026-10-02 **那个放宽真的发生了**（白名单 → 终态黑名单），
+//    而这里**果然**没有任何报错，是人工核对时想起来的。教训：注释里"将来会坏"的预言
+//    **不会**变成判据；它只会变成一句被人读过就忘的话。要么当时就补一格，要么别写成预言。
+//    残留面（当前真库 0 行，但结构上可达）：任务被人工复位回 `READY` 之类之后仍带着
+//    `landing_accepted` ⇒ 一张"飞机还停在地上"的卡片被顶到最前。它的**动作**被
+//    `inboundActionable` 挡着（卡上无按钮），但**排序**这一层没有判据。
 function siteTasks(tasks, outbound, inbound, mySiteId, handoverById) {
-    var first = [], rest = []
+    var awaiting = [], accepted = [], out = [], restIn = []
     for (var i = 0; i < tasks.length; i++) {
         var t = tasks[i]
-        if (!((outbound && isOutbound(t, mySiteId, handoverById)) ||
-              (inbound && isInbound(t, mySiteId, handoverById)))) continue
-        if (awaitingMyCheckin(t, handoverById)) first.push(t)
-        else rest.push(t)
+        switch (siteSection(t, outbound, inbound, mySiteId, handoverById)) {
+        case SEC_AWAITING: awaiting.push(t); break
+        case SEC_ACCEPTED: accepted.push(t); break
+        case SEC_OUTBOUND: out.push(t);        break
+        case SEC_INBOUND:  restIn.push(t);     break
+        }
     }
-    return first.concat(rest)
+    return awaiting.concat(sortedByAcceptedAt(accepted), out, restIn)
+}
+
+function siteSection(task, outbound, inbound, mySiteId, handoverById) {
+    var isOut = !!(outbound && isOutbound(task, mySiteId, handoverById))
+    var isIn = !!(inbound && isInbound(task, mySiteId, handoverById))
+    if (!isOut && !isIn) return SEC_NONE
+    if (awaitingMyCheckin(task, handoverById)) return SEC_AWAITING
+    if (isIn && landingAccepted(task)) return SEC_ACCEPTED
+    if (isOut) return SEC_OUTBOUND
+    return SEC_INBOUND
+}
+
+/// 该段是否用**进站配色**（青绿底 / 青绿边框，用户 2026-10-02 裁定⑥）。
+/// ‼️ 段 0（待我签入）**两种都可能**：站点视图收到的是 LANDING 待办、监控员视图是 ROUTE 待办
+///    ——同一条判据（`awaitingMyCheckin`）在两个视图里指向**不同相位** ⇒ 段号答不了这个问题，
+///    追问一次 `isInbound` 当场判。写成"段 0 恒为进站色"就是断言 `/handovers/pending` 的
+///    角色过滤永不改：那个断言在别处有它自己的位置，配色没有理由依赖它。
+/// ⚠️ 段 2（出站）**即使 `isInbound` 也为真**（同站起降且未接引）仍取**出站色**：
+///    配色必须与**排序位置**一致——否则用户看到的是"它排在出站那一段、却涂着进站的颜色"，
+///    而用户裁定②的原话正是用"排在哪"来定义这两类的。
+function sectionIsInbound(section, task, mySiteId, handoverById) {
+    if (section === SEC_AWAITING) return isInbound(task, mySiteId, handoverById)
+    return section === SEC_ACCEPTED || section === SEC_INBOUND
+}
+
+/// 进站卡片的**动作闸**：本站**已接管降落指挥**才可操作。
+/// 判据＝「任务已进入 `LANDING`，**或**（任务在航线中 **且** 已接引）」。
+///
+/// ‼️ 那个 `status === "IN_FLIGHT"` 合取项是 2026-10-02 外层闸放宽当天**加回来**的。
+///    它一度被删掉，理由写的是"冗余"：那时 `isInbound` 的外层是 `IN_FLIGHT`/`LANDING`
+///    白名单 ⇒ 走到这里「不是 LANDING」⟺「是 IN_FLIGHT」，
+///    `LANDING || landingAccepted` 与 `LANDING || (IN_FLIGHT && landingAccepted)` **逐值等价**。
+///    ⚠️ 那个等价的**前提是外层闸**，不是本函数。外层一放宽成"非终态"，定义域里就多了
+///    `SCHEDULED`/`READY`/`TAKEOFF` 三档，"不是 LANDING"不再蕴含"是 IN_FLIGHT"
+///    ⇒ 一条**还没起飞**却带着 `landing_accepted` 的任务会让这里放行，而卡上的
+///    【切换多旋翼降落】【指定机位】对一架停在地上的飞机没有意义。
+///    ‼️ 教训不是"别删冗余代码"，而是：**"冗余"永远是相对某一道闸说的**——删的时候必须把
+///    那道闸**写进注释**，否则将来放宽那道闸的人不会知道这里有个隐含前提。
+///    （反方向的坑见 `isInbound` 里"两道闸串联时只有更窄的那道有判据"。）
+///
+/// ‼️ 用户 2026-10-02 裁定③「到站任务卡片……除了选中外，不能对其做任何操作」；第二轮裁定
+///    「需要『航线监控员』执行签出后，隐藏的按钮才被点亮」。**当晚已就"点亮时刻"裁定完毕**
+///    （原话：「就航线管理员而言，签出，就是提请把该无人机的控制权限交给站点操作员；
+///    这个状态你来查；站点操作员的 qgc 收到该指令后（状态变化），自动点亮签入按钮」）。
+///
+///    ⇒ 那句"签出"＝**监控员发起 LANDING 移交那一刻**，状态落点是 `table_task_handover` 的
+///      `phase_to='LANDING' AND status='PENDING'`，下发通道 `/api/handovers/pending`
+///      （后端按 `hasRole(SITE_ATC)` 过滤 `t.landing_site_id IN (本站)`）。
+///      **那一刻亮的是卡片上的【签入】按钮**，判据是 `awaitingMyCheckin`（`_awaitingMe`），
+///      与 `handoverById` 同源 ⇒ 2 秒轮询内**自动**出现，无须任何手动刷新，还会自动弹接管框
+///      （`OpsShell._notifyNewPending`）。已在云端生产入口实测（阳性/阴性对照见交付报告）。
+///      ‼️ 但那个按钮**不归本函数管**——本函数的两个消费方是【切换多旋翼降落】与【指定机位】。
+///
+///    ⚠️ 那两格**不能**跟着提到签出那一刻：**后端对两者都硬校验**「存在 `phase_to='LANDING'
+///      AND status='ACCEPTED'` 的交接」（同一条子查询，两处各一份）——
+///      `AssignSlot` 的 `accepted == 0` ⇒ 409「任务须已签入(LANDING)或处于降落阶段，才能指定机位」；
+///      `Land` 的 `accepted == 0` ⇒ 409「本站尚未签入(LANDING)，无法发出降落指令」。
+///      提前点亮＝"按钮能点、点下去必然失败"，正是 CLAUDE.md 说的那种坏状态。
+///    ⇒ 本站卡片上"点亮"分两格，**各自与后端闸对齐**：
+///      监控员签出(PENDING) → 【签入】；本站签入(ACCEPTED) → 【切换多旋翼降落】【指定机位】。
+///
+/// ⚠️ 本函数**不**枚举"卡片上有哪些按钮"：那是各按钮自己的判据（还叠了 `_awaitingMe` 等）。
+///    它是**上限**——为假时进站动作一个都不该亮；为真也只是"允许"。
+/// ⚠️ 本次新增的那一类卡片（到站本站、飞机在飞、零交接，即 `isInbound` 第四项放行的那类）
+///    在本函数上**恒为假** ⇒ 它们身上没有任何进站动作。这正是需求③要的，而且它**不依赖**
+///    "两个按钮恰好各自叠了别的条件"这个巧合——那是会被下一次改动静默破坏的东西。
+function inboundActionable(task, mySiteId, handoverById) {
+    if (!isInbound(task, mySiteId, handoverById)) return false
+    return task.status === "LANDING"
+           || (task.status === "IN_FLIGHT" && landingAccepted(task))
+}
+
+// 「已接引」段的排序键：**接引时刻**升序（先接引的排前面）——用户 2026-10-02裁定⑤
+// 「如果当前站点有多个已经接引、但是未降落的任务，那么置顶项按照接引的顺序显示」。
+//
+// ‼️ 缺时刻时给一个**比任何真实时刻都大**的哨兵 `"9999"`，不是空串也不是 undefined：
+//    `""` 在字符串比较里比任何 `"2026-…"` 都**小** ⇒ 缺时刻的那条会排到最前、顶掉真正
+//    有时刻的（顺序错，且**没有任何报错**）。
+//    这形状后端标注为不可达（`Accept` 把状态与时刻写在同一句 UPDATE 里），但"缺信息的
+//    不能顶掉有信息的"这条不依赖可达性——真出现时宁可它排在后面。
+function acceptedAtKey(task) {
+    var s = task ? task.landing_accepted_at : undefined
+    return (typeof s === "string" && s) ? s : "9999"
+}
+
+// 装饰-排序-还原：用**原下标**做 tie-break，这样"时刻相同 ⇒ 保持输入顺序"是自己保证的，
+// 不依赖 JS 引擎 `sort` 是否稳定（Qt 的 V4 引擎在这一点上不做承诺，而"顺序看起来偶尔会变"
+// 是那种没人会报、也没法复现的故障）。
+function sortedByAcceptedAt(list) {
+    var d = []
+    for (var i = 0; i < list.length; i++) d.push({ t: list[i], k: acceptedAtKey(list[i]), i: i })
+    d.sort(function (x, y) { return x.k < y.k ? -1 : (x.k > y.k ? 1 : x.i - y.i) })
+    var r = []
+    for (var j = 0; j < d.length; j++) r.push(d[j].t)
+    return r
 }
 
 // 监控员视图的行集合：overview 已按负责航线过滤 IN_FLIGHT，原样返回
