@@ -85,7 +85,15 @@ public:
     /// 由 `RomView.qml` 在**每次成功轮询**后调用（§3.5.3）：
     /// 传入"需要监控的飞机"的 deviceID 列表，以及本次生效的超时阈值（毫秒）。
     ///
-    /// - 空列表 = "没有清单" ⇒ `_sendRegistration` 回退到 `_linkedDevices` 全体。
+    /// - **本函数被调用过** = 有一份清单生效（`_monitorListActive = true`），此后
+    ///   `_sendRegistration` 一律按 `_monitorDevices` 取列表；**空清单也是有效清单**
+    ///   （发 num=0 的登记帧，语义是"本 GCS 在线、暂不关联任何 PX4"）。
+    /// - 只有**从未成功推送过清单**时（`_monitorListActive == false`：站点视图、
+    ///   未登录、首拉未回）才回退到 `_linkedDevices` 全体。
+    ///   ‼️ 早先的实现拿 `_monitorDevices.isEmpty()` 兼作这个判据，把"成功的空清单"
+    ///   与"从没有过清单"混成了一格：前者被静默读成后者 ⇒ 取列表口径翻回
+    ///   `_linkedDevices` 全体 ⇒ 签出释出（`releaseDevice` 摘空清单之后）当场失效，
+    ///   那架飞机又被重新登记回去。
     /// - `frameTimeoutMs <= 0` ⇒ 用 `DEFAULT_FRAME_TIMEOUT_MS`。
     /// - 集合**内容变化**时立即跑一轮加速发送（§3.4）；
     ///   内容不变则什么都不做——2s 轮询会反复调用本函数，
@@ -102,7 +110,9 @@ public:
     /// 当前生效的超时阈值（毫秒）。
     int frameTimeoutMs() const;
 
-    /// 当前监控清单的条数（0 = 无清单，回退 `_linkedDevices`）。
+    /// 当前监控清单的条数。
+    /// ⚠️ **0 不等于"没有清单"**——清单有没有生效看 `monitorListActiveForTest()`：
+    ///    "生效的 0 条"与"从未推送过"在取列表口径上是两回事。
     /// 供测试与诊断读——`_monitorDevices` 本身是 private。
     int monitorDeviceCount() const;
 
@@ -175,6 +185,19 @@ public:
     /// 区分不了 `{a}` 与 `{b}`。供测试断言清单本身。
     QList<DeviceID> monitorDevicesForTest() const;
 
+    /// 监控清单是否**已生效**（`setMonitorDevices` 至少成功推送过一次）。
+    /// 与 `monitorDeviceCount()` 分开读：0 条**生效的**清单 ≠ 没有清单——取列表口径不同
+    /// （`_monitorListActive ? _monitorDevices : _linkedDevices`）。
+    bool monitorListActiveForTest() const;
+
+    /// 失联监测是否正在运行（`_linkLossTimer` 存在且 `isActive()`）。
+    /// 供测试钉住「让位释出」与「切换活跃目标」都会把它停掉（两处漏停都会在 5s 后对一架
+    /// **已不再被关心**的飞机发 `px4LinkLost` 假告警）。
+    /// ‼️ `_startLinkLossMonitor` 的第一道门是 `_cryptoEnabled`，其缺省为 false ⇒
+    ///    **用例必须先 `setCryptoEnabled(true)` 才有判别力**；否则定时器从不启动、
+    ///    `_stopLinkLossMonitor()` 退化成纯 no-op，删掉调用点也全绿。
+    bool linkLossMonitorActiveForTest() const;
+
     /// 最近一次进入 `_sendRegistrationFrame()` 时**实际装入帧**的 deviceID 序列
     /// （已按 `MAX_QGC_LINKED_PX4` 截断，口径与 `deviceBytes` 循环一致）。
     /// `registrationSendCountForTest()` 只数"发了几帧"，区分不了"帧里装的是 a 还是 b"
@@ -218,6 +241,67 @@ public:
     /// 声明本 QGC 关联的 PX4 deviceID（加入登记心跳 payload）。
     /// 单设备场景：建链目标 deviceID 即关联对象。
     void addLinkedDevice(DeviceID deviceID);
+
+    /// 撤销一条关联（从登记心跳 payload 里移除该 deviceID）。
+    /// ⚠️ 只有**逐条撤销**这一档，**没有 `clear()`**：本集合的语义是"本 GCS 还关联哪些
+    ///    飞机"，上层（`releaseDevice`）按签出事件一架一架地撤；一个"清空全部"的入口
+    ///    会把一次误判放大成整个站点掉线（mavp2p 侧全部配对在 `MAP_TTL` 后过期）。
+    /// @return true=该 deviceID 原本在集合里，已移除；false=本来就不在（幂等）
+    bool removeLinkedDevice(DeviceID deviceID);
+
+    /// **签出释出**：某架飞机签出后，本站在本地交还关于它的一切。
+    ///
+    /// 由站点视图（`OpsShell.qml`）在轮询 diff 检出"某架飞机已离开本站任务列表"时调用。
+    /// 时机判据（本端能观测到的确证签出）：该行离开 `view=site` ⟺ 监控员已 ACCEPT 该移交
+    /// （见 `ops-view-visibility-two-branches`）。**请求失败与空响应都不构成调用理由**
+    /// ——QML 侧只对"200 且是数组"的响应做 diff，且初值与空集合同形（见 QML 里的注释）。
+    ///
+    /// 四件事，缺一不可（2026-10-03 用户裁定「上下全清」）：
+    ///   ① 移出登记集合 —— 不再为它发 80005；mavp2p 的配对随后在 `MAP_TTL` 后过期；
+    ///      此后要重新接引，走那条明文待命心跳的老路即可（mavp2p 重新建配对）。
+    ///      ⚠️ 实现上是**内联** `_linkedDevices.removeAll(id)`，**不是**调上面那个
+    ///      `removeLinkedDevice`——后者自己加 `_mutex`，而本函数在调用点已持锁
+    ///      （`QMutex` 非递归）⇒ 调它会自死锁。两处做的是同一件事，只是不共函数。
+    ///   ①b **同时**从监控清单 `_monitorDevices` 摘除，并把轮转游标 `_regCursor` 归零
+    ///      （同为"移出登记集合"，只是第二个容器）。站点流程下 `_sendRegistration` 实际
+    ///      读的就是这一份；不摘的话，一份**刻意保留**的陈旧清单（§3.5.4：poll 失败时
+    ///      保留上一份清单）会一直把已释出的飞机登记下去。
+    ///   ② `removeKey` —— 删掉本地密钥；
+    ///   ③ `resetReplay` —— 上行与下行水位**一并清空**；
+    ///   ④ 若它正占着上行权（`_activeDeviceID`），当场让出并回 Standby。
+    ///
+    /// ‼️ ②③ 必须**同批**，这不是"顺手多清一个"，理由是一条因果链：
+    ///    水位清空后，本端下一次建链走 `nextOutgoingCounter()` 的**随机奇起点**档
+    ///    （`hasUp || hasDown` 皆假 ⇒ `else` 支）。随机起点要**必被接受**，前提是 PX4 侧
+    ///    两个方向的水位皆 unset——它们都是**全局标量**
+    ///    （`mavlink_crypto.h`，注释逐字 `(received frames, global)`；`_tx_last_nonce_set == false`
+    ///    就是 standby），与"有几台 QGC 连着它"无关。
+    ///    ⚠️ **"回到待命那一刻软重置"是设计依赖、当前并未实现**：PX4 树里
+    ///    `_rx_last_nonce_set` / `_tx_last_nonce_set` **从无 `= false` 赋值**（只有置 true 两处），
+    ///    规范 §2.9「断连机制（任务完成 / 解绑）」标题逐字写着「设计已定，待实现」。
+    ///    今天「从明文待命心跳重新接引是安全的」实际靠的是**开机时两标量皆 unset** 这一偶然前提。
+    ///    ⚠️ 且"收到明文待命心跳"与"上行水位已清"**不是同一个标量**：心跳的发出条件是
+    ///    `!_tx_last_nonce_set`，而能否接受我方首帧取决于 `_rx_last_nonce`；两者只在收到
+    ///    **奇数**上行时才同时置位 ⇒ 二者可分离，不能当"同义信号"用。
+    ///    ⚠️ 但另有两个建链入口**不**经过待命心跳：`MAVLinkProtocol.cc` 的两处自动建链
+    ///    （收到该 deviceID 的帧即 `beginLinking`）。它们的闸是
+    ///    `state() == Standby && hasKey(deviceID)`——飞机还在航线上飞时，PX4 的
+    ///    `_rx_last_nonce` 仍是上一台发指令的 QGC 推到的旧值，此时照随机档发首帧**可能**被
+    ///    丢弃（PX4 侧是**单向**阈值 `counter > _rx_last_nonce`、无跳变上限、也不回错；
+    ///    随机起点高于残留水位时仍会被接受，故是概率而非必然）。
+    ///    ⇒ **只清水位不删密钥，等于亲手开了这个缺口**；两件事必须一起做。
+    ///    （关掉那两个入口的可操作手段**就是**删密钥——闸的另一半 `state` 不由本端控制。）
+    ///    ⚠️ 代价（已知、可接受）：重新接引要多一个 `fetchKey` 往返——`beginLinking` 在
+    ///    `hasKey` 未命中时会自动取密钥（见其实现），不是"取不到密钥就卡住"。
+    ///
+    /// ‼️ ④ 的守卫是**必须**的：`_activeDeviceID` 是单槽，它可能正属于**另一架**飞机。
+    ///    无条件回 Standby 会把在飞那架的链路一起打掉。
+    ///
+    /// ⚠️ `_lastFrameMs` 与 `_deviceToSystem`/`_systemToDevice` **刻意不动**：前者没有清理
+    ///    时机判据（见其声明处）；后者是学习表、重建时会覆盖，且删掉会让
+    ///    `beginLinkingForSystemID` 在这架飞机上失效。两张表都不含 nonce，不在本次裁定范围内。
+    /// @param deviceID  要释出的 PX4 deviceID
+    Q_INVOKABLE void releaseDevice(quint32 deviceID);
 
     /// 设备密钥管理器（从 gcs_server 取密钥）。
     DeviceKeyManager* deviceKeyManager() { return &_keyManager; }
@@ -402,9 +486,14 @@ private:
     QTimer* _registrationTimer = nullptr; ///< 80005 周期发送定时器
     bool _registrationEnabled = false;
     QList<DeviceID> _linkedDevices; ///< 本 QGC 关联的 PX4 deviceID（登记心跳 payload）
-    /// 「需要监控的飞机」的 deviceID 列表（§3.5.3）。
-    /// 空 = 没有清单 ⇒ `_sendRegistration` 回退到 `_linkedDevices`。
+    /// 「需要监控的飞机」的 deviceID 列表（§3.5.3）。**条数可以是 0**——
+    /// "这份清单有没有生效"由 `_monitorListActive` 回答，不由本容器的空否回答。
     QList<DeviceID> _monitorDevices;
+    /// 监控清单是否已生效（`setMonitorDevices` 至少成功推送过一次）。缺省 false = 从未有过清单。
+    /// ‼️ 取列表的口径是 `_monitorListActive ? _monitorDevices : _linkedDevices`，
+    ///    **不是** `_monitorDevices.isEmpty() ? …`——后者会把"成功的空清单"读成"没有清单"，
+    ///    让签出释出（`releaseDevice` 摘空清单之后）当场失效、飞机被重新登记回去。
+    bool _monitorListActive = false;
     /// 本次生效的超时阈值（毫秒）。与 `_monitorDevices` 同一次调用更新。
     int _frameTimeoutMs = DEFAULT_FRAME_TIMEOUT_MS;
     /// 分批发送的游标（§3.3），跨两次 `_sendRegistration()` 保持。

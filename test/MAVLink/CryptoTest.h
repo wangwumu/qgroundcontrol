@@ -71,7 +71,13 @@ private slots:
     // 80005 分批（§3.3/§3.4）：切批 + 环形轮转 + 覆盖性
     void _testNextRegistrationBatch();
 
-    // 监控清单与超时阈值（§3.5.3/§3.6.4）：一次调用两个实参、非法 id 跳过、空清单回退
+    // 清单从未生效 ⇒ 回退 _linkedDevices（§3.5.4）这条零回归承诺的判据。
+    // ‼️ 必须声明在 _testSetMonitorDevices **之前**：_monitorListActive 一旦置 true 就永不
+    //    回落（全仓只有一处 `= true`、无复位点），而那个用例正是把它置 true 的地方。
+    //    moc 按声明顺序生成槽调用 ⇒ 排在它后面，false 那一臂就再也测不到。
+    void _testRegistrationFallbackToLinked();
+
+    // 监控清单与超时阈值（§3.5.3/§3.6.4）：一次调用两个实参、非法 id 跳过、空清单**生效**
     void _testSetMonitorDevices();
 
     // 加速首轮（§3.4）：集合变化触发连续发送、集合不变不触发、容量天花板截断
@@ -79,4 +85,12 @@ private slots:
 
     // 定向重发（§3.6.2）：只发一帧、**绝不移出登记集合**、自带 registrationEnabled 门
     void _testReRegisterDevice();
+
+    // 签出释出：登记集合撤销 + 密钥删除 + 上下行水位**全清** + 让出上行权（2026-10-03 裁定）
+    void _testReleaseDevice();
+
+    // 异步建链（§3.2）：密钥**未**缓存 ⇒ fetchKey → keyFetched 回包 ⇒ `_onKeyFetched` 的
+    // **正常臂**调 `confirmLinking()` 进 Active。本文件其余 `beginLinking` 没有一处落到这条
+    // 异步臂上，删掉那一句 `confirmLinking()` 现有用例会全绿。
+    void _testAsyncLinkingConfirm();
 };

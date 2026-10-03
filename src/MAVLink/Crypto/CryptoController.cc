@@ -148,6 +148,10 @@ void CryptoController::setMonitorDevices(const QVariantList& deviceIds, int fram
     {
         const QMutexLocker locker(&_mutex);
         _frameTimeoutMs = (frameTimeoutMs > 0) ? frameTimeoutMs : DEFAULT_FRAME_TIMEOUT_MS;
+        // ‼️ 走到这里就说明这是一份**成功推送的清单**（调用方只在该轮请求 200 且载荷合法时
+        //    才调本函数）。清单生效标志在此置位，且**此后不再回落**——它是"本视图有没有
+        //    话语权"的开关，不是"清单非空"的代词。空清单同样生效（见 .h 的语义说明）。
+        _monitorListActive = true;
         // ‼️ 判据是"集合内容变了"，不是"被调用了一次"（§3.4）
         changed = (parsed != _monitorDevices);
         if (changed) {
@@ -199,7 +203,10 @@ void CryptoController::requestAcceleratedRegistration()
         //    `ceil(n/16)` 少排一批，而追加在末尾的 `_activeDeviceID` 恰好总落在最后一批
         //    ⇒ 它这一轮永远取不到、要等下一个 10s 周期——而那架正是用户刚选定、
         //    正在建链的目标。改完 n = 这一轮真正要发的总量。
-        const QList<DeviceID>& devices = _monitorDevices.isEmpty() ? _linkedDevices : _monitorDevices;
+        // ‼️ 与 `_sendRegistration()` 同口径：`_monitorListActive` 而不是
+        //    `_monitorDevices.isEmpty()`（理由见那一处）。两处必须一起改，
+        //    否则"这一轮要发几架"与实际发出去的集合会对不上。
+        const QList<DeviceID>& devices = _monitorListActive ? _monitorDevices : _linkedDevices;
         listSize = devices.size();
         n = listSize;
         if (_activeDeviceID != kInvalidDeviceID && !devices.contains(_activeDeviceID)) {
@@ -266,6 +273,19 @@ QList<DeviceID> CryptoController::monitorDevicesForTest() const
     return _monitorDevices;
 }
 
+bool CryptoController::monitorListActiveForTest() const
+{
+    const QMutexLocker locker(&_mutex);
+    return _monitorListActive;
+}
+
+bool CryptoController::linkLossMonitorActiveForTest() const
+{
+    // 与 `_stopLinkLossMonitor()` 同口径：QTimer 的操作在锁外（timer 归属主线程，
+    // 持锁调它有反序风险）。这里只读 `isActive()`，不改状态。
+    return _linkLossTimer != nullptr && _linkLossTimer->isActive();
+}
+
 QList<DeviceID> CryptoController::lastRegistrationPayloadForTest() const
 {
     const QMutexLocker locker(&_mutex);
@@ -308,14 +328,91 @@ void CryptoController::addLinkedDevice(DeviceID deviceID)
     }
 }
 
+bool CryptoController::removeLinkedDevice(DeviceID deviceID)
+{
+    const QMutexLocker locker(&_mutex);
+    const bool removed = (_linkedDevices.removeAll(deviceID) > 0);
+    if (removed) {
+        qCDebug(CryptoControllerLog) << "linked device removed" << deviceID;
+    }
+    return removed;
+}
+
+void CryptoController::releaseDevice(quint32 deviceID)
+{
+    const DeviceID id = static_cast<DeviceID>(deviceID);
+    // 参数校验与 addLinkedDevice / setMonitorDevices 用**同一组**口径（非 0 + 签名位合法）
+    if (id == kInvalidDeviceID || !hasValidSignatureBit(id)) {
+        qCWarning(CryptoControllerLog) << "releaseDevice: 非法 deviceID，忽略" << deviceID;
+        return;
+    }
+    // 防御：本端 GCS 的 deviceID 不属于"被关联的 PX4"，绝不该出现在 _linkedDevices 里。
+    // 真出现了说明上游数据串了线，此时**释放它**会把自己的登记身份摘掉——
+    // 宁可留一条告警，也不做这个动作。
+    if (id == _gcsDeviceID) {
+        qCWarning(CryptoControllerLog) << "releaseDevice: 拒绝释放本端 GCS deviceID" << deviceID;
+        return;
+    }
+
+    bool yielded = false; // 本次是否让出了上行权（决定要不要停失联监测、发 stateChanged）
+    {
+        const QMutexLocker locker(&_mutex);
+        // ① 移出登记集合：本端不再为它发 80005（mavp2p 的配对随之在 MAP_TTL 后过期）。
+        //    编号与 .h 的四件事一致。这里写**内联** removeAll 而不调 `removeLinkedDevice`：
+        //    那个函数自己加 `_mutex`，本处已持锁 ⇒ `QMutex` 非递归会死锁。
+        _linkedDevices.removeAll(id);
+        // ①b 也从监控清单里摘掉（① 的同一件事，第二个容器）。清单本由上层整份重推
+        //     （poll 成功即全量替换），这里多做一步是为了补一个真实的缝：
+        //     **poll 失败时刻意保留上一次清单**（§3.5.4），若不摘，
+        //     已释出的飞机会被那一份陈旧清单一直登记着。
+        //     ⚠️ 摘完可能成为空清单——那不是"没有清单"。**若这份清单曾生效**
+        //     （`_monitorListActive == true`），取列表口径不会翻回 `_linkedDevices`
+        //     （否则这次释出当场失效）；而未打开过 RomView 的会话从不调
+        //     `setMonitorDevices`（全仓唯一调用点就在 RomView 里），此时该标志本就是
+        //     false，摘空也无从翻起。
+        if (_monitorDevices.removeAll(id) > 0) {
+            _regCursor = 0; // 集合变了，旧游标没有意义（同 setMonitorDevices）
+        }
+        // ④ 让出上行权——**只在它确实占着槽时**。`_activeDeviceID` 是单槽，
+        //    可能正属于另一架飞机，无条件回 Standby 会把在飞那架一起打掉。
+        if (_activeDeviceID == id) {
+            _activeDeviceID = kInvalidDeviceID;
+            _state = State::Standby;
+            yielded = true;
+        }
+    }
+
+    // ② 删本地密钥。**这一步是必需的**，它与 ③ 一起构成"清空水位"的安全前提：
+    //    `MAVLinkProtocol.cc` 那两处自动建链的闸就是 hasKey——删掉它，本端才不会在
+    //    飞机尚未回到待命（PX4 全局水位仍是旧值）时贸然用随机起点发首帧。
+    //    详见 .h 的因果链说明。`beginLinking` 在 hasKey 未命中时会自动取密钥，
+    //    所以重新接引不会因此卡住，只是多一个 HTTP 往返。
+    _keyManager.removeKey(id);
+    // ③ 上下行水位**一并清空**（2026-10-03 用户裁定）。清空之后本端对这架飞机的
+    //    上行起点重新回到"随机奇起点 ⇒ 收到下行后改取 下行+1"的规则（规范 §2.5/§3.2.4.2）。
+    resetReplay(id);
+
+    if (yielded) {
+        // 锁外调用：它内部要加锁（同 returnToStandby 的写法）
+        _stopLinkLossMonitor();
+    }
+    qCDebug(CryptoControllerLog) << "released device" << id << (yielded ? "(yielded uplink)" : "");
+    if (yielded) {
+        emit stateChanged();
+    }
+}
+
 void CryptoController::_sendRegistration()
 {
     QList<DeviceID> batch;
     {
         const QMutexLocker locker(&_mutex);
-        // §3.5.3：有监控清单时用清单，否则回退 _linkedDevices
-        //（未登录 / RomView 未打开 ⇒ 保持现状，零回归）
-        QList<DeviceID> devices = _monitorDevices.isEmpty() ? _linkedDevices : _monitorDevices;
+        // §3.5.3：有**生效的**监控清单时用清单，否则回退 _linkedDevices
+        //（未登录 / 站点视图从未推过清单 ⇒ 保持现状，零回归）。
+        // ‼️ 判据是 `_monitorListActive`，**不是** `_monitorDevices.isEmpty()`：清单生效之后
+        //    被摘空（签出释出最后一架）是"本 GCS 在线、暂不关联任何 PX4"，绝不是
+        //    "回退到 _linkedDevices 全体"——那会把刚释出的飞机原地登记回去。
+        QList<DeviceID> devices = _monitorListActive ? _monitorDevices : _linkedDevices;
         if (_activeDeviceID != kInvalidDeviceID && !devices.contains(_activeDeviceID)) {
             devices.append(_activeDeviceID);
         }
@@ -482,13 +579,23 @@ void CryptoController::beginLinking(DeviceID targetDeviceID)
         qCWarning(CryptoControllerLog) << "beginLinking: invalid target deviceID" << targetDeviceID;
         return;
     }
+    bool hadLinkLossMonitor = false;
     {
         const QMutexLocker locker(&_mutex);
         if (_state == State::Active && _activeDeviceID == targetDeviceID) {
             return; // 已在任务中
         }
+        // 切换活跃目标：在跑的那份失联监测监的是**上一个**目标。此后每一帧 `commitIncoming`
+        // 都会因 `deviceID != _activeDeviceID` 在 `_startLinkLossMonitor` 里早退 ⇒ 它既不会
+        // 被改派、也不会被自然停掉，只会在超时那一刻对一架**已不该被关心**的飞机发
+        // `px4LinkLost`（假失联告警）。故"停"必须挂在这里，不能只挂在 `releaseDevice` 的
+        // 让位分支上——被切走的目标未必紧接着被释出。
+        hadLinkLossMonitor = (_linkLossDevice != kInvalidDeviceID);
         _activeDeviceID = targetDeviceID;
         _state = State::Linking;
+    }
+    if (hadLinkLossMonitor) {
+        _stopLinkLossMonitor(); // 锁外调用（同 _startLinkLossMonitor：timer 归属主线程）
     }
     emit stateChanged();
 
@@ -602,11 +709,34 @@ void CryptoController::returnToStandby()
 
 void CryptoController::_onKeyFetched(DeviceID deviceID)
 {
+    bool releasedDevice = false;
     {
         const QMutexLocker locker(&_mutex);
         if (_state != State::Linking || _activeDeviceID != deviceID) {
-            return; // 非当前目标 / 状态已变
+            // ‼️ 早退之前先判一次：这次回包是不是为一个**已被释出**的 deviceID 而来。
+            //    必须在这里把它删掉，因为 `cacheKey` 已经在
+            //    `DeviceKeyManager::_onReplyFinished` 里**无条件**执行过了——`releaseDevice`
+            //    刚删掉的密钥，此刻被这个回包**原地装回来**，于是 `MAVLinkProtocol.cc`
+            //    两处自动建链的 `hasKey` 闸重新打开：收到该机的帧 ⇒ beginLinking ⇒
+            //    用**随机奇起点**给一架已经签出的飞机发首帧（正是 .h 里那条要堵的链）。
+            //    判据＝三个集合都不认它。正常的"建链目标从 A 改到 B"切换下 A 仍在某个
+            //    集合里 ⇒ 不误伤；真不在任何集合里，那它本来就该被释出。
+            releasedDevice = (_linkedDevices.indexOf(deviceID) < 0 &&
+                              _monitorDevices.indexOf(deviceID) < 0 &&
+                              _activeDeviceID != deviceID);
+            if (!releasedDevice) {
+                return; // 非当前目标 / 状态已变
+            }
         }
+    }
+    if (releasedDevice) {
+        _keyManager.removeKey(deviceID);  // 锁外调用（_keyManager 自管锁，同 releaseDevice）
+        // ‼️ 刻意用 **Warning** 而非 Debug：这是安全相关异常（在途回包正试图给一架已释出的
+        //    飞机重装密钥，也就是 `MAVLinkProtocol` 那两处自动建链闸重开的瞬间），同时是
+        //    本修复**唯一**可观测的痕迹。本类别（`QGCLoggingCategory`）默认级别就是
+        //    `QtWarningMsg`，用 Debug 在默认运行下根本不输出 —— 等于堵了洞却没留证。
+        qCWarning(CryptoControllerLog) << "key fetched for a released device, dropped again" << deviceID;
+        return;
     }
     confirmLinking();
 }
@@ -669,11 +799,15 @@ bool CryptoController::nextOutgoingCounter(uint64_t& outCounter)
     } else {
         // 上行与下行水位皆空 ⇒ 沿用建链首帧的随机起点，避免重启后从 1 重来导致
         // nonce 复用（规范 §2.5）。§3.2.4.2 只禁止用确定性或旧 counter，随机起点不违反。
-        // 能走到这里只有两条路，且都安全：① 明文待命心跳触发 beginLinking —— 此时
-        // QGC 是建链发起方，§2.5 的随机起点正是正确规则，且该待命心跳已清掉 mavp2p
-        // 的水位；② 同一次 receiveBytes 内先提交下行、后建链（微秒级窗口）。
-        // 注意：本档**不是**一次性抉择——生产路径无 resetReplay 调用方，但若进程内
-        // 先走本档、再收到下行，下一帧即按上式改取「下行 + 1」。
+        // 能走到这里有**三**条路：① 明文待命心跳触发 beginLinking——此时 QGC 是建链发起方，
+        // §2.5 的随机起点正是正确规则；② 同一次 receiveBytes 内先提交下行、后建链
+        // （微秒级窗口）；③ **释出后重建链**（`releaseDevice` 把水位清了之后）。
+        // ⚠️ 三条路里只有 ③ 的安全性由本端自己保证——它依赖同一批删掉的密钥（见
+        //    releaseDevice 的因果链）：密钥若还在，那两个自动建链入口会把飞机接回来，
+        //    而那时 PX4 的残留水位与我们的随机起点只是"可能"相容。
+        // 注意：本档**不是**一次性抉择——2026-10-03 起 `releaseDevice` 是生产路径上
+        // **唯一**的 `resetReplay` 调用方（此前只有测试调它），但若进程内先走本档、
+        // 再收到下行，下一帧即按上式改取「下行 + 1」。
         outCounter = randomOddCounter();
     }
 

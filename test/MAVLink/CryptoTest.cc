@@ -18,6 +18,7 @@
 #include <QFile>
 #include <QRegularExpression>
 #include <QSet>
+#include <QSignalSpy>
 #include <QTemporaryFile>
 #include <QVariantList>
 #include <cstring>
@@ -268,10 +269,11 @@ void CryptoTest::init()
 {
     UnitTest::init();
     // CryptoController 是单例（Q_APPLICATION_STATIC，跨用例共享），而测试进程没有登录
-    // 会话 ⇒ 责任方标志的缺省值（false，fail-closed）会让本文件里全部 8 处 beginLinking
+    // 会话 ⇒ 责任方标志的缺省值（false，fail-closed）会让本文件里全部 14 处 beginLinking
     // 停在 Standby。除专门验证该闸的用例外，一律先标为责任方。
-    // ‼️ 「8」是**数出来的**（`command grep -cE "^[[:space:]]*crypto->beginLinking\(" test/MAVLink/CryptoTest.cc`，
-    //    2026-09-27 实测）；此前写 6 是过时值——§3.5.1 那条用例自己带 2 处调用，把它顶了上去。
+    // ‼️ 「14」是**数出来的**（`command grep -cE "^[[:space:]]*crypto->beginLinking\(" test/MAVLink/CryptoTest.cc`，
+    //    2026-10-04 实测）；此前写 8 是过时值——`_testReleaseDevice` 的让位/切目标两段与
+    //    `_testAsyncLinkingConfirm` 又各添了调用，把它顶了上去。
     //    ⚠️ **必须带行首锚**：不加锚的 `grep -c` 会把本段注释里提到的函数名一起数进来
     //    （实测过程中出现过「数得 9、真值 8」）——判据命令的作用范围含同名文本时，先标定再采信。
     //    本文件再增删 beginLinking 调用时请重新数，别信这个数字。
@@ -1752,6 +1754,35 @@ void CryptoTest::_testNextRegistrationBatch()
     QCOMPARE(negCursor, 0);
 }
 
+void CryptoTest::_testRegistrationFallbackToLinked()
+{
+    CryptoController* const crypto = CryptoController::instance();
+
+    // 开门发帧会打 "registration sent ..."（QtDebugMsg，strict mode 下算未预期日志）
+    ignoreLogMessage("MAVLink.Crypto.CryptoController", QtDebugMsg, QRegularExpression("registration "));
+
+    // ‼️ 前提：本进程内还没有任何一份清单生效过。若不成立（有用例被挪到前面，或新增了
+    //    更早的用例推过清单），本用例已失去判别力 ⇒ 出声，别静默退化成"什么都没测"。
+    QVERIFY2(!crypto->monitorListActiveForTest(),
+             "本用例要求 _monitorListActive 仍为 false —— 它必须声明在 _testSetMonitorDevices 之前");
+
+    crypto->returnToStandby();          // 清掉可能残留的 active（它会混进 payload）
+    crypto->setRegistrationEnabled(false);
+
+    const DeviceID linked = makeDeviceID(0, 0, 0x91, 0x01);
+    QVERIFY(hasValidSignatureBit(linked));
+    crypto->addLinkedDevice(linked);
+
+    // 判据必须是帧里**装了什么**：只数条数的话，"回退到 _linkedDevices"与"用了一份空的
+    // 生效清单"都是"发了一帧"，区分不了（§3.4）。周期给到 1h ⇒ 用例内不会周期触发。
+    crypto->setRegistrationEnabled(true, 3600000);
+    QTRY_COMPARE_WITH_TIMEOUT(crypto->lastRegistrationPayloadForTest(),
+                              QList<DeviceID>{ linked }, TestTimeout::shortMs());
+
+    crypto->setRegistrationEnabled(false);
+    QVERIFY(crypto->removeLinkedDevice(linked));   // 不留 _linkedDevices 给后面的用例
+}
+
 void CryptoTest::_testSetMonitorDevices()
 {
     CryptoController* const crypto = CryptoController::instance();
@@ -1808,9 +1839,18 @@ void CryptoTest::_testSetMonitorDevices()
     //    "提前 return 导致清单没被换掉"这类缺陷是假绿。补内容断言。
     QCOMPARE(crypto->monitorDevicesForTest(), QList<DeviceID>{ b });
 
-    // 空清单 = "没有清单" ⇒ 回退到 _linkedDevices（§3.5.4 的未登录/RomView 未打开两支）
+    // 空清单：条数为 0，但**这份清单是生效的**。
+    // §3.5.4 那两支（未登录 / RomView 未打开 ⇒ 回退 `_linkedDevices`）走的是**另一格**：
+    // 从未成功推送过清单 ⇒ `monitorListActiveForTest()` 为 false。两格必须在判据上分开——
+    // 拿 `monitorDeviceCount() == 0` 兼作"没有清单"的实现，会把"推了一份空清单"与
+    // "从没有过清单"撞成一格：签出释出把清单摘空之后，取列表口径翻回 `_linkedDevices` 全体，
+    // 刚放走的飞机原地被登记回来，而日志上一切正常。
+    // ⚠️ "回退 vs 用空清单"的**判别格**不在这里（本用例没有任何 _linkedDevices 成员，
+    //    两种实现发出去的都是空帧）⇒ 在 `_testReleaseDevice()` 的 ④ 段，判据是帧里
+    //    **装了什么**（不是发了几帧——两种实现都"发了一帧"）。
     crypto->setMonitorDevices(QVariantList(), 3000);
     QCOMPARE(crypto->monitorDeviceCount(), 0);
+    QVERIFY(crypto->monitorListActiveForTest());
 }
 
 void CryptoTest::_testRequestAcceleratedRegistration()
@@ -2082,6 +2122,300 @@ void CryptoTest::_testReRegisterDevice()
     crypto->setRegistrationEnabled(false);
     crypto->setMonitorDevices(QVariantList(), 3000);
     QCOMPARE(crypto->monitorDeviceCount(), 0);
+}
+
+// ============================================================================================
+// 签出释出（2026-10-03 裁定）：`releaseDevice` 的四件事必须**同批**发生
+//   ① 移出登记集合  ② 删密钥  ③ 上下行水位**全清**  ④ 若占着上行权则当场让位
+// 为什么②③必须同批：水位清空后本端下一次建链走 `nextOutgoingCounter()` 的**随机奇起点**
+// 档。该档要**必被接受**，前提是 PX4 侧两个方向的全局水位皆 unset——注意这在今天**只可能
+// 来自开机**（"回到待命即软重置"是设计依赖、当前并未实现；完整因果链见 `CryptoController.h`
+// 里 `releaseDevice` 的文档）。而 `MAVLinkProtocol` 那两条**自动**建链入口不经过待命心跳，
+// 它们的唯一闸就是 `hasKey`——只清水位不删密钥，等于亲手把缺口留着。
+// ============================================================================================
+void CryptoTest::_testReleaseDevice()
+{
+    CryptoController* const crypto = CryptoController::instance();
+
+    // ④段要开门发帧 ⇒ 沿用前几例的整类豁免（"registration sent" 与 "registration disabled" 都能匹配）。
+    ignoreLogMessage("MAVLink.Crypto.CryptoController", QtDebugMsg,
+                     QRegularExpression("registration "));
+    // ②b 段主动触发一次在途回包（C-1 修复会把它丢弃）。那条告警**必须出现**，故不在这里
+    // 豁免，而是在触发点用 `expectLogMessage` 钉住（见 ②b）。
+
+    crypto->returnToStandby();
+    crypto->setRegistrationEnabled(false);
+
+    const DeviceID released = makeDeviceID(0, 0, 0x81, 0x01);
+    const DeviceID other    = makeDeviceID(0, 0, 0x81, 0x02);
+
+    // ---- ① 三个拒绝档：id 为 0 / 签名位非法 / 是本端 GCS 自己 ----
+    // 本端那格不是形式主义：`_linkedDevices` 若因上游串线混进了本端 GCS 的 deviceID，
+    // 释放它等于把自己的登记身份摘掉——本端自此不出现在 mavp2p 的 QGC 在线表里，
+    // 而**它自己**的登记心跳再没人发，只能靠重启恢复。
+    const int s0 = crypto->registrationSendCountForTest();
+    expectLogMessage("MAVLink.Crypto.CryptoController", QtWarningMsg, QRegularExpression("releaseDevice"));
+    crypto->releaseDevice(0);   // kInvalidDeviceID
+    verifyExpectedLogMessage();
+
+    const DeviceID badSig = makeDeviceID(0x01, 0, 0x81, 0x09);   // incompat bit0 ⇒ deviceID bit24
+    QVERIFY(!hasValidSignatureBit(badSig));
+    expectLogMessage("MAVLink.Crypto.CryptoController", QtWarningMsg, QRegularExpression("releaseDevice"));
+    crypto->releaseDevice(badSig);
+    verifyExpectedLogMessage();
+
+    const DeviceID gcsSaved = crypto->gcsDeviceID();   // 读回原值，测完复原（本端 id 是全局状态）
+    const DeviceID gcs      = makeDeviceID(0, 0, 0x8F, 0x01);
+    QVERIFY(hasValidSignatureBit(gcs));
+    crypto->setGcsDeviceID(gcs);
+    crypto->addLinkedDevice(gcs);                      // 模拟上游串线
+    expectLogMessage("MAVLink.Crypto.CryptoController", QtWarningMsg, QRegularExpression("releaseDevice"));
+    crypto->releaseDevice(gcs);
+    verifyExpectedLogMessage();
+    // ‼️ 拒绝的**证据**是"它还在集合里"：`releaseDevice` 若照单全收，这里返回 false。
+    QVERIFY2(crypto->removeLinkedDevice(gcs), "releaseDevice 释放了本端 GCS 的 id");
+    crypto->setGcsDeviceID(gcsSaved);
+    QCOMPARE(crypto->gcsDeviceID(), gcsSaved);
+    QCOMPARE(crypto->registrationSendCountForTest(), s0);   // ‼️ 释放本身一帧都不发
+
+    // ---- ② 让位的守卫：槽位属于**别人**时，释放 A 不得动槽、也不得删 B 的密钥 ----
+    // 单槽 `_activeDeviceID` 是上行权（飞行安全联锁）。没有这条守卫的实现会
+    // 「释出一架没在飞的飞机，顺手把正在飞的那架打回 Standby」——此后 LinkInterface 非
+    // Active 直接 drop，本端拒绝一切加密上行，在飞的那架当场失联。
+    // ⚠️ 先把监控清单设成非空：①b 的摘除段（`_monitorDevices.removeAll` + `_regCursor` 归零）
+    //    只在**清单非空**时才会执行，否则 `if (removeAll(id) > 0)` 恒不成立、整段删掉也全绿。
+    crypto->setMonitorDevices(QVariantList{ QVariant(static_cast<uint>(released)),
+                                            QVariant(static_cast<uint>(other)) }, 3000);
+    QCOMPARE(crypto->monitorDeviceCount(), 2);
+
+    crypto->deviceKeyManager()->cacheKey(other, testKey());
+    crypto->beginLinking(other);   // 密钥已缓存 ⇒ 同步进 Active
+    QCOMPARE(crypto->state(), CryptoController::State::Active);
+    QCOMPARE(crypto->activeDeviceID(), other);
+
+    crypto->addLinkedDevice(released);
+    crypto->addLinkedDevice(other);
+    QVERIFY(crypto->removeLinkedDevice(released));    // 先证明它确实在集合里…
+    QVERIFY(!crypto->removeLinkedDevice(released));   // …再证明"本来就不在"返回 false（幂等）
+    crypto->addLinkedDevice(released);                // 放回去，③段还要用
+
+    // ‼️ 非让位路径也必须删密钥 + 清水位——②段此前只给 `other` 造了前提，`released`
+    //    当时两手空空，于是"把 `removeKey`/`resetReplay` 整个搬进 `if (yielded)` 块"
+    //    也不会有一格红（后面三条断言查的全是 `other`）。
+    //    而签出的常态恰恰是"别人刚接手、自己没在飞"的那一架，正是这条路径。
+    crypto->deviceKeyManager()->cacheKey(released, testKey());
+    QVERIFY(crypto->deviceKeyManager()->hasKey(released));
+    crypto->commitIncoming(released, 2000);
+    // ⚠️ 阳性对照：水位确实落在 `released` 上（`commitIncoming` 无条件 commit，
+    //    与 state/active 无关，所以此刻 `other` 占着槽也照落）。
+    //    没有这一条，`isIncomingAcceptable(released, 1999) == true` 在下文就不能
+    //    区分"水位被清了"与"本来就没有水位"。
+    QVERIFY(!crypto->isIncomingAcceptable(released, 1999));
+
+    crypto->releaseDevice(released);                  // 释放的不是当前活跃目标
+    QCOMPARE(crypto->activeDeviceID(), other);        // ‼️ 槽位纹丝不动
+    QCOMPARE(crypto->state(), CryptoController::State::Active);
+    QVERIFY2(crypto->deviceKeyManager()->hasKey(other), "释放 A 误删了 B 的密钥");
+    QVERIFY2(!crypto->deviceKeyManager()->hasKey(released),
+             "非让位释放没删密钥 ⇒ MAVLinkProtocol 两处自动建链闸仍开着，"
+             "会给已签出的飞机发随机起点首帧");
+    QVERIFY2(crypto->isIncomingAcceptable(released, 1999), "非让位释放没清水位");
+    // ①b：同一个"移出登记集合"，只是第二个容器。站点流程下 `_sendRegistration` 实际读的
+    // 就是 `_monitorDevices`；不摘，那份**刻意保留**的陈旧清单（§3.5.4）会一直登记已释出机。
+    // ⚠️ 验"剩下的是谁"而不只是条数：只数条数的实现在"摘错了一个"时照样过。
+    QCOMPARE(crypto->monitorDevicesForTest(), QList<DeviceID>{ other });
+
+    // ---- ②b 在途 fetchKey 的回包，不得把已释出设备的密钥装回来 ----
+    // `DeviceKeyManager::_onReplyFinished` 在回包到达时**无条件** `cacheKey`，
+    // 而它跑在 `CryptoController::_onKeyFetched` **之前** ⇒ 只靠 `_onKeyFetched` 的
+    // 早退守卫（`_state != Linking || _activeDeviceID != deviceID`）挡不住：
+    // 密钥已经被装回，`MAVLinkProtocol` 两处自动建链的 `hasKey(deviceID)` 闸重新打开
+    // ⇒ 收到该机的帧就 `beginLinking`，用**随机奇起点**给一架已签出的飞机发首帧。
+    // 下面这一对调用复现的就是"释出之后、在途回包此刻到达"（顺序与真实链路一致：
+    // 先 `cacheKey`，再发信号）。
+    crypto->deviceKeyManager()->cacheKey(released, testKey());
+    QVERIFY(crypto->deviceKeyManager()->hasKey(released));   // 阳性对照：闸此刻确实是开的
+    // ‼️ 用 expect+verify（**必须出现**）而非 ignore（允许出现）：这是「级别从 Debug 升到
+    //    Warning」唯一可判别的判据——本类别默认级别就是 Warning，退回 Debug 后这句话在
+    //    默认运行下根本不输出，而 `ignoreLogMessage` 口径对"没出现"照绿。
+    expectLogMessage("MAVLink.Crypto.CryptoController", QtWarningMsg,
+                     QRegularExpression("key fetched for a released device"));
+    emit crypto->deviceKeyManager()->keyFetched(released);
+    verifyExpectedLogMessage();
+    QVERIFY2(!crypto->deviceKeyManager()->hasKey(released),
+             "在途 fetchKey 回包把已释出设备的密钥装回来了 ⇒ 自动建链闸重开，"
+             "会给已签出的飞机发随机起点首帧");
+    QCOMPARE(crypto->activeDeviceID(), other);   // ‼️ 顺手验：这次回包也没去动槽位
+
+    // ‼️ 反向判据：同样"本端非活跃目标收到回包"，但这架**仍在登记集合里** —— 正确判据必须
+    //    **不**删它的密钥（它只是"当前不是活跃目标"，并非"已被释出"）。少了这一格，
+    //    "早退即无条件 removeKey"这种过度删除的实现能骗过上面全部断言。
+    crypto->addLinkedDevice(released);
+    crypto->deviceKeyManager()->cacheKey(released, testKey());
+    emit crypto->deviceKeyManager()->keyFetched(released);
+    QVERIFY2(crypto->deviceKeyManager()->hasKey(released),
+             "把仍在登记集合里的设备当成已释出 ⇒ 误删密钥，该机此后每次建链都多一趟 fetchKey");
+    QVERIFY(crypto->removeLinkedDevice(released));   // 放回原状，③段还用
+
+    // ---- ③ 上下行水位**全清**：下行直接验，上行用"重建链后的首帧起点"验 ----
+    // 先构造 up > down，否则 `max(上行,下行)` 取到下行 ⇒ 上行清没清在产出上看不出来。
+    crypto->returnToStandby();
+    crypto->deviceKeyManager()->cacheKey(released, testKey());
+    crypto->beginLinking(released);
+    QCOMPARE(crypto->state(), CryptoController::State::Active);
+    QCOMPARE(crypto->activeDeviceID(), released);
+
+    // ‼️ 让失联监测**真的跑起来**：`_startLinkLossMonitor` 第一道门是 `_cryptoEnabled`，
+    //    其缺省为 false（见其声明处），而本文件**除本处外**从不把它置真 ⇒ 不补这一下，
+    //    `_stopLinkLossMonitor()` 在测试里是**纯 no-op**，删掉那一行也全绿；
+    //    线上却会留下一个待发火的计时器，5s 后对一架**已释出**的飞机发 px4LinkLost
+    //    （假失联告警）。
+    crypto->setCryptoEnabled(true);
+    // ⚠️ 取**差值**而不是绝对计数：`emit stateChanged()` 全类共 **5** 处，上面那次
+    //    `beginLinking` 也会发一条。本 spy 建于其**之后**，故 `spinsBeforeRelease`
+    //    当前恒为 0、两种写法此刻等价；取差值是为了对 spy 的插入位置不敏感
+    //    （一旦有人把 spy 上移到 `beginLinking` 之前，绝对计数就会恒真、零判别力）。
+    QSignalSpy stateChangedSpy(crypto, &CryptoController::stateChanged);
+
+    crypto->commitIncoming(released, 4000);                   // 下行水位 = 4000（偶数 = PX4 方向）
+    QVERIFY(!crypto->isIncomingAcceptable(released, 3999));    // 清空**前**的阳性对照：更小的值必拒
+    QVERIFY2(crypto->linkLossMonitorActiveForTest(),
+             "Active 且活跃目标刚收到下行，失联监测却没启动 ⇒ 下一格是假绿");
+    const int spinsBeforeRelease = stateChangedSpy.count();
+    uint64_t out1 = 0;
+    QVERIFY(crypto->nextOutgoingCounter(out1));
+    QCOMPARE(out1, 4001ull);   // 上行起点 = max(0, 下行 4000) 的奇数后继 ⇒ 此后 up(4001) > down(4000)
+
+    crypto->releaseDevice(released);
+
+    QCOMPARE(crypto->activeDeviceID(), kInvalidDeviceID);      // ④ 它正占着槽 ⇒ 当场让位
+    QCOMPARE(crypto->state(), CryptoController::State::Standby);
+    QVERIFY2(!crypto->linkLossMonitorActiveForTest(),
+             "让位释出没停掉失联监测 ⇒ 5s 后对已释出的飞机发假失联告警");
+    QVERIFY2(stateChangedSpy.count() > spinsBeforeRelease,
+             "让位释出没有 emit stateChanged ⇒ 依赖方（界面/链路层）不刷新");
+    QVERIFY2(!crypto->deviceKeyManager()->hasKey(released), "释放后密钥还在缓存里");
+    QVERIFY2(crypto->isIncomingAcceptable(released, 3999), "下行水位没被清空");
+
+    crypto->deviceKeyManager()->cacheKey(released, testKey()); // 密钥已被删 ⇒ 重新接引须重取
+    crypto->beginLinking(released);
+    uint64_t out2 = 0;
+    QVERIFY(crypto->nextOutgoingCounter(out2));
+    // ‼️ 只清下行的实现：up 仍是 4001 ⇒ `max(4001, 无下行)` 的奇数后继 = **4003**（确定值）。
+    //    全清则走随机奇起点档（值域是 [1, 2^62) 内的 2^61 个奇数），撞上 4003 的概率是
+    //    2^-61 ⇒ 本格的判别力落在"确定值 vs 随机值"。
+    QVERIFY2(out2 != 4003ull, "上行水位没被清空：重建链后仍从旧上行序列续起");
+
+    // ---- ③b 失联监测的**归属**：非让位释放不得误停，切换活跃目标必须停 ----
+    // 监测对象恒应是**当前活跃目标**，两个方向都可能错：
+    //   · 放太宽（把 `_stopLinkLossMonitor()` 挪出 `if (yielded)`）⇒ 释放一架非活跃飞机时
+    //     连正在飞的那架的监测一起停掉，它此后真失联也没人报；
+    //   · 放太窄（只在 `releaseDevice` 的让位分支停）⇒ 被**切走**的目标（未必紧接着被释出）
+    //     那份监测既不会被改派、也不会自然停，5s 后对已不该被关心的飞机发 px4LinkLost。
+    crypto->returnToStandby();
+    crypto->deviceKeyManager()->cacheKey(other, testKey());
+    crypto->beginLinking(other);
+    crypto->commitIncoming(other, 6000);
+    QVERIFY2(crypto->linkLossMonitorActiveForTest(), "前置：监测没起来，本段两格都成假绿");
+
+    crypto->releaseDevice(released);          // released 此刻**不是**活跃目标
+    QCOMPARE(crypto->activeDeviceID(), other);
+    QVERIFY2(crypto->linkLossMonitorActiveForTest(),
+             "释放一架非活跃飞机，把正在飞的那架的失联监测一并停了 ⇒ 它此后真失联也没人报");
+
+    const DeviceID third = makeDeviceID(0, 0, 0x81, 0x05);
+    crypto->deviceKeyManager()->cacheKey(third, testKey());
+    crypto->beginLinking(third);              // 切换活跃目标：other 被切走
+    QVERIFY2(!crypto->linkLossMonitorActiveForTest(),
+             "切换活跃目标没停掉旧目标的失联监测 ⇒ 5s 后对一架已不该被关心的飞机发假失联告警");
+
+    // ---- ④ 空清单是**生效的**清单，不是"没有清单" ----
+    // 这是本次改动最容易被写回去的一处：拿 `_monitorDevices.isEmpty()` 兼作回退判据时，
+    // 签出释出把清单摘空之后，取列表口径会翻回 `_linkedDevices` **全体** ⇒ 刚放走的飞机
+    // 被原地登记回来，而日志上一切正常。
+    // ⚠️ 判据必须是帧里**装了什么**：只数条数的话，"回退"与"正确的空清单"都只是"发了一帧"。
+    crypto->returnToStandby();          // 清掉 active，否则 `_sendRegistration` 会把它追加进 payload
+    crypto->addLinkedDevice(other);     // 诱饵：只在"回退 `_linkedDevices`"的实现里才会出现在帧里
+    crypto->setRegistrationEnabled(true, 3600000);
+    crypto->setMonitorDevices(QVariantList{ QVariant(static_cast<uint>(released)) }, 3000);
+    // 先等"非空清单"这一轮真的发出去——否则下面的空 payload 与"压根还没发过帧"同形 ⇒ 假绿。
+    QTRY_VERIFY_WITH_TIMEOUT(crypto->lastRegistrationPayloadForTest() == QList<DeviceID>{ released },
+                             TestTimeout::shortMs());
+    crypto->setMonitorDevices(QVariantList(), 3000);   // 非空 → 空：签出最后一架的转移
+    QTRY_VERIFY_WITH_TIMEOUT(crypto->lastRegistrationPayloadForTest() == QList<DeviceID>{},
+                             TestTimeout::shortMs());
+    QVERIFY(crypto->monitorListActiveForTest());
+    QCOMPARE(crypto->monitorDeviceCount(), 0);
+
+    // 复位（单例跨用例共享）：顺序同前几例——**先关登记、再清清单**，反序会排一串 burst
+    // 定时器搅乱下一个用例的计数基线。另外本用例是**唯一**往 `_linkedDevices` 里放东西的
+    // 地方，必须清干净：留着的话，后续任何用例一旦走到"回退 `_linkedDevices`"那支就凭空多一架。
+    crypto->setCryptoEnabled(false);   // ③段为验失联监测开过，复位（单例跨用例共享）
+    crypto->setRegistrationEnabled(false);
+    crypto->setMonitorDevices(QVariantList(), 3000);
+    crypto->returnToStandby();
+    QVERIFY(crypto->removeLinkedDevice(other));        // ④段的诱饵
+    QVERIFY(!crypto->removeLinkedDevice(released));    // ③段已被 releaseDevice 摘掉
+    crypto->deviceKeyManager()->removeKey(other);
+    crypto->deviceKeyManager()->removeKey(third);   // ③b 切走的那架：`beginLinking` 只装不删，
+                                                    // 留着会渗进后续用例的密钥缓存
+    QCOMPARE(crypto->monitorDeviceCount(), 0);
+}
+
+// ============================================================================================
+// 异步建链（§3.2）：`beginLinking` 时密钥**未**缓存 ⇒ 走 `fetchKey`，等回包到达后由
+// `_onKeyFetched` 的**正常臂**调 `confirmLinking()` 进 Active。
+// 为什么必须单独立一格：本文件其余 `beginLinking` 调用**没有一处**落到 `fetchKey` 的异步臂——
+// 要么命中 `hasKey` 的**同步**支（密钥已缓存 ⇒ 直接 Active），要么更早就被责任方闸挡回
+// （`_testBeginLinkingRequiresResponsibleParty` 格 1）。而 C-1 修复新加的 `releasedDevice`
+// 守卫正长在 `_onKeyFetched` 里——只测「该丢的丢了」（②b）不够，还得有一格钉住
+// 「**该确认的确认了**」。删掉 `_onKeyFetched` 末尾那句 `confirmLinking()`，生产里首次接引会
+// 永远停在 Linking（`nextOutgoingCounter` 对非 Active 恒拒发），而现有用例全绿（变异 M5 实测）。
+// ============================================================================================
+void CryptoTest::_testAsyncLinkingConfirm()
+{
+    CryptoController* const crypto = CryptoController::instance();
+    crypto->returnToStandby();
+
+    const DeviceID dev = makeDeviceID(0, 0, 0x91, 0x03);
+    crypto->deviceKeyManager()->removeKey(dev);
+
+    // ⚠️ 必须给一个**会真的把请求发出去**的地址，不能只靠「不可达」。`fetchKey` 在
+    //    `!isConfigured()`（`_serverUrl` 为空）时是**同步** `emit fetchFailed` ⇒
+    //    `_onFetchFailed` 当场把状态打回 Standby，根本停不在 Linking、异步臂永远测不到。
+    //    端口 1 无人监听 ⇒ 请求发得出去，reply 经事件循环回来后落进**非成功**分支
+    //    （既不 `cacheKey` 也不 `keyFetched`）⇒ 不会假装「密钥到了」。
+    crypto->deviceKeyManager()->setServerUrl(QStringLiteral("http://127.0.0.1:1"));
+    // 那条 `fetchKey failed:` 告警是本用例刻意构造的失败回包，不是缺陷。
+    ignoreLogMessage("MAVLink.Crypto.DeviceKeyManager", QtWarningMsg,
+                     QRegularExpression("fetchKey failed"));
+    // ‼️ spy 必须建在 `beginLinking` **之前**：失败回包随时可能落地，建晚了那一次 emission
+    //    就漏了、末尾的等待恒超时。而「它必须在**本用例内**落地」本身也是判据——漂到下一个
+    //    用例里去的话，那条告警会把别人的 strict mode 打红。
+    QSignalSpy fetchFailedSpy(crypto->deviceKeyManager(), &DeviceKeyManager::fetchFailed);
+
+    crypto->beginLinking(dev);
+    // 前提哨兵：停在此处才说明真的走在异步路径上。密钥若被缓存，`beginLinking` 会**同步**
+    // 进 Active，下面两条断言就与 `_onKeyFetched` 无关了 ⇒ 整格变成假绿。
+    QCOMPARE(crypto->state(), CryptoController::State::Linking);
+    QCOMPARE(crypto->activeDeviceID(), dev);
+
+    // 复现回包到达：`DeviceKeyManager::_onReplyFinished` 的成功分支就是这两步（先装、再发）。
+    crypto->deviceKeyManager()->cacheKey(dev, testKey());
+    emit crypto->deviceKeyManager()->keyFetched(dev);   // 同线程 AutoConnection ⇒ 同步跑完
+    QVERIFY2(crypto->state() == CryptoController::State::Active,
+             "`_onKeyFetched` 没在密钥到位后确认建链 ⇒ 生产里首次接引永远停在 Linking");
+    QCOMPARE(crypto->activeDeviceID(), dev);
+
+    // 复位：先撤出活跃态，再等在途请求的失败回包落地（此刻 state != Linking ⇒
+    // `_onFetchFailed` 早退，不会把 Standby 再打一次）。
+    crypto->returnToStandby();
+    QTRY_VERIFY_WITH_TIMEOUT(fetchFailedSpy.count() > 0, TestTimeout::shortMs());
+
+    // 清空 = 复位 `isConfigured()`：留着的话，后续用例任何一处「密钥未缓存」的 `fetchKey`
+    // 都会从同步失败变成真网络请求，行为和基线整个偏移。
+    crypto->deviceKeyManager()->setServerUrl(QString());
+    crypto->deviceKeyManager()->removeKey(dev);
 }
 
 UT_REGISTER_TEST_LIGHTWEIGHT(CryptoTest, TestLabel::Unit)
