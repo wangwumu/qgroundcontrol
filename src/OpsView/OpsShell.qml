@@ -96,6 +96,13 @@ Item {
     //-------------------------------------------------------------------------
     property var  _tasks:          []      // /ops/overview 任务数组（已按角色过滤）
     property string _tasksJson:    ""      // 上一轮 `_tasks` 载荷的内容指纹（作用见 `_fetchOverview`）
+    /// 上一轮任务列表里的 `device_id` 集合（排序后逗号连接）。**签出释出的唯一判据**。
+    /// 只统计 `device_id > 0`；`_fetchOverview` 每轮拿它在**200 且是数组**的响应上做 diff。
+    /// ‼️ 初值是空串，与"空集合"同形 ⇒ **首轮就是空数组时不会触发任何释出**。这不是巧合：
+    ///    一次返回空数组的异常（后端故障 / 本站还没有任何任务）不该被读成"全部飞机都签出了"，
+    ///    那会一次性删掉整个站点的密钥与水位。真正的"最后一架走了"必然经过一次
+    ///    **非空 → 空**的转移，那时 `prev` 里确实有东西可释放。
+    property string _siteDeviceIdsKey: ""
     // 地图 L1 航线的**几何数据源**：只含任务身份 + 航点，**不含 `latest` 遥测**。
     /// ‼️ 为什么要跟 `_tasks` 分开：`_tasks` 带 `latest`，飞机每动一次内容就变 ⇒ 换身份
     ///    ⇒ 航线**陪着一起销毁重建**（离屏探针实测：只改一条 `latest`，4 条线全量 +4/−4）。
@@ -630,10 +637,64 @@ Item {
         return true
     }
 
+    //---- 签出释出 ----
+
+    /// 释出一架已签出的飞机：交还本端关于它的**全部**本地状态。
+    /// - C++ 侧四件套（登记集合 / 密钥 / 上下行水位 / 上行权）见 `CryptoController::releaseDevice`
+    ///   的注释——那里写了"为什么删密钥与清水位必须同批"这条因果链。
+    /// - QML 侧清掉它的**历史轨迹**。`TrajectoryPoints` 是纯内存、与那条加密链路同生命周期，
+    ///   飞机走了它的线就该消失（用户报障的「黄箭头没了、红轨迹照跑」正是这两者不同步）。
+    ///   ⚠️ 轨迹层是 `MapItemView` 直接吃 `multiVehicleManager.vehicles`，`clear()` 会发
+    ///   `pointsCleared`，那层委托里已有处理器清 `path`（见 L3 上方注释），此处不必碰图层。
+    ///   ⚠️ 找不到载具（已经断了 3.5s 被摘掉）就不清——那种情况下轨迹线也随之消失了，
+    ///   没有任何东西需要擦。
+    function _releaseSiteDevice(deviceID) {
+        cryptoController.releaseDevice(deviceID)
+        var v = OpsCommon.matchDeviceToVehicle({ device_id: deviceID },
+                                               QGroundControl.multiVehicleManager.vehicles)
+        if (v && v.trajectoryPoints) v.trajectoryPoints.clear()
+    }
+
     //---- 接口封装 ----
     function _fetchOverview() {
         _get("/api/ops/overview?view=" + opsShell.overviewView, function(status, data) {
             if (status !== 200 || !Array.isArray(data)) { console.warn("OpsView overview", status); return }
+            //---- 签出释出（站点视图专属）----
+            // 判据：一架飞机的 device_id 在**本轮**列表里消失了。见 `_siteDeviceIdsKey` 的声明
+            // （初值与空集合同形 ⇒ 空数组的异常响应不会释放整站）。
+            // ⚠️ 这段刻意放在 `_tasksJson` 指纹**之外**：那一层判"要不要重建 marker/列表"，
+            //    本层判"有没有飞机走了"，两者判据不同——塞进指纹里会让"只有遥测在动"的轮次
+            //    跳过释出检查（当轮无害，但两件事的语义就串了）。
+            // ⚠️ 释出的时机就是"离开站点任务列表"，而这**只发生在监控员 ACCEPT 移交之后**
+            //    （`view=site` 的可见性判据，见 ops-view-visibility-two-branches）⇒ 这是本端
+            //    能观测到的**确证**签出；PENDING 挂着还没被接受时，飞机还在本站待命，
+            //    那时不该动它的密钥与水位。
+            var _ovIds = []
+            for (var _oi = 0; _oi < data.length; _oi++) {
+                var _odid = Number(data[_oi] ? data[_oi].device_id : 0)
+                if (_odid > 0) _ovIds.push(_odid)
+            }
+            // 排序只为让 key 稳定：同一集合无论按什么顺序到达，都不必每轮进 if 块重建 `now`。
+            // ⚠️ 它**不是**"防止误释出"的那一层——防误释出靠下面 `_ovNow` 的集合查表
+            //    （node 探针实测：去掉排序，17 格场景一格都不变红）。删掉只损失一点每轮
+            //    开销，但别把它当成正确性判据去加固，也别以为有它就万事大吉。
+            _ovIds.sort(function(a, b) { return a - b })
+            var _ovKey = _ovIds.join(",")
+            if (_ovKey !== _siteDeviceIdsKey) {
+                var _ovPrev = _siteDeviceIdsKey.length ? _siteDeviceIdsKey.split(",") : []
+                _siteDeviceIdsKey = _ovKey
+                // 只有站点视图释出：监控员视图此时正**接手**这架飞机（它的清单会由
+                // `routeTasksUpdated` 整份重推），对它做释出会把刚接上的链路打掉。
+                if (!routeLayersEnabled) {
+                    var _ovNow = {}
+                    for (var _ni = 0; _ni < _ovIds.length; _ni++) _ovNow[_ovIds[_ni]] = true
+                    for (var _pi = 0; _pi < _ovPrev.length; _pi++) {
+                        var _ovGone = Number(_ovPrev[_pi])
+                        if (!(_ovGone > 0) || _ovNow[_ovGone]) continue
+                        opsShell._releaseSiteDevice(_ovGone)
+                    }
+                }
+            }
             // ‼️ **内容没变就不要重新赋值**（理由同 `_fetchRouteTasks`）。`property var` 一旦换身份，
             //    吃 `_tasks` 的 `MapItemView`（飞机 marker）与右栏列表都会销毁重建全部委托。
             //    实测（改动前）：载荷**逐字节相同**时，4 条航线仍每轮新建 4 个，累计 4→8→12→… 无休止。
@@ -1523,7 +1584,14 @@ Item {
                         //    of the pen width）⇒ 配合下面的 strokeWidth: 2，实得 10 px 实 / 8 px 空。
                         //    改 strokeWidth 会连带改虚线密度，别把它当成两个独立的旋钮。
                         dashPattern: [5, 4]
-                        strokeColor: "#ffd400"
+                        // 用户 2026-10-03：「把站点的虚线圆圈改成白色虚线」⇒ 由 #ffd400（琥珀）改白。
+                        // ⚠️ 只动了**颜色**这一个值：线宽 2、`dashPattern [5,4]`、空心
+                        //    （`fillColor: transparent`）都与改前逐字相同 ⇒ 虚线段长与线宽没变。
+                        // ⚠️ 白色在卫星底图上够不够显眼**没实测**（改前那版琥珀也没做过对比度
+                        //    实测，是"亮而不荧光"的意图挑选）。真机若发灰/看不清，旋钮就是这一个值。
+                        // ‼️ 别拿 `SlotLayout.qml` 机位卡上那两条虚线当参照 —— 那是**卡片**上的
+                        //    （颜色走 `_style.outline` / `_style.mark`），与本圈各改各的。
+                        strokeColor: "#ffffff"
                         strokeWidth: 2
                         // 空心圈：实心填充会盖住底图上的地形与航线。**别改成半透明填充**——
                         // 那在深色卫星底图上只会让圈与底图的对比度下降。
@@ -1649,11 +1717,14 @@ Item {
                 model: opsShell.routeLayersEnabled ? [] : _tasks
                 delegate: MapQuickItem {
                     id: siteMarker
-                    // ‼️ 位置主源是**报文**，不是 `modelData.latest`（用户 2026-09-24 报障：
-                    //    「飞机图标不会在 OpsView 中出现」）。`latest` 来自后端轮询的
-                    //    `table_telemetry`（最多陈旧 2 s，且 `data_writer` 一旦停写就恒为旧值
-                    //    甚至为 null）；载具坐标则是**逐帧**的 MAVLink 位置。
-                    //    `OpsCommon.resolvePosition` 的次序就是"报文优先、REST 兜底"（§5.2）。
+                    // ‼️ 位置**只吃报文**（用户 2026-09-24 报障：「飞机图标不会在 OpsView 中
+                    //    出现」；2026-10-03 进一步裁定「位置/箭头/方向/轨迹都从 mavlink 报文来，
+                    //    不是取数据库」）。`modelData.latest` 来自后端轮询的 `table_telemetry`
+                    //    （最多陈旧 2 s，且 `data_writer` 一旦停写就恒为旧值甚至为 null）；
+                    //    载具坐标则是**逐帧**的 MAVLink 位置。
+                    //    ‼️ 2026-10-03 已把 `OpsCommon.resolvePosition` 里那条 REST 兜底**删掉**：
+                    //    库是报文的派生副本，报文读不到库里也没有新值 ⇒ 兜底只会画出假 marker。
+                    //    ⇒ 本 marker **没有位置就不画**（下面 `visible` 那条）。
                     // ‼️ 下面两段与 L3（监控员视图）marker **逐条同构**，是同一处坑：
                     //    · `vehicles` 必须在**绑定表达式里**读一次当实参传进去（`.pragma library`
                     //      里函数体读属性**不注册绑定依赖**，见 `OpsCommon.js` 头部）；
@@ -1668,8 +1739,8 @@ Item {
                         return OpsCommon.matchDeviceToVehicle(modelData, vs)
                     }
                     readonly property var _pos: OpsCommon.resolvePosition(
-                                                     modelData, _veh, _veh ? _veh.coordinate : null)
-                    // 两处都没有位置 ⇒ **不画**（与 L3 同一判据：该机尚无遥测）
+                                                     _veh, _veh ? _veh.coordinate : null)
+                    // 无载具 / 坐标无效 ⇒ **不画**（与 L3 同一判据）。**没有库兜底**（2026-10-03 裁定）。
                     visible: _pos !== null
                     coordinate: _pos !== null
                                 ? QtPositioning.coordinate(_pos.lat, _pos.lon)
@@ -1732,10 +1803,32 @@ Item {
                                 // 数字改小——改了数字就再也看不出它来自哪个图标了。
                                 transform: Scale { origin.x: 0; origin.y: 0; xScale: 1 / 3; yScale: 1 / 3 }
 
+                                // 白边（2026-10-03 加）：一条**白色剪影**垫在最底下，形状就是上游
+                                // `vehicleArrowOpaque.svg` 里那块飞镖轮廓（上面两条填充三角正是
+                                // 从它里面抠出来的，边缘内缩 0.5 单位）。垫在下面 ⇒ 填充的 path 与
+                                // 坐标一像素没动，也不像"给填充描白边"那样在两边的宽度里各吃一半。
+                                // ⚠️ 但这**不等于**"状态色一点没少"。离屏探针（QSvgRenderer 渲染
+                                //    24×24，改前 / 本档两图逐像素比）实测：
+                                //      近白像素         0 → 111
+                                //      "明显偏黄"像素  250 → 182（−27%）
+                                //    掉的**全在尖端与薄边**——那些像素覆盖率本就不足四成，原先与
+                                //    透明底混出接近纯色的值，现在改成与白混。填充的**几何范围没变**，
+                                //    变的是边缘混色的对象。
+                                // ⚠️ 单位是 72 制的 path 坐标，父级那层 Scale 缩 1/3 之后才是视觉值
+                                //    ⇒ 视觉白边 ≈ (0.5 + 8÷2) ÷ 3 ≈ 1.5 px。
+                                // ⚠️ RoundJoin：36.87° 的翼尖用斜接会拉出 3.2 倍尖刺（同上游 SVG）。
+                                ShapePath {
+                                    fillColor: "#ffffff"
+                                    strokeColor: "#ffffff"
+                                    strokeWidth: 8
+                                    joinStyle: ShapePath.RoundJoin
+                                    PathSvg { path: "M36 0 0 72l36-18 36 18z" }
+                                }
                                 ShapePath {
                                     fillColor: siteMarker._markerColor
                                     strokeColor: "#ffffff"
-                                    // 常态**不描边**：同样 3px 在圆点上只占周长 12.5%，在这条
+                                    // 本条填充**常态不描边**（图标的白边由上面那条白色剪影负责，
+                                    // 不占填充面积）：同样 3px 在圆点上只占周长 12.5%，在这条
                                     // **尖三角形**上会把填充色糊掉。L3 那边为这一档做过离屏探针
                                     // （实测「状态色只剩 19%、其余全被白边盖住」，图标看上去是
                                     // **白的**）——本块的形状、缩放与描边宽度与它**逐字相同**，
@@ -1887,7 +1980,7 @@ Item {
                     // 同理：`_veh.coordinate` 也必须在**实参位置**读一次，否则 MAVLink 位置一变
                     // 这个绑定不重估，marker **永远停在第一帧**——而界面看起来完全正常。
                     readonly property var _pos: OpsCommon.resolvePosition(
-                                                     modelData, _veh, _veh ? _veh.coordinate : null)
+                                                     _veh, _veh ? _veh.coordinate : null)
                     readonly property string _vis: OpsCommon.visibleForSelection(modelData, opsShell._selectedRouteId)
                     // 本机所属的航班。`_routeTasks` 与 `_routeDevices` 是后端**同一条 WHERE
                     // 的两个投影**，所以这里查得到是常态、查不到才是异常（`markerColor` 对此有兜底）。
@@ -1899,7 +1992,7 @@ Item {
                                                              modelData, _task, opsShell._now, opsShell._handoverById,
                                                              OpsCommon.isLandedOnGround(_veh ? _veh.flying : undefined))
 
-                    // 两处都没有位置 ⇒ **不画**（`device.latest` 为 null 是常态：该机尚无遥测）
+                    // 无载具 / 坐标无效 ⇒ **不画**（2026-10-03 裁定：位置**只吃报文**，没有库兜底）
                     visible: _pos !== null
                     coordinate: _pos !== null
                                 ? QtPositioning.coordinate(_pos.lat, _pos.lon)
@@ -1946,6 +2039,32 @@ Item {
                                 // 数字改小——改了数字就再也看不出它来自哪个图标了。
                                 transform: Scale { origin.x: 0; origin.y: 0; xScale: 1 / 3; yScale: 1 / 3 }
 
+                                // 白边（2026-10-03 加）：与站点视图 marker 那一块**逐字同源**
+                                // （形状、宽度、RoundJoin 都一样，改一处要回头看另一处）。
+                                // 一条**白色剪影**垫在最底下，形状就是上游
+                                // `vehicleArrowOpaque.svg` 里那块飞镖轮廓（上面两条填充三角正是
+                                // 从它里面抠出来的，边缘内缩 0.5 单位）。垫在下面 ⇒ 填充的 path 与
+                                // 坐标一像素没动。⚠️ 但边缘混色会变：同探针实测 近白 0 → 111、
+                                // "明显偏黄" 250 → 182，去掉的全是尖端/薄边——详见站点视图那一块
+                                // 的同名注释（两处**逐字同源**，那条说理也只写了一份）。
+                                // ⚠️ 单位是 72 制的 path 坐标，父级那层 Scale 缩 1/3 之后才是视觉值
+                                //    ⇒ 视觉白边 ≈ (0.5 + 8÷2) ÷ 3 ≈ 1.5 px。
+                                // ⚠️ 与下面那条 `strokeWidth: _vis === "lit" ? 3 : 0` 的关系
+                                //    （2026-10-03 实测，同探针）：常态 近白 111 / 明显偏黄 182；
+                                //    点亮 近白 162 / 明显偏黄 122。⇒ 点亮**不是**"再描一圈更粗的"
+                                //    （3 < 8，外缘一点没往外长），而是白描边**吃进填充**：
+                                //    白色 +46%、可见填充 −33%。两档差别仍在，只是从"有没有边"
+                                //    变成了"白多黄少"。
+                                //    ‼️ 顺带记一笔**原有**现象（本轮没引入、也没修）：那条白描边
+                                //    作用在两条三角的**公共中缝**上 ⇒ 点亮时箭头正中会多出一条
+                                //    白色竖线，把箭头劈成两半。要修得单独处理中缝。
+                                ShapePath {
+                                    fillColor: "#ffffff"
+                                    strokeColor: "#ffffff"
+                                    strokeWidth: 8
+                                    joinStyle: ShapePath.RoundJoin
+                                    PathSvg { path: "M36 0 0 72l36-18 36 18z" }
+                                }
                                 ShapePath {
                                     fillColor: devMarker._markerColor
                                     strokeColor: "#ffffff"
@@ -1959,8 +2078,10 @@ Item {
                                     //      1.5px = 48%   1px = 64%   无描边 = 100%
                                     //      0.67px ≈ 98%，但它被抗锯齿吃成 2 个像素 ⇒ 等于没画，
                                     //      所以**没有**"细到刚好"这一档可选。
-                                    //    ⇒ 常态**不描边**（状态色完整可见），点亮时用 1px 白边；
-                                    //      两档的差别落在"有没有边"上，而不是边的粗细。
+                                    //    ⇒ 本条填充**常态不描边**（状态色完整可见），点亮时在本条上
+                                    //      **再加** 1px 白边。
+                                    //      ⚠️ 2026-10-03 起两档的差别**不再是**"有没有边"——图标常态
+                                    //      就有白边了（上面那条白色剪影），差别落在**边粗不粗**上。
                                     // ⚠️ `strokeWidth` 的单位是 **path 的坐标（未缩放的 72 制）**，
                                     //    缩放 1/3 之后视觉宽度才等于它的三分之一 ⇒ 要 1px 视觉就写 3。
                                     strokeWidth: devMarker._vis === "lit" ? 3 : 0

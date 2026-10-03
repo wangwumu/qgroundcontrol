@@ -96,7 +96,7 @@ function phaseToLabel(p) { return p === "ROUTE" ? "航线监控" : p === "LANDIN
 // task TAKEOFF 且 VTOL 已转前飞 → "飞行中"；task LANDING 且已在地面 → "已落地"。
 // ‼️ 后两个实参由**调用点**从 `Vehicle` 上读好再传进来（`vtolInFwdFlight` / `flying`），
 //    **不要**改成在函数体里读 `vehicle.xxx`：`.pragma library` 的函数体内读属性**不注册
-//    绑定依赖**（同 `resolvePosition` 第三实参的注释），状态字会永远停在第一帧而界面不报错。
+//    绑定依赖**（同 `resolvePosition` 第二实参的注释），状态字会永远停在第一帧而界面不报错。
 // 数据源：加密心跳 EXT 重建的 EXTENDED_SYS_STATE（`Vehicle::_handleExtendedSysState`）。
 function displayStatus(task, handoverById, vtolInFwdFlight, landedOnGround) {
     if (!task) return "—"
@@ -336,7 +336,7 @@ function isTimeout(handover, nowMs) {
 // 不再读 `/ops/overview` 的 `latest`（那是数据库里的落库快照，滞后且与链路死活无关）。
 // ‼️ 本组函数一律**只做纯计算**：所有需要建立绑定依赖的属性读取都在**调用点的 QML 表达式**
 //    里完成，再作为实参传进来。`.pragma library` 的函数体内读属性不注册依赖（同
-//    `resolvePosition` 第三实参的注释）——写进去界面**看不出异常**，只是按钮永远停在
+//    `resolvePosition` 第二实参的注释）——写进去界面**看不出异常**，只是按钮永远停在
 //    第一帧的状态，而这类缺陷编译、lint、离屏快照全都发现不了。
 //--------------------------------------------------------------------------
 
@@ -874,23 +874,29 @@ function visibleForSelection(device, selectedRouteId) {
 // 淡化不透明度（数值本身无依据，§5.3 注明"按真机截图调"）
 var dimmedOpacity = 0.35
 
-// 位置主源选择（§5.2）。返回 `{lat, lon, source}` 或 **null**（调用方不画 marker）。
-//   source = "mavlink"（实时） | "rest"（最多陈旧 2s）
-// ‼️ 第三个实参 `vehicleCoord` **不是冗余**：`.pragma library` 里函数体读属性**不注册绑定依赖**
+// 飞机位置（§5.2 的"位置主源"）。**只有报文一个源**；取不到就返回 **null**（调用方不画 marker）。
+// ‼️ 2026-10-03 裁定（用户原话：「qgc 上包括箭头、状态栏数据、位置、方向轨迹都是从 mavlink
+//    报文中来，不是取数据库」「web 链路走固定数据，mavlink 走动态数据」
+//    「数据库也来源于 mavlink 报文，如果你从报文读不到，意味着数据库中也没有」）：
+//    **原先那条 `device.latest` 的 REST 兜底已删除**。理由：库里的遥测本身就是报文的派生副本
+//    （`data_writer` 落 `table_telemetry`）⇒ **报文读不到，库里也不会有新值**，兜底最多拿到
+//    一份冻结的旧快照，**没有任何信息增益**，却让一架「本地从未接引」的飞机在地图上被画成
+//    一枚位置陈旧、机头静默朝北的**假 marker**（2026-10-03 实测 `10000385`：库快照陈旧 **9 小时**，
+//    在界面上与在飞那架无从区分——用户报障「箭头方向始终指向北」）。
+//    ⇒ **不要**把 `device.latest` 加回来；也**不要**再加任何"从库里取动态值"的兜底。
+// ‼️ 第二个实参 `vehicleCoord` **不是冗余**：`.pragma library` 里函数体读属性**不注册绑定依赖**
 //    （见本文件头部）。把坐标作为**实参**传进来，绑定依赖才落在调用点的表达式上——
 //    这样 MAVLink 坐标一变，marker 的 `coordinate` 绑定才会重估。写成 `vehicle.coordinate`
 //    在函数体内，界面**看不出异常**，只是位置永远停在第一帧。
-function resolvePosition(device, vehicle, vehicleCoord) {
+function resolvePosition(vehicle, vehicleCoord) {
     if (vehicle && vehicleCoord && vehicleCoord.isValid) {
-        return { lat: vehicleCoord.latitude, lon: vehicleCoord.longitude, source: "mavlink" }
+        return { lat: vehicleCoord.latitude, lon: vehicleCoord.longitude }
     }
-    // ⚠️ `device.latest` 为 null 是**常态不是异常**（该机尚无任何遥测）⇒ 必须先判 `!!`。
-    //    直接写 `device.latest.lat` 会抛 TypeError，而 QML 绑定异常**不中断渲染**，
-    //    只把该属性留在 undefined（`qml-undefined-binding-falls-back-to-default-true`）。
-    var l = device ? device.latest : null
-    if (l && l.lat) return { lat: l.lat, lon: l.lon, source: "rest" }
     return null
 }
+// 注：原先返回的 `source`（"mavlink" / "rest"）随兜底一并删除——单源之下它恒为一个值，
+//     留着只会让人以为"还有第二种位置来源"。设计文档 §5.2 那张四行表随之只剩"有报文就画、
+//     没有就不画"两档（第 2/3 行的 REST 回落已作废）。
 
 // 按 `deviceID` 找真实 Vehicle。**第一个实参是"任何带 `device_id` 的行"**：站点/监控员的
 // 设备行（`device`）与任务行（`task`）用的是同一个字段、同一个查法，故两处共用本函数
