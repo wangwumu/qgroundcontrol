@@ -37,6 +37,10 @@ public:
 
     QUrl getTileURL(int x, int y, int zoom) const;
 
+    /// 叠加层 URL（带 alpha 的透明瓦片，由上层合成到底图上）。
+    /// 返回空 QUrl ⇒ 该 provider 是单层瓦片，走原来的路径。
+    QUrl getOverlayTileURL(int x, int y, int zoom) const;
+
     QString getImageFormat(QByteArrayView image) const;
 
     // TODO: Download Random Tile And Use That Size Instead?
@@ -65,6 +69,10 @@ protected:
     int _getServerNum(int x, int y, int max) const;
 
     virtual QString _getURL(int x, int y, int zoom) const = 0;
+
+    /// 可选的叠加层。默认不启用 —— 只有「服务端给不出合成瓦片、必须客户端叠两层」的
+    /// provider 才覆写（当前只有 `AmapHybridProvider`）。
+    virtual QString _getOverlayURL(int /*x*/, int /*y*/, int /*zoom*/) const { return QString(); }
 
     const QString _mapName;
     const QString _referrer;

@@ -55,6 +55,11 @@ QUrl MapProvider::getTileURL(int x, int y, int zoom) const
     return QUrl(_getURL(x, y, zoom));
 }
 
+QUrl MapProvider::getOverlayTileURL(int x, int y, int zoom) const
+{
+    return QUrl(_getOverlayURL(x, y, zoom));
+}
+
 QString MapProvider::getImageFormat(QByteArrayView image) const
 {
     if (image.size() < 3) {

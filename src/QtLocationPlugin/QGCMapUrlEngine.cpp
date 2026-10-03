@@ -5,6 +5,7 @@
 #include <QtCore/QtMinMax>
 #include <QtCore/QUrl>
 
+#include "AmapProvider.h"
 #include "BingMapProvider.h"
 #include "ElevationMapProvider.h"
 #include "EsriMapProvider.h"
@@ -70,7 +71,17 @@ const QList<SharedMapProvider> UrlFactory::_providers = {
 
     std::make_shared<CustomURLMapProvider>(),
 
-    std::make_shared<CopernicusElevationProvider>()
+    std::make_shared<CopernicusElevationProvider>(),
+
+    // ‼️ 新增 provider 一律追加到列表末尾，不要插进中间。
+    // _mapId = 本列表里的 1-based 序号（MapProvider::_mapIdIndex 静态初值 1，
+    // 按构造顺序自增），列表顺序就是落库的 Tiles.type 取值。中段插入会把其后
+    // 每个 provider 的 mapId 整体平移，既有的瓦片缓存会被**按新序号重新解释成
+    // 别的 provider**（缓存里的影像张冠李戴，且不报错）。
+    // 2026-10-02 现状：type=8 有 9175 张 Bing Hybrid、type=40 有 2396 个 Copernicus 高程。
+    std::make_shared<AmapRoadProvider>(),
+    std::make_shared<AmapSatelliteProvider>(),
+    std::make_shared<AmapHybridProvider>()
 };
 
 QString UrlFactory::getImageFormat(int qtMapId, QByteArrayView image)
