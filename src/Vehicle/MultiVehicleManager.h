@@ -3,6 +3,8 @@
 #include <QtCore/QObject>
 #include <QtQmlIntegration/QtQmlIntegration>
 
+#include "Crypto/DeviceID.h"   // MAVLinkCrypto::DeviceID：建 Vehicle 的去重键
+
 class LinkInterface;
 class Vehicle;
 class QmlObjectListModel;
@@ -55,10 +57,13 @@ private slots:
     void _setActiveVehiclePhase2(Vehicle *vehicle);
     void _vehicleParametersReadyChanged(bool parametersReady);
     void _sendGCSHeartbeat();
-    void _vehicleHeartbeatInfo(LinkInterface *link, int vehicleId, int componentId, int vehicleFirmwareType, int vehicleType);
+    void _vehicleHeartbeatInfo(LinkInterface *link, int vehicleId, int componentId, int vehicleFirmwareType, int vehicleType,
+                               MAVLinkCrypto::DeviceID deviceID);
 
 private:
     bool _vehicleExists(int vehicleId);
+    /// 按 deviceID 查重（加密链路的去重键）。sysid 在本场地 17 架同值时无法区分。
+    bool _vehicleExistsByDeviceID(MAVLinkCrypto::DeviceID deviceID) const;
     bool _vehicleSelected(int vehicleId);
     void _setActiveVehicle(Vehicle *vehicle);
     void _setActiveVehicleAvailable(bool activeVehicleAvailable);

@@ -6,6 +6,7 @@
 #include <QtCore/QSet>
 #include <QtCore/QString>
 
+#include "Crypto/DeviceID.h"   // MAVLinkCrypto::DeviceID 是 typedef，无法前置声明
 #include "LinkInterface.h"
 #include "MAVLinkEnums.h"
 #include "MAVLinkMessageType.h"
@@ -47,15 +48,21 @@ public:
     void checkForLostLogFiles();
 
 signals:
+    /// 建 Vehicle 的入口。deviceID：本心跳的来源设备（未加密路径为 kInvalidDeviceID）。
+    /// MultiVehicleManager 用它做去重键 —— 多机同 sysid 时 vehicleId 会塌成一架。
     void vehicleHeartbeatInfo(LinkInterface* link, int vehicleId, int componentId, int vehicleFirmwareType,
-                              int vehicleType);
+                              int vehicleType, MAVLinkCrypto::DeviceID deviceID);
 
-    void messageReceived(LinkInterface* link, const mavlink_message_t& message);
+    /// deviceID：本帧所属设备。Vehicle 用它做帧归属判定（多机同 sysid 时 sysid 不可用）。
+    /// 默认值服务于未加密路径（无 deviceID 概念）⇒ 消费侧回退 sysid 判据，行为与改动前一致。
+    void messageReceived(LinkInterface* link, const mavlink_message_t& message,
+                         MAVLinkCrypto::DeviceID deviceID = MAVLinkCrypto::kInvalidDeviceID);
 
     /// 加密心跳 EXT 注入的合成遥测（本地构造的标准遥测消息，非线上帧）。
     /// Vehicle 经它消费位置/姿态/GPS/电池，但**不参与丢包/seq 统计**——合成消息的 seq
     /// 取自 QGC 发送侧（MAVLINK_COMM_0），与车辆真实接收序列无关，混入会污染 _messagesLost。
-    void telemetryInjected(LinkInterface* link, const mavlink_message_t& message);
+    void telemetryInjected(LinkInterface* link, const mavlink_message_t& message,
+                           MAVLinkCrypto::DeviceID deviceID = MAVLinkCrypto::kInvalidDeviceID);
 
     void mavlinkMessageStatus(int sysid, uint64_t totalSent, uint64_t totalReceived, uint64_t totalLoss,
                               float lossPercent);
@@ -71,7 +78,8 @@ private slots:
     void _vehicleCountChanged();
 
 private:
-    void _logData(LinkInterface* link, const mavlink_message_t& message);
+    void _logData(LinkInterface* link, const mavlink_message_t& message,
+                  MAVLinkCrypto::DeviceID deviceID = MAVLinkCrypto::kInvalidDeviceID);
     bool _closeLogFile();
     void _startLogging();
     void _stopLogging();
@@ -81,7 +89,8 @@ private:
 
     void _updateCounters(uint8_t mavlinkChannel, const mavlink_message_t& message);
     bool _updateStatus(LinkInterface* link, const SharedLinkInterfacePtr linkPtr, uint8_t mavlinkChannel,
-                       const mavlink_message_t& message);
+                       const mavlink_message_t& message,
+                       MAVLinkCrypto::DeviceID deviceID = MAVLinkCrypto::kInvalidDeviceID);
 
     /// 加密接收：流式重组帧 → 按 msgid 分流（msgID=0 明文待命心跳直通 / 其余解密还原）→ 喂给 mavlink_parse_char。
     void _receiveEncryptedBytes(LinkInterface* link, const SharedLinkInterfacePtr& linkPtr, const QByteArray& data);
@@ -89,13 +98,16 @@ private:
     void _processEncryptedFrame(LinkInterface* link, const SharedLinkInterfacePtr& linkPtr, uint8_t channel,
                                 const QByteArray& encFrame);
     /// 把一段标准 MAVLink 帧字节逐字节喂给 mavlink_parse_char 并走常规处理（解密还原后 / 明文待命心跳复用）。
+    /// deviceID：本段字节的来源设备（明文待命心跳 / 解密还原帧均已带）。**刻意不给默认值**：
+    /// 新增调用点必须显式声明来源，否则会静默退化成 sysid 判据而无人发现。
     void _feedStandardFrame(LinkInterface* link, const SharedLinkInterfacePtr& linkPtr, uint8_t channel,
-                            const uint8_t* bytes, int len);
+                            const uint8_t* bytes, int len, MAVLinkCrypto::DeviceID deviceID);
     /// 加密心跳 EXT（协议 60822.0「加密心跳扩展基础状态」）：把解析出的基础状态构造标准遥测消息
     /// 注入 Vehicle 处理链（emit telemetryInjected，绕过 seq/丢包统计），替代原独立遥测流
     /// （PX4 精简后 EXT 是遥测唯一来源）。
     void _injectHeartbeatExt(LinkInterface* link, const SharedLinkInterfacePtr& linkPtr, uint8_t channel,
-                             const uint8_t* plainFrame, const MAVLinkCrypto::HeartbeatExt& ext);
+                             const uint8_t* plainFrame, const MAVLinkCrypto::HeartbeatExt& ext,
+                             MAVLinkCrypto::DeviceID deviceID);
 
     void _saveTelemetryLog(const QString& tempLogfile);
     bool _checkTelemetrySavePath();

@@ -27,6 +27,17 @@ using DeviceID = uint32_t;
 /// 无效/未登记的 deviceID 哨兵值。
 inline constexpr DeviceID kInvalidDeviceID = 0;
 
+/// 解密还原标准帧头时写入的 `compid`（取值 = MAVLink 的 `MAV_COMP_ID_AUTOPILOT1`）。
+///
+/// 规范 §1.2 把 deviceID 的低 8 位定为 componentID，并声明「二者均无独立语义」；
+/// 但 QGC 上游在 MAVLink 标准语义上**依赖**该字段：`MultiVehicleManager::_vehicleHeartbeatInfo`
+/// 只接受 `MAV_COMP_ID_AUTOPILOT1` 的心跳，其余一律丢弃 ⇒ 低字节 != 1 的飞机
+/// **结构性地建不出 Vehicle**（状态栏恒 `-`、起飞按钮点不亮）。
+/// ⇒ 还原帧一律归一化为 1，把「deviceID 编码」与「QGC 的组件语义」解耦；
+/// 原始低字节仍可从 deviceID 本身读出（帧头解密的四个调用点吃的都是原始帧）。
+/// 此处写常量而不引 mavlink 头，是为保持本头「纯整数、不依赖 mavlink 结构体」的契约。
+inline constexpr uint8_t kNormalizedComponentID = 1;
+
 // ---------------------------------------------------------------------------
 // 纯位操作（不依赖 mavlink 结构体）
 // ---------------------------------------------------------------------------

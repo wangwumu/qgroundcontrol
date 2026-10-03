@@ -237,7 +237,17 @@ void MAVLinkProtocol::_receiveEncryptedBytes(LinkInterface* link, const SharedLi
             //    其命令在 Standby 下全被 LinkInterface 丢弃 → RequestMission 重试耗尽 →
             //    弹「任务传输失败。错误：任务请求列表失败,超过了最大重试次数。」
             if (AuthController::standaloneModeEnabled() || AuthController::backendLoggedIn()) {
-                _feedStandardFrame(link, linkPtr, channel, frameData, frame.size());
+                // 还原帧头 compid 归一化的**第二处落点**（第一处在 CryptoCodec::decryptFrame）。
+                // 本分支不经 decryptFrame —— 明文待命心跳无 counter/tag（规范 §2.2），
+                // 原始帧直接交给标准解析器，帧头 compid 就是 deviceID 的低字节。
+                // 不归一化则低字节 != 1 的飞机在**建链前**就建不出 Vehicle（连心跳都被丢弃），
+                // 详见 DeviceID.h 的 kNormalizedComponentID。
+                // 不改 frame 本身：下面 learnDeviceSystemMapping / 日志记账吃的都是原始帧。
+                QByteArray normalized(frame);
+                normalized[6] = static_cast<char>(MAVLinkCrypto::kNormalizedComponentID);
+                _feedStandardFrame(link, linkPtr, channel,
+                                   reinterpret_cast<const uint8_t*>(normalized.constData()), normalized.size(),
+                                   deviceID);
             }
         } else {
             _processEncryptedFrame(link, linkPtr, channel, frame);
@@ -356,13 +366,13 @@ void MAVLinkProtocol::_processEncryptedFrame(LinkInterface* link, const SharedLi
     // 先喂标准帧（加密心跳内嵌的标准 HEARTBEAT：Vehicle 学 defaultComponentId + 更新模式/武装），
     // 再注入 EXT 遥测（协议 60822.0）：PX4 精简 GCS 链路独立遥测后，加密心跳是遥测唯一来源，
     // 明文 HEARTBEAT payload > 9 → 解析 EXT(37B) 构造标准遥测消息，替代原独立遥测流。
-    _feedStandardFrame(link, linkPtr, channel, plainFrame, plainLen);
+    _feedStandardFrame(link, linkPtr, channel, plainFrame, plainLen, deviceID);
     // payload > 9 说明含 EXT。解析失败（PX4 版本漂移 / EXT 长度变更）会丢全部遥测——
     // 必须告警 + 日志，避免"在线但无遥测"静默（遥测唯一来源失效）。
     if (msgid == MAVLINK_MSG_ID_HEARTBEAT && plainFrame[1] > 9) {
         MAVLinkCrypto::HeartbeatExt ext;
         if (MAVLinkCrypto::parseHeartbeatExtFromFrame(msgid, plainFrame, plainLen, &ext)) {
-            _injectHeartbeatExt(link, linkPtr, channel, plainFrame, ext);
+            _injectHeartbeatExt(link, linkPtr, channel, plainFrame, ext, deviceID);
         } else {
             qCWarning(MAVLinkProtocolLog) << "encrypted heartbeat EXT parse failed: device" << deviceID
                                           << "payloadLen" << static_cast<int>(plainFrame[1]);
@@ -374,7 +384,7 @@ void MAVLinkProtocol::_processEncryptedFrame(LinkInterface* link, const SharedLi
 }
 
 void MAVLinkProtocol::_feedStandardFrame(LinkInterface* link, const SharedLinkInterfacePtr& linkPtr, uint8_t channel,
-                                         const uint8_t* bytes, int len)
+                                         const uint8_t* bytes, int len, MAVLinkCrypto::DeviceID deviceID)
 {
     for (int i = 0; i < len; ++i) {
         mavlink_message_t message{};
@@ -398,16 +408,17 @@ void MAVLinkProtocol::_feedStandardFrame(LinkInterface* link, const SharedLinkIn
             _forward(message);
             _forwardSupport(message);
         }
-        _logData(link, message);
+        _logData(link, message, deviceID);
 
-        if (!_updateStatus(link, linkPtr, channel, message)) {
+        if (!_updateStatus(link, linkPtr, channel, message, deviceID)) {
             return;
         }
     }
 }
 
 void MAVLinkProtocol::_injectHeartbeatExt(LinkInterface* link, const SharedLinkInterfacePtr& linkPtr, uint8_t channel,
-                                          const uint8_t* plainFrame, const MAVLinkCrypto::HeartbeatExt& ext)
+                                          const uint8_t* plainFrame, const MAVLinkCrypto::HeartbeatExt& ext,
+                                          MAVLinkCrypto::DeviceID deviceID)
 {
     Q_UNUSED(linkPtr)
     Q_UNUSED(channel)
@@ -416,7 +427,7 @@ void MAVLinkProtocol::_injectHeartbeatExt(LinkInterface* link, const SharedLinkI
     // 此处只遍历 emit，经 telemetryInjected 走 Vehicle 消费（绕过 seq/丢包统计，避免合成消息污染 _messagesLost）。
     const QList<mavlink_message_t> msgs = MAVLinkCrypto::buildHeartbeatExtTelemetry(plainFrame, ext);
     for (const mavlink_message_t& msg : msgs) {
-        emit telemetryInjected(link, msg);
+        emit telemetryInjected(link, msg, deviceID);
     }
 }
 
@@ -492,7 +503,8 @@ void MAVLinkProtocol::_forwardSupport(const mavlink_message_t& message)
     (void)forwardingSupportLink->writeBytesThreadSafe(bytes.constData(), bytes.size());
 }
 
-void MAVLinkProtocol::_logData(LinkInterface* link, const mavlink_message_t& message)
+void MAVLinkProtocol::_logData(LinkInterface* link, const mavlink_message_t& message,
+                               MAVLinkCrypto::DeviceID deviceID)
 {
     // 飞行事件日志：**刻意放在下面那个 _tempLogFile 闸之外**。原始帧日志会因为一次写盘失败
     // 被 _logSuspendError 永久停掉，而那一时刻恰恰是最需要事件日志的时候。
@@ -533,7 +545,8 @@ void MAVLinkProtocol::_logData(LinkInterface* link, const mavlink_message_t& mes
             _startLogging();
             mavlink_heartbeat_t heartbeat{};
             mavlink_msg_heartbeat_decode(&message, &heartbeat);
-            emit vehicleHeartbeatInfo(link, message.sysid, message.compid, heartbeat.autopilot, heartbeat.type);
+            emit vehicleHeartbeatInfo(link, message.sysid, message.compid, heartbeat.autopilot, heartbeat.type,
+                                      deviceID);
             break;
         }
         case MAVLINK_MSG_ID_HIGH_LATENCY: {
@@ -541,14 +554,16 @@ void MAVLinkProtocol::_logData(LinkInterface* link, const mavlink_message_t& mes
             mavlink_high_latency_t highLatency{};
             mavlink_msg_high_latency_decode(&message, &highLatency);
             // HIGH_LATENCY does not provide autopilot or type information, generic is our safest bet
-            emit vehicleHeartbeatInfo(link, message.sysid, message.compid, MAV_AUTOPILOT_GENERIC, MAV_TYPE_GENERIC);
+            emit vehicleHeartbeatInfo(link, message.sysid, message.compid, MAV_AUTOPILOT_GENERIC, MAV_TYPE_GENERIC,
+                                      deviceID);
             break;
         }
         case MAVLINK_MSG_ID_HIGH_LATENCY2: {
             _startLogging();
             mavlink_high_latency2_t highLatency2{};
             mavlink_msg_high_latency2_decode(&message, &highLatency2);
-            emit vehicleHeartbeatInfo(link, message.sysid, message.compid, highLatency2.autopilot, highLatency2.type);
+            emit vehicleHeartbeatInfo(link, message.sysid, message.compid, highLatency2.autopilot, highLatency2.type,
+                                      deviceID);
             break;
         }
         default:
@@ -557,7 +572,7 @@ void MAVLinkProtocol::_logData(LinkInterface* link, const mavlink_message_t& mes
 }
 
 bool MAVLinkProtocol::_updateStatus(LinkInterface* link, const SharedLinkInterfacePtr linkPtr, uint8_t mavlinkChannel,
-                                    const mavlink_message_t& message)
+                                    const mavlink_message_t& message, MAVLinkCrypto::DeviceID deviceID)
 {
     if ((_totalReceiveCounter[mavlinkChannel] % 31) == 0) {
         const uint64_t totalSent = _totalReceiveCounter[mavlinkChannel] + _totalLossCounter[mavlinkChannel];
@@ -565,7 +580,7 @@ bool MAVLinkProtocol::_updateStatus(LinkInterface* link, const SharedLinkInterfa
                                   _totalLossCounter[mavlinkChannel], _runningLossPercent[mavlinkChannel]);
     }
 
-    emit messageReceived(link, message);
+    emit messageReceived(link, message, deviceID);
 
     if (linkPtr.use_count() == 1) {
         return false;

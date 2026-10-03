@@ -171,14 +171,17 @@ bool decryptFrame(const uint8_t* encFrame, int encLen, uint8_t crcExtra, const K
     const uint8_t* payload = plaintext + kDeviceIDSize;
     const uint16_t payloadLen = ciphertextLen - kDeviceIDSize;
 
-    // 还原标准帧（incompat/compat 清零，sysid/compid 从 deviceID 还原）
+    // 还原标准帧（incompat/compat 清零；sysid 从 deviceID 还原，compid **归一化**）
+    // ⚠️ compid 刻意不写 componentID(deviceID)：QGC 上游只认 MAV_COMP_ID_AUTOPILOT1，
+    //    低字节透传会让「deviceID & 0xFF != 1」的飞机建不出 Vehicle，
+    //    详见 DeviceID.h 的 kNormalizedComponentID。
     plainFrame[0] = 0xFD;
     plainFrame[1] = static_cast<uint8_t>(payloadLen);
     plainFrame[2] = 0;
     plainFrame[3] = 0;
     plainFrame[4] = seq;
     plainFrame[5] = systemID(deviceID);
-    plainFrame[6] = componentID(deviceID);
+    plainFrame[6] = kNormalizedComponentID;
     plainFrame[7] = static_cast<uint8_t>(msgid & 0xFFu);
     plainFrame[8] = static_cast<uint8_t>((msgid >> 8) & 0xFFu);
     plainFrame[9] = static_cast<uint8_t>((msgid >> 16) & 0xFFu);

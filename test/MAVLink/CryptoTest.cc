@@ -10,6 +10,8 @@
 #include "MAVLinkLib.h"
 #include "Extensions/VTOLSafetyMessages.h"
 
+#include <checksum.h>   // crc_init/crc_accumulate*：测试侧自算帧尾 CRC（见 frameCrc）
+
 #include <QtTest/QtTest>
 
 #include <QDir>
@@ -50,6 +52,26 @@ uint8_t heartbeatCrcExtra()
 {
     const mavlink_msg_entry_t* const entry = mavlink_get_msg_entry(MAVLINK_MSG_ID_HEARTBEAT);
     return entry ? entry->crc_extra : 0;
+}
+
+/// 按 MAVLink v2 规则重算整帧 CRC：crc(帧头第 1..kV2HeaderLen-1 字节) → crc(payload) → crc(crc_extra)。
+/// 首字节（magic 0xFD）与帧尾 2 字节 CRC 本身不参与计算。
+///
+/// 用途：独立地算出「这一帧的 CRC 应该是多少」，用来验证 decryptFrame 还原出的帧
+/// **与自身内容自洽** —— 归一化改了 compid，CRC 必须跟着重算，照抄原文的 CRC 会被标准解析器拒收。
+uint16_t frameCrc(const QByteArray& frame, uint8_t crcExtra)
+{
+    const int payloadLen = static_cast<uint8_t>(frame.at(1));
+    Q_ASSERT(frame.size() == static_cast<int>(kV2HeaderLen + kCrcLen) + payloadLen);
+
+    uint16_t crc = 0;
+    crc_init(&crc);
+    for (int i = 1; i < static_cast<int>(kV2HeaderLen); ++i) {
+        crc_accumulate(static_cast<uint8_t>(frame.at(i)), &crc);
+    }
+    crc_accumulate_buffer(&crc, frame.constData() + kV2HeaderLen, static_cast<uint16_t>(payloadLen));
+    crc_accumulate(crcExtra, &crc);
+    return crc;
 }
 
 /// 构造一个 incompat_flags 字节为指定值的合法 HEARTBEAT 帧（重算 CRC）。
@@ -404,7 +426,37 @@ void CryptoTest::_testCodecRoundTrip()
     QCOMPARE(boundDeviceID, gcsDeviceID);
     QCOMPARE(boundCounter, counter);
     QCOMPARE(decLen, plainFrame.size());
-    QCOMPARE(QByteArray(reinterpret_cast<const char*>(decryptedFrame), decLen), plainFrame);
+
+    // 还原帧与原文**只应差两处**（P0-1 归一化 compid 的必然结果）：
+    //   ① 帧头 compid（偏移 6）—— 归一化，理由见 DeviceID.h 的 kNormalizedComponentID；
+    //   ② 帧尾 2 字节 CRC —— CRC 是帧内容的函数，compid 一变它必变，decryptFrame 会重算。
+    // 「逐字节等于原文」是 P0-1 之前的契约；留着它就等于要求 deviceID 低字节继续透传 ——
+    // 而那正是「低字节 ≠ 1 的飞机建不出 Vehicle」的病根。
+    const QByteArray restored(reinterpret_cast<const char*>(decryptedFrame), decLen);
+
+    // 前提自检：本用例的 compid 必须**不是**归一化值，否则「差两处」退化成「只差 CRC」，
+    // 归一化那半条被删掉也照样全绿（改一下 makeHeartbeatFrame 的入参就会静默失效）。
+    QVERIFY2(plainFrame.at(6) != static_cast<char>(kNormalizedComponentID),
+             "用例前提失效：makeHeartbeatFrame 的 compid 已是归一化值，本组断言将恒真");
+
+    // 差处 ①：compid 归一化；帧头其余字节（magic/len/incompat/compat/seq/sysid）与 payload
+    // 必须逐字节不变 —— 归一化只许动这一个字节。
+    const int payloadStart = static_cast<int>(kV2HeaderLen);
+    const int payloadLen = plainFrame.size() - payloadStart - static_cast<int>(kCrcLen);
+    QCOMPARE(restored.at(6), static_cast<char>(kNormalizedComponentID));
+    QCOMPARE(restored.left(6), plainFrame.left(6));
+    QCOMPARE(restored.mid(payloadStart, payloadLen), plainFrame.mid(payloadStart, payloadLen));
+
+    // 差处 ②：帧尾 CRC 必须是**还原后内容**的 CRC，而不是照抄原文的 —— 照抄的话
+    // 标准解析器会按 CRC 失配丢帧。这里独立重算一遍，不复用 decryptFrame 的任何中间量。
+    const uint16_t crc = frameCrc(restored, heartbeatCrcExtra());
+    QByteArray expectedCrc(static_cast<int>(kCrcLen), '\0');
+    expectedCrc[0] = static_cast<char>(crc & 0xFFu);
+    expectedCrc[1] = static_cast<char>(static_cast<uint8_t>(crc >> 8));
+    QCOMPARE(restored.right(static_cast<int>(kCrcLen)), expectedCrc);
+    // 且它确实**变了**：若与原文 CRC 相同，「重算」就没发生（上面那条也会因 expectedCrc 抄错而失效）。
+    // 此处恒成立：两次 crc_accumulate 的输入仅第 6 字节不同，而该步对 d1≠d2 必给出不同结果。
+    QVERIFY(restored.right(static_cast<int>(kCrcLen)) != plainFrame.right(static_cast<int>(kCrcLen)));
 }
 
 void CryptoTest::_testCodecWrongKey()
@@ -1449,9 +1501,11 @@ void CryptoTest::_testHeartbeatExtInjection()
     QCOMPARE(goodMsgs[3].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_BATTERY_STATUS));
     QCOMPARE(goodMsgs[4].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_VFR_HUD));
     QCOMPARE(goodMsgs[5].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_EXTENDED_SYS_STATE));
-    // sysid/compid 从解密帧头还原（deviceID 拆分）
+    // sysid 从解密帧头还原（deviceID 拆分）；compid 归一化（P0-1）。
+    // 合成遥测必须与同一帧喂给标准解析器的那份（_feedStandardFrame）**同源**，
+    // 否则同一个物理帧在两条消费路径上会带着两个不同的 compid。
     QCOMPARE(goodMsgs[0].sysid, static_cast<uint8_t>(0x02));
-    QCOMPARE(goodMsgs[0].compid, static_cast<uint8_t>(0x03));
+    QCOMPARE(goodMsgs[0].compid, kNormalizedComponentID);
     // 字段映射（单位 degE7 / mm / cm/s / mV）
     mavlink_global_position_int_t gpi;
     mavlink_msg_global_position_int_decode(&goodMsgs[0], &gpi);

@@ -17,6 +17,7 @@
 #include <array>
 #include <atomic>
 
+#include "Crypto/DeviceID.h"   // MAVLinkCrypto::DeviceID：加密链路的载具身份键
 #include "QGCMAVLink.h"
 #include "VehicleFactGroup.h"
 #include "VehicleSigningController.h"  // Q_PROPERTY needs the full QObject type for moc/QML metatype registration
@@ -115,11 +116,14 @@ class Vehicle : public VehicleFactGroup, public VehicleTypes
     friend class GimbalController;                  // Allow GimbalController to call _addFactGroup
 
 public:
+    /// deviceID：本载具在加密链路上的设备标识，由心跳携带（未加密路径为 kInvalidDeviceID）。
+    /// 它同时是**帧归属判据** —— 本场地 17 架同 sysid=150，vehicleId 不足以区分谁是谁。
     Vehicle(LinkInterface*          link,
             int                     vehicleId,
             int                     defaultComponentId,
             MAV_AUTOPILOT           firmwareType,
             MAV_TYPE                vehicleType,
+            MAVLinkCrypto::DeviceID deviceID = MAVLinkCrypto::kInvalidDeviceID,
             QObject*                parent = nullptr);
 
     // Pass these into the offline constructor to create an offline vehicle which tracks the offline vehicle settings.
@@ -436,12 +440,12 @@ public:
     // Property accesors
     int id() const{ return _systemID; }
     int compId() const{ return _compID; }
-    /// 该载具的 MAVLink deviceID（加密链路设备标识）；0 = 未学到映射 / 未走加密链路。
+    /// 该载具的 MAVLink deviceID（加密链路设备标识）；0 = 未走加密链路（kInvalidDeviceID）。
     /// OpsView 起飞门控用它把后端任务上的无人机（`task.device_id`）对应到本地载具 ——
-    /// 「**这架**飞机的明文心跳是否已送到 QGC」的判据。
-    /// 写成 Q_INVOKABLE 而非 Q_PROPERTY(CONSTANT)：deviceID 由 `CryptoController` 在**收到明文
-    /// 心跳时**才学到，若在构造期读一次并缓存，早于学习就会永久缓存 0（判据恒假 ⇒ 永远不能
-    /// 起飞）；每次现算则学习到位后自愈。
+    /// 「**这架**飞机的明文心跳是否已送到 QGC」的判据；同时也是帧归属判据（见 _processMavlinkMessage）。
+    /// ⚠️ 现由构造期随心跳存入的 `_deviceID` **直接返回**，不再反查
+    /// `CryptoController::deviceIDForSystemID()` —— 反查以 sysid 为键，而本场地 17 架同
+    /// sysid=150，多架并存时反查只能返回「最后一架学到的那一个」，谁也不是。
     Q_INVOKABLE uint deviceID() const;
     MAV_AUTOPILOT firmwareType() const { return _firmwareType; }
     MAV_TYPE vehicleType() const { return _vehicleType; }
@@ -863,10 +867,14 @@ signals:
     void logData                        (uint32_t ofs, uint16_t id, uint8_t count, const uint8_t* data);
 
 private slots:
-    void _mavlinkMessageReceived            (LinkInterface* link, mavlink_message_t message);
+    /// deviceID：本帧来源设备，随信号携带（mavlink_message_t 是第三方结构体，装不进去）。
+    void _mavlinkMessageReceived            (LinkInterface* link, mavlink_message_t message,
+                                             MAVLinkCrypto::DeviceID deviceID);
     /// 加密心跳 EXT 注入的合成遥测（经 MAVLinkProtocol::telemetryInjected 到达）。
     /// 消费遥测（FactGroup/各 handler），但绕过 seq/丢包统计（合成消息 seq 取自 QGC 发送侧，非车辆序列）。
-    void _syntheticTelemetryReceived        (LinkInterface* link, const mavlink_message_t& message);
+    /// ⚠️ 这条分发同样要带 deviceID：EXT 遥测含**异常位**，不带就会串到错误的载具。
+    void _syntheticTelemetryReceived        (LinkInterface* link, const mavlink_message_t& message,
+                                             MAVLinkCrypto::DeviceID deviceID);
     void _sendMessageMultipleNext           ();
     void _parametersReady                   (bool parametersReady);
     void _handleFlightModeChanged           (const QString& flightMode);
@@ -894,7 +902,8 @@ private slots:
 private:
     void _activeVehicleChanged          (Vehicle* newActiveVehicle);
     /// 统一消息处理：synthetic=true 时为本地注入的合成遥测（跳过 link 活性/计数/seq 统计）。
-    void _processMavlinkMessage         (LinkInterface* link, mavlink_message_t message, bool synthetic);
+    void _processMavlinkMessage         (LinkInterface* link, mavlink_message_t message, bool synthetic,
+                                         MAVLinkCrypto::DeviceID deviceID);
     void _handlePing                    (LinkInterface* link, mavlink_message_t& message);
     void _handleHomePosition            (mavlink_message_t& message);
     void _handleHeartbeat               (mavlink_message_t& message);
@@ -952,6 +961,8 @@ private:
 
     int     _systemID;                    ///< Mavlink system id
     int     _defaultComponentId;
+    /// 加密链路的设备标识；**帧归属判据**（_systemID 在同 sysid 多机下不可用）。未加密 = 0。
+    MAVLinkCrypto::DeviceID _deviceID = MAVLinkCrypto::kInvalidDeviceID;
     bool    _offlineEditingVehicle = false; ///< true: This Vehicle is a "disconnected" vehicle for ui use while offline editing
 
     MAV_AUTOPILOT       _firmwareType;

@@ -25,7 +25,6 @@
 #include "AudioOutput.h"
 #include "AutoPilotPlugin.h"
 #include "ComponentInformationManager.h"
-#include "Crypto/CryptoController.h"   // Vehicle::deviceID()：按 sysid 反查设备标识（加密链路）
 #include "MAVLinkEventManager.h"
 #include "FirmwarePlugin.h"
 #include "FirmwarePluginManager.h"
@@ -104,10 +103,12 @@ Vehicle::Vehicle(LinkInterface*             link,
                  int                        defaultComponentId,
                  MAV_AUTOPILOT              firmwareType,
                  MAV_TYPE                   vehicleType,
+                 MAVLinkCrypto::DeviceID    deviceID,
                  QObject*                   parent)
     : VehicleFactGroup              (parent)
     , _systemID                     (vehicleId)
     , _defaultComponentId           (defaultComponentId)
+    , _deviceID                     (deviceID)
     , _firmwareType                 (firmwareType)
     , _vehicleType                  (vehicleType)
     , _defaultCruiseSpeed           (SettingsManager::instance()->appSettings()->offlineEditingCruiseSpeed()->rawValue().toDouble())
@@ -518,22 +519,33 @@ void Vehicle::resetCounters()
     _heardFrom          = false;
 }
 
-void Vehicle::_mavlinkMessageReceived(LinkInterface* link, mavlink_message_t message)
+void Vehicle::_mavlinkMessageReceived(LinkInterface* link, mavlink_message_t message,
+                                      MAVLinkCrypto::DeviceID deviceID)
 {
-    _processMavlinkMessage(link, message, false);
+    _processMavlinkMessage(link, message, false, deviceID);
 }
 
-void Vehicle::_syntheticTelemetryReceived(LinkInterface* link, const mavlink_message_t& message)
+void Vehicle::_syntheticTelemetryReceived(LinkInterface* link, const mavlink_message_t& message,
+                                          MAVLinkCrypto::DeviceID deviceID)
 {
     // 加密心跳 EXT 注入的合成遥测（MAVLinkProtocol::telemetryInjected）：消费位置/姿态/GPS/电池，
     // 但 seq 取自 QGC 发送侧（MAVLINK_COMM_0），与车辆真实接收序列无关——必须跳过 link 活性/
     // _messagesReceived/seq 统计，否则 _messagesLost 被持续虚高（合成消息污染丢包统计）。
-    _processMavlinkMessage(link, message, true);
+    _processMavlinkMessage(link, message, true, deviceID);
 }
 
-void Vehicle::_processMavlinkMessage(LinkInterface* link, mavlink_message_t message, bool synthetic)
+void Vehicle::_processMavlinkMessage(LinkInterface* link, mavlink_message_t message, bool synthetic,
+                                     MAVLinkCrypto::DeviceID deviceID)
 {
-    if (message.sysid != _systemID && message.sysid != 0) {
+    // 帧归属（P0-2）：加密路径改按 deviceID —— 本场地 17 架同 sysid=150，只按 sysid 会**互相抢帧**
+    // （每架都认为帧是自己的）⇒ 地图上位置互相跳变、建 Vehicle 去重也塌成一架。
+    // ⚠️ 只在一帧两侧**都带 deviceID** 时启用新判据：任一侧为 kInvalidDeviceID
+    //    （未加密链路 / 本载具非加密）即回退原 sysid 判据 ⇒ 非加密路径行为逐字不变。
+    const bool bothHaveDeviceID = (_deviceID != MAVLinkCrypto::kInvalidDeviceID) &&
+                                  (deviceID != MAVLinkCrypto::kInvalidDeviceID);
+    const bool notForThisVehicle = bothHaveDeviceID ? (deviceID != _deviceID)
+                                                    : (message.sysid != _systemID && message.sysid != 0);
+    if (notForThisVehicle) {
         // We allow RADIO_STATUS messages which come from a link the vehicle is using to pass through and be handled
         if (!(message.msgid == MAVLINK_MSG_ID_RADIO_STATUS && _vehicleLinkManager->containsLink(link))) {
             return;
@@ -1808,12 +1820,11 @@ QString Vehicle::vehicleClassInternalName() const
 
 uint Vehicle::deviceID() const
 {
-    // 反查而非自行位运算：deviceID 的编码（incompat<<24|compat<<16|sysid<<8|compid）留在
-    // `MAVLinkCrypto` 单点，此处不复制一份，免得编码变动时静默失配。
-    MAVLinkCrypto::DeviceID deviceID = MAVLinkCrypto::kInvalidDeviceID;
-    MAVLinkCrypto::CryptoController::instance()->deviceIDForSystemID(
-        static_cast<uint8_t>(_systemID), deviceID);
-    return deviceID;
+    // 构造期由心跳携带的 deviceID 存入，此处直接返回。
+    // 原实现反查 `CryptoController::deviceIDForSystemID(sysid)`：该反查以 sysid 为键，
+    // 多架同 sysid（本场地 17 架 = 150）时会返回「最后一架学到的那一个」—— 谁也不是，
+    // 且帧归属判据也跟着错。身份在构造那一刻就已确定，没有反查的必要。
+    return _deviceID;
 }
 
 /// Returns the string to speak to identify the vehicle

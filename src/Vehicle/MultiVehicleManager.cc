@@ -63,7 +63,8 @@ void MultiVehicleManager::init()
     _initialized = true;
 }
 
-void MultiVehicleManager::_vehicleHeartbeatInfo(LinkInterface* link, int vehicleId, int componentId, int vehicleFirmwareType, int vehicleType)
+void MultiVehicleManager::_vehicleHeartbeatInfo(LinkInterface* link, int vehicleId, int componentId, int vehicleFirmwareType, int vehicleType,
+                                                MAVLinkCrypto::DeviceID deviceID)
 {
     if (componentId != MAV_COMP_ID_AUTOPILOT1) {
         // Don't create vehicles for components other than the autopilot
@@ -100,7 +101,13 @@ void MultiVehicleManager::_vehicleHeartbeatInfo(LinkInterface* link, int vehicle
         return;
     }
 
-    if (_ignoreVehicleIds.contains(vehicleId) || getVehicleById(vehicleId) || (vehicleId == 0)) {
+    // 去重键（P0-2）：加密路径按 deviceID，不按 sysid —— 本场地 17 架同 sysid=150，
+    // 按 sysid 去重会让第 2 架起全部被挡在这里（20 架塌成一架 Vehicle）。
+    // 未加密路径没有设备标识概念（kInvalidDeviceID）⇒ 回退 sysid 判据，行为与改动前一致。
+    const bool alreadyExists = (deviceID != MAVLinkCrypto::kInvalidDeviceID)
+                                   ? _vehicleExistsByDeviceID(deviceID)
+                                   : (getVehicleById(vehicleId) != nullptr);
+    if (_ignoreVehicleIds.contains(vehicleId) || alreadyExists || (vehicleId == 0)) {
         return;
     }
 
@@ -115,7 +122,7 @@ void MultiVehicleManager::_vehicleHeartbeatInfo(LinkInterface* link, int vehicle
         QGC::showAppMessage(tr("Warning: A vehicle is using the same system id as %1: %2").arg(QCoreApplication::applicationName()).arg(vehicleId));
     }
 
-    Vehicle *const vehicle = new Vehicle(link, vehicleId, componentId, (MAV_AUTOPILOT)vehicleFirmwareType, (MAV_TYPE)vehicleType, this);
+    Vehicle *const vehicle = new Vehicle(link, vehicleId, componentId, (MAV_AUTOPILOT)vehicleFirmwareType, (MAV_TYPE)vehicleType, deviceID, this);
     (void) connect(vehicle->vehicleLinkManager(), &VehicleLinkManager::allLinksRemoved, this, &MultiVehicleManager::_deleteVehiclePhase1);
     (void) connect(vehicle->parameterManager(), &ParameterManager::parametersReadyChanged, this, &MultiVehicleManager::_vehicleParametersReadyChanged);
 
@@ -328,6 +335,17 @@ bool MultiVehicleManager::_vehicleSelected(int vehicleId)
     for (int i = 0; i < _selectedVehicles->count(); i++) {
         Vehicle *const vehicle = qobject_cast<Vehicle*>(_selectedVehicles->get(i));
         if (vehicle->id() == vehicleId) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool MultiVehicleManager::_vehicleExistsByDeviceID(MAVLinkCrypto::DeviceID deviceID) const
+{
+    for (int i = 0; i < _vehicles->count(); i++) {
+        Vehicle *const vehicle = qobject_cast<Vehicle*>(_vehicles->get(i));
+        if (vehicle && (vehicle->deviceID() == deviceID)) {
             return true;
         }
     }
