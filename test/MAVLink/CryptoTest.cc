@@ -2418,4 +2418,88 @@ void CryptoTest::_testAsyncLinkingConfirm()
     crypto->deviceKeyManager()->removeKey(dev);
 }
 
+// ============================================================================================
+// 会话边界作废监控清单（2026-10-04 补）
+// `setResponsibleParty` 是三个会话边界写入点（登录成功 / 登录被拒 / 本地密钥源初始化）的
+// **公共落点** ⇒ 上一个会话的 `_monitorDevices` 在此作废。不作废的话，`_monitorListActive`
+// 这个单向闩会让取列表口径永久钉在旧清单上，**跨会话**时本端一直按旧站点的清单发 80005。
+// ⚠️ 今天该场景**不可达**（本仓 QGC 没有登出），故本用例测的是"作废这件事本身成立"，
+//    而不是"某个可达故障被修好"——判据落在可观测的 `monitorListActiveForTest()` 上。
+// ============================================================================================
+void CryptoTest::_testMonitorListInvalidatedAtSessionBoundary()
+{
+    CryptoController* const crypto = CryptoController::instance();
+    ignoreLogMessage("MAVLink.Crypto.CryptoController", QtDebugMsg, QRegularExpression("registration "));
+    crypto->returnToStandby();
+    crypto->setRegistrationEnabled(false);
+
+    const DeviceID a = makeDeviceID(0, 0, 0x81, 0x21);
+    const DeviceID b = makeDeviceID(0, 0, 0x81, 0x22);
+
+    crypto->setMonitorDevices(QVariantList{ QVariant(static_cast<uint>(a)),
+                                            QVariant(static_cast<uint>(b)) }, 3000);
+    // 阳性对照：先证明闩**确实**置上了、清单**确实**非空 —— 否则下面两条断言在"本来就没生效"
+    // 的实现下也全绿（假绿）。
+    QVERIFY2(crypto->monitorListActiveForTest(), "前提不成立：清单没生效，本用例测不出东西");
+    QCOMPARE(crypto->monitorDeviceCount(), 2);
+
+    // 会话边界：责任方身份被重新判定一次（登录成功 / 被拒登录都走这里）。
+    crypto->setResponsibleParty(false);
+    QVERIFY2(!crypto->monitorListActiveForTest(),
+             "会话边界没作废监控清单 ⇒ 取列表口径仍钉在上一会话的 `_monitorDevices` 上");
+    QCOMPARE(crypto->monitorDeviceCount(), 0);
+
+    // 反向：重新推一份清单，闩必须能**再**置上 —— "作废监控清单"不得把 setMonitorDevices 一起废掉。
+    crypto->setMonitorDevices(QVariantList{ QVariant(static_cast<uint>(a)) }, 3000);
+    QVERIFY(crypto->monitorListActiveForTest());
+    QCOMPARE(crypto->monitorDeviceCount(), 1);
+
+    // 复位（单例跨用例共享）：先关登记、再清清单，反序会排一串 burst 定时器搅乱下个用例。
+    // ⚠️ 收尾**不用** `setMonitorDevices(空)`：空清单也是**有效**清单，那会让闩停在 true 上，
+    //    而 `_testRegistrationFallbackToLinked` 那类用例要的初态是 false。走会话边界收尾。
+    crypto->setRegistrationEnabled(false);
+    crypto->setResponsibleParty(false);
+    QVERIFY(!crypto->monitorListActiveForTest());
+    QCOMPARE(crypto->monitorDeviceCount(), 0);
+}
+
+// ============================================================================================
+// 释出的成员资格闸（2026-10-04 补）：与本端毫无关联的 deviceID 不得被释出。
+// ⚠️ 判据形态说明：对这样一个 id，`releaseDevice` 的四件事本来就**全是空操作**
+//    （removeAll=0 / removeKey 找不到条目 / ReplayGuard::reset 只 remove 不插入 / 槽位不是它）
+//    ⇒ **状态上没有任何差别**，唯一可观测的是"早退前留下一条告警"。故正面判据只能是
+//    `expectLogMessage`（**必须出现**），不能写成 `ignoreLogMessage`（那只是"允许出现"）。
+//    并配一格阳性对照，证明已关联的设备**不会**被这道闸挡下。
+// ============================================================================================
+void CryptoTest::_testReleaseDeviceUnknownDeviceIgnored()
+{
+    CryptoController* const crypto = CryptoController::instance();
+    crypto->returnToStandby();
+    crypto->setRegistrationEnabled(false);
+
+    const DeviceID stranger = makeDeviceID(0, 0, 0x81, 0x31);
+
+    // 前提自检：四个判据全假，本用例才真的落在"未关联"这一档上。
+    QVERIFY(!crypto->deviceKeyManager()->hasKey(stranger));
+    QVERIFY(!crypto->removeLinkedDevice(stranger));   // 既证明不在集合里，也顺带证明幂等
+    QCOMPARE(crypto->monitorDeviceCount(), 0);
+    QCOMPARE(crypto->activeDeviceID(), kInvalidDeviceID);
+
+    // 正面判据：必须留下"未与本端关联"的告警。
+    // ⚠️ 本类别默认级别就是 `QtWarningMsg` ⇒ 这句在默认运行下真的输出（用 Debug 就等于堵了洞不留证）。
+    expectLogMessage("MAVLink.Crypto.CryptoController", QtWarningMsg, QRegularExpression("未与本端关联"));
+    crypto->releaseDevice(stranger);
+    verifyExpectedLogMessage();
+
+    // ---- 阳性对照：**已关联**的 deviceID 不得走这条早退 ----
+    // 判据取"四件事之一真的发生了"：先把它放进登记集合，释出后它必须真的被摘掉。
+    // 没有这一格，把闸写成"无条件早退"也能过上面那句 `expectLogMessage`（那格只验告警文本）。
+    crypto->addLinkedDevice(stranger);
+    QVERIFY(crypto->removeLinkedDevice(stranger));    // 证明它确实进得去…
+    crypto->addLinkedDevice(stranger);                // …再放回去，交给 releaseDevice 去摘
+    crypto->releaseDevice(stranger);
+    QVERIFY2(!crypto->removeLinkedDevice(stranger),
+             "已关联的设备没被 releaseDevice 摘掉 ⇒ 成员资格闸写得太宽，把正常释出也挡了");
+}
+
 UT_REGISTER_TEST_LIGHTWEIGHT(CryptoTest, TestLabel::Unit)

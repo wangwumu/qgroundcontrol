@@ -256,6 +256,11 @@ public:
     /// （见 `ops-view-visibility-two-branches`）。**请求失败与空响应都不构成调用理由**
     /// ——QML 侧只对"200 且是数组"的响应做 diff，且初值与空集合同形（见 QML 里的注释）。
     ///
+    /// ⓪ 前置**成员资格闸**（2026-10-04 补）：本端关于这架飞机没有任何本地状态
+    ///   （不在 `_linkedDevices`、不在 `_monitorDevices`、没占 `_activeDeviceID`、本地无密钥）
+    ///   时告警并早退，不做下面四件事。⚠️ 今天它**不改任何可达行为**（那样的 id 上四件事本就
+    ///   全是空操作），挡的是将来新增的破坏性步骤；理由与残留假设见 .cc 内的实现注释。
+    ///
     /// 四件事，缺一不可（2026-10-03 用户裁定「上下全清」）：
     ///   ① 移出登记集合 —— 不再为它发 80005；mavp2p 的配对随后在 `MAP_TTL` 后过期；
     ///      此后要重新接引，走那条明文待命心跳的老路即可（mavp2p 重新建配对）。
@@ -356,6 +361,14 @@ public:
     /// ⚠️ 本函数**不只是写标志**：收回（false）时会把已建立的链路当场降回 Standby。理由是闸
     /// 只在 beginLinking 的入口检查一次，而 LinkInterface 只看 state()——只翻标志不撤链路，
     /// 闸对"先 Active 后收回"这条路径等于没生效（详见 .cc 内的实现说明）。
+    ///
+    /// ⚠️ 同时**作废监控清单**（2026-10-04 补）：`_monitorListActive` 回落、`_monitorDevices`
+    /// 清空、`_regCursor` 归零。理由：该闩全仓只置不落，而取列表的口径是
+    /// `_monitorListActive ? _monitorDevices : _linkedDevices` ⇒ 不在此处作废的话，**跨会话**
+    /// 时本端会一直按上一个站点的清单发 80005 登记心跳。本函数是三个会话边界写入点
+    /// （登录成功 / 登录被拒 / 本地密钥源初始化）的公共落点，故作废落在这里。
+    /// ⚠️ 本仓 QGC **没有登出**，今天这条不可达，是为将来加登出预备的（判定同 .cc）。
+    /// ⚠️ `_linkedDevices` **不在**本函数的清理范围：它由 `AuthController` 登录时写入并自管。
     ///
     /// @param responsible true=责任方（可建链）
     void setResponsibleParty(bool responsible);

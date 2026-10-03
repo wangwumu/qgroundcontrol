@@ -354,9 +354,33 @@ void CryptoController::releaseDevice(quint32 deviceID)
         return;
     }
 
+    // ⚠️ `hasKey` 在取本类 `_mutex` **之前**问：`_keyManager` 自管一把锁，两把锁没必要嵌套。
+    //    （`DeviceKeyManager::_onReplyFinished` 在 `cacheKey` 之后、`emit keyFetched` 之前
+    //    就已经放掉了它那把锁，故两侧本无锁序问题——这里只是不去制造一个。）
+    const bool hasCachedKey = _keyManager.hasKey(id);
+
     bool yielded = false; // 本次是否让出了上行权（决定要不要停失联监测、发 stateChanged）
     {
         const QMutexLocker locker(&_mutex);
+        // ⓪ 成员资格闸（2026-10-04 补）：本端关于这架飞机**没有任何本地状态**时早退。
+        //    判据四条：不在登记集合、不在监控清单、没占上行权、本地没有它的密钥。
+        //    ‼️ 今天这道闸**不改任何可达行为**——这四件事落在这样一个 id 上本来就全是空操作
+        //    （`removeAll` 返回 0、`removeKey` 找不到条目、`ReplayGuard::reset` 只 remove 不插入、
+        //    `_activeDeviceID != id` 故不让位），唯一的可观测差别是多一条告警。
+        //    ⇒ 它挡的是**将来**：本函数是 `Q_INVOKABLE` 的破坏性原语，日后任何**新增**的破坏性
+        //    步骤若忘了自带成员资格判据，会在这里被统一拦下。
+        //    判据与 `_onKeyFetched` 那处「已被释出」的三集合判定同源，多一条 `hasCachedKey`：
+        //    **有密钥却不在任何集合**（在途 `fetchKey` 刚装回来的那种）仍应允许释出 ——
+        //    删掉那把密钥正是释出要做的事。
+        //    残留假设（2026-10-04 查实，今天成立）：水位不会脱离密钥存在 —— 下行水位只有
+        //    `MAVLinkProtocol.cc` 在**解密 + tag 认证通过后**那一处写，那必然有密钥；上行水位只由
+        //    `nextOutgoingCounter()` 写，那条路要 Active，同样有密钥。故本闸不会挡下
+        //    「给一个已无密钥的 id 清水位」这种清理。
+        if (!hasCachedKey && !_linkedDevices.contains(id) && !_monitorDevices.contains(id) &&
+            _activeDeviceID != id) {
+            qCWarning(CryptoControllerLog) << "releaseDevice: 该 deviceID 未与本端关联，忽略" << deviceID;
+            return;
+        }
         // ① 移出登记集合：本端不再为它发 80005（mavp2p 的配对随之在 MAP_TTL 后过期）。
         //    编号与 .h 的四件事一致。这里写**内联** removeAll 而不调 `removeLinkedDevice`：
         //    那个函数自己加 `_mutex`，本处已持锁 ⇒ `QMutex` 非递归会死锁。
@@ -527,6 +551,25 @@ void CryptoController::setResponsibleParty(bool responsible)
     {
         const QMutexLocker locker(&_mutex);
         _responsibleParty = responsible;
+        // 会话边界：责任方身份被重新判定（登录成功 / 登录被拒 / 本地密钥源初始化）⇒
+        // 上一个会话的监控清单**当场作废**（闩回落 + 清单清空 + 轮转游标归零）。
+        // 为什么落在这里：`_monitorListActive` 是**单向闩**（全仓仅 `setMonitorDevices`
+        // 一处置 true），而取列表的口径是 `_monitorListActive ? _monitorDevices : _linkedDevices`
+        // —— 闩不回落，**跨会话**时本端会一直按上一个站点的 `_monitorDevices` 发 80005 登记心跳：
+        // 新会话的飞机登记不上，旧站点的飞机被继续登记。复位后回到 §3.5.4 的既有口径
+        // （回退 `_linkedDevices`），新会话的清单由 RomView 的 `setMonitorDevices` 重新推上来。
+        // ⚠️ 今天这条**不可达**：本仓 QGC 没有登出（`AuthController.cc` 逐字写着「当前 QGC 无
+        //    登出路径，进程内"已登录再换账号登录"不可达；将来若加登出，需一并清理」），故每次
+        //    调用本函数时闩最多为 false，本行不改任何可达行为——它是给"将来加登出"预备的。
+        // ⚠️ 只清监控清单，**不动** `_linkedDevices`：那是登录时写入的站点 deviceID 集合，
+        //    生命周期归 `AuthController`（见那里的说明），不归本函数。
+        // ⚠️ 刻意**不打日志**：这里不是异常而是定义的边界；且本文件用例的 `init()` 每次都调本
+        //    函数，留一条日志会让 strict mode 在下一个用例里以"未预期日志"红掉。
+        if (_monitorListActive) {
+            _monitorListActive = false;
+            _monitorDevices.clear();
+            _regCursor = 0;
+        }
         // 收回发言权时，已建立的链路必须**当场**降回待命。闸只在 beginLinking 的入口
         // 检查一次，而 LinkInterface 只看 state()——标志翻转本身不会撤销 Active 链路，
         // 于是本机会以「当前 Active」继续加密外发（操纵杆 MANUAL_CONTROL 天然走这条路）。

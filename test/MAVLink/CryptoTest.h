@@ -72,13 +72,19 @@ private slots:
     void _testNextRegistrationBatch();
 
     // 清单从未生效 ⇒ 回退 _linkedDevices（§3.5.4）这条零回归承诺的判据。
-    // ‼️ 必须声明在 _testSetMonitorDevices **之前**：_monitorListActive 一旦置 true 就永不
-    //    回落（全仓只有一处 `= true`、无复位点），而那个用例正是把它置 true 的地方。
-    //    moc 按声明顺序生成槽调用 ⇒ 排在它后面，false 那一臂就再也测不到。
+    // ‼️ 声明在 _testSetMonitorDevices **之前**：本用例要的初态是"闩仍为 false"。
+    //    这条顺序原本是**硬约束**（`_monitorListActive` 当时一旦置 true 就永不回落，全仓
+    //    只有一处 `= true`、无复位点 ⇒ 排在置 true 的那个用例之后，false 那一臂就再也测不到）；
+    //    2026-10-04 起 `CryptoController::setResponsibleParty` 会在会话边界作废清单，
+    //    而本文件 `init()` 每次都调它 ⇒ 顺序变成**冗余保险**而非必需。保留它：判据越少依赖
+    //    "谁先跑"越好，而这行注释的代价是零。
     void _testRegistrationFallbackToLinked();
 
     // 监控清单与超时阈值（§3.5.3/§3.6.4）：一次调用两个实参、非法 id 跳过、空清单**生效**
     void _testSetMonitorDevices();
+
+    // 会话边界作废监控清单（2026-10-04 补）：责任方身份被重新判定 ⇒ 闩回落、清单清空
+    void _testMonitorListInvalidatedAtSessionBoundary();
 
     // 加速首轮（§3.4）：集合变化触发连续发送、集合不变不触发、容量天花板截断
     void _testRequestAcceleratedRegistration();
@@ -88,6 +94,9 @@ private slots:
 
     // 签出释出：登记集合撤销 + 密钥删除 + 上下行水位**全清** + 让出上行权（2026-10-03 裁定）
     void _testReleaseDevice();
+
+    // 签出释出的成员资格闸（2026-10-04 补）：与本端毫无关联的 deviceID 不得被释出
+    void _testReleaseDeviceUnknownDeviceIgnored();
 
     // 异步建链（§3.2）：密钥**未**缓存 ⇒ fetchKey → keyFetched 回包 ⇒ `_onKeyFetched` 的
     // **正常臂**调 `confirmLinking()` 进 Active。本文件其余 `beginLinking` 没有一处落到这条
