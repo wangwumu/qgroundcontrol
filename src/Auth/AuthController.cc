@@ -28,8 +28,6 @@
 #include "MAVLink/Crypto/DeviceKeyManager.h"
 #include "MissionManager/PlanUploader.h"
 
-#include <algorithm>
-
 QGC_LOGGING_CATEGORY(AuthControllerLog, "Auth.AuthController")
 
 AuthController* AuthController::s_instance = nullptr;
@@ -422,39 +420,26 @@ void AuthController::_onLoginFinished(QNetworkReply* reply)
     keyManager->setAuthToken(_token);
     PlanUploader::instance()->setAuthToken(_token);   // 航线上传后台会话 token
 
-    // 设备密钥集合：解析 {devices:[{deviceID,key}]}，逐条
-    //  ① cacheKey(deviceID, key)：密钥写入内存缓存（QHash<DeviceID,Key>，不落地）；
-    //  ② addLinkedDevice(deviceID)：deviceID 加入关联集合 —— 80005 明文登记心跳的
-    //     payload 即此集合（规范 §3.2.4.2「QGC 重启恢复」：重新登录→取回 deviceID 集合→
-    //     登记心跳携带该集合）。两者一起，QGC 才既持有解密密钥、又能向 mavp2p 声明关联。
-    // 关键约束：deviceID 只与站点相关、不随登录用户变化——同一站点任意用户（登录/重登/
-    // 交接班）取回的集合完全相同，故无需按用户区分或清空 _linkedDevices。
-    // 获取规则暂未定义：后端测试时返回 table_device_key 全部，QGC 侧按此格式解析。
-    const QJsonArray devices = data.value(QStringLiteral("devices")).toArray();
-    int cachedCount = 0;
-    for (const QJsonValue& value : devices) {
-        const QJsonObject deviceObj = value.toObject();
-        const MAVLinkCrypto::DeviceID deviceID = static_cast<MAVLinkCrypto::DeviceID>(
-            deviceObj.value(QStringLiteral("deviceID")).toVariant().toUInt());
-        const QByteArray keyBytes = QByteArray::fromBase64(deviceObj.value(QStringLiteral("key")).toString().toUtf8());
-        if (deviceID == MAVLinkCrypto::kInvalidDeviceID || keyBytes.size() != static_cast<int>(MAVLinkCrypto::kKeySize)) {
-            qCWarning(AuthControllerLog) << "skipped invalid device entry: deviceID" << deviceID
-                                         << "keyLen" << keyBytes.size();
-            continue;
-        }
-        MAVLinkCrypto::Key key{};
-        std::copy(keyBytes.constBegin(), keyBytes.constEnd(), key.begin());
-        keyManager->cacheKey(deviceID, key);
-        crypto->addLinkedDevice(deviceID);   // 80005 登记集合 = 登录取回的 deviceID 集合
-        ++cachedCount;
-    }
-    qCInfo(AuthControllerLog) << "login success:" << _currentUser << "cached" << cachedCount << "device keys"
-                              << "(site-scoped: deviceID set independent of user, same for any login; "
-                                 "linked set used as 80005 registration payload)";
+    qCInfo(AuthControllerLog) << "login success:" << _currentUser;
 
-    // 80005 登记集合刚被填充 ⇒ 立即跑一轮加速，让全平台设备在秒级内接上，
-    // 而不是等 batches × 10s 的游标周期（设计文档 §3.4）。复用上面已取的 `crypto`，
-    // 不新起 CryptoController::instance() 调用点。
+    // 设备密钥与 deviceID **都不再随登录响应下发**（规范 §2.7.2 c）。
+    // 旧行为是解析响应里的 {devices:[{deviceID,key}]}、逐条 cacheKey + addLinkedDevice，
+    // 而后端返回的是 table_device_key 全平台 ACTIVE 集合 ⇒ 任意一台 QGC 登录后即手握
+    // 每一架飞机的密钥（先到的那架抢占 CryptoController 的唯一 Active 槽位，后到者永远排队）。
+    //
+    // deviceID 与密钥的唯一合法来源是两条**已在跑的轮询**：
+    //   · 站点操作员 ⇒ `OpsShell.qml` 把 overview 的 device_id 推给 `addLinkedDevice`
+    //   · 航线监控员 ⇒ `RomView.qml` 推 `setMonitorDevices`
+    // 取密钥发生在建链闸**之前**（`CryptoController::addLinkedDevice` /
+    // `setMonitorDevices` / `MAVLinkProtocol` 明文待命心跳支的被动触发），见规范 §2.7.2 e。
+    // 因此登录这一步**不做任何** deviceID/密钥的装配，也不清空 —— 那两份集合各有
+    // 自己的替换语义（站点视图是"新出现即加、消失即释出"的集合 diff，见 `OpsShell.qml`
+    // 的 `_siteDeviceIdsKey`；监控清单是整份替换）。
+
+    // 立即跑一轮登记加速，让设备在秒级内接上，而不是等 batches × 10s 的游标周期
+    // （设计文档 §3.4）。⚠️ 理由**不是**"登录刚填充了登记集合"——登录已不再填充任何集合
+    // （见上）；这里是"登录是一个合理的重试时机"，且此后各通道的 adopt 侧会各自触发。
+    // 复用上面已取的 `crypto`，不新起 CryptoController::instance() 调用点。
     // ⚠️ 排在 emit loginSucceeded() 之前：那块信号已经接了一堆消费者
     //    （计划控制器的自动装载等），把登记加速排在它们后面没有意义。
     crypto->requestAcceleratedRegistration();
