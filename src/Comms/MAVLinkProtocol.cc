@@ -230,7 +230,8 @@ void MAVLinkProtocol::_receiveEncryptedBytes(LinkInterface* link, const SharedLi
             //    少了它就是对同一架飞机每秒一次 HTTP。
             //
             // ⚠️ 加密帧支**不设**同样的触发，这是刻意的：无密钥时 `_processEncryptedFrame`
-            //    在查密钥处就打了日志 return（`:307`/`:311`），根本走不到它自己的闸；
+            //    在 `keyForDevice` 那句 `if` 里就打了日志并 `return`（本文件搜 `no key for device`），
+            //    根本走不到它自己的闸；
             //    而对端在收到 QGC 的加密回应之前只发明文待命心跳（规范 §3.1）
             //    ⇒ 把被动触发挂在解密失败处永远等不到。所以被动落点**只有**本分支。
             // ⚠️ 单独开一个作用域而不是复用下面那个 `crypto`：下面几行才声明同名变量，

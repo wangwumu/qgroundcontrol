@@ -1046,6 +1046,96 @@ void CryptoTest::_testBeginLinkingRequiresResponsibleParty()
     crypto->resetReplay(deviceID);
 }
 
+void CryptoTest::_testBeginLinkingRequiresInitiatorSite()
+{
+    // 起/终维（2026-10-04 用户裁定逐字）：「一架尚未连入网络的无人机（刚开机）只有在一个
+    // 飞行任务的起飞点所在站点的 qgc 才会与之握手」。
+    //
+    // 为什么责任方闸挡不住它：可接引范围 = 出站 ∪ **进站**（§2.7.2 d，`scope.go` 两轴）
+    // ⇒ **终点站**同样拿得到密钥、`isResponsibleParty()` 同样为真 ⇒ 若无本闸，终点站也会
+    // 与飞机握手，占住 `_activeDeviceID` 单槽把起飞站挤掉。规范 §3.1 的口径是「同一
+    // deviceID 指令方向同一时刻只有一个发送端（**发起任务的那个 QGC**）」。
+    CryptoController* const crypto = CryptoController::instance();
+    const DeviceID deviceID = 0x0A0B0C0Fu;   // bit24=0，满足签名位约束（规范 §1.4）
+
+    // ---- QML 可达性：机械判据（不含在本用例的语义格里，但它钉的是同一件事的前提）----
+    // `setInitiatorDevices` 是站点视图（QML）**唯一**的起/终维入口。它若被写成普通成员
+    // 函数，QML 调用是**运行时** TypeError——Qt 构建不报、C++ 测试也不报（同 `addLinkedDevice`
+    // 头文件里那段）。判据取 moc 生成的方法索引：`Q_INVOKABLE` 与否是它的直接后果。
+    const QMetaObject* const mo = crypto->metaObject();
+    QVERIFY(mo->indexOfMethod("setInitiatorDevices(QVariantList)") >= 0);
+    // ‼️ 阴性对照：不存在的名字必须查不到。少了这一条，本判据在"moc 元对象整体没生成"
+    //    的实现下也会恒真（记忆：探针须先拿已知取值标定）。
+    QVERIFY(mo->indexOfMethod("noSuchMethodForProbeCalibration()") < 0);
+
+    crypto->returnToStandby();
+    crypto->resetReplay(deviceID);
+    crypto->deviceKeyManager()->cacheKey(deviceID, testKey());
+
+    // ---- 格 0：起/终维**尚未推送** ⇒ 退回旧形态（责任方即可建链）----
+    // `setResponsibleParty` 是会话边界，它同时作废起/终维（与它作废监控清单同一处、同一
+    // 理由）。单机模式（本地密钥源）与所有不跑站点视图的部署靠的就是这一格行为不变。
+    // ‼️ 本格**必须自己先造出「起/终维已生效」的状态再撤**，否则它钉不住会话边界：
+    //    进入本格时 `_initiatorScopeValid` **本来**就是 false（`init()` 每格都调
+    //    `setResponsibleParty`）⇒ 把 `setResponsibleParty` 里那两行复位**删掉**，本格
+    //    照样绿——它钉住的会退化成 `isInitiatorFor` 的 fail-open 分支，而不是"会话边界
+    //    作废起/终维"。写法照同文件 `_testMonitorListInvalidatedAtSessionBoundary`：
+    //    先正面断言"已生效"，再撤，再断言"退回旧形态"。
+    crypto->setResponsibleParty(true);
+    crypto->setInitiatorDevices(QVariantList{});
+    crypto->beginLinking(deviceID);
+    QCOMPARE(crypto->state(), CryptoController::State::Standby);  // 已生效：名单空 ⇒ 全拒
+    QCOMPARE(crypto->activeDeviceID(), kInvalidDeviceID);
+    crypto->setResponsibleParty(true);                            // 会话边界：无条件复位
+    crypto->beginLinking(deviceID);
+    QCOMPARE(crypto->state(), CryptoController::State::Active);
+    QCOMPARE(crypto->activeDeviceID(), deviceID);
+
+    // ---- 格 1：起/终维已推送、本端**不是**它的起飞站 ⇒ 停在 Standby ----
+    // ⚠️ 本格**刻意不预期任何日志**：本闸与责任方闸同处一个函数、同一频率（每条待命心跳
+    //    1 Hz 各调一次），拒绝路径同样是静默的。若将来有人在这里加日志，strict mode 会以
+    //    "未预期日志"立刻红——正是我们要的。
+    // ⚠️ 密钥**已就绪**（上面 cacheKey）是本判据有效的前提：否则"没进 Active"会有一个
+    //    替代解释（取不到密钥），本格在闸缺失时也可能绿（假绿）。
+    crypto->returnToStandby();
+    crypto->setInitiatorDevices(QVariantList{});
+    crypto->beginLinking(deviceID);
+    QCOMPARE(crypto->state(), CryptoController::State::Standby);
+    QCOMPARE(crypto->activeDeviceID(), kInvalidDeviceID);
+
+    // ---- 格 2（阳性对照）：把同一架标为「本端起飞的飞机」⇒ 同一次调用即建链 ----
+    // ‼️ 没有这一格，格 1 在"闸被写成恒假"的实现下**同样绿**——它只证明"拒绝了"，
+    //    不证明"拒绝的是该拒绝的那一架"。
+    crypto->setInitiatorDevices(QVariantList{ static_cast<uint>(deviceID) });
+    crypto->beginLinking(deviceID);
+    QCOMPARE(crypto->state(), CryptoController::State::Active);
+    QCOMPARE(crypto->activeDeviceID(), deviceID);
+
+    // ---- 格 2b：**每轮整体重推**同一份名单 ⇒ Active 必须纹丝不动 ----
+    // ‼️ 本格是「名单必须每轮整体重推」这条口径在 C++ 侧的**唯一**判据。缺它，该口径的
+    //    核心失效模式无人拦：把 `revokeActiveLink` 误写成 `(_state != State::Standby)`
+    //    （丢掉 `!parsed.contains(_activeDeviceID)`），其余四格**逐格照样全绿**——它们
+    //    没有一格处在「Active **且本机仍在名单内**」这个状态下调 `setInitiatorDevices`。
+    //    真实后果是致命的：站点视图每 2 s 重推一次（`OpsShell.qml` 的 `_fetchOverview`）
+    //    ⇒ 链路每 2 s 被 `returnToStandby()` 撕一次 ⇒ **站点永远持链不超过 2 s**。
+    crypto->setInitiatorDevices(QVariantList{ static_cast<uint>(deviceID) });
+    QCOMPARE(crypto->state(), CryptoController::State::Active);
+    QCOMPARE(crypto->activeDeviceID(), deviceID);
+
+    // ---- 格 3：任务改由别站起飞 ⇒ 本端**当场**让出上行权 ----
+    // 闸只在 beginLinking 入口检查一次（同 `_testBeginLinkingRequiresResponsibleParty`
+    // 的格 4）：集合里被移走若不撤销 Active 链路，本机会继续以当前 Active 加密外发，
+    // 与新起飞站的 QGC 争同一 deviceID 的上行奇数序列。
+    crypto->setInitiatorDevices(QVariantList{});
+    QCOMPARE(crypto->state(), CryptoController::State::Standby);
+    QCOMPARE(crypto->activeDeviceID(), kInvalidDeviceID);
+
+    // 清理（单例 + 全局 lastNonce + key cache 均持久，避免污染同进程其他测试）
+    crypto->returnToStandby();
+    crypto->deviceKeyManager()->removeKey(deviceID);
+    crypto->resetReplay(deviceID);
+}
+
 void CryptoTest::_testVtolMessages()
 {
     // 1) CRC_EXTRA：必须与 pymavlink message_checksum 一致（算法已用 HEARTBEAT=50 校验）。
@@ -2652,7 +2742,12 @@ void CryptoTest::_testAddLinkedDeviceFetchesOnlyWhenKeyMissing()
     //    （`fetchKeys` 未配置时静默早退——Task 6 的 Ruling AD；本用例正是因为配了才观测得到。）
     //    这个 reply 归属单例的 `_networkManager` ——不随用例析构——它的失败日志若漂到下一个
     //    用例的事件循环里，会在那个用例的 strict-mode 日志检查上变红（一条与它毫无关系的警告）。
-    // 允许那条失败警告出现（规则被匹配即消费，不是整条用例豁免）。
+    // 允许那条失败警告出现。⚠️ `ignoreLogMessage` 是**整条用例豁免**，不是"匹配即消费"：
+    //    规则收在 `_expectedLogMessages->ignored`（`UnitTest.cc` 的 `ignoreLogMessage`），
+    //    比对时命中即跳过、**不标记已消费**（同文件的 `isIgnored` lambda），整表只在 `init()` 清空。
+    //    "匹配一次就失效"那是 `expectLogMessage` 的 `consumedMessageIndices` 机制，两者不是一回事。
+    //    ⇒ 本行一旦写下，本用例内此后**每一条**同类别同级别的 `fetchKeys failed` 都被放过；
+    //    要精确到条数请改用 `expectLogMessage` + `verifyExpectedLogMessage`。
     ignoreLogMessage("MAVLink.Crypto.DeviceKeyManager", QtWarningMsg,
                      QRegularExpression("fetchKeys failed"));
     absorbPendingKeyFetches(crypto, 1);
@@ -2674,9 +2769,11 @@ void CryptoTest::_testIsInManifestUsesMonitorListActiveNotEmptiness()
     crypto->removeLinkedDevice(id);
     crypto->addLinkedDevice(id); // 进 `_linkedDevices`
 
-    // ⚠️ 这里**不**先断言"未推过清单时回退 `_linkedDevices`"：`_monitorListActive` 只有
-    //    置位入口、没有复位入口，前面任何一个推过清单的用例都会让它恒为 true，
-    //    那条断言会退化成顺序依赖的假红。下面用 `setMonitorDevices` 把两种取值都显式钉住。
+    // ⚠️ 这里**不**先断言"未推过清单时回退 `_linkedDevices`"：那条断言要的是"进本用例时闩为
+    //    false"，而闩的复位路径（`init()` 每格无条件调 `setResponsibleParty`）是**另一件事**
+    //    ——本用例要钉的是 `isInManifest` 的**取清单口径**，不是闩的初值。绑在一起的话，
+    //    将来那条复位路径断掉时，本用例会以"前提取值不对"的名义红，指错方向。
+    //    下面用 `setMonitorDevices` 把两种取值都显式钉住，不依赖任何前序状态。
     crypto->setMonitorDevices(QVariantList(), 0);
     QVERIFY2(crypto->monitorListActiveForTest(), "setMonitorDevices 之后清单必须生效");
     QVERIFY2(!crypto->isInManifest(id),
@@ -2685,7 +2782,9 @@ void CryptoTest::_testIsInManifestUsesMonitorListActiveNotEmptiness()
     crypto->setMonitorDevices(QVariantList{ static_cast<uint>(id) }, 0);
     QVERIFY2(crypto->isInManifest(id), "清单里有的 ID 必须在清单内");
 
-    // 复位：`_monitorListActive` 的置位无法撤销，只把清单内容与 `_linkedDevices` 清干净。
+    // 复位：把清单内容与 `_linkedDevices` 清干净。闩本身不必在这里处理——本文件 `init()`
+    // 每格都**无条件**调 `setResponsibleParty`（传 true，但被调函数不判实参，见
+    // `CryptoController::setResponsibleParty` 内那块清闩），故下格开头闩恒为 false。
     crypto->setMonitorDevices(QVariantList(), 0);
     crypto->removeLinkedDevice(id);
 }

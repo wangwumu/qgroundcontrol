@@ -193,10 +193,21 @@ void DeviceKeyManager::fetchKeys(const QList<DeviceID>& deviceIDs)
 
 void DeviceKeyManager::_onBatchReplyFinished(QNetworkReply* reply)
 {
-    // ⚠️ 判成功一律走 `QGCNetworkHelper::isSuccess`，**不写** `reply->error() != NoError`：
-    //    Qt 的 `QNetworkReply::error()` 只在**网络层**出错时非 NoError，HTTP 404/401
-    //    **不置**它。而服务端对"未登记密钥"与"范围外"正是回 **404**——那是**正常**情形，
-    //    用 error() 判会把 404 当成成功、解析出空数组 ⇒ 静默吞掉（连日志都没有）。
+    // ⚠️ 判成功一律走 `QGCNetworkHelper::isSuccess`。⚠️ 但别把它当成与 `error()` 无关的
+    //    另一套判据——它**内部第一句就是** `reply->error() != NoError ⇒ false`，之后才叠
+    //    `status == -1 || isHttpSuccess(status)`（`QGCNetworkHelper.cc`）。它比单看 `error()`
+    //    多拒的形状只有一类：**带了非 2xx 状态码却没置 error 的响应**（典型是未跟随的 3xx）；
+    //    另加"非 HTTP 响应（`status == -1`）也放行"。⇒ 用它的理由是拿这份口径的**唯一实现**，
+    //    不是"绕开 `error()`"。
+    // ⚠️ 也别把 `error()` 说成"网络层错误与业务状态码不可分"：Qt 的枚举**自带分段注释**
+    //    （`QtNetwork/qnetworkreply.h` 逐字「network layer errors [relating to the destination
+    //    server] (1-99)」，各段以 `UnknownNetworkError`(99) / `UnknownProxyError`(199) /
+    //    `UnknownContentError`(299) / `ProtocolFailure`(399) / `UnknownServerError`(499) 收尾）；
+    //    404 ⇒ `ContentNotFoundError`、401 ⇒ `AuthenticationRequiredError` 都落在 201–299 段，
+    //    与超时/拒连的 1–99 段**可分**。
+    // ⚠️ 也别把「服务端回 404」当成本函数会遇到的形状：**批量**接口对"未登记密钥"与
+    //    "范围外"一律回 **200 + 过滤后的数组**（`handlers/devicekey.go` 的 `Batch`），
+    //    404 只属于单发 `Get`/`Delete`。
     if (!QGCNetworkHelper::isSuccess(reply)) {
         qCWarning(DeviceKeyManagerLog) << "fetchKeys failed:" << QGCNetworkHelper::errorMessage(reply);
         return;

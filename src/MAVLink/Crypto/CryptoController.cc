@@ -169,7 +169,9 @@ void CryptoController::setMonitorDevices(const QVariantList& deviceIds, int fram
     // 主动取密钥时机之二（规范 §2.7.2 e）：监控清单**内容变化**时，对尚无本地密钥的 ID 批量拉。
     //
     // ⚠️ 监控员的取密钥**纯粹用于解密**——`responsibleParty=false` 使其全程不建链
-    //    （`beginLinking` 入口的责任方闸），拉 key 只是为了并行解密多架遥测。
+    //    （`beginLinking` 入口那道闸；2026-10-04 起闸名已由 `isResponsibleParty()` 收窄为
+    //    `isInitiatorFor(deviceID)`——责任方只是它的第一条，不再充分），拉 key 只是为了
+    //    并行解密多架遥测。
     //    与站点侧 `addLinkedDevice` 的逐条拉取同属「主动」，但落点不同：那份清单是
     //    一个个接手过来的，这一份是**整份推来**的，所以这里是**一次批量**。
     //
@@ -618,11 +620,17 @@ void CryptoController::setResponsibleParty(bool responsible)
         // —— 闩不回落，**跨会话**时本端会一直按上一个站点的 `_monitorDevices` 发 80005 登记心跳：
         // 新会话的飞机登记不上，旧站点的飞机被继续登记。复位后回到 §3.5.4 的既有口径
         // （回退 `_linkedDevices`），新会话的清单由 RomView 的 `setMonitorDevices` 重新推上来。
-        // ⚠️ 今天这条**不可达**：本仓 QGC 没有登出（`AuthController.cc` 逐字写着「当前 QGC 无
-        //    登出路径，进程内"已登录再换账号登录"不可达；将来若加登出，需一并清理」），故每次
-        //    调用本函数时闩最多为 false，本行不改任何可达行为——它是给"将来加登出"预备的。
-        // ⚠️ 只清监控清单，**不动** `_linkedDevices`：那是登录时写入的站点 deviceID 集合，
-        //    生命周期归 `AuthController`（见那里的说明），不归本函数。
+        // ⚠️ **生产路径**上这段今天不改任何行为：本仓 QGC 没有登出（`AuthController.cc` 逐字写着
+        //    「当前 QGC 无登出路径，进程内"已登录再换账号登录"不可达；将来若加登出，需一并清理」），
+        //    一次会话内本函数只在登录时被调一次，那时闩必为 false。它是给"将来加登出"预备的。
+        //    ‼️ 但**别**据此说这段"不可达"：单元测试二进制里它是**活的**——`CryptoTest::init()`
+        //    每格无条件调本函数，某格用 `setMonitorDevices` 把闩置真之后，**下一格的 `init()`**
+        //    就会走进这里把闩清掉。改这段前先想清楚测试侧的可见后果。
+        // ⚠️ 只清监控清单，**不动** `_linkedDevices`：它的写侧是站点视图的接手/释出
+        //    （`OpsShell.qml` 调 `addLinkedDevice` / `releaseDevice`）与单机模式的本地密钥源
+        //    （`QGCApplication.cc` 调 `addLinkedDevice`），生命周期不归本函数。
+        //    ⚠️ 旧注释说它"是登录时写入的、归 `AuthController`"——自 2026-10-04 起登录**不再**
+        //    写它（登录响应已不含 `devices`），那句已失效。
         // ⚠️ 刻意**不打日志**：这里不是异常而是定义的边界；且本文件用例的 `init()` 每次都调本
         //    函数，留一条日志会让 strict mode 在下一个用例里以"未预期日志"红掉。
         if (_monitorListActive) {
@@ -630,6 +638,16 @@ void CryptoController::setResponsibleParty(bool responsible)
             _monitorDevices.clear();
             _regCursor = 0;
         }
+        // 同一会话边界，**起/终维也当场作废**（2026-10-04 补）。理由与上面那段同源：它是
+        // 「本端是哪些飞机的起飞站」的判定结果，归属登录会话；跨会话留着会让新账号按上一个
+        // 站点的起飞站名单建链。
+        // ‼️ 缺省 false 还有第二重作用：它是「本端**尚未确定**起/终维」的表达，而
+        //    `isInitiatorFor` 靠它退回旧形态。**单机模式（本地密钥源）不推起/终维，行为
+        //    不变靠的就是这一条**——它与 `_monitorListActive` 不同，必须**无条件**清，
+        //    不能挂在上面那个 `if` 里。
+        // ⚠️ 同样刻意不打日志（本函数在单测里每格都被调，留日志会让 strict mode 红）。
+        _initiatorScopeValid = false;
+        _initiatorDevices.clear();
         // 收回发言权时，已建立的链路必须**当场**降回待命。闸只在 beginLinking 的入口
         // 检查一次，而 LinkInterface 只看 state()——标志翻转本身不会撤销 Active 链路，
         // 于是本机会以「当前 Active」继续加密外发（操纵杆 MANUAL_CONTROL 天然走这条路）。
@@ -647,6 +665,74 @@ bool CryptoController::isResponsibleParty() const
 {
     const QMutexLocker locker(&_mutex);
     return _responsibleParty;
+}
+
+void CryptoController::setInitiatorDevices(const QVariantList& deviceIds)
+{
+    QList<DeviceID> parsed;
+    parsed.reserve(deviceIds.size());
+    for (const QVariant& v : deviceIds) {
+        bool ok = false;
+        const uint id = v.toUInt(&ok);
+        // ⚠️ 与 `addLinkedDevice` / `setMonitorDevices` 用**同一组**校验（非 0 + 签名位合法，
+        //    规范 §1.4），保证"能进 `_linkedDevices` 的就能进本集合"，三处口径不漂移。
+        if (!ok || id == kInvalidDeviceID || !hasValidSignatureBit(static_cast<DeviceID>(id))) {
+            qCWarning(CryptoControllerLog) << "setInitiatorDevices: 非法 deviceID，已跳过" << v;
+            continue;
+        }
+        parsed.append(static_cast<DeviceID>(id));
+    }
+
+    bool revokeActiveLink = false;
+    {
+        const QMutexLocker locker(&_mutex);
+        // 走到这里就说明这是一份**成功推送的名单**（调用方只在该轮请求 200 且载荷合法时才
+        // 调本函数）。生效标志在此置位，且**此后不再回落**（只有会话边界 `setResponsibleParty`
+        // 能清它）——它是"本端有没有确定起/终维"的开关，不是"名单非空"的代词。
+        // ‼️ 空名单同样生效：它表示「本端不是任何一架的出站」⇒ 全拒（fail-closed）。
+        _initiatorScopeValid = true;
+        _initiatorDevices = parsed;
+        // 闸只在 `beginLinking` 入口检查**一次**（同 `setResponsibleParty` 收权那一段的
+        // 理由）：正在 Active 的那一架若不再属于本端的起飞站（任务改由别站起飞），必须
+        // 当场让出上行权。否则本机会继续以当前 Active 加密外发，与新起飞站的 QGC 争同一
+        // deviceID 的上行奇数序列——违反 §3.1「同一时刻只有一个发送端（任务 QGC）」。
+        // 判据用 `!= Standby` 而非 `== Active`：Linking 中途同样要打断（它会走向 Active，
+        // 且 `_activeDeviceID` 已被占用）。
+        revokeActiveLink = (_state != State::Standby) && !parsed.contains(_activeDeviceID);
+    }
+    // `returnToStandby` 自己取 `_mutex`，必须在锁外调用（QMutex 非递归）。
+    // ⚠️ 它**不删密钥**——本端可能仍是这架飞机的降落站，遥测还要照常解密上屏，
+    //    交还的只是"发言权"。
+    if (revokeActiveLink) {
+        returnToStandby();
+    }
+}
+
+bool CryptoController::isInitiatorFor(DeviceID deviceID) const
+{
+    // ① 旧闸（2026-09-27 裁定），语义**不变**：非责任方一律不建链（航线监控员等）。
+    //    它在其它分支之前，故监控员视图从不推起/终维也不影响它。
+    if (!isResponsibleParty()) {
+        return false;
+    }
+    // ② 退回旧形态（信息不可得，**不是**"信息说不是"）：没有 deviceID 就无从判起/终。
+    //    非加密路径上 `Vehicle::_deviceID` 是默认实参 `kInvalidDeviceID`，且它建车即定
+    //    终身、无 setter ⇒ 这类会话永远走分支 ③ 或本条。
+    if (deviceID == kInvalidDeviceID) {
+        return true;
+    }
+    const QMutexLocker locker(&_mutex);
+    // ③ 退回旧形态：本端尚未收到过起/终维。两种来源——站点视图还没刷出第一轮（窗口
+    //    **最长 2 s**：`_bootstrap` 站点支只调 `_fetchMySite`、不调 `_fetchOverview`，
+    //    首次推送要等 `pollTimer` 的第一个 tick，`OpsShell.qml` 的 `interval: 2000`），
+    //    或本部署根本不跑站点视图（**单机模式的本地密钥源**）。
+    //    ⚠️ 这一条是**刻意 fail-open** 的，且它与 ④ 的差别是本设计的全部要害：
+    //    收紧它会让单机模式一架都建不了链（该建链的也建不了）。
+    if (!_initiatorScopeValid) {
+        return true;
+    }
+    // ④ 已生效 ⇒ 严格按名单判，fail-closed：不在名单里就是不建链。
+    return _initiatorDevices.contains(deviceID);
 }
 
 void CryptoController::beginLinking(DeviceID targetDeviceID)
@@ -673,7 +759,13 @@ void CryptoController::beginLinking(DeviceID targetDeviceID)
     //      debug 默认关闭，且 QGCLoggingCategoryManager 装了自定义 category filter，
     //      setFilterRules 被它覆写——想在测试里观察必须走 --logging= 命令行，不值得。
     // 需要判断"本机是不是责任方"的调用方直接读 isResponsibleParty()，不要靠日志。
-    if (!isResponsibleParty()) {
+    //
+    // ‼️ 2026-10-04 起判据从 `isResponsibleParty()` 收窄为 `isInitiatorFor(targetDeviceID)`：
+    //    责任方只是"本端有权发言"，还差"本端是**这一架**的起飞站"。可接引范围 = 出站 ∪
+    //    **进站**（§2.7.2 d）⇒ 终点站也拿得到密钥、也是责任方 ⇒ 旧判据挡不住它，它会占住
+    //    `_activeDeviceID` 单槽把起飞站挤掉，违反 §3.1「同一 deviceID 指令方向同一时刻
+    //    只有一个发送端（发起任务的那个 QGC）」。拒绝路径的静默理由与上面同一段，不变。
+    if (!isInitiatorFor(targetDeviceID)) {
         return;
     }
 

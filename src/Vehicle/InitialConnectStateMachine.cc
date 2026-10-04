@@ -332,8 +332,21 @@ bool InitialConnectStateMachine::_shouldSkipForNoResponsibleParty() const
 {
     // cryptoEnabled() 为假（未启用加密链路）⇒ 本判据整体不适用，行为与改动前一致。
     // 因此单机版、以及所有未开加密的部署都不受影响。
+    //
+    // 判据自 2026-10-04 起从 `isResponsibleParty()` 收窄为 `isInitiatorFor(本车 deviceID)`：
+    // 责任方只是「本端有权发言」，还差「本端是**这一架**的起飞站」。可接引范围 = 出站 ∪
+    // **进站**（§2.7.2 d）⇒ **终点站也是责任方**，旧判据挡不住它：终点站会跑完下面六类
+    // 请求，而 LinkInterface 对非 Active 逐条 drop ⇒ 各自重试耗尽 ⇒ 弹「任务传输失败…
+    // 超过了最大重试次数」，根因（本端不是它的起飞站）在界面上完全看不见。那正是本判据
+    // 存在的理由（见构造函数里那段），只是此前只覆盖了"非责任方"这一半。
+    //
+    // ⚠️ `vehicle()->deviceID()` 在**构造期**可求值：`Vehicle::_deviceID` 在成员初始化
+    //    列表里赋值，早于本状态机的构造（Vehicle.cc 内两处，前者在前）。
+    // ⚠️ 退化路径：非加密路径的 deviceID 是 `kInvalidDeviceID`，或起/终维尚未推送
+    //    （站点视图还没刷出第一轮 / 单机模式不跑站点视图）⇒ `isInitiatorFor` 退回只判
+    //    责任方，与改动前**逐字相同**。
     MAVLinkCrypto::CryptoController* const crypto = MAVLinkCrypto::CryptoController::instance();
-    return crypto->cryptoEnabled() && !crypto->isResponsibleParty();
+    return crypto->cryptoEnabled() && !crypto->isInitiatorFor(vehicle()->deviceID());
 }
 
 // ============================================================================

@@ -373,8 +373,13 @@ public:
     ///
     /// 判据是「**含** SITE_ATC」，不是「不含 ROUTE_MONITOR」——后端 roles.go 明确允许
     /// SITE_ATC 与 ROUTE_MONITOR 双身份并存（角色是并集），按后者写会把这类账号误判成
-    /// 非责任方。另：站点归属无需在此判断——能走到 beginLinking 就说明该 deviceID 在本站
-    /// 集合里（登录时后端已校验 site_id ∈ 用户 role_sites）。
+    /// 非责任方。
+    /// ‼️ 本标志只回答「本端**有没有发言权**」，**不足以**回答「本端该不该与**这一架**
+    ///    握手」。握手权的完整判据是 `isInitiatorFor()` = 责任方 **且** 本端是该机当前
+    ///    任务的起飞站，`beginLinking` 用的是后者。
+    ///    （旧注释在此处写「站点归属无需判断——能走到 beginLinking 就说明该 deviceID 在本站
+    ///    集合里」。**该句已于 2026-10-04 证伪**：可接引范围 = 出站 ∪ **进站**，「在本站
+    ///    集合里」把**终点站**也算了进来，而终点站不该与飞机握手。）
     ///
     /// 缺省 **false**（fail-closed：没被授予就不能发言）。生产路径有三个写入点：
     ///   · AuthController 登录成功 ⇒ setResponsibleParty(roles 含 SITE_ATC)。**无条件覆写**，
@@ -394,8 +399,15 @@ public:
     /// `_monitorListActive ? _monitorDevices : _linkedDevices` ⇒ 不在此处作废的话，**跨会话**
     /// 时本端会一直按上一个站点的清单发 80005 登记心跳。本函数是三个会话边界写入点
     /// （登录成功 / 登录被拒 / 本地密钥源初始化）的公共落点，故作废落在这里。
-    /// ⚠️ 本仓 QGC **没有登出**，今天这条不可达，是为将来加登出预备的（判定同 .cc）。
-    /// ⚠️ `_linkedDevices` **不在**本函数的清理范围：它由 `AuthController` 登录时写入并自管。
+    /// ⚠️ **生产路径**上这段今天不改任何行为（本仓 QGC 没有登出，一次会话内本函数只在登录时
+    /// 被调一次，那时闩必为 false），它是为将来加登出预备的；‼️ 但**别**说它"不可达"——
+    /// 单元测试二进制里它是活的，详见 .cc 内那段（同判定）。
+    /// ⚠️ `_linkedDevices` **不在**本函数的清理范围：它的写侧是站点视图的接手/释出
+    /// （`OpsShell.qml` 调 `addLinkedDevice` / `releaseDevice`）与单机模式的本地密钥源
+    /// （`QGCApplication.cc` 调 `addLinkedDevice`）。
+    /// ‼️ 旧注释说它"由 `AuthController` 登录时写入并自管"——**自 2026-10-04 起已失效**：
+    /// 登录不再装配任何 deviceID 集合（登录响应已不含 `devices`），`AuthController.cc` 里
+    /// 那句"返回设备密钥集合 devices"的说明也已一并删除。
     ///
     /// @param responsible true=责任方（可建链）
     void setResponsibleParty(bool responsible);
@@ -403,9 +415,50 @@ public:
     /// 当前是否为责任方（线程安全，加锁读取）。
     bool isResponsibleParty() const;
 
+    /// **起/终维**：声明「本端是哪些飞机**当前任务的起飞站**」（2026-10-04 用户裁定）。
+    ///
+    /// 用户裁定逐字：「一架尚未连入网络的无人机（刚开机）只有在一个飞行任务的起飞点所在
+    /// 站点的 qgc 才会与之握手」。
+    ///
+    /// 由站点视图（`OpsShell.qml` 的 `_fetchOverview`）**每轮轮询整体重推**：
+    /// `takeoff_site_id === AuthController.siteId` 的那些行的 `device_id`。
+    /// ‼️ 必须是**整体替换**、且**每轮都推**，不能只在 diff 时推：同一架飞机的
+    ///    `takeoff_site_id` 可以在行的集合完全不变的情况下改掉（飞机落地后本站从起飞站
+    ///    变成降落站），那种变化不会让 `_siteDeviceIdsKey` 变动。
+    /// ‼️ 必须是 `Q_INVOKABLE`（理由同 `addLinkedDevice`：QML 只认 `Q_INVOKABLE`，
+    ///    写成普通成员函数是**运行时** `TypeError`，Qt 构建不会报）。
+    ///
+    /// ⚠️ 它是**独立于 `_linkedDevices` 的另一维**，不是它的子集筛子：
+    ///    · `_linkedDevices` 答「本端关联哪些飞机」（登记心跳 payload + 取密钥范围）；
+    ///    · 本集合答「本端**是哪些飞机的起飞站**」（唯一建链权）。
+    ///    范围闸（§2.7.2 d）是取密钥的边界，**不是**建链的边界——可接引范围含**进站**支，
+    ///    终点站同样拿得到密钥。故本集合是 `isInitiatorFor` 的另一条腿，缺它则终点站
+    ///    会与飞机握手并占住 `_activeDeviceID` 单槽。
+    ///
+    /// ⚠️ 空列表 **≠** "本端无所事事"：与 `setMonitorDevices` 同一口径——**被调用过**
+    ///    就表示起/终维已生效（`_initiatorScopeValid`），此后空集表示「本端不是任何一架
+    ///    的出站」= 全部不建链。反过来说，**从未被调用**时才退回旧形态（见 `isInitiatorFor`）。
+    ///
+    /// ⚠️ 非法 deviceID（0 / 签名位非法，规范 §1.4）逐条跳过并告警，与
+    ///    `setMonitorDevices` / `addLinkedDevice` 用**同一组**校验，三处口径不漂移。
+    Q_INVOKABLE void setInitiatorDevices(const QVariantList& deviceIds);
+
+    /// 本端是否为 `deviceID` 的**接引方**（= 责任方 **且** 本端是它的起飞站）。
+    ///
+    /// 这是建链权的**唯一判据**，`beginLinking` 与 `InitialConnectStateMachine` 两处共用。
+    /// 两个"退回旧形态"分支都是**信息不可得**，不是"信息说不是"：
+    ///   · `deviceID == kInvalidDeviceID`：非加密路径（`Vehicle::_deviceID` 建车即定终身、
+    ///     无 setter）⇒ 无从判起/终 ⇒ 只按责任方判。
+    ///   · `!_initiatorScopeValid`：本端尚未收到过起/终维（站点视图还没刷出第一轮、或本部署
+    ///     根本不跑站点视图，如单机模式的本地密钥源）⇒ 同样只按责任方判。
+    /// ⚠️ 这两条是**刻意 fail-open** 的：它们只在"本端不知道"时生效，而那时收紧闸的后果
+    ///    是**该建链的也建不了**（单机模式全废）。信息已知时严格 fail-closed。
+    bool isInitiatorFor(DeviceID deviceID) const;
+
     /// 任务建链：选定目标无人机，取密钥，进入 Linking。
     /// 由上层在「确定航线 + 选定无人机」时调用。
-    /// ⚠️ 非责任方调用时**直接返回、状态保持 Standby**（判据见 setResponsibleParty）。
+    /// ⚠️ 非责任方、或本端非该机起飞站时**直接返回、状态保持 Standby**
+    ///    （判据见 `isInitiatorFor` 与 `setResponsibleParty`）。
     void beginLinking(DeviceID targetDeviceID);
 
     /// 按 systemID 触发建链（便捷方法：内部查 deviceID↔systemID 映射）。
@@ -502,8 +555,8 @@ private:
     /// ‼️ 独占的取清单口径，判据是 `_monitorListActive` 而**不是** `_monitorDevices.isEmpty()`：
     ///    清单生效之后被摘空（签出释出最后一架）是"本 GCS 在线、暂不关联任何 PX4"，
     ///    绝不是"回退到 `_linkedDevices` 全体"——那会把刚释出的飞机原地登记回去。
-    ///    这个口径原先在三个地方各写了一遍（批次计数、`_sendRegistration`、
-    ///    `isInManifest`），改一处漏两处不会报错，只会让"这一轮该发几架"和
+    ///    这套口径分散在三处（批次计数、`_sendRegistration`、以及 2026-10-04 新增的
+    ///    `isInManifest`），各写一遍时改一处漏两处不会报错，只会让"这一轮该发几架"和
     ///    "实际发出去的集合"悄悄对不上。抽成一个函数就是为了它们不可能再漂。
     /// ⚠️ 调用方**须已持 `_mutex`**（返回的是成员引用）。
     const QList<DeviceID>& _manifestLocked() const;
@@ -526,6 +579,15 @@ private:
     /// 写入点见 setResponsibleParty 的文档注释；**不受 returnToStandby 影响**——
     /// 它是"登录会话/运行模式"的属性，不是"本次任务"的属性。
     bool _responsibleParty = false;
+    /// 起/终维（2026-10-04 裁定）：本端是**哪些飞机当前任务的起飞站**。语义见
+    /// `setInitiatorDevices`。⚠️ 与 `_monitorDevices` 同样是"空集可以生效"的口径，
+    /// 故"有没有生效"由下面那个标志回答，不由本容器的空否回答。
+    QList<DeviceID> _initiatorDevices;
+    /// 起/终维是否已生效（`setInitiatorDevices` 至少被推过一次）。缺省 false = 从未有过。
+    /// ‼️ `isInitiatorFor` 靠它区分「本端不是它的起飞站」（false 的**阴性**结论）与
+    ///    「本端还不知道自己是不是」（尚未推送）——两者的建链答案相反。
+    /// 复位点只有一处：`setResponsibleParty`（会话边界），与监控清单的作废同处同源。
+    bool _initiatorScopeValid = false;
     ReplayGuard _replayGuard;
     QHash<DeviceID, uint8_t> _deviceToSystem; ///< deviceID → systemID 映射（接收端学习）
     QHash<uint8_t, DeviceID> _systemToDevice; ///< systemID → deviceID 反向映射

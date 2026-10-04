@@ -661,8 +661,11 @@ Item {
     ///    登录响应已不再下发 `devices`（规范 §2.7.2 c）之后，站点操作员**彻底建不了链**。
     /// ⚠️ `addLinkedDevice` 必须是 `Q_INVOKABLE`（`CryptoController.h` 里已注明原因）：
     ///    普通成员函数在 QML 里是**运行时** `TypeError`，Qt 构建不会报。
-    /// ⚠️ 它只做「推入集合 + 按需取密钥」；真正能否接引仍由服务端的可接引范围闸决定
-    ///    （§2.7.2 d）——客户端不判第二遍。
+    /// ⚠️ 它只做「推入集合 + 按需取密钥」。**取不取得到密钥**由服务端的可接引范围闸决定
+    ///    （§2.7.2 d）——这一层客户端不判第二遍。
+    /// ‼️ 但「取到密钥」**不等于**「可以握手」：可接引范围 = 出站 ∪ **进站** ⇒ 终点站照样
+    ///    拿得到密钥。握手权是**另一维**（起/终维），由 `_fetchOverview` 每轮调
+    ///    `setInitiatorDevices` 给出——客户端**要**判第二遍，只是判的不是范围。
     function _adoptSiteDevice(deviceID) {
         cryptoController.addLinkedDevice(deviceID)
     }
@@ -724,6 +727,48 @@ Item {
                         opsShell._adoptSiteDevice(_ovNew)
                     }
                 }
+            }
+            //---- 起/终维（2026-10-04 裁定）----
+            // 用户裁定逐字：「一架尚未连入网络的无人机（刚开机）只有在一个飞行任务的起飞点
+            // 所在站点的 qgc 才会与之握手」。本端把「自己是哪些飞机**当前任务起飞站**」的
+            // 名单整份推给 C++ 侧；`CryptoController::beginLinking` 只对名单内的飞机开闸。
+            // ⚠️ 为什么不能只靠服务端的可接引范围闸：范围 = 出站 ∪ **进站** ⇒ 终点站同样
+            //    拿得到密钥、同样是责任方 ⇒ 它会与飞机握手并占住单槽，把起飞站挤掉
+            //    （规范 §3.1：同一 deviceID 指令方向同一时刻只有一个发送端）。
+            // ‼️ 必须**每轮**推、且是**整份替换**，不能塞进上面那个
+            //    `_ovKey !== _siteDeviceIdsKey` diff 块：`takeoff_site_id` 能在行的集合
+            //    **完全不变**时改掉（飞机落地后本站从起飞站变成降落站），那种变化不会让
+            //    key 变动。整份替换同时覆盖"某架被移出名单"——C++ 侧会因此当场让出上行权。
+            // ⚠️ 只对站点视图推：监控员视图全程 `responsibleParty=false`，
+            //    `isInitiatorFor` 的第一条就把它挡在门外，推了是死状态。
+            // ⚠️ 无站点身份（平台级账号 / `role_sites` 为空）时**不推**，而不是推空集：
+            //    「没推过」在 C++ 侧退回旧形态，「推了空集」是"本端不是任何一架的起飞站"
+            //    ⇒ 全拒。两者的建链答案相反。口径同 `_fetchMySite` 的 `if (!(sid > 0)) return false`。
+            var _mySid = Number(_mySiteId)
+            if (!routeLayersEnabled && _mySid > 0) {
+                var _initIds = []
+                for (var _ri = 0; _ri < data.length; _ri++) {
+                    var _rrow = data[_ri]
+                    if (!_rrow) continue
+                    var _rdid = Number(_rrow.device_id)
+                    if (!(_rdid > 0)) continue
+                    // 裸判 `takeoff_site_id === 本端站点`。**不要**改用 `OpsCommon.isOutbound`
+                    // / `isInbound`：那两者判的是「本端该不该管它」，含任务状态条件
+                    // （`isOutbound` 在飞机 `IN_FLIGHT` 且已接引移交之后返回 false）。
+                    //
+                    // ⚠️ **但裸判保不住「起飞站全程都在名单里」，别把它当护身符**：本循环遍历的 `data`
+                    //    本身已被服务端 `siteScopeWhere` 的出站支筛过，该支含
+                    //    `t.status='IN_FLIGHT' AND NOT EXISTS(…phase_to='ROUTE' AND status='ACCEPTED')`
+                    //    ⇒ ROUTE 交接 `ACCEPTED` 之后，起飞站照样不在 `data` 里、照样掉出 `_initIds`，
+                    //    `setInitiatorDevices` 会当场 `returnToStandby()` 让出上行权。**这是设计意图**
+                    //    （2026-10-05 裁定：起飞站只负责起飞阶段，起飞后交接给航线监控员），不是本处缺陷；
+                    //    交接没完成（`PENDING`/被拒/超时）时行留在行集内，起飞站持续接引。
+                    //    裸判挡住的是**客户端**复用 `isOutbound`，挡不住**服务端行集**上游的同一条件。
+                    //    详见规范 §2.7.2 h。
+                    if (Number(_rrow.takeoff_site_id) !== _mySid) continue
+                    _initIds.push(_rdid)
+                }
+                cryptoController.setInitiatorDevices(_initIds)
             }
             // ‼️ **内容没变就不要重新赋值**（理由同 `_fetchRouteTasks`）。`property var` 一旦换身份，
             //    吃 `_tasks` 的 `MapItemView`（飞机 marker）与右栏列表都会销毁重建全部委托。

@@ -229,7 +229,10 @@ void AuthController::login(const QString& username, const QString& password)
     QJsonObject body;
     body.insert(QStringLiteral("username"), username);
     body.insert(QStringLiteral("password"), password);
-    // 声明 QGC 客户端：后端按 qgc 处理并返回设备密钥集合 devices
+    // 声明 QGC 客户端：后端按 qgc 处理（qgc 角色白名单 / client_type 分支）。
+    // ⚠️ 登录响应**不含** `devices`——devices 于 2026-10-04 移除，密钥改按需经
+    //    `/api/device-keys/batch` 取（规范 §2.7.2 e），后端 `handlers/auth.go` 只回
+    //    token/user_id/company_id/username/display_name/roles/role_sites/client_type。
     body.insert(QStringLiteral("client_type"), QStringLiteral("qgc"));
     // 设备序列号（站点归属门禁）：后端查表得绑定站点并与用户站点匹配，匹配才放行（恢复门禁后生效）
     body.insert(QStringLiteral("device_serial"), deviceSerial);
@@ -366,9 +369,14 @@ void AuthController::_onLoginFinished(QNetworkReply* reply)
     // ⚠️ 与后端 handlers/auth.go 的 qgc 白名单**两端同解**（后端同句文案、同三种角色）；此处是第二道，
     //    防的是旧版后端/绕过前端闸的情形。**两处白名单必须同步修改**，只改一边会出现"能登进去但处处 403"
     //    或"根本登不进去"。
-    // 位置约束（关键）：必须在 `_loggedIn = true` **之前**。若放到其后，就成了"先算登录成功、再回滚登出"，
-    //    而下方 DeviceKeyManager::cacheKey / CryptoController::addLinkedDevice 已执行——加密链路会带着
-    //    非授权账号取回的 deviceID 集合继续跑（80005 登记集合被污染）。
+    // 位置约束（关键）：必须在 `_loggedIn = true` **之前**。若放到其后，就成了"先算登录成功、再回滚登出"
+    //    ——中间存在一个"已登录却仍带着上一账号身份"的窗口。
+    //    ⚠️ 会话字段的**实际**写入位置（2026-10-04 实测本文件）：`_token` 在正常登录路径开头，
+    //    `_userId` / `_roles` 紧随其后，三者**都在本闸与本闸之后的 `_loggedIn = true` 之前**；
+    //    `_loggedIn = true` 之后本函数只写 `responsibleParty`（`setResponsibleParty`）与两处
+    //    `setAuthToken`。⇒ 回滚要清的是**上述已写的那一批**，不是"`_loggedIn` 之后的那批"。
+    //    （2026-10-04 起登录**不再**装配任何 deviceID 集合——登录响应已不含 `devices`；
+    //     此处原先"下方 cacheKey/addLinkedDevice 已执行"那条理由随之失效。）
     // 已知边界：DeviceKeyManager/PlanUploader 内**先前**会话注入的 token 不在此处理（既有失败分支同样不
     //    处理）。当前 QGC 无登出路径，进程内"已登录再换账号登录"不可达；将来若加登出，需一并清理。
     if (!_roles.contains(QStringLiteral("SITE_ATC"))

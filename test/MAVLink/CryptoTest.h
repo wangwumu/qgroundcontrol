@@ -51,6 +51,9 @@ private slots:
     // 责任方闸：只有站点操作员（含 SITE_ATC 身份）的 QGC 才允许建链进 Active
     void _testBeginLinkingRequiresResponsibleParty();
 
+    // 起/终维（2026-10-04 裁定）：只有**该机当前任务起飞站**的 QGC 才允许建链
+    void _testBeginLinkingRequiresInitiatorSite();
+
     // VTOL 自定义消息（80000-80003）：字段排序 + CRC_EXTRA + 往返（纳入加密链路）
     void _testVtolMessages();
 
@@ -113,8 +116,11 @@ private slots:
 
     // `isInManifest` 的取清单口径（Task 6，Task 8 依赖）：必须是
     // `_monitorListActive ? _monitorDevices : _linkedDevices`，**不是**按 `_monitorDevices`
-    // 空否判。⚠️ 本用例会置 `_monitorListActive = true`，而它**没有复位入口** ⇒
-    //    必须声明在所有依赖"未推过清单"的用例**之后**（即 slots 最末）。
+    // 空否判。⚠️ 本用例会置 `_monitorListActive = true`；它**不在 slots 末尾**
+    //    （其后还有 `_testSetMonitorDevicesFetchesOnlyMissing` 等三格），所以"不污染后续用例"
+    //    靠的**不是声明位置**，而是闩**有**复位入口：`CryptoController::setResponsibleParty`
+    //    在会话边界作废清单，而本文件 `init()`（`CryptoTest.cc`）每格**无条件**调它
+    //    ⇒ 每格开头闩恒为 false，顺序**非硬约束**；格内再用 `setMonitorDevices` 显式钉两种取值。
     void _testIsInManifestUsesMonitorListActiveNotEmptiness();
 
     // 主动取密钥时机之二（规范 §2.7.2 e，Task 7）：监控清单**内容变化**时，对尚无本地
