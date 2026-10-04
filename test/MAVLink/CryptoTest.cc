@@ -5,6 +5,7 @@
 #include "Crypto/CryptoHeartbeatExt.h"
 #include "Crypto/CryptoLinkLogger.h"
 #include "Crypto/DeviceID.h"
+#include "Crypto/DeviceKeyManager.h"
 #include "Crypto/MAVLinkCrypto.h"
 #include "Crypto/ReplayGuard.h"
 #include "MAVLinkLib.h"
@@ -2500,6 +2501,69 @@ void CryptoTest::_testReleaseDeviceUnknownDeviceIgnored()
     crypto->releaseDevice(stranger);
     QVERIFY2(!crypto->removeLinkedDevice(stranger),
              "已关联的设备没被 releaseDevice 摘掉 ⇒ 成员资格闸写得太宽，把正常释出也挡了");
+}
+
+// ============================================================================================
+// 批量取密钥（规范 §2.7.2 d，Task 5）
+// 「清单为空 ⇒ 0 次 HTTP」是**设计约束**，不是优化——退化回"全拉一遍"就等于把
+// §2.7.2 的范围收窄整个作废。故本用例钉的是"一个请求都没发"，不是"发得少"。
+//
+// ⚠️ 判据只落在 `keysRequested` 上。**不要**改用"等 100ms 看有没有日志"或"连一个必然
+//    失败的端口看有没有错误"这类时序/副作用判据——它们对「没发」与「发了但失败得很
+//    安静」不可分，而后者正是本模块失败路径的常态（见 `_onReplyFinished`）。
+// ⚠️ `mgr` 是**局部**对象，不是 `CryptoController::instance()->deviceKeyManager()`：
+//    不碰单例就不必担心跨用例污染（既有 `_testAsyncLinkingConfirm` 用完单例要手工复位
+//    `setServerUrl(QString())`，本用例没有这笔账）。
+// ============================================================================================
+void CryptoTest::_testFetchKeysEmptyListMakesNoRequest()
+{
+    DeviceKeyManager mgr;
+    mgr.setServerUrl(QStringLiteral("http://127.0.0.1:1")); // 必然连不上的端口
+    mgr.setAuthToken(QStringLiteral("t"));
+
+    QList<DeviceID> requested;
+    // ⚠️ 必须带 context（这里是 `&mgr`）：本仓禁用了 contextless connect
+    //    （`qobject.h` 里那个候选只收 5 参）⇒ 三参形态编译不过。既有 `.cc` 里每一处
+    //    `connect` 都带 `this` 就是这个原因。
+    QObject::connect(&mgr, &DeviceKeyManager::keysRequested, &mgr,
+                     [&requested](const QList<DeviceID>& ids) { requested += ids; });
+
+    mgr.fetchKeys({});
+    QVERIFY2(requested.isEmpty(), "空列表必须一次请求都不发");
+
+    // 全非法 ID（kInvalidDeviceID / 签名位非法）也要早退，不能把无效 id 拼进 URL。
+    mgr.fetchKeys({ DeviceID(kInvalidDeviceID) });
+    QVERIFY2(requested.isEmpty(), "过滤后为空也必须不发");
+
+    // ‼️ 第二臂：**非零**但签名位非法的 ID 不会被 `id == kInvalidDeviceID` 拦下，
+    //    只能靠 `!hasValidSignatureBit(...)` 拦住。少了这一臂，「只判零」的变异体全绿。
+    mgr.fetchKeys({ static_cast<DeviceID>(0x01000000u) }); // bit24=1 ⇒ 签名位非法
+    QVERIFY2(requested.isEmpty(), "签名位非法的 ID 过滤后为空也必须不发");
+
+    // ---- 阳性对照：非空合法列表**必须**真的发射，且载荷是过滤后的那批 ----
+    // ‼️ 上面三条全是「什么都没发生」型的断言，把 `fetchKeys` 写成空函数体它们**全绿**。
+    //    没有这一臂，本用例证明不了任何事——它只是"没发射"的两个可能原因之一（另一个是没实现）。
+    // ⚠️ 本臂会真的把请求发到 127.0.0.1:1 ⇒ 回包必然失败、必然留下一条 `fetchKeys failed:`
+    //    告警。那是本用例刻意构造的失败回包，不是缺陷（同 `_testAsyncLinkingConfirm` 的口径）。
+    ignoreLogMessage("MAVLink.Crypto.DeviceKeyManager", QtWarningMsg,
+                     QRegularExpression("fetchKeys failed"));
+    QList<DeviceID> sent;
+    QObject::connect(&mgr, &DeviceKeyManager::keysRequested, &mgr,
+                     [&sent](const QList<DeviceID>& ids) { sent = ids; });
+
+    const DeviceID good = makeDeviceID(0, 0, 0x91, 0x05);
+    mgr.fetchKeys({ good });
+    QCOMPARE(static_cast<int>(sent.size()), 1);
+    QCOMPARE(sent.first(), good);
+
+    // 判据取"拉的是哪几个"，不只是"拉没拉"：混进非法 ID 时，载荷必须只剩过滤后的那个。
+    sent.clear();
+    mgr.fetchKeys({ DeviceID(kInvalidDeviceID), good, static_cast<DeviceID>(0x01000000u) });
+    QCOMPARE(static_cast<int>(sent.size()), 1);
+    QCOMPARE(sent.first(), good);
+
+    // 在途的失败回包由 `mgr` 析构时随 `_networkManager` 一并销毁（lambda 的 context 是
+    // `&mgr`，析构即断连）⇒ 不会漂到下个用例去污染别人的 strict mode。
 }
 
 UT_REGISTER_TEST_LIGHTWEIGHT(CryptoTest, TestLabel::Unit)

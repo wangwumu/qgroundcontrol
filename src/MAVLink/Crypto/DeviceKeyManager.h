@@ -10,6 +10,7 @@
 /// 线程安全：密钥缓存由互斥锁保护（接收链路可能多线程查询）。
 
 #include <QtCore/QHash>
+#include <QtCore/QList>
 #include <QtCore/QMutex>
 #include <QtCore/QObject>
 #include <QtCore/QString>
@@ -62,6 +63,16 @@ public:
     /// 完成后发 keyFetched()（成功）或 fetchFailed()（失败）。
     void fetchKey(DeviceID deviceID);
 
+    /// 批量向 gcs_server 获取设备密钥（规范 §2.7.2 d）。
+    ///
+    /// **空列表直接返回，一次 HTTP 都不发**——「清单内为空 ⇒ 0 次请求」是设计约束，
+    /// 不是优化：退化回"全拉一遍"就等于把 §2.7.2 的范围收窄整个作废。
+    /// N=1 也走本路径（服务端 ids 长度 1..N，N=1 合法）。
+    /// 非 0 且签名位合法的 ID 才计入请求；逐条成功则 cacheKey() 并发 keyFetched()，
+    /// 失败**静默**（仅日志，无 fetchFailed——批量响应里没有"某一条失败"的语义，
+    /// 服务端对范围外/未登记的 ID 是**静默跳过**，与不存在不可区分）。
+    void fetchKeys(const QList<DeviceID>& deviceIDs);
+
 signals:
     /// 密钥获取成功（已缓存，可通过 keyForDevice 读取）。
     void keyFetched(DeviceID deviceID);
@@ -69,8 +80,17 @@ signals:
     /// 密钥获取失败。
     void fetchFailed(DeviceID deviceID, const QString& error);
 
+    /// 即将发起批量请求，载荷＝过滤掉非法 ID 后**实际要拉的那批**。
+    /// ⚠️ 生产代码**不连**它：它存在只为让「拉没拉、拉的是哪几个」在测试里可观测
+    ///    （空列表早退发生在它**之前**，故"没收到"即"一个请求都没发"）。
+    void keysRequested(const QList<DeviceID>& deviceIDs);
+
 private:
     void _onReplyFinished(DeviceID deviceID, QNetworkReply* reply);
+
+    /// 批量响应处理。⚠️ 不能复用 `_onReplyFinished`：后者签名带**单一** deviceID，
+    /// 而本响应含多个。
+    void _onBatchReplyFinished(QNetworkReply* reply);
 
     QNetworkAccessManager* _networkManager = nullptr;
     QString _serverUrl;

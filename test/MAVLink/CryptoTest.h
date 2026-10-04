@@ -102,4 +102,8 @@ private slots:
     // **正常臂**调 `confirmLinking()` 进 Active。本文件其余 `beginLinking` 没有一处落到这条
     // 异步臂上，删掉那一句 `confirmLinking()` 现有用例会全绿。
     void _testAsyncLinkingConfirm();
+
+    // 批量取密钥（规范 §2.7.2 d，Task 5）：空列表 / 全非法 ID ⇒ 过滤后为空 ⇒ 一次 HTTP 都不发。
+    // 判据落在新增的 `keysRequested` 信号上（它是"到底有没有发起请求"的唯一可观测点）。
+    void _testFetchKeysEmptyListMakesNoRequest();
 };
