@@ -1,11 +1,18 @@
 #include "MAVLinkCryptoFrameTest.h"
 
+#include <QtCore/QObject>
+#include <QtCore/QRegularExpression>
 #include <QtCore/QScopeGuard>
+#include <QtCore/QVariantList>
+#include <QtNetwork/QNetworkAccessManager>
+#include <QtNetwork/QNetworkReply>
 #include <QtTest/QTest>
 
 #include "Crypto/CryptoCodec.h"
 #include "Crypto/CryptoController.h"
 #include "Crypto/DeviceID.h"
+#include "Crypto/DeviceKeyManager.h"
+#include "Crypto/MAVLinkCrypto.h"
 #include "MAVLinkLib.h"
 #include "MAVLinkProtocol.h"
 #include "MockLink.h"
@@ -27,6 +34,19 @@ constexpr MAVLinkCrypto::DeviceID kPlaintextDeviceID =
 constexpr MAVLinkCrypto::DeviceID kEncryptedDeviceID =
     MAVLinkCrypto::makeDeviceID(0, 0, kEncryptedSysId, kEncryptedCompId);
 
+/// 被动取密钥那一格的两个 deviceID（Task 8）：同样与其它格互不重叠。
+/// 两格共用一份清单，靠 `isInManifest` 的**真假**分开——这样「拉」与「不拉」之间
+/// 只差清单归属这一个变量，不掺进"两次注入的帧有何不同"。
+constexpr uint8_t kInManifestSysId = 0x79;
+constexpr uint8_t kInManifestCompId = 0x44;
+constexpr uint8_t kOutOfManifestSysId = 0x7A;
+constexpr uint8_t kOutOfManifestCompId = 0x45;
+
+constexpr MAVLinkCrypto::DeviceID kInManifestDeviceID =
+    MAVLinkCrypto::makeDeviceID(0, 0, kInManifestSysId, kInManifestCompId);
+constexpr MAVLinkCrypto::DeviceID kOutOfManifestDeviceID =
+    MAVLinkCrypto::makeDeviceID(0, 0, kOutOfManifestSysId, kOutOfManifestCompId);
+
 /// 读数上界（毫秒）。`>= 0` 单独用区分不了「刚刚记的」与「很久以前记的」，真正把
 /// 「刚刚」钉死的是前面那句 `QCOMPARE(..., qint64(-1))`；这条上界是**加固**，用来抓
 /// 「在陈旧时刻记账」这类回归。
@@ -37,6 +57,16 @@ constexpr MAVLinkCrypto::DeviceID kEncryptedDeviceID =
 /// 构造到用例执行之间的间隔，由进程启动 + QGC 初始化决定），1000 会**放它过去**
 /// ——一条恒真的断言等于没有断言。故 200 才是这条加固的判据下限。
 constexpr qint64 kFreshFrameUpperBoundMs = 200;
+
+/// 32 字节试验密钥（内容无关紧要，本用例只问"本地有没有"）。
+MAVLinkCrypto::Key testKey()
+{
+    MAVLinkCrypto::Key key{};
+    for (size_t i = 0; i < key.size(); ++i) {
+        key[i] = static_cast<uint8_t>(i);
+    }
+    return key;
+}
 
 /// 构造一个标准（明文）MAVLink v2 HEARTBEAT 帧的线上字节。
 /// 帧头 layout：0=magic(0xFD) 1=len 2=incompat 3=compat 4=seq 5=sysid 6=compid 7..9=msgid
@@ -97,6 +127,12 @@ void MAVLinkCryptoFrameTest::cleanup()
     // 今天因 deviceID 独占看着无害，但这正是本文件在防的那类跨用例泄漏。
     crypto->resetReplay(kPlaintextDeviceID);
     crypto->resetReplay(kEncryptedDeviceID);
+
+    // gcs_server 地址同样是进程级的：`DeviceKeyManager` 挂在单例上，用例末尾那句
+    // `setServerUrl(QString())` 在**失败路径**上不会执行。配了地址的用例会让 `fetchKeys`
+    // 从"静默早退"变成"真的发请求"，此后任何一次拉取都会多出一条失败的 warning
+    // ——落在别的用例的 strict-mode 日志检查上。故复位点放在这里。
+    crypto->deviceKeyManager()->setServerUrl(QString());
 
     VehicleTestManualConnect::cleanup();
 }
@@ -174,6 +210,97 @@ void MAVLinkCryptoFrameTest::_testEncryptedFrameNotesFrame()
     const qint64 ms = crypto->msSinceLastFrame(deviceID);
     QVERIFY2(ms >= 0 && ms < kFreshFrameUpperBoundMs,
              qPrintable(QStringLiteral("加密帧支必须记收帧时间戳，且须记在防重放检查之前（读数 ms=%1）").arg(ms)));
+}
+
+/// 被动取密钥时机（规范 §2.7.2 e，Task 8）：明文待命心跳支。
+///
+/// 钉的是条件 `!hasKey(deviceID) && isInManifest(deviceID)` 的**两个合取项**，
+/// 外加"确实发了请求"这一事实本身：
+///   ① 清单内 + 本地无密钥 ⇒ 拉 1 个      ← 正面判据：证明这套观测是活的
+///   ② 清单外 + 本地无密钥 ⇒ 一个都不拉   ← 钉 `isInManifest`
+///   ③ 清单内 + 本地有密钥 ⇒ 也不拉       ← 钉 `!hasKey`
+/// ②③ 的断言形态都是"什么都没发生"，**单看没有判别力**（把整块实现删掉它们也绿）。
+/// 它们的判别力全部来自同一个用例里的 ① 做了阳性对照 —— 三格必须同处一个函数，
+/// 拆开就是把 ②③ 变成恒真的装饰。
+///
+/// ‼️ 走的是真入口：`_injectWithCryptoEnabled` → `MAVLinkProtocol::receiveBytes`。
+///    直接调 `beginLinking` 或 `fetchKeys` 都测不到"被动时机"，那是另一回事。
+void MAVLinkCryptoFrameTest::_testPlaintextHeartbeatTriggersFetchOnlyWhenInManifest()
+{
+    MAVLinkCrypto::CryptoController* const crypto = MAVLinkCrypto::CryptoController::instance();
+
+    _connectMockLinkNoInitialConnectSequence();
+    _mockLink->setCommLost(true);
+
+    // ‼️ 必须显式配一个 serverUrl，被动触发才可观测：`fetchKeys` 在 `!isConfigured()` 时
+    //    **静默早退**，且早退排在 `emit keysRequested` **之前** ⇒ 不配的话信号永不发射，
+    //    ① 会红、② 会以"什么都没发生"的理由假绿。端口 1 无人监听（必然被拒），
+    //    只为了让 `isConfigured()` 为真，不发真实流量。
+    crypto->deviceKeyManager()->setServerUrl(QStringLiteral("http://127.0.0.1:1"));
+    crypto->deviceKeyManager()->clearCache();
+
+    // 两次必然失败的请求各打一条 warning。strict mode 下未预期的日志＝用例失败。
+    // `isIgnored` 是逐条匹配、**不消费**规则的 ⇒ 一条规则覆盖同类全部告警。
+    ignoreLogMessage("MAVLink.Crypto.DeviceKeyManager", QtWarningMsg, QRegularExpression("fetchKeys failed"));
+
+    // 清单里只有 kInManifestDeviceID。
+    // ‼️ 必须在挂观察者**之前**推：这一步自己就会触发一次拉取（Task 7 的 `changed` 判据，
+    //    而 `clearCache()` 刚把密钥清空 ⇒ 那一次一定发得出去），那是"主动时机"的信号，
+    //    不属于本用例要钉的"被动时机"。信号是同步发射的，先推后挂即可把它挡在观察窗之外。
+    crypto->setMonitorDevices(QVariantList{ static_cast<uint>(kInManifestDeviceID) }, 5000);
+
+    QList<MAVLinkCrypto::DeviceID> requested;
+    // 用栈上的 `guard` 当 context（不是 `this`、更不是三参写法）：本类对象跨用例不析构，
+    // 而这个 lambda 按引用捕获 `requested` —— 连接若活过本函数，它写的就是已析构的栈帧。
+    // `guard` 出作用域即断开，把这件事交给编译器而不是"记得手动 disconnect"。
+    QObject guard;
+    QObject::connect(crypto->deviceKeyManager(), &MAVLinkCrypto::DeviceKeyManager::keysRequested, &guard,
+                     [&requested](const QList<MAVLinkCrypto::DeviceID>& ids) { requested += ids; });
+
+    // 前置：两格的清单归属确实是一真一假。少了这两句，② 有可能因为"清单其实也含它"而恒真。
+    QVERIFY2(crypto->isInManifest(kInManifestDeviceID), "前置：①的 deviceID 必须在清单内");
+    QVERIFY2(!crypto->isInManifest(kOutOfManifestDeviceID), "前置：②的 deviceID 必须不在清单内");
+
+    // ① 清单内 + 本地无密钥 ⇒ 被动拉 1 个
+    // 变异自证：删掉 `MAVLinkProtocol.cc` 里那段被动拉取 ⇒ 此处变红（`requested` 为空）。
+    _injectWithCryptoEnabled(plaintextHeartbeatFrame(kInManifestSysId, kInManifestCompId));
+    QCOMPARE(requested, QList<MAVLinkCrypto::DeviceID>{ kInManifestDeviceID });
+
+    // ② 清单外 + 本地无密钥 ⇒ 一个都不拉
+    // 变异自证：把判断里的 `isInManifest(deviceID)` 去掉 ⇒ 此处变红（会多出 kOutOfManifestDeviceID）。
+    requested.clear();
+    _injectWithCryptoEnabled(plaintextHeartbeatFrame(kOutOfManifestSysId, kOutOfManifestCompId));
+    QVERIFY2(requested.isEmpty(), "清单外的 deviceID 一律不拉（规范 §2.7.2 e）");
+
+    // ③ 清单内 + 本地**已有**密钥 ⇒ 也不拉
+    //    这一格钉的是合取项 `!hasKey(deviceID)`。①② 都盖不到它：① 里 `hasKey` 为假，
+    //    ② 里第一个合取项为真、被 `isInManifest` 短路。少了这一格，把 `!hasKey(...)` 整个
+    //    删掉（于是每架在飞飞机 1 Hz 的心跳各触发一次 HTTP，清单多大就是多少次/秒）
+    //    在本文件里**一条断言都不会变红**。
+    //
+    //    ⚠️ 前置：本格是全文第一处让建链闸 `state()==Standby && hasKey(deviceID)` 成真的地方
+    //       （①② 无密钥，从不进闸），因此 `beginLinking` 会被**真正调用**。非责任方在入口
+    //       静默 return，那正是本进程的常态；但若本进程其实是责任方，它会真的进 Linking、
+    //       改动加密状态机与失联监测——那测的就不是本用例要测的东西了。宁可按前置失败报出来，
+    //       也不要让它静默地测成另一回事。
+    QVERIFY2(!crypto->isResponsibleParty(),
+             "前置：本格假定本进程是非责任方（BEGINLINKING 入口静默返回）；若本进程已是责任方，"
+             "本格会真的建链，须重新设计");
+    requested.clear();
+    crypto->deviceKeyManager()->cacheKey(kInManifestDeviceID, testKey());
+    _injectWithCryptoEnabled(plaintextHeartbeatFrame(kInManifestSysId, kInManifestCompId));
+    QVERIFY2(requested.isEmpty(), "本地已有密钥的 deviceID 不得重复拉取（否则每架飞机每次心跳一次 HTTP）");
+    crypto->deviceKeyManager()->removeKey(kInManifestDeviceID);
+
+    // ---- 把上面两次请求的 HTTP 副作用在**本用例内**消化掉 ----
+    // 这个 QNAM 是单例 `DeviceKeyManager` 的值成员，**进程内不析构** ⇒ 不排空的话，那两条
+    // 失败的 reply 会落在后续的事件循环里，以"未预期日志"把别人判红。
+    // 判据用"NAM 名下不再挂着子 reply"（`nam->get()` 的返回值就以 it 为 parent），
+    // 比数数耐用：无论漏了几条都在这儿收干净。
+    QNetworkAccessManager* const nam = crypto->deviceKeyManager()->findChild<QNetworkAccessManager*>();
+    QVERIFY2(nam != nullptr, "DeviceKeyManager 必须持有一个以自身为 parent 的 QNAM");
+    // ⚠️ 条件式等待，不是固定延时（本仓 Golden Rule 禁止 `QTest::qWait(<毫秒>)`）。
+    QTRY_VERIFY_WITH_TIMEOUT(nam->findChildren<QNetworkReply*>().isEmpty(), 5000);
 }
 
 UT_REGISTER_TEST(MAVLinkCryptoFrameTest, TestLabel::Integration, TestLabel::Comms)

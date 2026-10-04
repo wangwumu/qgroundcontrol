@@ -214,6 +214,35 @@ void MAVLinkProtocol::_receiveEncryptedBytes(LinkInterface* link, const SharedLi
             // ⚠️ 两处收帧点必须都记——只记心跳会让判据在接引成功那一刻起永久失效。
             MAVLinkCrypto::CryptoController::instance()->noteDeviceFrame(deviceID);
 
+            // 被动取密钥时机（规范 §2.7.2 e）：收到明文待命心跳但本地无该密钥、且它在清单内 ⇒ 拉 1 个。
+            //
+            // ⚠️ 位置必须在下面那个建链闸**之前**：闸的两个合取项之一就是 `hasKey(deviceID)`，
+            //    而整个 §2.7.2 的存在前提就是"本地起初没有密钥"——把触发放在闸后面，
+            //    这一帧只会因为"没密钥"而被闸拒之门外，然后什么都不发生，永远等不到密钥。
+            //    （`CryptoController.cc` 自动建链路径上那个 `else { fetchKey(...) }` 同理不可达。）
+            //
+            // ⚠️ 边界是「清单外的一律不拉」：清单 = 登录用户所属站点/航线名册对应的设备，
+            //    由 `CryptoController::isInManifest` 单点持有口径
+            //    （`_monitorListActive ? _monitorDevices : _linkedDevices`）。
+            //    这里**不**再写一遍判据，避免第二套会漂移的清单定义。
+            //
+            // ⚠️ `!hasKey` 不是冗余：已缓存的设备再收到心跳是常态（每架在飞飞机 1 Hz），
+            //    少了它就是对同一架飞机每秒一次 HTTP。
+            //
+            // ⚠️ 加密帧支**不设**同样的触发，这是刻意的：无密钥时 `_processEncryptedFrame`
+            //    在查密钥处就打了日志 return（`:307`/`:311`），根本走不到它自己的闸；
+            //    而对端在收到 QGC 的加密回应之前只发明文待命心跳（规范 §3.1）
+            //    ⇒ 把被动触发挂在解密失败处永远等不到。所以被动落点**只有**本分支。
+            // ⚠️ 单独开一个作用域而不是复用下面那个 `crypto`：下面几行才声明同名变量，
+            //    这里若再声明一次就是 shadow（本仓 `-Wshadow -Werror`，编译直接失败）；
+            //    而把那句声明挪上来又是对既有行的改动——建链闸附近**一个字都不许动**。
+            {
+                MAVLinkCrypto::CryptoController* const crypto = MAVLinkCrypto::CryptoController::instance();
+                if (!crypto->deviceKeyManager()->hasKey(deviceID) && crypto->isInManifest(deviceID)) {
+                    crypto->deviceKeyManager()->fetchKeys({ deviceID });
+                }
+            }
+
             // 自动建链（C2 修正）：待命心跳声明 PX4 在线，且本地已缓存该 deviceID 的密钥 → 自动建链。
             // 否则 QGC 初始连接状态机发出的 COMMAND_LONG 等命令在 Standby 下全被 LinkInterface 丢弃，
             // PX4 永远收不到任何请求 → 初始连接死锁（航线 UI 又依赖连接完成，形成鸡生蛋）。

@@ -25,4 +25,12 @@ private:
 private slots:
     void _testPlaintextHeartbeatNotesFrame();
     void _testEncryptedFrameNotesFrame();
+
+    /// 被动取密钥时机（规范 §2.7.2 e，Task 8）：明文待命心跳支。
+    ///
+    /// ‼️ 必须声明在**最后**：本用例会置 `_monitorListActive = true`（无复位入口，全仓只有
+    ///    `setResponsibleParty` 会在会话边界清它）并设上 `_serverUrl`。两个都是**进程级**状态，
+    ///    排在前面会把"清单未生效 ⇒ 回退 `_linkedDevices`"这类判据的基础态污染掉。
+    ///    moc 按声明顺序生成，故"最后"＝"最后跑"。
+    void _testPlaintextHeartbeatTriggersFetchOnlyWhenInManifest();
 };
