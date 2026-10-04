@@ -165,6 +165,38 @@ void CryptoController::setMonitorDevices(const QVariantList& deviceIds, int fram
     if (changed) {
         requestAcceleratedRegistration();
     }
+
+    // 主动取密钥时机之二（规范 §2.7.2 e）：监控清单**内容变化**时，对尚无本地密钥的 ID 批量拉。
+    //
+    // ⚠️ 监控员的取密钥**纯粹用于解密**——`responsibleParty=false` 使其全程不建链
+    //    （`beginLinking` 入口的责任方闸），拉 key 只是为了并行解密多架遥测。
+    //    与站点侧 `addLinkedDevice` 的逐条拉取同属「主动」，但落点不同：那份清单是
+    //    一个个接手过来的，这一份是**整份推来**的，所以这里是**一次批量**。
+    //
+    // ‼️ 判据必须是 `changed`，**不是**"被调用了一次"，也不是 `_monitorListActive`：
+    //    调用方 `RomView.qml` 由每轮 `routeTasksUpdated` 驱动 ⇒ 不加本判据就是每轮一次
+    //    HTTP；而 `_monitorListActive` 在上面那个锁块里是**无条件**置位的（空清单同样生效），
+    //    拿它当"清单变了"的判据恒真。
+    //
+    // ⚠️ 锁**外**发（与 `addLinkedDevice` 同理）：`fetchKeys` 内部会 `emit keysRequested`，
+    //    持锁 emit 会把信号处理器拖进临界区（`_mutex` 非递归）。`missing` 在锁内算、锁外发。
+    // ⚠️ 这里**不**写 `if (!missing.isEmpty())`：空列表早退已在 `DeviceKeyManager::fetchKeys`
+    //    里钉住（Task 5 的用例守着），再判一次就是第二个会漂移的判据。
+    if (changed) {
+        QList<DeviceID> missing;
+        {
+            const QMutexLocker locker(&_mutex);
+            for (DeviceID id : _monitorDevices) {
+                // `hasKey` 取的是 `_keyManager` 自己的锁（`_cacheMutex`）。两把锁的获取顺序
+                // 全仓只有 `_mutex` → `_cacheMutex` 这一个方向：`_keyManager` 不回调本类，
+                // 且它 `emit keyFetched` 在 `cacheKey` 的锁**之外** ⇒ 无反转。
+                if (!_keyManager.hasKey(id)) {
+                    missing << id;
+                }
+            }
+        }
+        _keyManager.fetchKeys(missing); // ⚠️ 值成员，用 `.` 不是 `->`
+    }
 }
 
 int CryptoController::frameTimeoutMs() const

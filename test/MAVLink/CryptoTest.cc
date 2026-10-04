@@ -266,6 +266,38 @@ ExtRoundTrip roundTripExt(const QByteArray& extFrame, const Key& key, DeviceID d
     return rt;
 }
 
+/// 把 `n` 次批量取密钥留下的 HTTP 副作用在**当前用例内**消化掉。
+///
+/// 为什么必须做：`DeviceKeyManager` 的 `QNetworkAccessManager` 挂在单例 `CryptoController` 的
+/// 值成员上，**进程内不析构** ⇒ 不做的话，那些 reply 会落在**下一个**用例的事件循环里，
+/// 以"未预期日志"把别人判红（strict mode）。本函数只等 `finished` 信号，不解析结果。
+///
+/// ⚠️ 必须在**首次转事件循环之前**调用：`QSignalSpy` 只记它创建**之后**发出的信号，而本文件
+///    这些用例的断言全是同步的（`QCOMPARE`/`QVERIFY` 不转事件循环）⇒ 只要还在同一个函数体里
+///    就来得及。若哪天在中间插了会转事件循环的东西，这里会**少收到**信号从而由下面那个 QTRY
+///    超时——失败得很响，不会静默变绿。
+/// ⚠️ 用 `QTRY_COMPARE_WITH_TIMEOUT`（条件式等待）而**不是** `QTest::qWait(<毫秒>)`：
+///    本仓 Golden Rule 禁止固定延时。
+void absorbPendingKeyFetches(CryptoController* crypto, int n)
+{
+    QNetworkAccessManager* nam = crypto->deviceKeyManager()->findChild<QNetworkAccessManager*>();
+    QVERIFY2(nam != nullptr, "DeviceKeyManager 必须持有一个以自身为 parent 的 QNAM");
+    QSignalSpy finishedSpy(nam, &QNetworkAccessManager::finished);
+
+    // ① 本用例那 n 次请求必须真的落地（正面判据：证明这套 HTTP 观测不是死的）。
+    //    ⚠️ 用 `>=` 而**不是** `==`：更早的用例若因断言失败中途 return，它的 reply 会残留到
+    //       本次的事件循环里，`==` 会把**别人**的红记到这一格上、掩盖真正的失败点。实测过：
+    //       变异 B 下这一格报 `finishedSpy.count() = 3` 而期望 2，多出来那条属于上一个用例
+    //       （前一个断言刚失败、还没来得及走本函数）。判"到底发了几次请求"是上面
+    //       `QCOMPARE(requested, …)` 的职责，不是这里的。
+    QTRY_VERIFY_WITH_TIMEOUT(finishedSpy.count() >= n, 5000);
+
+    // ② 再把网络层**彻底**排空，确保什么都不漂给下一个用例。`QNAM` 就是 reply 的 parent
+    //    （`nam->get()` 的返回值），没有挂着的子 reply 即已排空——这比数数更耐用：
+    //    无论上一个用例漏了几条，这里都替它收干净。
+    QTRY_VERIFY_WITH_TIMEOUT(nam->findChildren<QNetworkReply*>().isEmpty(), 5000);
+}
+
 } // namespace
 
 void CryptoTest::init()
@@ -2616,18 +2648,14 @@ void CryptoTest::_testAddLinkedDeviceFetchesOnlyWhenKeyMissing()
     QVERIFY2(requested.isEmpty(), "已在 _linkedDevices 里的 ID 不得重复触发拉取");
 
     // ---- 把上面那次拉取的 HTTP 副作用在**本用例内**消化掉 ----
-    // ‼️ `fetchKeys` 没有 `isConfigured()` 早退（Task 5 的裁定），所以哪怕 `_serverUrl`
-    //    是空的，上面那次也**真的**发了一个请求。这个 reply 归属单例的 `_networkManager`
-    //    ——不随用例析构——它的失败日志若漂到下一个用例的事件循环里，会在那个用例的
-    //    strict-mode 日志检查上变红（一条与它毫无关系的警告）。所以必须在这里等到它落地。
-    QNetworkAccessManager* nam = keyMgr->findChild<QNetworkAccessManager*>();
-    QVERIFY2(nam != nullptr, "DeviceKeyManager 必须持有一个以自身为 parent 的 QNAM");
-    QSignalSpy finishedSpy(nam, &QNetworkAccessManager::finished);
-    // 允许那条失败警告出现**一次**（规则被匹配即消费，不是整条用例豁免）。
+    // ‼️ 本用例的 `_serverUrl` 是**显式设过**的（见上方），所以上面那次是真的发了一个请求。
+    //    （`fetchKeys` 未配置时静默早退——Task 6 的 Ruling AD；本用例正是因为配了才观测得到。）
+    //    这个 reply 归属单例的 `_networkManager` ——不随用例析构——它的失败日志若漂到下一个
+    //    用例的事件循环里，会在那个用例的 strict-mode 日志检查上变红（一条与它毫无关系的警告）。
+    // 允许那条失败警告出现（规则被匹配即消费，不是整条用例豁免）。
     ignoreLogMessage("MAVLink.Crypto.DeviceKeyManager", QtWarningMsg,
                      QRegularExpression("fetchKeys failed"));
-    // ⚠️ 不用 `QTest::qWait(<毫秒>)`：本仓 Golden Rule 禁止固定延时。等的是**信号**不是时间。
-    QVERIFY2(finishedSpy.wait(5000), "那次拉取的 HTTP 必须在本用例内落地");
+    absorbPendingKeyFetches(crypto, 1);
 
     // 还原单例的 serverUrl：它是 CryptoController 的值成员，本用例改了就一直在。
     keyMgr->setServerUrl(QString());
@@ -2660,6 +2688,133 @@ void CryptoTest::_testIsInManifestUsesMonitorListActiveNotEmptiness()
     // 复位：`_monitorListActive` 的置位无法撤销，只把清单内容与 `_linkedDevices` 清干净。
     crypto->setMonitorDevices(QVariantList(), 0);
     crypto->removeLinkedDevice(id);
+}
+
+// 监控清单**内容变化**时，只对尚无本地密钥的 ID 触发一次批量拉取（主动时机之二）。
+void CryptoTest::_testSetMonitorDevicesFetchesOnlyMissing()
+{
+    CryptoController* crypto = CryptoController::instance();
+    DeviceKeyManager* keyMgr = crypto->deviceKeyManager();
+
+    const DeviceID cached = 10001048;
+    const DeviceID missingA = 10000385;
+    const DeviceID missingB = 10000030;
+
+    // ‼️ 判据落在 `keysRequested` 上，而该信号在 `fetchKeys` 里**排在 `isConfigured()` 早退
+    //    之后**（Task 6 的 Ruling AD）⇒ 不配 `_serverUrl` 时它**永远不会发**，"没收到"就同时
+    //    意味着"没配服务器"，观测整体失效（本用例的 RED 阶段实测踩到过：把 `_serverUrl` 留空
+    //    时三条断言全红，且红法与"实现没写"不可区分）。故必须配一个必然被拒的端口，只为让信号
+    //    可达；**不发真实流量**（127.0.0.1:1 上没有任何监听）。
+    // ⚠️ 显式设一遍而不依赖"Task 6 那个用例复原过"——本文件用例按 `.h` 的声明顺序执行，
+    //    但顺序依赖是能免则免的东西。
+    keyMgr->setServerUrl(QStringLiteral("http://127.0.0.1:1"));
+    keyMgr->clearCache();
+    keyMgr->cacheKey(cached, testKey());
+
+    // 先把清单清空 ⇒ 下面那次非空推送**必定**是"内容变化"，与前面跑过什么无关。
+    // （空清单 ⇒ `missing` 为空 ⇒ 本行本身一次 HTTP 都不发。）
+    crypto->setMonitorDevices(QVariantList(), 5000);
+
+    QList<DeviceID> requested;
+    // ⚠️ context 必须是**能析构**的对象：`CryptoController` 是 `Q_APPLICATION_STATIC` 单例、
+    //    进程内永不析构，拿它当 context 会让这个捕获 `&requested` 的 lambda 活过本栈帧。
+    QObject guard;
+    // ⚠️ 本仓禁用了 contextless connect（`qobject.h` 那个候选只收 5 参）。
+    QObject::connect(keyMgr, &DeviceKeyManager::keysRequested, &guard,
+                     [&requested](const QList<DeviceID>& ids) { requested += ids; });
+
+    crypto->setMonitorDevices(QVariantList{ static_cast<uint>(cached),
+                                            static_cast<uint>(missingA),
+                                            static_cast<uint>(missingB) }, 5000);
+
+    // 顺序也要对：`_monitorDevices` 的顺序就是推上来的顺序。
+    QCOMPARE(requested, QList<DeviceID>({ missingA, missingB }));
+
+    // 收尾：把那次拉取的 HTTP 副作用在**本用例内**消化掉，并复原单例的 `_serverUrl`
+    // （它是 `CryptoController` 的值成员，本用例改了就一直在）。
+    ignoreLogMessage("MAVLink.Crypto.DeviceKeyManager", QtWarningMsg,
+                     QRegularExpression("fetchKeys failed"));
+    absorbPendingKeyFetches(crypto, 1);
+    crypto->setMonitorDevices(QVariantList(), 5000);
+    keyMgr->removeKey(cached);
+    keyMgr->setServerUrl(QString());
+}
+
+// ‼️ 清单内容**没变**时不得重复拉：`routeTasksUpdated` 每轮都推，不判 `changed` 就是每轮一次 HTTP。
+void CryptoTest::_testSetMonitorDevicesUnchangedDoesNotRefetch()
+{
+    CryptoController* crypto = CryptoController::instance();
+    DeviceKeyManager* keyMgr = crypto->deviceKeyManager();
+
+    const DeviceID first = 10000385;
+    const DeviceID second = 10000030;
+
+    keyMgr->setServerUrl(QStringLiteral("http://127.0.0.1:1")); // 理由同上一格
+    keyMgr->clearCache();
+
+    // 首推（**不**捕获）：把清单撑成 {first}。⚠️ `first` 刻意**不**预置密钥——若预置了，
+    // 下面"删掉 `changed` 判据"的变异体在第二次推送时算出的 `missing` 仍为空 ⇒ 变异体也会
+    // 全绿，本用例就退化成了装饰。
+    crypto->setMonitorDevices(QVariantList(), 5000);
+    crypto->setMonitorDevices(QVariantList{ static_cast<uint>(first) }, 5000);
+
+    QList<DeviceID> requested;
+    QObject guard;
+    QObject::connect(keyMgr, &DeviceKeyManager::keysRequested, &guard,
+                     [&requested](const QList<DeviceID>& ids) { requested += ids; });
+
+    crypto->setMonitorDevices(QVariantList{ static_cast<uint>(first) }, 5000);
+    QVERIFY2(requested.isEmpty(), "集合未变不得重复触发拉取");
+
+    // ‼️ **阳性对照**：把"没收到"与"这套观测整体是死的"分开。只断言"什么都没发生"的用例，
+    //    在 `keysRequested` 压根没接上、或 `changed` 恒为 false 时**照样全绿**。
+    // ⚠️ 期望值是**两个**不是 `{second}`：上面那次拉取发的是 127.0.0.1:1，必然失败 ⇒
+    //    `first` 至今仍无本地密钥 ⇒ 两个都要拉。
+    crypto->setMonitorDevices(QVariantList{ static_cast<uint>(first), static_cast<uint>(second) }, 5000);
+    QCOMPARE(requested, QList<DeviceID>({ first, second }));
+
+    ignoreLogMessage("MAVLink.Crypto.DeviceKeyManager", QtWarningMsg,
+                     QRegularExpression("fetchKeys failed"));
+    absorbPendingKeyFetches(crypto, 2); // 首推 1 次 + 阳性对照 1 次
+    crypto->setMonitorDevices(QVariantList(), 5000);
+    keyMgr->setServerUrl(QString());
+}
+
+// 清单为空 ⇒ 一次 HTTP 都不发（Review Focus #1）。
+void CryptoTest::_testSetMonitorDevicesEmptyFetchesNothing()
+{
+    CryptoController* crypto = CryptoController::instance();
+    DeviceKeyManager* keyMgr = crypto->deviceKeyManager();
+
+    const DeviceID first = 10000385;
+    const DeviceID second = 10000030;
+
+    keyMgr->setServerUrl(QStringLiteral("http://127.0.0.1:1")); // 理由同上
+    keyMgr->clearCache();
+
+    // 先撑开成非空，让下面那次空推送**必定**是"内容变化"（否则 `changed` 为 false，
+    // 空清单不发请求就成了假绿——那判的压根不是空清单这一格）。
+    crypto->setMonitorDevices(QVariantList(), 5000);
+    crypto->setMonitorDevices(QVariantList{ static_cast<uint>(first) }, 5000);
+
+    QList<DeviceID> requested;
+    QObject guard;
+    QObject::connect(keyMgr, &DeviceKeyManager::keysRequested, &guard,
+                     [&requested](const QList<DeviceID>& ids) { requested += ids; });
+
+    crypto->setMonitorDevices(QVariantList(), 5000);
+    QVERIFY2(requested.isEmpty(), "空清单必须一次 HTTP 都不发");
+
+    // ‼️ **阳性对照**：紧接一次非空推送必须真的拉。否则"空清单不发"与"这套路径整个是死的"
+    //    在断言上无法区分——而后者恰恰是最可能的实现错误（比如把拉取写进了错误的 `if`）。
+    crypto->setMonitorDevices(QVariantList{ static_cast<uint>(second) }, 5000);
+    QCOMPARE(requested, QList<DeviceID>({ second }));
+
+    ignoreLogMessage("MAVLink.Crypto.DeviceKeyManager", QtWarningMsg,
+                     QRegularExpression("fetchKeys failed"));
+    absorbPendingKeyFetches(crypto, 2); // 撑开时 1 次 + 阳性对照 1 次
+    crypto->setMonitorDevices(QVariantList(), 5000);
+    keyMgr->setServerUrl(QString());
 }
 
 UT_REGISTER_TEST_LIGHTWEIGHT(CryptoTest, TestLabel::Unit)

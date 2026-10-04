@@ -116,4 +116,12 @@ private slots:
     // 空否判。⚠️ 本用例会置 `_monitorListActive = true`，而它**没有复位入口** ⇒
     //    必须声明在所有依赖"未推过清单"的用例**之后**（即 slots 最末）。
     void _testIsInManifestUsesMonitorListActiveNotEmptiness();
+
+    // 主动取密钥时机之二（规范 §2.7.2 e，Task 7）：监控清单**内容变化**时，对尚无本地
+    // 密钥的 ID 触发**一次批量**拉取。
+    // ⚠️ 三格都在钉 `changed` 这个判据：变了才拉 / 没变不拉 / 空清单不拉。
+    //    判据同样落在 `keysRequested` 上（与 Task 5/6 同一套观测点）。
+    void _testSetMonitorDevicesFetchesOnlyMissing();
+    void _testSetMonitorDevicesUnchangedDoesNotRefetch();
+    void _testSetMonitorDevicesEmptyFetchesNothing();
 };
