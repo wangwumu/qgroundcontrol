@@ -240,7 +240,24 @@ public:
 
     /// 声明本 QGC 关联的 PX4 deviceID（加入登记心跳 payload）。
     /// 单设备场景：建链目标 deviceID 即关联对象。
-    void addLinkedDevice(DeviceID deviceID);
+    ///
+    /// 站点视图下由 `OpsShell._adoptSiteDevice` 调用——它是清单**新增侧**的入口，
+    /// 与 `releaseDevice`（消失侧）是同一对操作的两半。
+    /// ‼️ 因此**必须**是 `Q_INVOKABLE`：QML 引擎只认 `Q_INVOKABLE`/slot/`Q_PROPERTY`，
+    ///    写成普通成员函数时 `cryptoController.addLinkedDevice(...)` 在 QML 里是
+    ///    **运行时** `TypeError`（不是编译错误，Qt 构建不会报）。
+    ///    加了它也只是让 QML 够得着；本函数自身不做任何危险动作——纯累加，
+    ///    随后那次取密钥还要过服务端的可接引范围闸（§2.7.2 d）。
+    ///
+    /// ‼️ 形参刻意拼 `quint32` 而**不是** `DeviceID`——两者是同一个类型（`using DeviceID
+    ///    = uint32_t`），但 moc 是**按字面**解析的：写 `DeviceID` 时它不认得这个 typedef，
+    ///    于是把形参记成"未解析类型"（生成的 moc 里是 `0x80000000 | <串表下标>`，
+    ///    类型名逐字 `"DeviceID"`），而全仓**没有**任何 `DeviceID` 的 metatype 注册。
+    ///    写 `quint32` 则直接解析成 `QMetaType::UInt`。本类其余 QML 入口
+    ///    （`releaseDevice` / `reRegisterDevice` / `msSinceLastFrame`）拼的也都是 `quint32`。
+    ///    ⚠️ 不要把它"改回" `DeviceID`——那样 C++ 侧照常编译、测试照常通过，
+    ///    只有 QML 调用会在运行时失效。
+    Q_INVOKABLE void addLinkedDevice(quint32 deviceID);
 
     /// 撤销一条关联（从登记心跳 payload 里移除该 deviceID）。
     /// ⚠️ 只有**逐条撤销**这一档，**没有 `clear()`**：本集合的语义是"本 GCS 还关联哪些
@@ -248,6 +265,16 @@ public:
     ///    会把一次误判放大成整个站点掉线（mavp2p 侧全部配对在 `MAP_TTL` 后过期）。
     /// @return true=该 deviceID 原本在集合里，已移除；false=本来就不在（幂等）
     bool removeLinkedDevice(DeviceID deviceID);
+
+    /// 该 deviceID 是否在**本机当前清单**内。
+    ///
+    /// 口径与取清单那几处**逐字相同**（它们现在共用 `_manifestLocked()`）：
+    /// `_monitorListActive ? _monitorDevices : _linkedDevices`。
+    /// ‼️ **不是** `_monitorDevices.isEmpty() ? _linkedDevices : _monitorDevices`——后者会把
+    ///    "生效的空清单"读成"没有清单"，于是签出释出最后一架之后，本端又认为那架"还在清单内"。
+    /// ‼️ 用途：判断"现在能不能被动接引这个 ID"（`MAVLinkProtocol` 的明文待命心跳支）。
+    ///    它与 `hasKey` 是**两件事**——`hasKey` 说"我手上有钥匙"，本函数说"这架归我管"。
+    bool isInManifest(DeviceID deviceID) const;
 
     /// **签出释出**：某架飞机签出后，本站在本地交还关于它的一切。
     ///
@@ -469,6 +496,18 @@ private:
 
     void _onKeyFetched(DeviceID deviceID);
     void _onFetchFailed(DeviceID deviceID, const QString& error);
+
+    /// 本机当前生效的清单（返回**成员本身的引用**，不拷贝）。
+    ///
+    /// ‼️ 独占的取清单口径，判据是 `_monitorListActive` 而**不是** `_monitorDevices.isEmpty()`：
+    ///    清单生效之后被摘空（签出释出最后一架）是"本 GCS 在线、暂不关联任何 PX4"，
+    ///    绝不是"回退到 `_linkedDevices` 全体"——那会把刚释出的飞机原地登记回去。
+    ///    这个口径原先在三个地方各写了一遍（批次计数、`_sendRegistration`、
+    ///    `isInManifest`），改一处漏两处不会报错，只会让"这一轮该发几架"和
+    ///    "实际发出去的集合"悄悄对不上。抽成一个函数就是为了它们不可能再漂。
+    /// ⚠️ 调用方**须已持 `_mutex`**（返回的是成员引用）。
+    const QList<DeviceID>& _manifestLocked() const;
+
     void _sendRegistration(); ///< 发送 80005 登记/保活心跳（周期触发）
     /// 把一批 deviceID 组帧并发出（§3.3 的组帧 + UDP link 过滤 + sent 日志）。
     /// 抽出来是为了让定向重发（`reRegisterDevice`）复用同一套逻辑，

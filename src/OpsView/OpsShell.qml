@@ -655,6 +655,18 @@ Item {
         if (v && v.trajectoryPoints) v.trajectoryPoints.clear()
     }
 
+    /// 接手一架飞机：把它的 deviceID 推入 C++ 侧的登记集合，并（在本地尚无密钥时）
+    /// 让它去 gcs_server 取那一个密钥。
+    /// ‼️ 与 `_releaseSiteDevice` 是**同一对操作的两半**，必须同时在场：只释不加 ⇒
+    ///    登录响应已不再下发 `devices`（规范 §2.7.2 c）之后，站点操作员**彻底建不了链**。
+    /// ⚠️ `addLinkedDevice` 必须是 `Q_INVOKABLE`（`CryptoController.h` 里已注明原因）：
+    ///    普通成员函数在 QML 里是**运行时** `TypeError`，Qt 构建不会报。
+    /// ⚠️ 它只做「推入集合 + 按需取密钥」；真正能否接引仍由服务端的可接引范围闸决定
+    ///    （§2.7.2 d）——客户端不判第二遍。
+    function _adoptSiteDevice(deviceID) {
+        cryptoController.addLinkedDevice(deviceID)
+    }
+
     //---- 接口封装 ----
     function _fetchOverview() {
         _get("/api/ops/overview?view=" + opsShell.overviewView, function(status, data) {
@@ -692,6 +704,24 @@ Item {
                         var _ovGone = Number(_ovPrev[_pi])
                         if (!(_ovGone > 0) || _ovNow[_ovGone]) continue
                         opsShell._releaseSiteDevice(_ovGone)
+                    }
+                    //---- 接手（与上面的释出**对称**，同用 `!routeLayersEnabled` 闸）----
+                    // 判据：一个 device_id 在**本轮**列表里新出现。
+                    // ‼️ 与释出共用同一个 diff 块是有意的——清单的「加」与「减」是同一件事的
+                    //    两半，分成两处判据必然漂移。**不要**另起 `onPolled` 处理器或新信号。
+                    // ⚠️ 闸的理由与释出侧不同、但同样必要：监控员视图走的是 `setMonitorDevices`
+                    //    那条通道（`_monitorDevices`），它**不建链**（responsibleParty=false）
+                    //    ⇒ 往 `_linkedDevices` 里塞会让两条通道互相污染。
+                    // ⚠️ `_ovPrev` 初值是空数组（`_siteDeviceIdsKey` 初值空串 ⇒ `"" .length` 为 0）
+                    //    ⇒ **首轮所有 ID 都算"新出现"**，一次性全推。这正是首拉该做的事，与
+                    //    `_siteDeviceIdsKey` 声明里"空数组的异常响应不会释放整站"不冲突：
+                    //    那条管的是**释放**，这里是**接手**，方向相反。
+                    var _ovBefore = {}
+                    for (var _bi = 0; _bi < _ovPrev.length; _bi++) _ovBefore[Number(_ovPrev[_bi])] = true
+                    for (var _ai = 0; _ai < _ovIds.length; _ai++) {
+                        var _ovNew = Number(_ovIds[_ai])
+                        if (!(_ovNew > 0) || _ovBefore[_ovNew]) continue
+                        opsShell._adoptSiteDevice(_ovNew)
                     }
                 }
             }

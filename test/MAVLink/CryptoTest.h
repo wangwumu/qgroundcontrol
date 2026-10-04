@@ -106,4 +106,14 @@ private slots:
     // 批量取密钥（规范 §2.7.2 d，Task 5）：空列表 / 全非法 ID ⇒ 过滤后为空 ⇒ 一次 HTTP 都不发。
     // 判据落在新增的 `keysRequested` 信号上（它是"到底有没有发起请求"的唯一可观测点）。
     void _testFetchKeysEmptyListMakesNoRequest();
+
+    // 站点视图清单的 adopt 侧（规范 §2.7.2 e，Task 6）：`addLinkedDevice` 只在
+    // "**新**加入且本地尚无密钥"时触发一次拉取。判据同样落在 `keysRequested` 上。
+    void _testAddLinkedDeviceFetchesOnlyWhenKeyMissing();
+
+    // `isInManifest` 的取清单口径（Task 6，Task 8 依赖）：必须是
+    // `_monitorListActive ? _monitorDevices : _linkedDevices`，**不是**按 `_monitorDevices`
+    // 空否判。⚠️ 本用例会置 `_monitorListActive = true`，而它**没有复位入口** ⇒
+    //    必须声明在所有依赖"未推过清单"的用例**之后**（即 slots 最末）。
+    void _testIsInManifestUsesMonitorListActiveNotEmptiness();
 };

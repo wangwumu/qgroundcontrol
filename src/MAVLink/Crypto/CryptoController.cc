@@ -203,10 +203,10 @@ void CryptoController::requestAcceleratedRegistration()
         //    `ceil(n/16)` 少排一批，而追加在末尾的 `_activeDeviceID` 恰好总落在最后一批
         //    ⇒ 它这一轮永远取不到、要等下一个 10s 周期——而那架正是用户刚选定、
         //    正在建链的目标。改完 n = 这一轮真正要发的总量。
-        // ‼️ 与 `_sendRegistration()` 同口径：`_monitorListActive` 而不是
-        //    `_monitorDevices.isEmpty()`（理由见那一处）。两处必须一起改，
-        //    否则"这一轮要发几架"与实际发出去的集合会对不上。
-        const QList<DeviceID>& devices = _monitorListActive ? _monitorDevices : _linkedDevices;
+        // ‼️ 与 `_sendRegistration()` 同口径：走同一个 `_manifestLocked()`，两处不可能再漂
+        //    （口径本身"为什么是 `_monitorListActive` 而不是 `_monitorDevices.isEmpty()`"
+        //    见那个函数的声明处，这里刻意不再复述——复述就是下一个漂移点）。
+        const QList<DeviceID>& devices = _manifestLocked();
         listSize = devices.size();
         n = listSize;
         if (_activeDeviceID != kInvalidDeviceID && !devices.contains(_activeDeviceID)) {
@@ -314,17 +314,35 @@ QList<DeviceID> CryptoController::nextRegistrationBatch(const QList<DeviceID>& d
     return out;
 }
 
-void CryptoController::addLinkedDevice(DeviceID deviceID)
+void CryptoController::addLinkedDevice(quint32 deviceID)
 {
+    // ⚠️ 形参是 `quint32` 而非 `DeviceID`（同一个类型，仅拼写不同）——理由见头文件：
+    //    moc 按字面解析，写 typedef 会让这个 QML 入口的形参变成"未解析类型"。
     // 规范 §1.4：PX4 deviceID 的 bit24（incompatFlag bit0）必须为 0
     if (deviceID == kInvalidDeviceID || !hasValidSignatureBit(deviceID)) {
         qCWarning(CryptoControllerLog) << "addLinkedDevice: invalid deviceID" << deviceID;
         return;
     }
-    const QMutexLocker locker(&_mutex);
-    if (!_linkedDevices.contains(deviceID)) {
-        _linkedDevices.append(deviceID);
-        qCDebug(CryptoControllerLog) << "linked device added" << deviceID;
+    bool added = false;
+    {
+        const QMutexLocker locker(&_mutex);
+        if (!_linkedDevices.contains(deviceID)) {
+            _linkedDevices.append(deviceID);
+            added = true;
+            qCDebug(CryptoControllerLog) << "linked device added" << deviceID;
+        }
+    }
+    // ⚠️ 锁**外**：`fetchKeys` 内部会 `emit keysRequested`，持锁 emit 会把信号处理器
+    //    拖进临界区（`_mutex` 非递归，处理器里再取锁就是自死锁）。
+    //
+    // 主动取密钥时机之一（规范 §2.7.2 e）：清单里**新出现**一个本地尚无密钥的 ID ⇒ 拉它。
+    // ‼️ 这一句是自动建链的必要条件，不是优化：两处建链闸都要求 `hasKey(deviceID)` 已为真，
+    //    而 `beginLinking` 内部那条"无密钥则 fetchKey"的 `else` 落在闸**之后**，
+    //    在自动建链路径上**恒不可达**。登录响应一旦不再下发 key，少了这一句整条路径死锁。
+    // ⚠️ 判 `added` 而不是只判 `hasKey`：站点视图每 2s 重推同一份清单，
+    //    只判 `hasKey` 会在"服务端没有这份密钥"时变成每轮重拉一次 HTTP。
+    if (added && !_keyManager.hasKey(deviceID)) {
+        _keyManager.fetchKeys({ deviceID }); // `_keyManager` 是**值成员**，用 `.` 不是 `->`
     }
 }
 
@@ -336,6 +354,17 @@ bool CryptoController::removeLinkedDevice(DeviceID deviceID)
         qCDebug(CryptoControllerLog) << "linked device removed" << deviceID;
     }
     return removed;
+}
+
+const QList<DeviceID>& CryptoController::_manifestLocked() const
+{
+    return _monitorListActive ? _monitorDevices : _linkedDevices;
+}
+
+bool CryptoController::isInManifest(DeviceID deviceID) const
+{
+    const QMutexLocker locker(&_mutex);
+    return _manifestLocked().contains(deviceID);
 }
 
 void CryptoController::releaseDevice(quint32 deviceID)
@@ -433,10 +462,9 @@ void CryptoController::_sendRegistration()
         const QMutexLocker locker(&_mutex);
         // §3.5.3：有**生效的**监控清单时用清单，否则回退 _linkedDevices
         //（未登录 / 站点视图从未推过清单 ⇒ 保持现状，零回归）。
-        // ‼️ 判据是 `_monitorListActive`，**不是** `_monitorDevices.isEmpty()`：清单生效之后
-        //    被摘空（签出释出最后一架）是"本 GCS 在线、暂不关联任何 PX4"，绝不是
-        //    "回退到 _linkedDevices 全体"——那会把刚释出的飞机原地登记回去。
-        QList<DeviceID> devices = _monitorListActive ? _monitorDevices : _linkedDevices;
+        // ‼️ 取清单的判据收在 `_manifestLocked()` 一处（`_monitorListActive`，**不是**
+        //    `_monitorDevices.isEmpty()`）——这里刻意只留引用，理由不再复述。
+        QList<DeviceID> devices = _manifestLocked();
         if (_activeDeviceID != kInvalidDeviceID && !devices.contains(_activeDeviceID)) {
             devices.append(_activeDeviceID);
         }

@@ -139,6 +139,18 @@ void DeviceKeyManager::_onReplyFinished(DeviceID deviceID, QNetworkReply* reply)
 
 void DeviceKeyManager::fetchKeys(const QList<DeviceID>& deviceIDs)
 {
+    // ‼️ 未配置 gcs_server ⇒ 静默早退，**一个请求都不发**。这不是优化：
+    //    `addLinkedDevice` 在单机模式（`QGCApplication.cc` 的本地密钥源）下也会走到这里，
+    //    而那里根本没有 gcs_server。少了这一句，每次关联一架飞机都会发起一个 scheme 为空
+    //    的请求、并打一条 `fetchKeys failed` 警告——实测足以把三个既有用例判红
+    //    （strict mode 下未预期的 warning 即失败）。
+    // ⚠️ 用 `qCDebug` 而**不是** `fetchKey` 那样的 `qCWarning`：批量路径的失败语义本就是
+    //    「静默」（见头文件），而"这台 QGC 不用 gcs_server"是一个**正常**状态，不是错误。
+    if (!isConfigured()) {
+        qCDebug(DeviceKeyManagerLog) << "fetchKeys: gcs_server 未配置，跳过";
+        return;
+    }
+
     // N=1 也走本路径（服务端明说 ids 长度 1..N、N=1 合法，不必走别的路径）。
     // ⚠️ 校验口径与 CryptoController 里 addLinkedDevice / setMonitorDevices / releaseDevice
     //    那三处**逐字同组**（非 0 + 签名位合法）。口径漂移时没有任何东西会报错，

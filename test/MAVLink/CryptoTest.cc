@@ -22,6 +22,8 @@
 #include <QSignalSpy>
 #include <QTemporaryFile>
 #include <QVariantList>
+#include <QtNetwork/QNetworkAccessManager>
+#include <QtNetwork/QNetworkReply>
 #include <cstring>
 
 namespace {
@@ -2564,6 +2566,100 @@ void CryptoTest::_testFetchKeysEmptyListMakesNoRequest()
 
     // 在途的失败回包由 `mgr` 析构时随 `_networkManager` 一并销毁（lambda 的 context 是
     // `&mgr`，析构即断连）⇒ 不会漂到下个用例去污染别人的 strict mode。
+}
+
+// `addLinkedDevice` 是纯累加，而站点视图的**释出侧已经存在**
+// （`OpsShell._releaseSiteDevice` ⇒ `releaseDevice`）⇒ 整条通道是「加 + 消失时释出」
+// ＝集合替换语义。本用例只管「加」这一半：**新**加入且本地尚无密钥 ⇒ 拉那一个。
+void CryptoTest::_testAddLinkedDeviceFetchesOnlyWhenKeyMissing()
+{
+    CryptoController* crypto = CryptoController::instance();
+    DeviceKeyManager* keyMgr = crypto->deviceKeyManager();
+
+    const DeviceID hasKeyId = 10001048;
+    const DeviceID noKeyId  = 10000385;
+
+    // 单例会在用例间串状态 ⇒ 先清干净（既有同类用例的清理手法）。
+    // ⚠️ 清理**不能**用 `QVERIFY(crypto->removeLinkedDevice(...))`：它返回的是"原本在不在"，
+    //    而清理的语义恰恰是"在不在都行"——断言它等于把用例变成顺序依赖的。
+    keyMgr->removeKey(hasKeyId);
+    keyMgr->removeKey(noKeyId);
+    crypto->removeLinkedDevice(hasKeyId);
+    crypto->removeLinkedDevice(noKeyId);
+
+    keyMgr->cacheKey(hasKeyId, testKey()); // 已有密钥
+
+    // `fetchKeys` 在未配置 serverUrl 时**静默早退**（`addLinkedDevice` 也会被单机模式调用，
+    // 那里没有 gcs_server）⇒ 必须配一个才观测得到"拉没拉"。用必然被拒的端口，不发真实流量。
+    keyMgr->setServerUrl(QStringLiteral("http://127.0.0.1:1"));
+
+    // ⚠️ 必须带 context（本仓禁用了 contextless connect，`qobject.h` 那个候选只收 5 参）。
+    // ‼️ context 用**栈上**的 guard，**不是** crypto：crypto 是单例、进程内永不析构，
+    //    拿它当 context 会让这个捕获 `&requested` 的 lambda 活过本函数 ⇒ 后续任何一次
+    //    `fetchKeys` 都会写进已析构的栈帧。既有用例连的对象都会析构，所以没踩到这个坑。
+    QList<DeviceID> requested;
+    QObject guard;
+    QObject::connect(keyMgr, &DeviceKeyManager::keysRequested, &guard,
+                     [&requested](const QList<DeviceID>& ids) { requested += ids; });
+
+    crypto->addLinkedDevice(hasKeyId); // 已有本地密钥 ⇒ 不拉
+    QVERIFY2(requested.isEmpty(), "已有本地密钥的 ID 不得触发拉取");
+
+    crypto->addLinkedDevice(noKeyId); // 新加入且无密钥 ⇒ 拉这一个
+    QCOMPARE(static_cast<int>(requested.size()), 1);
+    QCOMPARE(requested.first(), noKeyId);
+
+    // 重复添加同一个 ID 不得重复拉 —— `_fetchOverview` 每 2s 重推同一份清单，
+    // 若只判 `hasKey`，"服务端没有这份密钥"会变成每轮重拉一次。
+    requested.clear();
+    crypto->addLinkedDevice(noKeyId);
+    QVERIFY2(requested.isEmpty(), "已在 _linkedDevices 里的 ID 不得重复触发拉取");
+
+    // ---- 把上面那次拉取的 HTTP 副作用在**本用例内**消化掉 ----
+    // ‼️ `fetchKeys` 没有 `isConfigured()` 早退（Task 5 的裁定），所以哪怕 `_serverUrl`
+    //    是空的，上面那次也**真的**发了一个请求。这个 reply 归属单例的 `_networkManager`
+    //    ——不随用例析构——它的失败日志若漂到下一个用例的事件循环里，会在那个用例的
+    //    strict-mode 日志检查上变红（一条与它毫无关系的警告）。所以必须在这里等到它落地。
+    QNetworkAccessManager* nam = keyMgr->findChild<QNetworkAccessManager*>();
+    QVERIFY2(nam != nullptr, "DeviceKeyManager 必须持有一个以自身为 parent 的 QNAM");
+    QSignalSpy finishedSpy(nam, &QNetworkAccessManager::finished);
+    // 允许那条失败警告出现**一次**（规则被匹配即消费，不是整条用例豁免）。
+    ignoreLogMessage("MAVLink.Crypto.DeviceKeyManager", QtWarningMsg,
+                     QRegularExpression("fetchKeys failed"));
+    // ⚠️ 不用 `QTest::qWait(<毫秒>)`：本仓 Golden Rule 禁止固定延时。等的是**信号**不是时间。
+    QVERIFY2(finishedSpy.wait(5000), "那次拉取的 HTTP 必须在本用例内落地");
+
+    // 还原单例的 serverUrl：它是 CryptoController 的值成员，本用例改了就一直在。
+    keyMgr->setServerUrl(QString());
+}
+
+// `isInManifest` 的取清单口径必须与取清单那几处**逐字相同**：
+// `_monitorListActive ? _monitorDevices : _linkedDevices`。
+// 本用例专钉最容易写错的**半**：清单"生效但为空"时，一个明明在 `_linkedDevices` 里的 ID
+// **不算**在清单内。写成 `_monitorDevices.isEmpty() ? … : _monitorDevices` 会在这里变红，
+// 而那正是"签出释出最后一架之后把它原地登记回去"的那个 bug。
+void CryptoTest::_testIsInManifestUsesMonitorListActiveNotEmptiness()
+{
+    CryptoController* crypto = CryptoController::instance();
+    const DeviceID id = 10001048;
+
+    crypto->removeLinkedDevice(id);
+    crypto->addLinkedDevice(id); // 进 `_linkedDevices`
+
+    // ⚠️ 这里**不**先断言"未推过清单时回退 `_linkedDevices`"：`_monitorListActive` 只有
+    //    置位入口、没有复位入口，前面任何一个推过清单的用例都会让它恒为 true，
+    //    那条断言会退化成顺序依赖的假红。下面用 `setMonitorDevices` 把两种取值都显式钉住。
+    crypto->setMonitorDevices(QVariantList(), 0);
+    QVERIFY2(crypto->monitorListActiveForTest(), "setMonitorDevices 之后清单必须生效");
+    QVERIFY2(!crypto->isInManifest(id),
+             "生效的空清单 ⇒ 清单内为空，`_linkedDevices` 不参与");
+
+    crypto->setMonitorDevices(QVariantList{ static_cast<uint>(id) }, 0);
+    QVERIFY2(crypto->isInManifest(id), "清单里有的 ID 必须在清单内");
+
+    // 复位：`_monitorListActive` 的置位无法撤销，只把清单内容与 `_linkedDevices` 清干净。
+    crypto->setMonitorDevices(QVariantList(), 0);
+    crypto->removeLinkedDevice(id);
 }
 
 UT_REGISTER_TEST_LIGHTWEIGHT(CryptoTest, TestLabel::Unit)
