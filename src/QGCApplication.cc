@@ -96,7 +96,11 @@ QGCApplication::QGCApplication(int& argc, char* argv[], const QGCCommandLinePars
 #ifdef QGC_DAILY_BUILD
         // This gives daily builds their own separate settings space. Allowing you to use daily and stable builds
         // side by side without daily screwing up your stable settings.
-        applicationName = QStringLiteral("ABC 地面站");
+        // Must stay ASCII: this name feeds QGCNetworkHelper::defaultUserAgent(), and that value goes out through
+        // QHttpHeaders (the QString path). Qt rejects a header value containing non-ASCII, drops the whole header
+        // and substitutes "Mozilla/5.0" — so a non-ASCII name silently costs every QGCNetworkHelper request its
+        // User-Agent (login, fetchKeys, PlanUploader, QGCFileDownload, NTRIP).
+        applicationName = QStringLiteral("ABC GCS");
 #else
         applicationName = QGC_APP_NAME;
 #endif
