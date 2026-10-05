@@ -117,6 +117,19 @@ void LinkInterface::sendMessageThreadSafe(mavlink_message_t &message)
     MAVLinkCrypto::CryptoController* const crypto = MAVLinkCrypto::CryptoController::instance();
     if (crypto->cryptoEnabled()) {
         if (crypto->state() != MAVLinkCrypto::CryptoController::State::Active) {
+            // GCS 心跳（msgid 0）被丢是**预期**行为，不是异常：协议 §2.5 下 PX4 结构性收不到
+            // GCS 心跳（mavp2p 会拦），此处也不该发明文（全加密链路上接收端会丢弃明文帧）。
+            // 它不构成「指令丢失」，因此：
+            //   * **不进 FlightEventLogger** —— 否则 QGC 从启动到建链成功的整段时间里每秒
+            //     一条「发送被丢弃」，会把真正的飞行事件淹掉；
+            //   * 日志降到 Debug —— 默认不出现在控制台（原先 1Hz 刷屏），
+            //     需要时 `--logging=Comms.LinkInterface` 仍看得到。
+            // 其余 msgid 一律保留告警 + 事件日志：那些是用户真下发的命令（任务上传、起飞、
+            // 降落…），事后必须能看出「没到飞控」。
+            if (message.msgid == MAVLINK_MSG_ID_HEARTBEAT) {
+                qCDebug(LinkInterfaceLog) << "crypto enabled, link not Active, dropping GCS heartbeat";
+                return;
+            }
             // 加密已启用但链路未就绪：不发明文（全加密链路上接收端会丢弃明文帧）。
             qCWarning(LinkInterfaceLog) << "crypto enabled, link not Active, dropping msgid" << message.msgid;
             // 帧被丢了就没发出去 —— 事件日志必须记「丢弃」而不是记「已发」，

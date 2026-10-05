@@ -150,16 +150,19 @@ void MAVLinkCryptoFrameTest::cleanup()
 ///
 /// ‼️ 为什么窗口必须这么窄：`CryptoController::setCryptoEnabled` 本身只是加锁 + 赋值
 /// （不起定时器、不动状态机），但**开启期间任何外发消息**都会命中 `LinkInterface`
-/// 发送路径上的那个 `qCWarning`（"crypto enabled, link not Active"）⇒ strict mode 下
-/// 用例失败。这里只包住同步的 `receiveBytes` 调用、不回到事件循环，
-/// 故 MockLink 的遥测（已由 `setCommLost(true)` 静音）不可能落进窗口内。
+/// 发送路径上「加密未就绪」那条分支（"crypto enabled, link not Active"）⇒ strict mode 下
+/// 用例失败。⚠️ 该分支 2026-10-05 起按 msgid 分流：非心跳仍走 `qCWarning` + 飞行事件日志，
+/// **msgid 0（GCS 心跳）改为 `qCDebug` 且不写事件日志**（QGC 从启动到建链成功期间它按 1Hz
+/// 刷屏）。别因此以为心跳落进窗口就无害 —— 那条 debug 会不会被本进程的 strict mode 抓到，
+/// 取决于该 category 的 debug 是否开启，不要依赖它。这里只包住同步的 `receiveBytes` 调用、
+/// 不回到事件循环，故 MockLink 的遥测（已由 `setCommLost(true)` 静音）不可能落进窗口内。
 void MAVLinkCryptoFrameTest::_injectWithCryptoEnabled(const QByteArray& frame)
 {
     MAVLinkCrypto::CryptoController* const crypto = MAVLinkCrypto::CryptoController::instance();
     crypto->setCryptoEnabled(true);
     // ⚠️ 复位必须是 scope guard，不能写成裸的尾随语句：将来若在下面这行 `receiveBytes`
     // 前后插入一个早 `return`（或它抛出），尾随语句会被跳过，`cryptoEnabled` 就
-    // **进程级泄漏为 true** —— 此后本进程每一条外发消息都会命中 `LinkInterface`
+    // **进程级泄漏为 true** —— 此后本进程每一条**非心跳**外发消息都会命中 `LinkInterface`
     // 发送路径上那个 `qCWarning`（"crypto enabled, link not Active"，strict mode 下
     // 连带把别的用例搞红）。`cleanup()` 只兜得住「用例断言失败」，兜不住「用例中途中断」。
     const auto guard = qScopeGuard([crypto] { crypto->setCryptoEnabled(false); });
