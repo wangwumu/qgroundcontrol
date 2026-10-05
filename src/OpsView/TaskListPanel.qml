@@ -93,6 +93,14 @@ ColumnLayout {
     property real   cardMargin: 10              // 卡片左空位；站点视图传机位左空隙，与之对齐
     property real   cardRightGap: 20
     property real   cardGap: OpsCommon.taskCardGap
+    // 普通卡片的边框色（用户 2026-10-06：「每个卡片加一个浅蓝色的边框」）。
+    // 默认值 = 改动前的原色 `#2a3a55`，与 `cardMargin`/`cardRightGap` 同族——**由视图各自
+    // 决定**：两个使用方现在**都**传浅蓝（`OpsView` 与 `RomView`，用户同日先后点名）。
+    // 保留属性而不直接把下面 delegate 里的字面量改掉，是为了让"浅蓝"这个决定留在**调用方**：
+    // 将来哪个视图想要原色，不传即可，不必回来动面板。
+    // ‼️ 它**不覆盖**三种语义边框色：超时红 / 选中蓝 / 进站青绿在 `border.color` 里优先级
+    //    更高（见那里的三元链）。把它们一起涂成浅蓝等于删掉「超时」与「已选中」两个信号。
+    property color  cardBorderColor: "#2a3a55"
     // 进站卡的配色（用户 2026-10-02 裁定⑥：「出站任务，与入站任务使用不同颜色的边框和
     // 背景显示」）。**只此一处定义**：卡片的 `color` 与 `border.color` 都读它——
     // 两处各写一遍字面量的话，将来改配色漏掉一处就是"青绿底 + 蓝边框"，而它不会报错。
@@ -316,9 +324,12 @@ ColumnLayout {
                 border.width: 1
                 // 边框优先级：**超时红 > 选中蓝 > 段色**。选中色两段共用——"选中"是跨段同一种
                 // 状态，给它两套色会让用户以为选中了两种不同的东西。
+                // 「段色」= 进站青绿，否则 `panel.cardBorderColor`（两个视图都传浅蓝，见该属性）。
+                // ⚠️ 浅蓝落在**最后一档**，是有意的：它是"没有别的状态可报"时的底色，一旦提到
+                //    前面两档之前，超时卡和选中卡就再也显示不出自己的状态了。
                 border.color: _timedOut ? "#ff3b3b"
                               : (panel.selectedTaskId === modelData.task_id ? "#2f6bd8"
-                                 : (_inboundCard ? panel.inboundCardBorderColor : "#2a3a55"))
+                                 : (_inboundCard ? panel.inboundCardBorderColor : panel.cardBorderColor))
 
                 // 点整项选中任务（视图侧收到 taskSelected 后自行决定是否同步点亮机位）
                 MouseArea {

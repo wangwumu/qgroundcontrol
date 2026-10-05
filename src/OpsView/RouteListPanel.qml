@@ -34,6 +34,12 @@ ColumnLayout {
     property real cardMargin: 10        // 与任务卡同一个左空位，两段天然对齐
     property real cardRightGap: 20
     property real cardGap: OpsCommon.taskCardGap
+    // 普通卡片（未选中）的边框色（用户 2026-10-06：RomView 的航线列表也要浅蓝边框）。
+    // 默认值 = 改动前的原色 `#2a3a55` ⇒ 不传就与本面板既有观感完全一致，要不要变由**使用方**定。
+    // 与 `TaskListPanel.cardBorderColor` 同族、同默认值、同用法——两个面板刻意同构（见文件头）。
+    // ⚠️ 本面板的 delegate 只有**两档**边框色（选中蓝 / 本属性），没有任务卡那三种语义色：
+    //    航线没有"超时""进站"这两个状态。
+    property color cardBorderColor: "#2a3a55"
 
     //-------------------------------------------------------------------------
     // 输出
@@ -71,7 +77,9 @@ ColumnLayout {
             radius: 4
             color: "#16233c"
             border.width: 1
-            border.color: routeCard._selected ? "#2f6bd8" : "#2a3a55"
+            // 选中蓝优先于本属性：`_selected` 是本面板**唯一**的语义状态，涂掉它等于
+            // 删掉"已选中"信号。⚠️ 本行原先是字面量 `"#2a3a55"`，与本属性默认值同值。
+            border.color: routeCard._selected ? "#2f6bd8" : panel.cardBorderColor
 
             // 点整行 ⇒ 选中该航线（再点一次是取消，由骨架的 `selectRoute` toggle）
             MouseArea {

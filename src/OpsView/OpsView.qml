@@ -1512,6 +1512,13 @@ OpsShell {
                         cardMargin: opsView._taskCardMargin
                         cardRightGap: opsView._taskCardRightGap
                         cardGap: opsView._taskCardGap
+                        // 普通卡片边框＝浅蓝（用户 2026-10-06：「每个卡片加一个浅蓝色的边框」）。
+                        // ‼️ `RomView.qml` 那个实例**同日也传了同一个色值**（用户随后点名了航线
+                        //    列表与任务列表）—— 两个视图现在一致。色值在**两处各写一遍**，不共享
+                        //    常量：改色要两处一起改，只改一处会让两个视图悄悄分叉。
+                        // ⚠️ 三种语义边框色不受影响 —— 超时红 / 选中蓝 / 进站青绿在
+                        //    `TaskListPanel.border.color` 的三元链里优先级更高，这里是最后一档。
+                        cardBorderColor: "#6f9fd8"
                         canTakeoffFn: opsView._canTakeoff
                         takeoffBlockReasonFn: opsView._takeoffBlockReason
                         // 点整项：选中任务 + 同步点亮对应机位（骨架负责写 _selectedTaskId）

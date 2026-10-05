@@ -238,6 +238,10 @@ OpsShell {
                     cardMargin: romView._panelCardMargin
                     cardRightGap: romView._panelCardRightGap
                     cardGap: romView._taskCardGap
+                    // 航线卡边框＝浅蓝（用户 2026-10-06：「RomView 的右边栏中的航线列表和
+                    // 任务列表也加一个浅蓝色的边框，如刚刚你在OpsView中做的那样」）。
+                    // 选中蓝仍然优先（见 `RouteListPanel.border.color`）。
+                    cardBorderColor: "#6f9fd8"
                 }
             }
 
@@ -297,6 +301,9 @@ OpsShell {
                     cardMargin: romView._panelCardMargin
                     cardRightGap: romView._panelCardRightGap
                     cardGap: romView._taskCardGap
+                    // 任务卡边框＝浅蓝，与上面航线列表、以及 `OpsView` 同一色值（用户 2026-10-06）。
+                    // ⚠️ 三处字面量各自独立，改色值要一起改。
+                    cardBorderColor: "#6f9fd8"
                     // 点整项由骨架写 _selectedTaskId 并发 taskSelected（机位同步是站点视图的事）
                     onTaskSelected: function(task) { romView.selectTask(task) }
                     onHandoverProposed: function(taskId, phase) { romView._proposeHandover(taskId, phase) }
