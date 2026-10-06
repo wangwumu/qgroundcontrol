@@ -152,6 +152,16 @@ void CryptoController::setMonitorDevices(const QVariantList& deviceIds, int fram
         //    才调本函数）。清单生效标志在此置位，且**此后不再回落**——它是"本视图有没有
         //    话语权"的开关，不是"清单非空"的代词。空清单同样生效（见 .h 的语义说明）。
         _monitorListActive = true;
+        // 名册里出现 = 本端以**监控员身份**重新认领它 ⇒ 撤销"已签出"记号（2026-10-06）。
+        // ⚠️ 这一处撤销是**必要**的，不是宽纵：监控员名册取自 `_routeDevices`（后端 ③ 的
+        //    **航线名册**投影），与"场地签出"正交。若签出后该 id 仍在名册里，说明本端
+        //    **确实需要**收它的遥测（画 L3 marker）——那是正当接收，不是"被残余报文激活"。
+        // ⚠️ 判据是"在 parsed 里"，不是"在 parsed 里且是本次新增的"：清单是**整份替换**语义，
+        //    两种写法在这次转移上等价；选无条件 remove 是因为误撤销只回到今天的行为，
+        //    误保留却会让本端收不到一架它该监控的飞机的遥测。
+        for (const DeviceID did : parsed) {
+            _releasedDevices.remove(did);
+        }
         // ‼️ 判据是"集合内容变了"，不是"被调用了一次"（§3.4）
         changed = (parsed != _monitorDevices);
         if (changed) {
@@ -291,6 +301,24 @@ void CryptoController::reRegisterDevice(quint32 deviceID)
     if (!registrationEnabled()) {
         return;
     }
+    // ‼️ **签出闸**（2026-10-06 补）：与上面那道门同样落在**被调用方**，理由也一样——
+    //    本函数是 `Q_INVOKABLE`，而 `_releasedDevices` 是 private，QML 调用点
+    //    （`RomView.qml` 的 2s 节拍）物理上查不到闸的状态。
+    //    这道闸不是"多一道防线"，而是与 `releaseDevice` 清 `_lastFrameMs` **配对**的另一半：
+    //    清掉时间戳后 `msSinceLastFrame()` 返回 -1 ⇒ 调用点的 `since < 0` 判据**恒真**
+    //    ⇒ 每 2s 对签出过的飞机发一次；而 `_monitorIds` 取自
+    //    `OpsCommon.monitorDeviceIds(_routeDevices)`——那是后端 ③ 的**航线名册**投影，
+    //    与"场地签出"正交，签出后该 id 仍可能留在里面（同机双角色时必然如此）。
+    //    缺这道闸，重发会把 mavp2p 那个配对的 `qgcSeen` 重新刷新鲜（`processRegistration`
+    //    命中已有配对时 `lastSeen` 与 `qgcSeen` 两个都刷）⇒ 配对**永不过期**、
+    //    残余加密帧无限期投喂——正好抵消 `releaseDevice` 想达成的效果。
+    // ⚠️ **静默**返回、不打告警：这是一条 2s 一次的**预期路径**，打日志就是刷屏。
+    {
+        const QMutexLocker locker(&_mutex);
+        if (_releasedDevices.contains(static_cast<DeviceID>(deviceID))) {
+            return;
+        }
+    }
     // 单发一批（只含这一个），复用 _sendRegistrationFrame 的组帧与发送逻辑。
     // ‼️ 这里**不碰** _monitorDevices、不碰 _regCursor —— 重发是幂等刷新，
     //    任何集合改动都会把"超时自愈"变成"超时自我放逐"（§3.6.2）。
@@ -362,6 +390,10 @@ void CryptoController::addLinkedDevice(quint32 deviceID)
     bool added = false;
     {
         const QMutexLocker locker(&_mutex);
+        // 接手 = 撤销"已签出"记号（2026-10-06）。放在 `if (!contains)` **之外**：站点视图
+        // 每 2s 重推同一份清单，重复接手同一架是常态，只在首次 `added` 时撤销会漏掉
+        // "签出 → 同轮又接手"那条路径。
+        _releasedDevices.remove(deviceID);
         if (!_linkedDevices.contains(deviceID)) {
             _linkedDevices.append(deviceID);
             added = true;
@@ -462,6 +494,37 @@ void CryptoController::releaseDevice(quint32 deviceID)
         if (_monitorDevices.removeAll(id) > 0) {
             _regCursor = 0; // 集合变了，旧游标没有意义（同 setMonitorDevices）
         }
+        // ⑤ 清三张 per-device 表，并记入 `_releasedDevices`（2026-10-06 补）。
+        //    ⚠️ 这三张表原来**刻意不动**（见 .h 的旧注释）：理由是"前者没有清理时机判据"
+        //    与"删掉会让 `beginLinkingForSystemID` 在这架飞机上失效"。今天两条都反过来了——
+        //    签出**就是**那个清理时机，而让 `beginLinkingForSystemID` 在这架飞机上失效
+        //    **正是**签出要做的事（清表后它会打一条 `unknown systemID` 警告并 return；
+        //    留着映射则本端还能凭一个 systemID 为已经交还出去的飞机重新建链）。
+        _lastFrameMs.remove(id);
+        //    ⚠️ `_deviceToSystem` 今天**只写不读**（`:901` 是唯一写点，全仓无读者——
+        //    `deviceIDForSystemID` 读的是反向表）。清它是防泄漏 + 与反向表保持一致，
+        //    没有"不清就会被读错"这一层；下面的断言也验不到它（无观测点）。
+        _deviceToSystem.remove(id);
+        //    ‼️ `_systemToDevice` **不能**按正向表反查 systemID 再删。反向表按 systemID
+        //    只存**最后一架**（`learnDeviceSystemMapping` 是无条件 insert），而**多架同
+        //    systemID 是常态**——`Vehicle.cc` 的 `deviceID()` 注释记着实测：本场地 17 架
+        //    的 sysid 全是 150。照正向表反查会把**别人**的条目一起删掉
+        //    （`beginLinkingForSystemID(150)` 此后对 B 也失效）。
+        //    判据只能是"值等于本 id"，故这里遍历而不是查表。
+        for (auto it = _systemToDevice.begin(); it != _systemToDevice.end();) {
+            if (it.value() == id) {
+                it = _systemToDevice.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        //    ‼️ 只清不够：mavp2p 在配对老化前（`MAP_TTL`，实测云端部署未传 `--map-ttl`
+        //    ⇒ 默认 60s）仍会把该机的加密帧转发过来，而 `MAVLinkProtocol.cc` 的四条收帧记账
+        //    是**无条件**的 ⇒ 只清不记的话，上面三张表会被**下一帧**原地写回，签出等于没签出。
+        //    这个记号由三个入口自己消费：`learnDeviceSystemMapping` / `noteDeviceFrame` /
+        //    `reRegisterDevice`；撤销点是"本端以任何身份重新认领它"
+        //    （`addLinkedDevice` / `setMonitorDevices`）。
+        _releasedDevices.insert(id);
         // ④ 让出上行权——**只在它确实占着槽时**。`_activeDeviceID` 是单槽，
         //    可能正属于另一架飞机，无条件回 Standby 会把在飞那架一起打掉。
         if (_activeDeviceID == id) {
@@ -832,6 +895,14 @@ void CryptoController::beginLinkingForSystemID(uint8_t systemID)
 void CryptoController::learnDeviceSystemMapping(DeviceID deviceID, uint8_t systemID)
 {
     const QMutexLocker locker(&_mutex);
+    // 签出闸（2026-10-06 补）：`releaseDevice` 刚清掉这两张表，而 mavp2p 在配对老化前
+    // （`MAP_TTL`，实测默认 60s）仍会转发该机的帧 ⇒ 不挡的话下一帧就把表重建回来。
+    // ‼️ 闸收在**本函数体内**、不在 `MAVLinkProtocol.cc` 的调用点：那里的注释
+    //    （`:211-222`）写明了那四行必须**无条件**执行（失联判据依赖它们，且它们是
+    //    "全新启动学映射"的唯一入口）。用白名单（`isInManifest`）当闸会打破那个入口。
+    if (_releasedDevices.contains(deviceID)) {
+        return;
+    }
     _deviceToSystem.insert(deviceID, systemID);
     _systemToDevice.insert(systemID, deviceID);
 }
@@ -842,6 +913,11 @@ void CryptoController::noteDeviceFrame(DeviceID deviceID)
         return;
     }
     const QMutexLocker locker(&_mutex);
+    // 签出闸：理由同 `learnDeviceSystemMapping`（`releaseDevice` 已清 `_lastFrameMs`，
+    // 不挡的话残余帧会把它重建回来，本端就为一条**已经交还出去**的链路保留了收帧记录）。
+    if (_releasedDevices.contains(deviceID)) {
+        return;
+    }
     _lastFrameMs.insert(deviceID, _frameClock.elapsed());
 }
 

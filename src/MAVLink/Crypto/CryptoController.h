@@ -23,6 +23,7 @@
 #include <QtCore/QMutex>
 #include <QtCore/QMutexLocker>
 #include <QtCore/QObject>
+#include <QtCore/QSet>
 #include <QtCore/QString>
 #include <QtCore/QTimer>
 #include <QtCore/QVariantList>
@@ -146,7 +147,9 @@ public:
     ///
     /// 由 `RomView.qml` 在每 2s 的轮询节拍上、对 `msSinceLastFrame(id)` 超过
     /// 生效阈值（`frameTimeoutMs()`）的飞机调用。mavp2p 收到后只做**幂等刷新**
-    /// （`m.pairs[k] = e; e.lastSeen = now`），不触碰任何其它 pair、不断开已建立的链路。
+    /// （`manager.go` 的 `processRegistration`：命中已有配对则两个时间戳都刷，
+    ///  `e.lastSeen = now; e.qgcSeen = now`），不触碰任何其它 pair、不断开已建立的链路。
+    /// ⚠️ 正因为 `qgcSeen` 会被刷，本函数**绝不能**对已签出的飞机调用——见下方签出闸。
     ///
     /// ‼️ **只重发，绝不移出登记集合**（`_monitorDevices` / `_regCursor` 一概不碰）——
     ///    移出会让它更收不到帧 ⇒ 下一轮又超时 ⇒ **永久静默失效**，且日志上看不出
@@ -170,6 +173,16 @@ public:
     ///    超时检查照常兜底：这正是要保留的语义。
     ///    （对照：`_sendRegistration()` / `_sendRegistrationFrame()` 仍然都没有门——它们只被
     ///    C++ 内部调用，闸在调用方；见 `requestAcceleratedRegistration()` 的注释。）
+    ///
+    /// ‼️ **自带签出闸**（2026-10-06 补）—— 已释出（`_releasedDevices`）的 deviceID 一律静默
+    ///    返回。这道闸不是可选的第二道防线，而是与 `releaseDevice` 清 `_lastFrameMs` **配对**
+    ///    的另一半：清掉时间戳后 `msSinceLastFrame()` 返回 -1 ⇒ `RomView.qml` 的
+    ///    `since < 0` 判据**恒真** ⇒ 每 2s 一次定向重发；而 `_monitorIds` 取自
+    ///    `OpsCommon.monitorDeviceIds(_routeDevices)`——那是后端 ③ 的**航线名册**投影，
+    ///    与"场地签出"正交，签出后该 id 仍可能留在里面。缺这道闸，重发会把 mavp2p 那个配对的
+    ///    `qgcSeen` 重新刷新鲜（见上一条）⇒ 配对**永不过期**、残余加密帧无限期投喂——
+    ///    正好抵消 `releaseDevice` 想达成的效果。
+    ///    ⚠️ 与上面那道门同样落在**被调用方**：QML 调用点物理上查不到 `_releasedDevices`。
     Q_INVOKABLE void reRegisterDevice(quint32 deviceID);
 
     /// ---- 仅供单测（生产代码不得调用）----
@@ -288,7 +301,7 @@ public:
     ///   时告警并早退，不做下面四件事。⚠️ 今天它**不改任何可达行为**（那样的 id 上四件事本就
     ///   全是空操作），挡的是将来新增的破坏性步骤；理由与残留假设见 .cc 内的实现注释。
     ///
-    /// 四件事，缺一不可（2026-10-03 用户裁定「上下全清」）：
+    /// 五件事，缺一不可（2026-10-03 用户裁定「上下全清」；⑤ 为 2026-10-06 补）：
     ///   ① 移出登记集合 —— 不再为它发 80005；mavp2p 的配对随后在 `MAP_TTL` 后过期；
     ///      此后要重新接引，走那条明文待命心跳的老路即可（mavp2p 重新建配对）。
     ///      ⚠️ 实现上是**内联** `_linkedDevices.removeAll(id)`，**不是**调上面那个
@@ -300,7 +313,9 @@ public:
     ///      保留上一份清单）会一直把已释出的飞机登记下去。
     ///   ② `removeKey` —— 删掉本地密钥；
     ///   ③ `resetReplay` —— 上行与下行水位**一并清空**；
-    ///   ④ 若它正占着上行权（`_activeDeviceID`），当场让出并回 Standby。
+    ///   ④ 若它正占着上行权（`_activeDeviceID`），当场让出并回 Standby；
+    ///   ⑤ 清掉三张 per-device 表（`_lastFrameMs` / `_deviceToSystem` / `_systemToDevice`）
+    ///      并记入 `_releasedDevices`，详见下方。
     ///
     /// ‼️ ②③ 必须**同批**，这不是"顺手多清一个"，理由是一条因果链：
     ///    水位清空后，本端下一次建链走 `nextOutgoingCounter()` 的**随机奇起点**档
@@ -329,9 +344,20 @@ public:
     /// ‼️ ④ 的守卫是**必须**的：`_activeDeviceID` 是单槽，它可能正属于**另一架**飞机。
     ///    无条件回 Standby 会把在飞那架的链路一起打掉。
     ///
-    /// ⚠️ `_lastFrameMs` 与 `_deviceToSystem`/`_systemToDevice` **刻意不动**：前者没有清理
-    ///    时机判据（见其声明处）；后者是学习表、重建时会覆盖，且删掉会让
-    ///    `beginLinkingForSystemID` 在这架飞机上失效。两张表都不含 nonce，不在本次裁定范围内。
+    /// ‼️ ⑤（2026-10-06 补）—— 三张 per-device 表必须清，且**只清不够**。
+    ///    旧注释在此写着这三者「刻意不动」，两条理由分别是"没有清理时机判据（见其声明处）"
+    ///    与"删掉会让 `beginLinkingForSystemID` 在这架飞机上失效"。**今天两条都反过来了**：
+    ///    · 签出**就是**那个清理时机；
+    ///    · 让 `beginLinkingForSystemID` 在这架飞机上失效，**正是签出要做的事**
+    ///      （它的唯一消费者就是那个函数：清表后它会打一条 `unknown systemID` 警告并 return，
+    ///      而 `_systemToDevice` 里若留着映射，本端就还能凭一个 systemID 为**已经交还出去**的
+    ///      飞机重新建链——那正是要堵的）。
+    ///    ⚠️ 清表**必须**配合 `_releasedDevices`：mavp2p 在配对老化前（`MAP_TTL`，实测云端
+    ///    部署未传 `--map-ttl` ⇒ 默认 60s）仍会把该机的加密帧转发过来，而 `MAVLinkProtocol.cc`
+    ///    的四条收帧记账是无条件的 ⇒ 只清不记的话，三张表会被**下一帧**原地写回。
+    ///    ⚠️ 删除 `_systemToDevice` 时**不能**只按正向表反查 systemID：反向表可能已被别的
+    ///    deviceID 覆写（`learnDeviceSystemMapping` 是无条件 `insert`），按正向表反查会误删
+    ///    别人的条目。判据必须是"**值等于本 id**"，实现见 .cc。
     /// @param deviceID  要释出的 PX4 deviceID
     Q_INVOKABLE void releaseDevice(quint32 deviceID);
 
@@ -483,6 +509,11 @@ public:
     void beginLinkingForSystemID(uint8_t systemID);
 
     /// 学习 deviceID ↔ systemID 映射（接收端解密成功后调用）。
+    /// ‼️ 已签出（`_releasedDevices`）的 deviceID **不学**：否则 `releaseDevice` 刚清掉的
+    ///    两张表会被 mavp2p 继续转发的残余帧（`MAP_TTL` 内，实测默认 60s）逐帧重建回来。
+    ///    调用点（`MAVLinkProtocol.cc` 的两处收帧分支）**不设**闸——`:211-222` 的注释写明了
+    ///    那四行必须无条件执行（失联判据依赖它们，且它们是"全新启动学映射"的唯一入口）；
+    ///    闸收在本函数体内，让"什么算已签出"这个口径单点持有。
     void learnDeviceSystemMapping(DeviceID deviceID, uint8_t systemID);
 
     /// 记录「收到了该 deviceID 的任意一帧」的时刻（设计文档 §3.6.1）。
@@ -495,6 +526,10 @@ public:
     /// 由 `MAVLinkProtocol` 在**两个**收帧分支各显式调用一行（明文待命心跳支、
     /// 加密帧支）。**不要**塞进 `learnDeviceSystemMapping` 内部——那个函数的名字
     /// 只承诺"学习映射"，隐式更新时间戳属于名字没体现的行为。
+    ///
+    /// ‼️ 已签出（`_releasedDevices`）的 deviceID **不记**：`releaseDevice` 已清掉
+    ///    `_lastFrameMs`，不记才不会让残余帧把它重建回来；否则本端会为一条**已经交还出去**
+    ///    的链路保留收帧记录。闸落在本函数体内，理由同 `learnDeviceSystemMapping`。
     void noteDeviceFrame(DeviceID deviceID);
 
     /// 距上次收到该 deviceID 的帧过去了多少毫秒；**-1 = 从未收到**。
@@ -606,11 +641,47 @@ private:
     /// 复位点只有一处：`setResponsibleParty`（会话边界），与监控清单的作废同处同源。
     bool _initiatorScopeValid = false;
     ReplayGuard _replayGuard;
+    /// 「本端已主动签出（`releaseDevice`）过、且此后**未以任何身份重新接手**」的 deviceID。
+    /// 签出后它一概拒绝重新激活本端关于这架飞机的任何本地状态。
+    ///
+    /// ‼️ 存在的理由：`releaseDevice` 摘完清单、删完密钥之后，mavp2p **还会把这个 deviceID 的
+    ///    加密帧继续转发过来**（配对靠 `MAP_TTL` 老化，实测云端部署未传 `--map-ttl` ⇒ 走默认
+    ///    **60s**：`manager.go` 的 `fanoutTargets` 判据是 `now.Sub(e.qgcSeen) < ttl`，而
+    ///    `qgcSeen` 只在 `processRegistration` 的 `for (i < num)` 循环体内刷新 ⇒ 签出后本端
+    ///    不再把它写进 80005 payload ⇒ 该配对的 `qgcSeen` 冻结 ⇒ TTL 到期自然停发）。
+    ///    问题出在这 60s 里：`MAVLinkProtocol.cc` 那四条收帧记账是**无条件**的
+    ///    （`learnDeviceSystemMapping` / `noteDeviceFrame`，明文待命心跳支两条、加密帧支两条，
+    ///    见 `:211-222` 的注释），于是刚清掉的 `_deviceToSystem` / `_systemToDevice` /
+    ///    `_lastFrameMs` 会被**逐帧写回**——签出等于没签出。
+    ///
+    /// ‼️ 判据必须是**显式黑名单**，不能拿 `isInManifest()`（`_linkedDevices`）当闸：
+    ///    那是个白名单，"不在白名单里"既可能是"已签出"，也可能是"全新启动、还没登录、
+    ///    清单还没拉回来"，而后者**必须**照常学映射——`:211-222` 写明了这个先有鸡先有蛋：
+    ///    无密钥 ⇒ 无法解密 ⇒ 学不到映射 ⇒ `beginLinkingForSystemID` 无从触发。
+    ///    两者形状相同、语义相反，只有黑名单能把它们分开。
+    ///    （`_onKeyFetched` 里那处"三集合都不认它"的判据同理不可搬来：那里必然处于 `Linking`
+    ///    状态，全新启动进不去，所以"都不认"唯一可能是"已释出"。）
+    ///
+    /// 撤销点（两处，都是"本端以某种身份重新认领这架飞机"）：
+    ///   · `addLinkedDevice` —— 站点操作员接手（`OpsShell.qml::_adoptSiteDevice`）；
+    ///   · `setMonitorDevices` —— 监控员名册含它（`RomView.qml`）。⚠️ 这一处**必须**撤销：
+    ///     监控员名册是**航线名册**、与"场地签出"正交，若签出后该 id 仍在名册里，说明本端
+    ///     以监控员身份**确实需要**收它的遥测（画 L3 marker）——那是正当接收，不是"激活"。
+    ///
+    /// 生命周期：内存、本会话。**不设过期、不设上限**——条目数 = 本会话签出过的飞机数
+    /// （量级几十），而"过期"等于把刚堵上的窗口重新打开。QGC 重启后集合为空，与
+    /// "重启后 `_linkedDevices` / `_keyCache` 也空"一致，不会出现"重启后意外认领"。
+    QSet<DeviceID> _releasedDevices;
     QHash<DeviceID, uint8_t> _deviceToSystem; ///< deviceID → systemID 映射（接收端学习）
     QHash<uint8_t, DeviceID> _systemToDevice; ///< systemID → deviceID 反向映射
     /// deviceID → 最近一次收帧时 `_frameClock` 的毫秒读数。
-    /// ⚠️ 刻意**不做清理**：条目数 = 本进程见过的 deviceID 数（天花板 80），
-    ///    内存可忽略；加清理反而引入"清理时机"这个新判据，是净损失。
+    /// ⚠️ 清理时机**只有一处**：`releaseDevice`（签出）。旧注释的理由「加清理会引入
+    ///    '清理时机'这个新判据，是净损失」自 2026-10-06 起不再成立——签出**就是**那个判据，
+    ///    且签出后必须清：留着它等于本端为一条**已经交还出去**的链路继续保留收帧记录，
+    ///    而 `msSinceLastFrame()` 正是"本端现在认不认这架飞机"的答案来源。
+    /// ⚠️ 光清它、不给 `reRegisterDevice` 加闸会**制造**一个回归：`RomView.qml` 的 2s 节拍
+    ///    读到 `-1`（`since < 0` 判据恒真）⇒ 每 2s 定向重发一次 80005 ⇒ mavp2p 那个配对的
+    ///    `qgcSeen` 被重新刷新鲜 ⇒ 配对**永不过期**、残余帧无限期投喂。两件事必须同批。
     QHash<DeviceID, qint64> _lastFrameMs;
     /// `_lastFrameMs` 的时间基准。单调、不受系统时钟调整影响。
     QElapsedTimer _frameClock;

@@ -2628,6 +2628,194 @@ void CryptoTest::_testReleaseDeviceUnknownDeviceIgnored()
 }
 
 // ============================================================================================
+// 释出的 ⑤（2026-10-06 补）：签出后三张 per-device 表必须清
+//
+// 「签出」＝ `releaseDevice`。在此之前它只做四件事（摘登记集合 / 摘监控清单 / 删密钥 /
+// 让出上行槽），三张 per-device 表**刻意不动**（旧注释的理由："没有清理时机判据"、
+// "删掉会让 beginLinkingForSystemID 失效"）。今天两条都反过来了：签出**就是**那个清理时机，
+// 而让 `beginLinkingForSystemID` 在这架飞机上失效**正是**签出要做的事。
+//   · `_lastFrameMs`    —— 本端"还认不认这架飞机"的答案来源（`msSinceLastFrame`）
+//   · `_systemToDevice` —— `beginLinkingForSystemID` 的唯一索引；留着它，本端就还能凭一个
+//                          systemID 为**已经交还出去**的飞机重新建链
+//   · `_deviceToSystem` —— 正向表，今天**只写不读**（全仓无读者）⇒ 清它是防泄漏，
+//                          **行为上不可观测**，本格因此刻意不给它设断言（见下面 ℹ️）
+//
+// ⚠️ 单例状态跨用例共享 ⇒ 本组三格用 `0xA1`/`0xA2`/`0xA3` 三段**独占的 sysid**
+//    （既有用例占 `0x61`/`0x81`/`0x8F`，`_testNoteDeviceFrame` 用裸 `0x0A0B0C10`）。
+// ============================================================================================
+void CryptoTest::_testReleaseDeviceClearsPerDeviceTables()
+{
+    CryptoController* const crypto = CryptoController::instance();
+    // 本仓 strict mode 连 QtDebugMsg 都算未预期日志（见 `_testReRegisterDevice` 的说明）。
+    // 下面这些 Debug 都不是被测行为（判据全在 `deviceIDForSystemID` / `msSinceLastFrame` 上），
+    // 故整类豁免；正则覆盖本格会触发的四种。
+    ignoreLogMessage("MAVLink.Crypto.CryptoController", QtDebugMsg,
+                     QRegularExpression("registration |linked device|released device|return to standby"));
+
+    crypto->returnToStandby();
+    crypto->setRegistrationEnabled(false);
+
+    const uint8_t sysid = 0xA1;
+    const DeviceID dev  = makeDeviceID(0, 0, sysid, 0x01);
+
+    crypto->addLinkedDevice(dev);
+    crypto->learnDeviceSystemMapping(dev, sysid);
+    crypto->noteDeviceFrame(dev);
+
+    // ‼️ 前提自检（阳性对照）：没有这两句，"清干净了"对一个**从未写进去**的实现同样成立。
+    DeviceID out = kInvalidDeviceID;
+    QVERIFY2(crypto->deviceIDForSystemID(sysid, out), "前提：映射没学进去 ⇒ 本格必假绿");
+    QCOMPARE(out, dev);
+    QVERIFY2(crypto->msSinceLastFrame(dev) >= 0, "前提：收帧时刻没记上 ⇒ 本格必假绿");
+
+    crypto->releaseDevice(dev);
+
+    // ‼️ 判据一（本组最重的一格）：systemID 反查必须落空。留着映射，本端就还能凭一个
+    //    systemID 为**已经交还出去**的飞机重新建链——`MissionController::sendToVehicle`
+    //    → `CryptoController::beginLinkingForSystemID(vehicle->id())` 是它的唯一消费者链。
+    QVERIFY2(!crypto->deviceIDForSystemID(sysid, out),
+             "签出后 systemID 反查仍命中 ⇒ 本端还能为已经交还出去的飞机重新建链");
+    // ‼️ 判据二：收帧记录必须回到"从未收到"——是 -1，不是 0（0 会被 `RomView.qml` 当成
+    //    "刚刚收到"；`_testNoteDeviceFrame` 的第一格钉的就是这条口径）。
+    QCOMPARE(crypto->msSinceLastFrame(dev), qint64(-1));
+    // ℹ️ `_deviceToSystem` **刻意不设断言**：它今天只写不读（全仓无读者），清与不清在行为上
+    //    完全等价，任何断言都只能是"读 private 成员"式的白盒，钉不住真实后果。
+    //    清它是为了与反向表保持一致 + 防泄漏；真正的判据在反向表那一格。
+
+    // 复原：`releaseDevice` 会给 dev 打上"已签出"记号，撤销它使本用例不留痕。
+    // ⚠️ 撤销点是 `addLinkedDevice`（接手），**不是** `removeLinkedDevice`。
+    crypto->addLinkedDevice(dev);
+    crypto->removeLinkedDevice(dev);
+}
+
+// ============================================================================================
+// 释出的 ⑤ 后半：**只清不够** —— 残余报文不得把它重新激活
+//
+// 场景：`releaseDevice` 之后，mavp2p 仍会把这个 deviceID 的加密帧继续转发过来，直到配对
+// 老化（`MAP_TTL`；实测云端部署未传 `--map-ttl` ⇒ 走默认 **60s**，且 `fanoutTargets` 的判据
+// 是 `qgcSeen` 而非 `lastSeen`：签出后本端不再把它写进 80005 payload ⇒ `qgcSeen` 冻结
+// ⇒ TTL 到期自然停发——用户说的"等超时"机制成立）。
+// 问题出在这 60s 里：`MAVLinkProtocol.cc` 的四条收帧记账是**无条件**的（明文待命心跳支两条、
+// 加密帧支两条），于是刚清掉的三张表会被**下一帧**原地写回——签出等于没签出。
+// ⇒ 闸落在 `learnDeviceSystemMapping` / `noteDeviceFrame` **函数体内**，调用点不设闸：
+//    那里的注释写明那四行必须无条件执行（失联判据依赖它们，且它们是"全新启动学映射"的
+//    唯一入口——用白名单 `isInManifest()` 当闸会打破那个先有鸡先有蛋）。
+// ============================================================================================
+void CryptoTest::_testReleaseDeviceBlocksFrameReactivation()
+{
+    CryptoController* const crypto = CryptoController::instance();
+    ignoreLogMessage("MAVLink.Crypto.CryptoController", QtDebugMsg,
+                     QRegularExpression("registration |linked device|released device|return to standby"));
+
+    crypto->returnToStandby();
+    crypto->setRegistrationEnabled(false);
+
+    const uint8_t sysid = 0xA1;
+    const DeviceID dev  = makeDeviceID(0, 0, sysid, 0x02);
+
+    crypto->addLinkedDevice(dev);
+    crypto->learnDeviceSystemMapping(dev, sysid);
+    crypto->noteDeviceFrame(dev);
+    crypto->releaseDevice(dev);
+
+    // ---- ① 签出后，残余帧不得把它激活 ----
+    // ‼️ 下面两句**就是** `MAVLinkProtocol.cc` 收帧路径上那四行所做的事，逐字模拟。
+    crypto->learnDeviceSystemMapping(dev, sysid);
+    crypto->noteDeviceFrame(dev);
+
+    DeviceID out = kInvalidDeviceID;
+    QVERIFY2(!crypto->deviceIDForSystemID(sysid, out),
+             "残余帧把 systemID 映射重建回来了 ⇒ 三张表被逐帧写回，签出等于没签出");
+    QCOMPARE(crypto->msSinceLastFrame(dev), qint64(-1));
+
+    // ---- ② 阳性对照之一：闸必须**可撤销**，否则这架飞机在本会话里永久失联 ----
+    // 撤销点＝站点操作员重新接手（`OpsShell.qml::_adoptSiteDevice` → `addLinkedDevice`）。
+    // ‼️ 没有这一格，"无条件拒绝一切 learn/note"这种把本端钉死的实现也能过 ①。
+    crypto->addLinkedDevice(dev);
+    crypto->learnDeviceSystemMapping(dev, sysid);
+    crypto->noteDeviceFrame(dev);
+    out = kInvalidDeviceID;
+    QVERIFY2(crypto->deviceIDForSystemID(sysid, out),
+             "重新接手后映射学不回来 ⇒ MissionController::sendToVehicle 再也建不了链");
+    QCOMPARE(out, dev);
+    QVERIFY(crypto->msSinceLastFrame(dev) >= 0);
+
+    // ---- ③ 阳性对照之二：监控员名册（`setMonitorDevices`）也必须撤销 ----
+    // ‼️ 这一半**必须**有，且判据是**整份名册**而不是"本次新增的那几个"：监控员名册取自
+    //    `_routeDevices`（后端 ③ 的**航线名册**投影），与"场地签出"正交。若签出后该 id 仍在
+    //    名册里，说明本端**确实需要**收它的遥测（画 L3 marker）——那是正当接收，不是
+    //    "被残余报文激活"。缺这一半，同机双角色下监控员收不到已签出飞机的遥测，**且无告警**。
+    // ⚠️ 用**独立的** sysid：与 ② 共用会让 ② 刚学回的映射污染本格判据（假绿）。
+    const uint8_t sysid2 = 0xA2;
+    const DeviceID monitor = makeDeviceID(0, 0, sysid2, 0x03);
+    crypto->addLinkedDevice(monitor);
+    crypto->learnDeviceSystemMapping(monitor, sysid2);
+    crypto->releaseDevice(monitor);
+    DeviceID tmp = kInvalidDeviceID;
+    QVERIFY2(!crypto->deviceIDForSystemID(sysid2, tmp), "前提：它没被挡住 ⇒ 本格必假绿");
+    crypto->setMonitorDevices(QVariantList{ QVariant(static_cast<uint>(monitor)) }, 3000);
+    crypto->learnDeviceSystemMapping(monitor, sysid2);
+    QVERIFY2(crypto->deviceIDForSystemID(sysid2, tmp),
+             "监控员名册把它带回来了、记号却没撤销 ⇒ 监控员收不到这架已签出飞机的遥测（且无告警）");
+
+    // 复原：清名册（两架的"已签出"记号已分别由 ② / ③ 的接手动作撤销）。
+    crypto->setMonitorDevices(QVariantList{}, 3000);
+}
+
+// ============================================================================================
+// 释出的 ⑤ 第三格：`reRegisterDevice` 的签出闸
+//
+// ‼️ 这道闸不是"多一道防线"，而是与 ⑤ 清 `_lastFrameMs` **配对**的另一半：
+//    清掉时间戳后 `msSinceLastFrame()` 返回 -1 ⇒ `RomView.qml::_checkFrameTimeouts()` 的
+//    `since < 0` 判据**恒真** ⇒ 每 2s 一次定向重发 80005；而 `_monitorIds` 取自
+//    `OpsCommon.monitorDeviceIds(_routeDevices)`——那是后端 ③ 的**航线名册**投影，与
+//    "场地签出"正交，签出后该 id 仍可能留在里面（同机双角色时必然如此）。
+//    缺这道闸，重发会把 mavp2p 那个配对的 `qgcSeen` 重新刷新鲜（`processRegistration`
+//    命中已有配对时 `lastSeen` 与 `qgcSeen` **两个都刷**）⇒ 配对**永不过期**、残余加密帧
+//    无限期投喂——正好抵消 `releaseDevice` 想达成的效果。
+// ⚠️ 判据的落点必须在**被调用方**：`registrationEnabled()` 与 `_releasedDevices` 都不是
+//    `Q_INVOKABLE`，QML 调用点（那 2s 节拍）物理上查不到闸的状态。
+// ============================================================================================
+void CryptoTest::_testReleaseDeviceBlocksReRegister()
+{
+    CryptoController* const crypto = CryptoController::instance();
+    ignoreLogMessage("MAVLink.Crypto.CryptoController", QtDebugMsg,
+                     QRegularExpression("registration |linked device|released device|return to standby"));
+
+    crypto->returnToStandby();
+    crypto->setRegistrationEnabled(false);
+
+    const DeviceID dev = makeDeviceID(0, 0, 0xA3, 0x01);
+    crypto->addLinkedDevice(dev);
+    crypto->setMonitorDevices(QVariantList{ QVariant(static_cast<uint>(dev)) }, 3000);
+
+    // ‼️ 周期给到 1 小时：用例内绝不可能周期触发 ⇒ 增量只可能来自下面的直调。
+    //    开门（enabled 分支）**自身立即发一帧**（`_sendRegistration()`）⇒ 一律用差值断言。
+    crypto->setRegistrationEnabled(true, 3600000);
+
+    // ‼️ 前提自检（阳性对照）：门开着、又不在黑名单里 ⇒ 它**确实**发得出去。
+    //    没有这一格，"无条件早退"（谁都不发）这种实现也能过下面那格。
+    const int s0 = crypto->registrationSendCountForTest();
+    crypto->reRegisterDevice(dev);
+    QCOMPARE(crypto->registrationSendCountForTest(), s0 + 1);
+
+    crypto->releaseDevice(dev);
+    const int s1 = crypto->registrationSendCountForTest();
+    crypto->reRegisterDevice(dev);
+    QCOMPARE(crypto->registrationSendCountForTest(), s1);   // ‼️ 一帧都不发
+
+    // 阳性对照：重新接手后必须恢复发送，否则这架飞机在本会话里永久掉线。
+    crypto->addLinkedDevice(dev);
+    crypto->reRegisterDevice(dev);
+    QCOMPARE(crypto->registrationSendCountForTest(), s1 + 1);
+
+    // 复原：登记关掉（`enabled == false` 分支只 stop 定时器，**不发帧** ⇒ 计数不动）。
+    crypto->setRegistrationEnabled(false);
+    crypto->setMonitorDevices(QVariantList{}, 3000);
+    crypto->removeLinkedDevice(dev);
+}
+
+// ============================================================================================
 // 批量取密钥（规范 §2.7.2 d，Task 5）
 // 「清单为空 ⇒ 0 次 HTTP」是**设计约束**，不是优化——退化回"全拉一遍"就等于把
 // §2.7.2 的范围收窄整个作废。故本用例钉的是"一个请求都没发"，不是"发得少"。

@@ -640,19 +640,59 @@ Item {
     //---- 签出释出 ----
 
     /// 释出一架已签出的飞机：交还本端关于它的**全部**本地状态。
-    /// - C++ 侧四件套（登记集合 / 密钥 / 上下行水位 / 上行权）见 `CryptoController::releaseDevice`
-    ///   的注释——那里写了"为什么删密钥与清水位必须同批"这条因果链。
+    /// - C++ 侧五件套（登记集合 / 密钥 / 上下行水位 / 上行权 / per-device 表）见
+    ///   `CryptoController::releaseDevice` 的注释——那里写了"为什么删密钥与清水位必须同批"
+    ///   这条因果链，以及"为什么光清表不够、还要挡住残余报文把它重建回来"。
     /// - QML 侧清掉它的**历史轨迹**。`TrajectoryPoints` 是纯内存、与那条加密链路同生命周期，
     ///   飞机走了它的线就该消失（用户报障的「黄箭头没了、红轨迹照跑」正是这两者不同步）。
     ///   ⚠️ 轨迹层是 `MapItemView` 直接吃 `multiVehicleManager.vehicles`，`clear()` 会发
     ///   `pointsCleared`，那层委托里已有处理器清 `path`（见 L3 上方注释），此处不必碰图层。
     ///   ⚠️ 找不到载具（已经断了 3.5s 被摘掉）就不清——那种情况下轨迹线也随之消失了，
     ///   没有任何东西需要擦。
+    /// - QGC 侧**干净断开**：把载具对象本身销掉（2026-10-06 补）。
+    ///   ‼️ 为什么必须销：控制权交出去了，本端却还挂着一个"活跃载具"——`releaseDevice` 删掉
+    ///   密钥后，`MAVLinkProtocol.cc` 把该机的加密帧一律丢弃（`no key for device ...
+    ///   dropping encrypted frame`）⇒ 3500ms 收不到心跳 ⇒ `_commLostCheck` 置
+    ///   `_communicationLost = true` ⇒ 按钮栏**同时**冒出「通信丢失」红块与「断开」按钮
+    ///   （同一个变量驱动的两处）。那两处提示是**误导**的：链路本来就该断，不是出了故障。
+    ///   ⚠️ 默认路径**不会**自动销载具：`Vehicle::_autoDisconnect` 默认 false（全仓只有
+    ///   `FirmwareUpgrade.qml` 置 true）⇒ 收不到心跳时只置标志、不调 `closeVehicle()`。
+    ///   所以这一句必须在这里显式做。
+    ///   ⚠️ 销载具**不会**被 mavp2p 转来的残余帧重建。残余帧有两条，两条都堵着：
+    ///     · **加密帧**（建链过的那架随后发的）：密钥已删 ⇒ `MAVLinkProtocol::_processEncryptedFrame`
+    ///       在 `keyForDevice` 处打 `no key for device ... dropping encrypted frame` 并丢弃
+    ///       ⇒ 没有 HEARTBEAT 上浮到 `MultiVehicleManager`。
+    ///     · **明文待命心跳**（msgID=0 且 payload block < 28，规范 §2.2）：`MAVLinkProtocol.cc`
+    ///       那条分支要先过被动取密钥的合取闸 `!hasKey(deviceID) && isInManifest(deviceID)`。
+    ///       签出后本端是**场地操作员**：`releaseDevice` 已把它从 `_linkedDevices` 摘掉，
+    ///       而 `isInManifest` 的口径是 `_monitorListActive ? _monitorDevices : _linkedDevices`
+    ///       ——`_monitorListActive` 只由 `setMonitorDevices` 置位，全仓唯一的调用点是
+    ///       `RomView.qml`（监控员视图）⇒ 场地视图下恒 false ⇒ 读的是不含它的 `_linkedDevices`
+    ///       ⇒ 不合取 ⇒ **不拉密钥**；紧随其后的建链闸 `Standby && hasKey` 也因此为假。
+    ///       （这就是本次 `_releasedDevices` 那道闸要保的东西：不挡的话残余帧会把刚清掉的
+    ///       映射与收帧记录逐帧写回，而 `learnDeviceSystemMapping` 是"全新启动学映射"的唯一入口，
+    ///       白名单式的闸会同时封死冷启动——两者形状相同、语义相反。）
+    ///   ⚠️ **例外**（刻意留的，不是漏洞）：本端若**同时**是这架飞机的监控员，则
+    ///   `_monitorDevices` 含它 ⇒ 上面那道取密钥闸成立、`_releasedDevices` 也被撤销
+    ///   ⇒ 载具会被重新建出来。那是**正当**的：监控员名册是**航线名册**投影、与"场地签出"
+    ///   正交，本端确实需要收它的遥测。判据是「谁在收」，不是「帧从哪来」。
+    ///   ⚠️ UDP link 本身会在 1s 内被 `LinkManager::_addUDPAutoConnectLink()` 重建，
+    ///   但那只是个空链接对象，不产生载具。
+    ///   ⚠️ 销载具会走 `PlanMasterController` / `MissionController` 的 `_managerVehicle`
+    ///   生命周期，而 `OpsRouteSync.qml` 那个裸 controller 从不调 `start()`、收不到
+    ///   `activeVehicleChanged` ⇒ 悬垂。本行依赖 2026-10-06 那处悬垂崩溃已修（QPointer 化 +
+    ///   读点回落）——那笔改动与本次同批，必须在场。
     function _releaseSiteDevice(deviceID) {
         cryptoController.releaseDevice(deviceID)
         var v = OpsCommon.matchDeviceToVehicle({ device_id: deviceID },
                                                QGroundControl.multiVehicleManager.vehicles)
-        if (v && v.trajectoryPoints) v.trajectoryPoints.clear()
+        if (!v) return
+        // 先清轨迹（趁载具还在）。销掉之后这一层随委托一起销毁，但显式清一次让回收路径单向。
+        if (v.trajectoryPoints) v.trajectoryPoints.clear()
+        // 再销载具：链路摘除 + 命令处理停止 + `allLinksRemoved` → `_deleteVehiclePhase1`
+        // → 20ms 后 `_deleteVehiclePhase2` → `deleteLater()`。
+        // ⚠️ 异步：本函数返回时载具还在，20ms 后才真的销毁。
+        v.closeVehicle()
     }
 
     /// 接手一架飞机：把它的 deviceID 推入 C++ 侧的登记集合，并（在本地尚无密钥时）

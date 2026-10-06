@@ -130,4 +130,19 @@ private slots:
     void _testSetMonitorDevicesFetchesOnlyMissing();
     void _testSetMonitorDevicesUnchangedDoesNotRefetch();
     void _testSetMonitorDevicesEmptyFetchesNothing();
+
+    // 签出释出的 ⑤（2026-10-06 补）：三张 per-device 表必须清。此前 ①–④ 一律不动它们。
+    void _testReleaseDeviceClearsPerDeviceTables();
+
+    // ⑤ 的后半：**只清不够** —— mavp2p 在配对老化（实测默认 60s）前仍会转发该机的帧，
+    // 而 `MAVLinkProtocol.cc` 的四条收帧记账是**无条件**的 ⇒ 闸必须落在
+    // `learnDeviceSystemMapping` / `noteDeviceFrame` 体内，否则下一帧就把表重建回来。
+    // ⚠️ 本格同时钉"闸可撤销"（`addLinkedDevice` 与 `setMonitorDevices` 两个撤销点）——
+    //    少了那半，"无条件拒绝一切 learn/note"这种把本端钉死的实现也会全绿。
+    void _testReleaseDeviceBlocksFrameReactivation();
+
+    // ⑤ 的第三格：`reRegisterDevice` 的签出闸。它与 ⑤ 清 `_lastFrameMs` 是**配对**的两半：
+    // 清掉时间戳后 `RomView.qml` 的 `since < 0` 判据恒真 ⇒ 每 2s 重发会把 mavp2p 那个配对的
+    // `qgcSeen` 重新刷新鲜 ⇒ 配对永不过期。
+    void _testReleaseDeviceBlocksReRegister();
 };
