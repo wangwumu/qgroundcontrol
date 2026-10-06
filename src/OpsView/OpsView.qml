@@ -1091,6 +1091,67 @@ OpsShell {
     //=========================================================================
     property var _routeSyncs: ({})
 
+    //── VTOL 起飞转换距离（运营常数，2026-10-06 设计稿 §5/§7）────────────────
+    //
+    // 这个距离**是运营常数**，与那四个高度常数同一张表（`table_operational_constant`），
+    // 由后端 `GET /api/operational-constants` 下发。QGC 侧**不再**读
+    // `PlanViewSettings.vtolTransitionDistance` —— 那个设置项**留着不动**，
+    // 改它对本项目的起飞转换点**已无效**，界面上没有这个提示，是设计稿 §10.1 登记过的已知代价。
+    //
+    // 「留着不动」不是随口说的：2026-10-06 全仓 `rg` 实测，该设置项**还有两个 src 侧读者**
+    // （都在上游 QGC 的 Plan 视图路径上，与 `OpsView` 无关）：
+    //   · `MissionManager/TakeoffMissionItem.cc:166` —— **起飞点**的默认距离。
+    //     ⚠️ 它只在 `!coordinate().isValid()` 时进入，且沿**方位角 0（正北）**偏
+    //     （`:179 atDistanceAndAzimuth(distance, 0)`）—— 设计稿里「失效时朝正北飞」
+    //     那个现象就是这一行。本项目走不到它：`OpsRouteSync.qml:659` 的
+    //     `takeoff.coordinate = takeoffPoint` 是**最后一次**写
+    //     （`TakeoffMissionItem::setCoordinate`（`:97-105`）无条件转调
+    //     `SimpleMissionItem::setCoordinate`）⇒ **我们算的点赢**。
+    //   · `MissionManager/VTOLLandingComplexItem.cc:38-42` —— 垂起着陆航线的
+    //     `landingDistance` 默认值种子（降落侧，与本参数无关）。
+    // 另：`AppSettings/pages/PlanView.SettingsUI.json:13` 仍把它摆在设置页上（所以用户看得见、改得动、但改了没用）。
+    //
+    // ‼️ **触发频率 = 每个 Vehicle 对象一次**（设计稿 §7.2），**不是**「每次建链」：
+    //   · 触发点是 `_onVehicleConnected()`，但该函数**约每 2s** 还会被
+    //     `on_TasksChanged → _syncRoutesForAlreadyConnected()` 再调一次（遥测链活着时）
+    //     ⇒ **必须有闩**，否则变成每 2s 一个 XHR。
+    //   · 闩按 **Vehicle 对象身份**，**不能按值**：兜底的 300 与库里取到的 300
+    //     在值上完全同形，用值当判据分不出「问过没有」。
+    //   · 「重连飞机」在本项目里**通常不会**重建 Vehicle 对象（那是 PX4 重启，QGC 到
+    //     mavp2p 的 link 没断）⇒ 改库后要**重启 QGC** 才会重新取。
+    //
+    // `-1` = **第一个**请求还没回来（§7.5）。‼️ 只有初始值才是 `-1`：后续取值
+    // **不再重置**——该常数全局同值、与是哪架飞机无关，重置只会给所有飞机多开一个
+    // 「不建 sync」的窗口，带不来任何正确性。
+    property real _vtolTransitionDistance: -1
+    // 闩：已经为**这个 Vehicle 对象**取过（含在途）。`null` = 还没为任何飞机取过。
+    property var  _vtolDistanceAskedFor: null
+    // 请求序号：每发一次取值请求 +1；回调带着**自己那次的序号**回来。
+    // 用途＝去重。一次请求有三个可能先到的落定点（`readystatechange(DONE)`、`onerror`、
+    // 超时 `Timer`），谁先到谁算数、后到的丢弃。**不能**改用 `_vtolTransitionDistance`
+    // 是否已是 `>= 100` 当这个判据：那样第二架飞机的那次请求（结果本应照样刷新缓存）
+    // 会被静默丢弃 —— §7.3 的粒度是「每个 Vehicle 对象取一次」，不是「全局只取一次」。
+    property int  _vtolReqSeq: 0
+    property int  _vtolSettledSeq: -1
+
+    /// 取值请求的**超时计时器** —— 「预设一个时间，时间一到不等返回」（用户原话）。
+    ///
+    /// ‼️ **为什么不用 `xhr.timeout`：Qt 6.11 的 QML `XMLHttpRequest` 没实现它。**
+    ///    2026-10-06 实测（黑洞服务端：accept 后永不回包）——
+    ///    `xhr.timeout = 1200` 赋值**能读回 1200**（那只是个 JS 属性、骗过读回），
+    ///    但 **5 s 内零回调**：无 `ontimeout`、无 `readyState === DONE`、无 `onerror`
+    ///    ⇒ 请求**永远挂着**，回调永远不来。⚠️ 别用「读回等于所设」当它生效的判据。
+    ///    对照臂（同一份脚本里对正常应答的服务端）：2 ms 拿到 `status 200`，机制本身没问题。
+    ///    ⇒ 超时只能由 QML 侧自己的 `Timer` 兜。见 `_onVtolDistanceArrived()`（它会停表）。
+    Timer {
+        id: _vtolTimeoutTimer
+        interval: 5000
+        repeat: false
+        // 迟到的应答由 `_onVtolDistanceArrived` 里的 `seq` 判据丢弃，所以这里
+        // 直接报「当前在途的那一次的序号」即可。
+        onTriggered: opsView._onVtolDistanceArrived(opsView._vtolReqSeq, false, NaN)
+    }
+
     /// 取出任务对应的同步器（没有就造一个）。**幂等**：已存在时直接返回旧的。
     ///
     /// ‼️ 幂等判据是"这个 key 存不存在"，**不是**"同步成功没" —— 正在同步中也不能
@@ -1125,6 +1186,16 @@ OpsShell {
             if (ex.vehicle !== vehicle) { ex.reset(); ex.vehicle = vehicle; ex.start() }
             return ex
         }
+        // ‼️ **转换距离还在路上时不要建 sync**（设计稿 §7.3.1）。
+        //    `OpsRouteSync.vtolTransitionDistance` 是下面的 `createObject` 初值，
+        //    而初值**只在建的这一刻求值一次** ⇒ 在途时建会把「还没有值」烘进航线；
+        //    更糟的是事后补调会命中上面那个 `ex` 早返回（`ex.vehicle === vehicle`，
+        //    不会重发）⇒ `start()` 一次都不会被调，**航线永远发不出去且全程无报错**。
+        //    ⇒ 未就绪就**别建**：`_routeSyncs` 里不留半成品，补调走的是「新建」分支。
+        // 位置＝`ex` 早返回**之后**：放函数最前面的话，为 B 机取值的那几十毫秒里会把
+        //    A 机已建好的 sync 也一并挡掉（本函数只有一个调用点、返回值无人使用，
+        //    两种放法行为无差，放这里要解释的东西更少）。
+        if (_vtolTransitionDistance === -1) return null
         var sync = _routeSyncComponent.createObject(opsView, {
             "vehicle": vehicle,
             "routeId": task.route_id,
@@ -1133,7 +1204,10 @@ OpsShell {
             // 偏到机位朝向上（见该文件 §④c）。这里**传整个 task** 而不是先取出朝向：
             // 朝向是 `createObject` 之后才算的，而 `createObject` 的初值只在建的这一刻求值一次
             // ⇒ 先把 task 交给它，由它自己按同一份数据算，避免"两处各算一遍"。
-            "task":    task
+            "task":    task,
+            // 转换距离**按值注入**（不是绑定）：初值只在建的这一刻求值一次，而上面那道闸
+            // 已保证此刻它必然 **>= 100**（`-1` 到不了这里，§7.4 的归一化保证没有其它形态）。
+            "vtolTransitionDistance": _vtolTransitionDistance
         })
         if (!sync) {
             // `createObject` 失败在 QML 里**不报错**，只静默回 null。
@@ -1186,6 +1260,14 @@ OpsShell {
     /// ‼️ 用 `deviceID` 匹配，**不用** `activeVehicle`（多机场景会把航线发错飞机）。
     function _onVehicleConnected(vehicle) {
         if (!vehicle) return
+        // ‼️ **闩只包住「发请求」这一句，任务循环每次照跑**（设计稿 §7.3.1 末）。
+        //    反过来写 —— 把闩提到本函数第一句
+        //        `if (_vtolDistanceAskedFor === vehicle) return`
+        //    —— 会让航线**永远建不出来**，因为补调走的正是这条路：
+        //        XHR 回来 → _syncRoutesForAlreadyConnected() → _onVehicleConnected(同一架)
+        //        → 闩命中 → return ⇒ 任务循环根本没跑到。
+        //    （`_fetchVtolTransitionDistance` 内部自己判闩，所以这句是幂等的。）
+        _fetchVtolTransitionDistance(vehicle)
         var ts = _tasks
         if (!ts) return
         for (var i = 0; i < ts.length; i++) {
@@ -1194,6 +1276,76 @@ OpsShell {
             if (!t.route_id) continue
             _syncRouteForTask(t, vehicle)
         }
+    }
+
+    /// 取一次 VTOL 起飞转换距离（设计稿 §7.3）。
+    ///
+    /// **内部自己判闩**：每个 Vehicle 对象只发 1 次（含在途）。调用方每次都调它，
+    /// 由它决定这次要不要真的发 —— 这样 `_onVehicleConnected()` 的任务循环
+    /// 不会被闩挡住（见该函数里那段）。
+    ///
+    /// ‼️ **请求必须带超时**：服务端不响应时回调**永远不来** ⇒ 参数永远停在 `-1`、
+    ///    航线永远建不出来（`_syncRouteForTask()` 那道闸会一直挡住）。
+    ///    这不是本参数特有的要求，是「取一次后台数据」这件事的通用做法：
+    ///    **预设一个时间，时间一到不等返回**（用户原话）。
+    ///    ⚠️ 超时**不能用 `xhr.timeout`**（Qt 6.11 的 QML XHR 没实现它，见
+    ///    `_vtolTimeoutTimer` 的注释与那里的实测）⇒ 由那个 Timer 兜。
+    ///    也因此这里不走 `OpsShell._get`（它没带超时能力）。
+    function _fetchVtolTransitionDistance(vehicle) {
+        if (_vtolDistanceAskedFor === vehicle) return
+        _vtolDistanceAskedFor = vehicle
+        _vtolReqSeq += 1
+        var seq = _vtolReqSeq
+        if (_apiBase === "") {
+            // gcs_server 地址没配 ⇒ 不必干等超时，直接走同一个落定出口。
+            _onVtolDistanceArrived(seq, false, NaN)
+            return
+        }
+        var xhr = new XMLHttpRequest()
+        xhr.open("GET", _apiBase + "/api/operational-constants")
+        xhr.setRequestHeader("Content-Type", "application/json")
+        xhr.setRequestHeader("Authorization", "Bearer " + AuthController.authToken())
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState !== XMLHttpRequest.DONE) return
+            var ok = (xhr.status >= 200 && xhr.status < 300)
+            var v = NaN
+            if (ok && xhr.responseText && xhr.responseText.length) {
+                try {
+                    var data = JSON.parse(xhr.responseText)
+                    var items = data ? data.items : null
+                    for (var i = 0; items && i < items.length; i++) {
+                        if (items[i] && items[i].key === "vtol_takeoff_transition_distance") {
+                            v = Number(items[i].value)
+                            break
+                        }
+                    }
+                } catch (e) {
+                    console.warn("OpsView: 运营常数响应非 JSON，起飞转换距离退回内置 300")
+                }
+            }
+            _onVtolDistanceArrived(seq, ok, v)
+        }
+        // 网络错（连接被拒、DNS 失败…）走这里；**「服务端不响应」不走这里**，
+        // 那条路由 `_vtolTimeoutTimer` 兜（`xhr.timeout` 在 Qt 6.11 无效）。
+        xhr.onerror = function() { _onVtolDistanceArrived(seq, false, NaN) }
+        _vtolTimeoutTimer.restart()
+        xhr.send(null)
+    }
+
+    /// 取值**落定**（成功、超时、网络错、地址未配，四条路都走这里）：
+    /// 按 `seq` 去重 ⇒ §7.4 归一化 ⇒ 补调被挡下的建 sync。
+    function _onVtolDistanceArrived(seq, ok, v) {
+        // 一次请求有三个落定点，谁先到谁算数、后到的丢弃（`seq` 只增 ⇒ `<=` 即已落定）。
+        if (seq <= _vtolSettledSeq) return
+        _vtolSettledSeq = seq
+        _vtolTimeoutTimer.stop()
+        // ‼️ **「内置 300」这个字面量在 QGC 侧只有这一处**（设计稿 §7.4）。
+        //    ⚠️ 跨语言/跨文件的相等关系**没有判据**：迁移里的种子值、Go 的
+        //    `defaultVtolTakeoffTransitionDistance`、这一处，三处要人工同改。
+        _vtolTransitionDistance = (ok && isFinite(v) && v >= 100) ? v : 300
+        // 在途期间被 `_syncRouteForTask()` 挡下的那些任务，现在补建。
+        // （该函数已存在，`Component.onCompleted` 与 `on_TasksChanged` 都在调它。）
+        _syncRoutesForAlreadyConnected()
     }
 
     /// 补扫：QGC 启动时飞机**已经**连好的那一批——`initialConnectComplete` 早发过了，

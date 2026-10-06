@@ -64,6 +64,16 @@ Item {
     ///    但「整个 `task` 为 `null`」这一档已经**被拒**（见 `start()` 里那道飞行高度闸）。
     property var    task:     null
 
+    /// VTOL 起飞转换距离（米，`home` 沿机位朝向偏移这么多）—— 由 `OpsView` 注入，
+    /// 来源是**运营常数表**（`GET /api/operational-constants` 的
+    /// `vtol_takeoff_transition_distance`），**不是** `PlanViewSettings.vtolTransitionDistance`。
+    /// ⇒ 设置页里那一项从 2026-10-06 起对本文件**不再生效**（设计稿 §10.1，界面无提示、已知并接受）。
+    ///
+    /// 默认 `0` = **未注入**哨兵：注入漏了才会停在 0。④c 里那道 `< 100` 判据专门接住它 ——
+    /// ‼️ 接住的方式**不是**回落 `home`（那与 `distM = 0` 是同一件事，正是「起飞后方向随机」），
+    /// 而是用与正常兜底**同源**的内置 300 在**已知朝向**上现算。
+    property real   vtolTransitionDistance: 0
+
     //-------------------------------------------------------------------------
     // 输出（调用方只读）
     //-------------------------------------------------------------------------
@@ -628,8 +638,20 @@ Item {
         var takeoffPoint = home
         var slotHeading = OpsCommon.takeoffSlotHeading(task)
         if (slotHeading !== null) {
-            var transitionM = Number(QGroundControl.settingsManager.planViewSettings
-                                     .vtolTransitionDistance.rawValue)
+            // ④ 转换距离读**注入值**（运营常数），不再读 `PlanViewSettings.vtolTransitionDistance`
+            //    —— 那个设置项的 `min` 就是 100，且从 2026-10-06 起本项目的转换点由**库**决定。
+            // ⑤ 防御：注入整个漏了（`OpsView` 的 `createObject` 初值 map 少写一项）时本属性
+            //    停在默认 0。判据与阈值和 ④ 的归一化**相同**（设计稿 §6.2 ⑤）。
+            //    ‼️ **这里不回落 `home`**：`takeoffTransitionPoint(lat, lon, h, 0)` 恒等还原
+            //    ⇒ 返回起点本身，与「方向随机」是同一件事，恰恰是本设计要消灭的现象。
+            //    正解＝用**与 ④ 同源**的内置 300 在**本来就有的已知朝向**上现算 ⇒ 方向仍是对的。
+            //    这是编程错误、不是运行期故障，所以只需要一条 warn，**不需要**界面痕迹。
+            var transitionM = vtolTransitionDistance
+            if (!isFinite(transitionM) || transitionM < 100) {
+                console.warn("OpsRouteSync: vtolTransitionDistance 未注入或非法（" + transitionM
+                             + "），按内置 300 处理（设计稿 §6.2 ⑤）")
+                transitionM = 300
+            }
             var moved = OpsCommon.takeoffTransitionPoint(home.latitude, home.longitude,
                                                          slotHeading, transitionM)
             if (moved) takeoffPoint = QtPositioning.coordinate(moved.lat, moved.lon)
