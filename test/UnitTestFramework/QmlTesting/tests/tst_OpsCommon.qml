@@ -3254,4 +3254,223 @@ TestCase {
     function test_nrrsmUsableAGL_infinityIsNotUsable() {
         compare(OpsCommon.nrrsmUsableAGL(Infinity), false, "Infinity ⇒ 不可用（有限性）")
     }
+
+    //-------------------------------------------------------------------------
+    // 起/终维：**指令权持有方**（规范 §2.7.2 h，2026-10-06 由"起飞站"扩到三档）
+    //
+    //   ① 起飞站：`takeoff_site_id == 本端` 且 `checkout_state !== 'ACCEPTED'`
+    //   ② 监控员：`signed_in`               且 `!landing_accepted`
+    //   ③ 降落站：`landing_site_id == 本端` 且 `landing_accepted`
+    //
+    // 三档**互斥** ⇒ 同一架飞机在任一时刻恰好只有一处"本端持有它的指令权"。
+    // ‼️ 这不是"谁能看"（可接引范围，服务端判），是"该由谁**发言**"（建链权，客户端判）。
+    //    判错的后果不是显示不对，而是同一 deviceID 两端各取一个 counter ⇒ nonce 重复
+    //    ⇒ GCM keystream 泄漏（规范 §2.5）——**链路上没有任何一处会报错。**
+    //
+    // ⚠️ 本组夹具**刻意不造**实现不该读的字段（`landing_state`、监控员侧的 `checkout_state`）：
+    //    一旦实现去读它们，读到的是 `undefined`，本组会当场红。
+    //-------------------------------------------------------------------------
+
+    /// 与 `opsOverviewItem`（`GET /api/ops/overview?view=site`）同形的最小任务项。
+    /// 站点侧判据**只吃**这四个字段 —— 多造一个都会让"实现读错字段"这件事变得不可观测。
+    function _ctlSiteTask(takeoffSite, landingSite, checkoutState, landingAccepted) {
+        return {
+            task_id: 91103,
+            takeoff_site_id: takeoffSite,
+            landing_site_id: landingSite,
+            checkout_state: checkoutState,
+            landing_accepted: landingAccepted
+        }
+    }
+
+    /// 与 `opsMonitorDevice`（③ `devices[]`）同形的最小项。
+    /// ‼️ 服务端的 `opsMonitorDevice` 上**没有** `checkout_state`、**也没有** `landing_state`。
+    function _ctlDevice(deviceId, signedIn, landingAccepted) {
+        return { device_id: deviceId, signed_in: signedIn, landing_accepted: landingAccepted }
+    }
+
+    /// ① 起飞站档：闸是 `checkout_state !== 'ACCEPTED'` —— 一个**否定**判据。
+    ///
+    /// 三格分别钉住三种写法，缺任何一格都有一种错法全绿：
+    ///   · `''`（无交接）⇒ true —— 钉"把判据写成 `=== 'PENDING'`"（那样立刻能飞的任务没人管）；
+    ///   · `'REJECTED'/'CANCELLED'/'TIMEOUT'` ⇒ **仍** true —— 钉"把判据写成 `=== ''`"。
+    ///     签出被驳回/撤回/超时之后责任**还在起飞站手上**（这正是用户 2026-09-23 要求
+    ///     那三种终态仍显示【签出】【回航】的原因）⇒ 这三格是**与 `checkoutPending` 的分界**；
+    ///   · `'ACCEPTED'` ⇒ **必须 false** —— 钉"漏掉整条判据"（那样交棒之后起飞站还在抢话）。
+    function test_siteHoldsControl_takeoffTierIsNegatedCheckoutState() {
+        verify(OpsCommon.siteHoldsControl(_ctlSiteTask(1, 2, "", false), 1) === true,
+               "无交接 ⇒ 责任在起飞站，必须持有")
+        verify(OpsCommon.siteHoldsControl(_ctlSiteTask(1, 2, "PENDING", false), 1) === true,
+               "签出等待确认中 ⇒ 责任仍在起飞站（判定写成 === 'PENDING' 会漏掉下面三格）")
+        var ended = ["REJECTED", "CANCELLED", "TIMEOUT"]
+        for (var i = 0; i < ended.length; i++) {
+            verify(OpsCommon.siteHoldsControl(_ctlSiteTask(1, 2, ended[i], false), 1) === true,
+                   "签出终态 " + ended[i] + " ⇒ 责任**仍在**起飞站（判据若写成 === '' 这里会红）")
+        }
+        verify(OpsCommon.siteHoldsControl(_ctlSiteTask(1, 2, "ACCEPTED", false), 1) === false,
+               "监控员已签入 ⇒ 起飞站**当场让出**（漏掉本格，交棒之后起飞站还在抢话）")
+        verify(OpsCommon.siteHoldsControl(_ctlSiteTask(1, 2, "ACCEPTED", false), 2) === false,
+               "非本站 ⇒ 无论状态如何都不得持有")
+    }
+
+    /// ③ 降落站档：`landing_site_id == 本端` **且** `landing_accepted`。
+    /// `landing_accepted`（= `EXISTS(phase_to='LANDING' ∧ status='ACCEPTED')`）与
+    /// `tasks[].landing_state`（= 最近一条 LANDING 交接的状态）不是一回事。
+    ///
+    /// ⚠️ 本行此前称 `landing_accepted` 为**单调**——**2026-10-06 订正**，与 `OpsCommon.js`
+    ///    `monitorHoldsControl` 上方那段同步：它**不是无条件单调**的，改降作废会把那条
+    ///    ACCEPTED 行改写成 `CANCELLED` ⇒ EXISTS 当场翻假。准确的说法是「**不随重提翻假**」
+    ///    （多一条 PENDING 不影响它），而**不是**「永真」。
+    function test_siteHoldsControl_landingTierNeedsLandingAccepted() {
+        verify(OpsCommon.siteHoldsControl(_ctlSiteTask(1, 2, "ACCEPTED", true), 2) === true,
+               "降落本站 + 已签入 LANDING ⇒ 起飞站交棒完毕，责任在**降落站**")
+        verify(OpsCommon.siteHoldsControl(_ctlSiteTask(1, 2, "ACCEPTED", false), 2) === false,
+               "降落本站但**尚未**签入 ⇒ 责任还在监控员手上，降落站不得持有")
+        verify(OpsCommon.siteHoldsControl(_ctlSiteTask(1, 2, "ACCEPTED", true), 3) === false,
+               "本站既非起飞也非降落、却已签入 LANDING ⇒ 不得持有")
+    }
+
+    /// ‼️ **站点字段的合取不可省**（两格，各钉一种简化写法）：
+    ///   · 只写 `landingAccepted(task)` ⇒ 凡是有人签入 LANDING 的飞机，**每个**站点都自称持有；
+    ///   · 只写 `checkoutState(task) !== 'ACCEPTED'` ⇒ 凡是还没签出的飞机，**每个**站点都自称持有。
+    /// 两种简化都不会报错，只会在多站点场景下让**不相干的站**一起抢着建链。
+    function test_siteHoldsControl_siteFieldIsNotOptional() {
+        verify(OpsCommon.siteHoldsControl(_ctlSiteTask(1, 2, "ACCEPTED", true), 3) === false,
+               "只写 landingAccepted 的实现会让**第三站**也持有（本站与这架飞机毫无关系）")
+        verify(OpsCommon.siteHoldsControl(_ctlSiteTask(1, 2, "", false), 3) === false,
+               "只写 !checkoutState 的实现会让**第三站**也持有")
+        verify(OpsCommon.siteHoldsControl(_ctlSiteTask(1, 2, "ACCEPTED", true), 0) === false,
+               "`mySiteId` 无效（0 / 未登录）⇒ fail-closed，不得因 `Number(undefined)>0` 为假而误判")
+        verify(OpsCommon.siteHoldsControl(null, 1) === false, "无任务 ⇒ false，且不得抛错")
+        verify(OpsCommon.siteHoldsControl(_ctlSiteTask(1, 2, "", false), undefined) === false,
+               "`mySiteId` 为 undefined ⇒ false（不得让 `Number(undefined) === NaN` 蒙混过关）")
+    }
+
+    /// ‼️ **三档互斥**：把四格**可达**组合枚举一遍，逐格数"有几处持有"。
+    ///
+    /// 只断言"某格为 false"是不够的 —— 那样一个"谁来问都说 true"的实现在逐格断言下
+    /// 只会红一格，而**互斥性**才是本组要保的东西（两端同时持有 ⇒ nonce 重复）。
+    /// ⇒ 本格断言的是**持有者的集合**，不是单点取值。
+    ///
+    /// ⚠️ 只枚举四格：`landing_accepted=true` 而 `checkout_state!=='ACCEPTED'` 的两格由后端不变量
+    ///    `landing_accepted ⟹ checkout_state === 'ACCEPTED'` 排除（LANDING 交接只可能在 ROUTE
+    ///    被签入之后提出）。该不变量属服务端，本组断言不到它 —— 但它一旦被破坏，
+    ///    `siteHoldsControl` 会让起飞站与降落站**同时**为真，所以在这里写明。
+    function test_siteHoldsControl_atMostOneSiteHoldsControl() {
+        var combos = [
+            { checkout: "",         accepted: false, want: [1] },   // 责任在起飞站
+            { checkout: "PENDING",  accepted: false, want: [1] },   // 同上（签出等待确认）
+            { checkout: "REJECTED", accepted: false, want: [1] },   // 同上（终态退回起飞站）
+            { checkout: "ACCEPTED", accepted: false, want: []  },   // 已交棒，责任在监控员——两站皆无
+            { checkout: "ACCEPTED", accepted: true,  want: [2] }    // 交棒完毕，责任在降落站
+        ]
+        for (var i = 0; i < combos.length; i++) {
+            var c = combos[i]
+            var task = _ctlSiteTask(1, 2, c.checkout, c.accepted)
+            var holders = []
+            if (OpsCommon.siteHoldsControl(task, 1)) holders.push(1)
+            if (OpsCommon.siteHoldsControl(task, 2)) holders.push(2)
+            compare(holders.join(","), c.want.join(","),
+                    "checkout_state=" + c.checkout + " landing_accepted=" + c.accepted +
+                    " ⇒ 持有方必须是 [" + c.want + "]")
+        }
+    }
+
+    /// ② 监控员档：`signed_in` **且** `!landing_accepted`。
+    ///
+    /// 两格缺一不可，且各自钉掉一种错法：
+    ///   · `signed_in=false` ⇒ false：钉"恒 true"（那会让**每个**监控员都去建链）；
+    ///   · `landing_accepted=true` ⇒ **必须 false**：这是第三跳的**让位点**。
+    ///     少了它，监控员与降落站会**同时**持有上行权 ⇒ 同 deviceID 两端各取一个 counter
+    ///     ⇒ nonce 重复（规范 §2.5）。
+    function test_monitorHoldsControl_needsSignedInAndNotLandingAccepted() {
+        verify(OpsCommon.monitorHoldsControl(_ctlDevice(9103, true, false)) === true,
+               "已签入、尚未签入 LANDING ⇒ 监控员持有")
+        verify(OpsCommon.monitorHoldsControl(_ctlDevice(9103, false, false)) === false,
+               "未签入 ⇒ 不得持有（恒 true 的实现会让每个监控员都去建链）")
+        verify(OpsCommon.monitorHoldsControl(_ctlDevice(9103, true, true)) === false,
+               "已签入 LANDING ⇒ 监控员**当场让出**（少了本格，两端同时持有）")
+        verify(OpsCommon.monitorHoldsControl(_ctlDevice(9103, false, true)) === false,
+               "两者皆非 ⇒ false")
+        verify(OpsCommon.monitorHoldsControl(null) === false, "无设备 ⇒ false，且不得抛错")
+    }
+
+    /// ‼️ 本组钉的是**取值来源**：监控员侧必须读 `landing_accepted`，不得读
+    ///    `tasks[].landing_state`，也不得读站点侧的 `checkout_state`。
+    ///
+    /// 两格构造出"两个字段给出相反答案"的输入 —— 这是能把取值来源钉死的形状。
+    ///
+    /// ⚠️ **两格的输入在现行实现下都不是生产可达的形状**，本注释此前把它们说成可达，
+    ///    **2026-10-06 订正**（静态论证，未做运行时探针）：
+    ///   · `landing_accepted=true` 而 `landing_state='PENDING'` ⇒ 本格仍要求 **false**。
+    ///     **修复前**它真实可达：`Propose` 的 LANDING 分支只挡 PENDING（不像 ROUTE 分支还挡
+    ///     ACCEPTED）⇒ 签入之后再提一条就把 `landing_state` 打回 PENDING，此时若实现读
+    ///     `landing_state` 判据翻真 ⇒ 监控员与降落站**同时**持有（规范 §2.5）。
+    ///     **2026-10-06 起该缺口已堵**（LANDING 闸改成 `status IN ('PENDING','ACCEPTED')`）⇒
+    ///     LANDING 的 PENDING 行只能由 `Propose` 产生，而它此刻必被 409 挡下
+    ///     （`task.Return` 那条 INSERT 只写 ACCEPTED，且仅在无 ACCEPTED 时写）⇒ 形状不再可达。
+    ///     ⚠️ 闸一旦被放宽，形状立刻回来 —— 本格是那道闸的**下游**保险，别因"不可达"删格。
+    ///   · `landing_accepted=false` 而 `landing_state='ACCEPTED'` ⇒ 本格仍要求 **true**。
+    ///     此形状**结构上不可能**，不只是"少见"：`landing_state` 取 max-id LANDING 行的状态
+    ///     （`lastLandingHandover`），而 `landing_accepted` ＝ `EXISTS(phase_to='LANDING' ∧
+    ///     status='ACCEPTED')` —— max-id 行是 ACCEPTED ⟹ `EXISTS` 必为真。
+    ///     ⇒ 本格**纯属合成输入**，价值仅剩"实现读了哪个字段"这一条（那正是本组要钉的）。
+    function test_monitorHoldsControl_readsMonotonicFieldNotLandingState() {
+        var stale = _ctlDevice(9103, true, true)
+        stale.landing_state = "PENDING"
+        verify(OpsCommon.monitorHoldsControl(stale) === false,
+               "landing_accepted=true 而 landing_state=PENDING ⇒ 必须 false" +
+               "（读 landing_state 会翻真，两端同时持有上行权）")
+
+        var reverted = _ctlDevice(9103, true, false)
+        reverted.landing_state = "ACCEPTED"
+        verify(OpsCommon.monitorHoldsControl(reverted) === true,
+               "landing_accepted=false 而 landing_state=ACCEPTED ⇒ 必须 true" +
+               "（这一格挡住『反正都是 LANDING 的状态，挑一个读就行』）")
+
+        // 站点侧的 `checkout_state` 在 ③ 的 `devices[]` 上**根本不存在**：读它得到 undefined，
+        // 而 `undefined !== 'ACCEPTED'` 恒真 ⇒ 判据恒真 ⇒ 监控员永远不让位。这里把那个输入
+        // 显式造出来，钉住"实现不得回头去找站点侧的字段"。
+        verify(OpsCommon.monitorHoldsControl(_ctlDevice(9103, true, true)) === false,
+               "构造的项上没有任何 checkout_state：若实现拿它兜底，本格会因恒真而红")
+    }
+
+    /// ③ 名单提取：`initiatorDeviceIds` 与 `monitorDeviceIds` **不是同一份清单，不得合并**。
+    ///
+    /// 两者管的是两件事：前者＝建链权（**当前**持有指令权的那一架），后者＝80005 登记集合
+    /// （本端名册上的**全部**飞机，收了帧才不掉线）。合并的后果不是"多推了几个 id"，
+    /// 而是**用可接引范围顶替责任方判据**——两个正交维被压成一维。
+    /// ⇒ 本格的核心断言是**两份清单不相等**，而不是各查各的。
+    function test_initiatorDeviceIds_isNotTheMonitorRoster() {
+        var devices = [
+            _ctlDevice(9103, true,  false),   // 持有 ⇒ 两份都在
+            _ctlDevice(9104, false, false),   // 未签入 ⇒ 只在登记集合里
+            _ctlDevice(9105, true,  true),    // 已让位 ⇒ 只在登记集合里
+            _ctlDevice(9103, true,  false)    // 重复项（后端已去重，此处是第二道）
+        ]
+        compare(JSON.stringify(OpsCommon.initiatorDeviceIds(devices)), "[9103]",
+                "指令权名单 = 当前持有指令权的那一架；未签入的（9104）与已让位的（9105）都不得进")
+        compare(JSON.stringify(OpsCommon.monitorDeviceIds(devices)), "[9103,9104,9105]",
+                "登记集合 = 名册上的全部飞机（两者**必须**不同，否则本函数没有存在意义）")
+    }
+
+    /// 名单提取的边角：`device_id <= 0` 必须在 **QML → C++ 的唯一入口**上被挡掉。
+    /// 漏掉它会在 mavp2p 侧建出一个 `deviceID=0` 的 pair —— **没有任何一处会报错**。
+    /// 另：无人持有 ⇒ 返回**空数组**（不是 null/undefined）：它表示"本端此刻不持有任何一架"，
+    /// 是**有效**结论 ⇒ 全拒（fail-closed）；与"从未推送过"是相反的建链答案。
+    function test_initiatorDeviceIds_filtersInvalidIdsAndNeverReturnsNull() {
+        var withBad = [
+            _ctlDevice(0,    true, false),
+            _ctlDevice(-1,   true, false),
+            _ctlDevice(9103, true, false)
+        ]
+        compare(JSON.stringify(OpsCommon.initiatorDeviceIds(withBad)), "[9103]",
+                "device_id <= 0 必须被挡（否则会建出 deviceID=0 的 pair，零报错）")
+        verify(Array.isArray(OpsCommon.initiatorDeviceIds([_ctlDevice(9104, false, false)])),
+               "无人持有 ⇒ 必须是空**数组**，表示『本端此刻不持有任何一架』（有效结论，全拒）")
+        compare(OpsCommon.initiatorDeviceIds([_ctlDevice(9104, false, false)]).length, 0,
+                "同上：长度为 0 —— 与『从未推送过』在建链答案上相反，故不得返回 null/undefined")
+        verify(Array.isArray(OpsCommon.initiatorDeviceIds(null)), "null ⇒ 空数组，且不得抛错")
+    }
+
 }

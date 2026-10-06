@@ -457,6 +457,78 @@ function landingNotice(task, isReceiver) {
              : qsTr("移交降落指挥已超时作废，请重新发起")
 }
 
+//--------------------------------------------------------------------------
+// 指令权（控制权）持有方 —— 起/终维的**唯一**判据（规范 §2.7.2 h）
+//--------------------------------------------------------------------------
+// 责任链四段（权威表述见 `gcs_server/handlers/handover_propose_requires_checkin_test.go` 的头注）
+// 把「谁对一架飞机说话」切成**三个互斥区间**：
+//
+//   起飞站持有 ⟺ ROUTE 交接**尚未** ACCEPTED（监控员还没签入）
+//   监控员持有 ⟺ ROUTE 已 ACCEPTED ∧ LANDING 尚未 ACCEPTED
+//   降落站持有 ⟺ LANDING 已 ACCEPTED
+//
+// 三者是同一个真值轴上的三段，**不是**三个各自独立的开关；任取两个同时为真 = 两端同时上行
+// = 两侧各取一个 counter = nonce 重复 ⇒ GCM keystream 泄漏（规范 §2.5）。故本节的函数必须
+// 成对使用：站点侧 `siteHoldsControl`、监控员侧 `monitorHoldsControl`。
+//
+// ‼️ **站点字段必须与状态位合取**，任一半都不能单独当判据：
+//   · 只用站点字段（`takeoff_site_id == 本端`）⇒ 终点站在起飞阶段就抢到指令权（它**同样**
+//     拿得到密钥——可接引范围 = 出站 ∪ **进站**），与起飞站同时上行；同站起降时更是
+//     起飞站在**监控员阶段**仍霸着不放。
+//   · 只用状态位 ⇒ 平台级账号（无站点身份）或**别的**站点也会开闸——状态位描述的是
+//     「**这条任务**的交接走到哪了」，**不含任何站点条件**。
+
+/// 本端（站点侧，吃 `/api/ops/overview?view=site` 的行）此刻是不是这架飞机的指令权持有方。
+/// 无站点身份（平台级账号 / `role_sites` 为空）⇒ 恒 false。
+///
+/// ⚠️ 起飞档读 `checkout_state` 而**不是**「有没有 ACCEPTED 的 ROUTE 交接」：`opsOverviewItem`
+///    上**只有**前者——`signed_in` 只下发在 `opsRouteTaskItem` / `opsMonitorDevice` 上。
+///    两者等价**依赖后端一道闸**：`OpsHandler.Propose` 的 ROUTE 分支在
+///    `status IN ('PENDING','ACCEPTED')` 时回 409（拒绝重签）⇒ ACCEPTED 之后不可能再插一条
+///    新的 ROUTE 交接 ⇒ `checkout_state`（取 `MAX(h.id)` 那条）恒停在 ACCEPTED、**不会回退**。
+///    ⚠️ 那道闸若被放宽，本函数会**静默**把起飞站的指令权还回去——没有任何东西会报错。
+function siteHoldsControl(task, mySiteId) {
+    if (!task) return false
+    var sid = Number(mySiteId)
+    if (!(sid > 0)) return false
+    if (Number(task.landing_site_id) === sid && landingAccepted(task)) return true
+    if (Number(task.takeoff_site_id) === sid && checkoutState(task) !== "ACCEPTED") return true
+    return false
+}
+
+/// 本端（监控员侧，吃 ③ 的 `devices[]` 行）此刻是不是这架飞机的指令权持有方。
+///
+/// ‼️ `!landingAccepted` 不可省：LANDING 被签入后降落站接手，本端必须**当场让出**。
+/// ⚠️ 用**单调**的 `landing_accepted` 而**不是**任何形态的"最近一条交接的状态"：
+///    `opsMonitorDevice`（= 本函数的入参形状）上**根本没有** `landing_state` 字段；而
+///    `opsRouteTaskItem`（`tasks[]`）**有**它——于是"改成从 `tasks[]` 读 `landing_state`"
+///    看起来更省事，**那是陷阱**：`landing_state` 取的是**最近一条** LANDING 交接的状态，
+///    只要有人签入后再提一条，它就被打回 PENDING，基于它的判据随即翻假，两端又
+///    同时持有（nonce 重复，规范 §2.5）。**`landing_accepted` 这个字段就是为这条判据
+///    才加到 `opsMonitorDevice` 上的**（2026-10-06）；读 `tasks[]` 与 `devices[]` 是**两个数组**，
+///    跨数组关联是明令禁止的（`ops.go` 的 `RouteTasks` 段有警告）。
+///
+///    ⚠️ **`landing_accepted` 不是无条件单调的**（2026-10-06 订正——此处原写「ACCEPTED 的行
+///    永不被改写（超时扫描器只碰 PENDING）⇒ EXISTS 形态单调」，那句被当日的改降修复**证伪**）。
+///    「重提」不翻假（`EXISTS` 对新增行不敏感）——这仍是它优于 `landing_state` 的**全部**理由；
+///    但「**改降**」会翻假，且是**设计意图**：降落目的地真的变了，原降落站那条 ACCEPTED 被作废
+///    （`recordDispositionTx` ③b），责任当场退回监控员。那一格安全是因为作废与
+///    `landing_site_id` 的改写**同事务**，而 ③ 档是合取（`landing_site_id == 本端` ∧ 本字段）
+///    ⇒ 原降落站靠前一个合取项当场出局。⇒ 靠的是**原子性 + 合取**，不是"这行不会被改"。
+///
+///    ⚠️ "签入后再提一条"那个入口已于 2026-10-06 被堵（`Propose` 两个相位的生效中交接判据
+///    现在同形，都挡 `IN ('PENDING','ACCEPTED')`）。**本条仍不得改用 `landing_state`**：
+///    单调性必须由本判据自己的数据源保证，**不能寄望于另一个组件的闸**——那道闸若回归，
+///    这里翻假的表现是两端同时持有上行权而**链路上零报错**，没有任何一处会发现。
+///    ⚠️ 反过来说，`landing_state` 在**前端按钮门控**里是**合适**的：那边问的是"**此刻**这一
+///    相位还有没有活着的交接单"，正是"最近一条的状态"这个语义——见 `TaskListPanel.qml`
+///    的【移交降落指挥】。**同一个字段在两条判据上一个该用一个不该用**，因为问的不是同一件事：
+///    这里问"是否**曾经**签入过"（必须单调），那里问"**此刻**是否已交接"（取当前态才对）。
+function monitorHoldsControl(device) {
+    if (!device) return false
+    return signedIn(device) && !landingAccepted(device)
+}
+
 // 出场=本站=起飞点且**责任尚未交出去**：SCHEDULED/READY/TAKEOFF，以及落库 IN_FLIGHT 之后
 // 尚未被监控员接管的整段（§6.0-F：签出=责任里程碑；接管后退出出场）。
 //
@@ -1082,6 +1154,35 @@ function monitorDeviceIds(devices) {
         var id = Number(devices[i] ? devices[i].device_id : 0)
         if (!(id > 0)) continue
         if (seen[id]) continue
+        seen[id] = true
+        out.push(id)
+    }
+    return out
+}
+
+// 从 ③ 的 `devices[]` 提取**监控员侧**的**指令权**名单（起/终维，§2.7.2 h）。
+//
+// ‼️ 与 `monitorDeviceIds` **不是同一份清单，不要合并**——两者管的是两件事：
+//   · `monitorDeviceIds` = 80005 登记集合（本端名册上的**全部**飞机；收了帧才不掉线），
+//     它的失败形状是"飞机 60s TTL 后集体掉线"（§3.5.4）；
+//   · 本函数 = 建链权（**当前**签入的那一架），它的失败形状是"两端同时说话 ⇒ nonce 重复"。
+//   合并的后果不是"多推了几个 id"，而是**用可接引范围去顶替责任方判据**——两回事。
+//
+// ⚠️ 与站点侧同口径：**整份替换**、每轮重推（`checkout_state` / `landing_accepted` 都能在
+//    行集完全不变时翻转），且**无监控员身份时不推**而不是推空集（「没推过」与「推了空集」
+//    在建链答案上相反，见 `OpsShell._fetchOverview` 里同一条注释）。
+// ⚠️ 重复项过滤与 `<= 0` 过滤照抄 `monitorDeviceIds`：后端已按 `device_id` 去重，此处是第二道。
+function initiatorDeviceIds(devices) {
+    var seen = {}
+    var out = []
+    if (!devices) return out
+    for (var i = 0; i < devices.length; i++) {
+        var d = devices[i]
+        if (!d) continue
+        var id = Number(d.device_id)
+        if (!(id > 0)) continue
+        if (seen[id]) continue
+        if (!monitorHoldsControl(d)) continue
         seen[id] = true
         out.push(id)
     }

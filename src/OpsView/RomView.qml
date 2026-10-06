@@ -92,9 +92,34 @@ OpsShell {
         }
     }
 
+    /// ③ **成功**后由骨架发 `routeTasksUpdated` 触发；推**指令权**名单（起/终维，§2.7.2 h）。
+    ///
+    /// ‼️ 与 `_pushMonitorDevices` 是**两份不同的清单**，绝不合并——差别与各自的失败形状见
+    ///    `OpsCommon.initiatorDeviceIds` 的头注：那份管 80005 登记（本端名册上的**全部**飞机，
+    ///    掉了就集体掉线），本份管建链权（**当前**签入的那一架，错了就两端同时说话）。
+    ///
+    /// ‼️ **每轮整份替换**，不能塞进"清单变了才推"的 diff：`landing_accepted` 能在行的集合
+    ///    **完全不变**时翻转（降落站签入那一刻本端就该让出）⇒ 靠 diff 判必漏这一格。
+    /// ⚠️ 失败时不推（`routeTasksUpdated` 本来就不发），理由与 `_pushMonitorDevices` 同：
+    ///    把"请求失败"当成"本端不持有任何一架的指令权"会让本端在监控员阶段**静默让出**上行权，
+    ///    而失败原因可能只是一次网络抖动（§3.5.4）——那时本端仍该说话。
+    function _pushInitiatorDevices() {
+        cryptoController.setInitiatorDevices(OpsCommon.initiatorDeviceIds(romView._routeDevices))
+    }
+
     // ③ 每次**成功**后推清单（§3.5.3）。⚠️ 不能挂在 `onPolled` 上：`_poll()` 发出信号时
     // ③ 的异步响应还没回来，那时读到的是**上一轮**的 devices，首拉时更是空的。
-    onRouteTasksUpdated: _pushMonitorDevices()
+    // ⚠️ 两份清单**同一次**推：登记集合与指令权名单取自**同一份** `_routeDevices` 快照，
+    //    分两个处理器读会让两者可能落在不同轮次上（指令权名单与登记集合短暂不一致）。
+    // ‼️ 顺序**不可颠倒**：`setMonitorDevices` 会触发取密钥/登记（异步的），而
+    //    `isInitiatorFor` 在**首次**推名单之前是 **fail-open**（`_initiatorScopeValid`
+    //    为假 ⇒ 任何有密钥的 deviceID 都放行）。先推登记集合，就会留下一段"密钥到了、
+    //    名单还没到"的窗口——那窗口里本端会对**整份名册**开闸，而不只是签入的那一架。
+    //    先推指令权名单把这个窗口压成零。
+    onRouteTasksUpdated: {
+        _pushInitiatorDevices()
+        _pushMonitorDevices()
+    }
     // 超时检查与轮询同相、每 2s 一次（§3.6.2）：**即使 ③ 失败也要跑**——超过阈值收不到帧
     // 正是它要自愈的场景，而那种时刻 ③ 往往也在失败。
     onPolled: _checkFrameTimeouts()

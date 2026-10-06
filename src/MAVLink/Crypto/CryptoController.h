@@ -365,18 +365,22 @@ public:
     // 握手流程
     // -----------------------------------------------------------------------
 
-    /// 责任方（站点操作员）标志：**只有责任方的 QGC 允许建链**，其余身份（航线监控员、
-    /// 飞行安全监理）停在 Standby——即 State::Standby 的定义「只读（解密遥测），不建链、
-    /// 不发指令」。三个建链入口全部汇聚到 beginLinking，这一处闸就覆盖了任务/围栏/集结点/
-    /// 参数/心跳的全部上行（LinkInterface 对非 Active 直接 drop），而接收/解密路径不看
-    /// state ⇒ 非责任方仍照常收到遥测，是"只读监视"而不是"断线"。
+    /// 责任方**资格**标志：本端**有资格**成为责任方（= 有发言权），其余身份（飞行安全监理）
+    /// 停在 Standby——即 State::Standby 的定义「只读（解密遥测），不建链、不发指令」。
+    /// 三个建链入口全部汇聚到 beginLinking，这一处闸就覆盖了任务/围栏/集结点/参数/心跳的
+    /// 全部上行（LinkInterface 对非 Active 直接 drop），而接收/解密路径不看 state ⇒
+    /// 无资格者仍照常收到遥测，是"只读监视"而不是"断线"。
     ///
-    /// 判据是「**含** SITE_ATC」，不是「不含 ROUTE_MONITOR」——后端 roles.go 明确允许
-    /// SITE_ATC 与 ROUTE_MONITOR 双身份并存（角色是并集），按后者写会把这类账号误判成
-    /// 非责任方。
+    /// ‼️ 2026-10-06 起判据是「**含** SITE_ATC **或** 含 ROUTE_MONITOR」：指令权按责任链
+    ///    四段在 起飞机场 → 航线监控员 → 降落机场 之间流转，监控员那一段的指令
+    ///    （出发/回航/备降，用户 2026-10-06 裁定）只有他该发。改前只认 SITE_ATC
+    ///    ⇒ 监控员那台 QGC 的 `isInitiatorFor` 第一条恒假 ⇒ 名单再对也建不了链。
+    ///    ⚠️ 仍然**不是**"不含某某"的排除法：后端 roles.go 明确允许身份并存（角色是并集），
+    ///    按排除法写会把兼双身份的账号误判。
     /// ‼️ 本标志只回答「本端**有没有发言权**」，**不足以**回答「本端该不该与**这一架**
-    ///    握手」。握手权的完整判据是 `isInitiatorFor()` = 责任方 **且** 本端是该机当前
-    ///    任务的起飞站，`beginLinking` 用的是后者。
+    ///    握手」。握手权的完整判据是 `isInitiatorFor()` = 有资格 **且** 本端是**此刻持有
+    ///    该机指令权的那一方**（`_initiatorDevices`，随责任链流转），`beginLinking`
+    ///    用的是后者。**前者静态、后者动态，两处都不可省。**
     ///    （旧注释在此处写「站点归属无需判断——能走到 beginLinking 就说明该 deviceID 在本站
     ///    集合里」。**该句已于 2026-10-04 证伪**：可接引范围 = 出站 ∪ **进站**，「在本站
     ///    集合里」把**终点站**也算了进来，而终点站不该与飞机握手。）
@@ -415,35 +419,48 @@ public:
     /// 当前是否为责任方（线程安全，加锁读取）。
     bool isResponsibleParty() const;
 
-    /// **起/终维**：声明「本端是哪些飞机**当前任务的起飞站**」（2026-10-04 用户裁定）。
+    /// **起/终维**：声明「本端是哪些飞机**当前任务的指令权持有方**」
+    /// （2026-10-04 用户裁定；2026-10-06 由"起飞站"扩到三档）。
     ///
     /// 用户裁定逐字：「一架尚未连入网络的无人机（刚开机）只有在一个飞行任务的起飞点所在
-    /// 站点的 qgc 才会与之握手」。
+    /// 站点的 qgc 才会与之握手」——这是**第一档**。2026-10-06 扩为责任链三档，因为
+    /// 指令权随任务推进在 起飞机场 → 航线监控员 → 降落机场 之间**流转**，而三方互斥：
+    ///   ① 起飞站：`takeoff_site_id == 本端` **且** `checkout_state !== 'ACCEPTED'`
+    ///   ② 监控员：`signed_in == true` **且** `!landing_accepted`
+    ///   ③ 降落站：`landing_site_id == 本端` **且** `landing_accepted`
+    /// **唯一判据点**是 `OpsCommon.siteHoldsControl` / `OpsCommon.monitorHoldsControl`
+    /// （纯函数、有单测）——本头文件里的注释不是判据的第二份拷贝，改口径只改那一处。
     ///
-    /// 由站点视图（`OpsShell.qml` 的 `_fetchOverview`）**每轮轮询整体重推**：
-    /// `takeoff_site_id === AuthController.siteId` 的那些行的 `device_id`。
-    /// ‼️ 必须是**整体替换**、且**每轮都推**，不能只在 diff 时推：同一架飞机的
-    ///    `takeoff_site_id` 可以在行的集合完全不变的情况下改掉（飞机落地后本站从起飞站
-    ///    变成降落站），那种变化不会让 `_siteDeviceIdsKey` 变动。
+    /// 由**两处**每轮轮询整体重推，推进**同一个**集合：
+    ///   · 站点视图（`OpsShell.qml` 的 `_fetchOverview`）⇒ 挡①③两档；
+    ///   · 监控员视图（`RomView.qml` 的 `onRouteTasksUpdated`）⇒ 挡②档。
+    /// ‼️ 必须是**整体替换**、且**每轮都推**，不能只在 diff 时推：同一架飞机的档位可以在
+    ///    **行的集合完全不变**的情况下翻转（`checkout_state` 签出即翻、`landing_accepted`
+    ///    签入即翻），那种变化不会让 `_siteDeviceIdsKey` 变动。
     /// ‼️ 必须是 `Q_INVOKABLE`（理由同 `addLinkedDevice`：QML 只认 `Q_INVOKABLE`，
     ///    写成普通成员函数是**运行时** `TypeError`，Qt 构建不会报）。
     ///
     /// ⚠️ 它是**独立于 `_linkedDevices` 的另一维**，不是它的子集筛子：
     ///    · `_linkedDevices` 答「本端关联哪些飞机」（登记心跳 payload + 取密钥范围）；
-    ///    · 本集合答「本端**是哪些飞机的起飞站**」（唯一建链权）。
+    ///    · 本集合答「本端**此刻持有哪些飞机的指令权**」（唯一建链权）。
     ///    范围闸（§2.7.2 d）是取密钥的边界，**不是**建链的边界——可接引范围含**进站**支，
     ///    终点站同样拿得到密钥。故本集合是 `isInitiatorFor` 的另一条腿，缺它则终点站
     ///    会与飞机握手并占住 `_activeDeviceID` 单槽。
+    /// ⚠️ 也**不要**与 `setMonitorDevices` 合并：那是登记集合（§3.6.2），判据是
+    ///    `_monitorListActive` 闩与整份名册；本集合是建链权，判据是三档状态位。
+    ///    两者在监控员那台机器上**恰好会重叠**，但重叠是结果不是定义。
     ///
     /// ⚠️ 空列表 **≠** "本端无所事事"：与 `setMonitorDevices` 同一口径——**被调用过**
-    ///    就表示起/终维已生效（`_initiatorScopeValid`），此后空集表示「本端不是任何一架
-    ///    的出站」= 全部不建链。反过来说，**从未被调用**时才退回旧形态（见 `isInitiatorFor`）。
+    ///    就表示起/终维已生效（`_initiatorScopeValid`），此后空集表示「本端此刻不持有
+    ///    任何一架的指令权」= 全部不建链。反过来说，**从未被调用**时才退回旧形态
+    ///    （见 `isInitiatorFor`）。
     ///
     /// ⚠️ 非法 deviceID（0 / 签名位非法，规范 §1.4）逐条跳过并告警，与
     ///    `setMonitorDevices` / `addLinkedDevice` 用**同一组**校验，三处口径不漂移。
     Q_INVOKABLE void setInitiatorDevices(const QVariantList& deviceIds);
 
-    /// 本端是否为 `deviceID` 的**接引方**（= 责任方 **且** 本端是它的起飞站）。
+    /// 本端是否为 `deviceID` 的**接引方**（= 有责任方资格 **且** 本端是它**此刻的指令权
+    /// 持有方**，三档见 `setInitiatorDevices`）。
     ///
     /// 这是建链权的**唯一判据**，`beginLinking` 与 `InitialConnectStateMachine` 两处共用。
     /// 两个"退回旧形态"分支都是**信息不可得**，不是"信息说不是"：
@@ -457,7 +474,7 @@ public:
 
     /// 任务建链：选定目标无人机，取密钥，进入 Linking。
     /// 由上层在「确定航线 + 选定无人机」时调用。
-    /// ⚠️ 非责任方、或本端非该机起飞站时**直接返回、状态保持 Standby**
+    /// ⚠️ 无责任方资格、或本端不持有该机指令权时**直接返回、状态保持 Standby**
     ///    （判据见 `isInitiatorFor` 与 `setResponsibleParty`）。
     void beginLinking(DeviceID targetDeviceID);
 
@@ -575,17 +592,17 @@ private:
     DeviceID _activeDeviceID = kInvalidDeviceID;
     DeviceKeyManager _keyManager; ///< 密钥管理（内部持有，构造时以 this 为 parent）
     bool _cryptoEnabled = false;
-    /// 责任方标志（站点操作员）。缺省 false = fail-closed：没被授予就不能建链。
-    /// 写入点见 setResponsibleParty 的文档注释；**不受 returnToStandby 影响**——
+    /// 责任方**资格**标志（站点操作员 / 航线监控员）。缺省 false = fail-closed：没被授予
+    /// 就不能建链。写入点见 setResponsibleParty 的文档注释；**不受 returnToStandby 影响**——
     /// 它是"登录会话/运行模式"的属性，不是"本次任务"的属性。
     bool _responsibleParty = false;
-    /// 起/终维（2026-10-04 裁定）：本端是**哪些飞机当前任务的起飞站**。语义见
-    /// `setInitiatorDevices`。⚠️ 与 `_monitorDevices` 同样是"空集可以生效"的口径，
-    /// 故"有没有生效"由下面那个标志回答，不由本容器的空否回答。
+    /// 起/终维（2026-10-04 裁定，2026-10-06 扩到三档）：本端是**哪些飞机此刻的指令权
+    /// 持有方**。语义见 `setInitiatorDevices`。⚠️ 与 `_monitorDevices` 同样是"空集可以
+    /// 生效"的口径，故"有没有生效"由下面那个标志回答，不由本容器的空否回答。
     QList<DeviceID> _initiatorDevices;
     /// 起/终维是否已生效（`setInitiatorDevices` 至少被推过一次）。缺省 false = 从未有过。
-    /// ‼️ `isInitiatorFor` 靠它区分「本端不是它的起飞站」（false 的**阴性**结论）与
-    ///    「本端还不知道自己是不是」（尚未推送）——两者的建链答案相反。
+    /// ‼️ `isInitiatorFor` 靠它区分「本端不持有它的指令权」（false 的**阴性**结论）与
+    ///    「本端还不知道自己持不持有」（尚未推送）——两者的建链答案相反。
     /// 复位点只有一处：`setResponsibleParty`（会话边界），与监控清单的作废同处同源。
     bool _initiatorScopeValid = false;
     ReplayGuard _replayGuard;

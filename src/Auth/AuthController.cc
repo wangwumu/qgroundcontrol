@@ -412,19 +412,34 @@ void AuthController::_onLoginFinished(QNetworkReply* reply)
     MAVLinkCrypto::CryptoController* const crypto = MAVLinkCrypto::CryptoController::instance();
     MAVLinkCrypto::DeviceKeyManager* const keyManager = crypto->deviceKeyManager();
 
-    // 责任方闸（2026-09-27 用户裁定）：**只有站点操作员那一台 QGC 与 PX4 握手**。
-    // 航线监控员在获取权限前没有权限向 PX4 发送任何指令——它的 QGC 停在 Standby，
-    // 只解密遥测，任务/围栏/集结点/参数/心跳一条都发不出去（LinkInterface 对非 Active
-    // 直接 drop；闸的落点是 CryptoController::beginLinking，那是三个建链入口的汇聚点）。
+    // 责任方**资格**闸（2026-09-27 裁定；2026-10-06 放宽到监控员）。
     //
-    // 判据是「**含** SITE_ATC」而非「不含 ROUTE_MONITOR」：后端 roles.go 明确允许这两种
-    // 身份并存（角色是并集），按后者写会把兼双身份的账号误判成非责任方。
+    // ‼️ 本标志的语义是「本端**有资格**成为责任方」，**不是**「本端**此刻就是**责任方」。
+    //    「此刻是不是」由 `CryptoController::isInitiatorFor` 的**第二条腿**给出——
+    //    `_initiatorDevices`，每轮由 `OpsShell._fetchOverview`（站点侧）与
+    //    `RomView._pushInitiatorDevices`（监控员侧）按状态位整份替换。两处都不可省：
+    //    本闸是**静态身份**（登录时定一次），那条腿是**动态责任**（随签入/签出/移交降落
+    //    指挥在 起飞站 → 监控员 → 降落站 之间流转）。
+    //    把「有资格」当成「就是」，等于让责任链上的三方**同时**开闸 ⇒ 同一 deviceID 两端
+    //    各取一个 counter ⇒ nonce 重复 ⇒ GCM keystream 泄漏（规范 §2.5）。
+    //
+    // 为什么监控员也必须有资格：指令权按责任链在**三方之间流转**，其中监控员那一段
+    // （起飞后到移交降落指挥被签入之前）的指令只有他该发——用户 2026-10-06 裁定逐字：
+    // 「出发回航、备降，在航线端只能有航线监控员控制（px4 也会自动触发，那是另外一个维度）」。
+    // 改前 `responsibleParty` 只认 SITE_ATC ⇒ 监控员那台 QGC 的 `isInitiatorFor` 第一条
+    // 恒假 ⇒ 名单再对也建不了链，它的 `beginLinking` 永远早退到 Standby，
+    // 而 `LinkInterface` 对非 Active 直接 drop（连告警都只是丢弃计数）。
+    // 飞行安全监理（FLIGHT_SUPERVISOR）仍然**不**给：它全程只读。
+    //
+    // 判据是「**含** SITE_ATC **或** 含 ROUTE_MONITOR」，不是"不含某某"：后端 roles.go
+    // 明确允许身份并存（角色是并集），按排除法写会把兼双身份的账号误判。
     //
     // ‼️ **无条件覆写**，不能写成"只在为 false 时才设"：QGCApplication::init 在本地密钥源
     //    （cryptoKeySource==0）时已写过 true，而那是"单机联调不登录"场景的判断。若用户在
     //    那样配置的机器上仍然登录（进运营模式），必须以角色为准把那个 true 收回来，
-    //    否则航线监控员会带着 init 留下的责任方身份建链。
-    crypto->setResponsibleParty(_roles.contains(QStringLiteral("SITE_ATC")));
+    //    否则无资格的身份会带着 init 留下的责任方标志建链。
+    crypto->setResponsibleParty(_roles.contains(QStringLiteral("SITE_ATC"))
+                                || _roles.contains(QStringLiteral("ROUTE_MONITOR")));
     keyManager->setAuthToken(_token);
     PlanUploader::instance()->setAuthToken(_token);   // 航线上传后台会话 token
 

@@ -168,10 +168,12 @@ void CryptoController::setMonitorDevices(const QVariantList& deviceIds, int fram
 
     // 主动取密钥时机之二（规范 §2.7.2 e）：监控清单**内容变化**时，对尚无本地密钥的 ID 批量拉。
     //
-    // ⚠️ 监控员的取密钥**纯粹用于解密**——`responsibleParty=false` 使其全程不建链
-    //    （`beginLinking` 入口那道闸；2026-10-04 起闸名已由 `isResponsibleParty()` 收窄为
-    //    `isInitiatorFor(deviceID)`——责任方只是它的第一条，不再充分），拉 key 只是为了
-    //    并行解密多架遥测。
+    // ⚠️ 登记集合的取密钥**不等于建链权**：取名单是为了并行解密多架遥测，建不建链另由
+    //    `beginLinking` 入口的 `isInitiatorFor(deviceID)` 回答（2026-10-04 起闸名已由
+    //    `isResponsibleParty()` 收窄——资格只是它的第一条，不再充分）。
+    //    ‼️ 旧注释在此写「监控员 `responsibleParty=false`、全程不建链」——**2026-10-06 起
+    //    两头都错**：监控员已是有资格的责任方（他是责任链第二跳），且**持有指令权时确实
+    //    建链**（`OpsCommon.monitorHoldsControl`）。取密钥与建链在此**解耦**。
     //    与站点侧 `addLinkedDevice` 的逐条拉取同属「主动」，但落点不同：那份清单是
     //    一个个接手过来的，这一份是**整份推来**的，所以这里是**一次批量**。
     //
@@ -639,8 +641,8 @@ void CryptoController::setResponsibleParty(bool responsible)
             _regCursor = 0;
         }
         // 同一会话边界，**起/终维也当场作废**（2026-10-04 补）。理由与上面那段同源：它是
-        // 「本端是哪些飞机的起飞站」的判定结果，归属登录会话；跨会话留着会让新账号按上一个
-        // 站点的起飞站名单建链。
+        // 「本端持有哪些飞机的指令权」的判定结果，归属登录会话；跨会话留着会让新账号按上一个
+        // 站点的名单建链。
         // ‼️ 缺省 false 还有第二重作用：它是「本端**尚未确定**起/终维」的表达，而
         //    `isInitiatorFor` 靠它退回旧形态。**单机模式（本地密钥源）不推起/终维，行为
         //    不变靠的就是这一条**——它与 `_monitorListActive` 不同，必须**无条件**清，
@@ -689,12 +691,12 @@ void CryptoController::setInitiatorDevices(const QVariantList& deviceIds)
         // 走到这里就说明这是一份**成功推送的名单**（调用方只在该轮请求 200 且载荷合法时才
         // 调本函数）。生效标志在此置位，且**此后不再回落**（只有会话边界 `setResponsibleParty`
         // 能清它）——它是"本端有没有确定起/终维"的开关，不是"名单非空"的代词。
-        // ‼️ 空名单同样生效：它表示「本端不是任何一架的出站」⇒ 全拒（fail-closed）。
+        // ‼️ 空名单同样生效：它表示「本端此刻不持有任何一架的指令权」⇒ 全拒（fail-closed）。
         _initiatorScopeValid = true;
         _initiatorDevices = parsed;
         // 闸只在 `beginLinking` 入口检查**一次**（同 `setResponsibleParty` 收权那一段的
-        // 理由）：正在 Active 的那一架若不再属于本端的起飞站（任务改由别站起飞），必须
-        // 当场让出上行权。否则本机会继续以当前 Active 加密外发，与新起飞站的 QGC 争同一
+        // 理由）：正在 Active 的那一架若本端不再持有其指令权（责任链推进、交棒给了下一方），
+        // 必须当场让出上行权。否则本机会继续以当前 Active 加密外发，与新持有方的 QGC 争同一
         // deviceID 的上行奇数序列——违反 §3.1「同一时刻只有一个发送端（任务 QGC）」。
         // 判据用 `!= Standby` 而非 `== Active`：Linking 中途同样要打断（它会走向 Active，
         // 且 `_activeDeviceID` 已被占用）。
@@ -710,7 +712,11 @@ void CryptoController::setInitiatorDevices(const QVariantList& deviceIds)
 
 bool CryptoController::isInitiatorFor(DeviceID deviceID) const
 {
-    // ① 旧闸（2026-09-27 裁定），语义**不变**：非责任方一律不建链（航线监控员等）。
+    // ① **资格**闸（2026-09-27 裁定；2026-10-06 放宽到含 ROUTE_MONITOR）。
+    //    语义是"本端有没有发言权"，**不是**"本端此刻是不是责任方"——后者由 ④ 回答。
+    //    ‼️ 旧注释在此写「非责任方一律不建链（航线监控员等）」——**2026-10-06 起已失效**：
+    //    监控员正是责任链的第二跳，他的指令（出发/回航/备降）只有他该发，故他必须有资格。
+    //    仍在闸外的是 FLIGHT_SUPERVISOR。
     //    它在其它分支之前，故监控员视图从不推起/终维也不影响它。
     if (!isResponsibleParty()) {
         return false;
@@ -737,9 +743,10 @@ bool CryptoController::isInitiatorFor(DeviceID deviceID) const
 
 void CryptoController::beginLinking(DeviceID targetDeviceID)
 {
-    // 责任方闸（2026-09-27 用户裁定）：**只有站点操作员那一台 QGC 与 PX4 握手**。
-    // 航线监控员在获取权限前没有权限向 PX4 发送任何指令——它向 PX4 发任务/围栏/
-    // 集结点命令是完全错误的。非责任方在此直接返回，状态保持 Standby。
+    // 建链闸（2026-09-27 用户裁定；2026-10-06 扩到责任链三档）：**同一时刻只有持有该机
+    // 指令权的那一台 QGC 与 PX4 握手**。越过持有方去发任务/围栏/集结点命令是完全错误的
+    // ——两端各取一个上行 counter ⇒ nonce 重复（规范 §2.5）。非接引方在此直接返回，
+    // 状态保持 Standby。
     //
     // 位置：**函数最前**，早于非法 deviceID 检查、早于任何状态写入与其它日志。
     // 这是"本进程压根不该建链"的更高层判据，与参数是否合法无关；放后面还会让非责任方
@@ -761,10 +768,10 @@ void CryptoController::beginLinking(DeviceID targetDeviceID)
     // 需要判断"本机是不是责任方"的调用方直接读 isResponsibleParty()，不要靠日志。
     //
     // ‼️ 2026-10-04 起判据从 `isResponsibleParty()` 收窄为 `isInitiatorFor(targetDeviceID)`：
-    //    责任方只是"本端有权发言"，还差"本端是**这一架**的起飞站"。可接引范围 = 出站 ∪
-    //    **进站**（§2.7.2 d）⇒ 终点站也拿得到密钥、也是责任方 ⇒ 旧判据挡不住它，它会占住
-    //    `_activeDeviceID` 单槽把起飞站挤掉，违反 §3.1「同一 deviceID 指令方向同一时刻
-    //    只有一个发送端（发起任务的那个 QGC）」。拒绝路径的静默理由与上面同一段，不变。
+    //    资格只是"本端有权发言"，还差"本端**此刻**持有**这一架**的指令权"。可接引范围 =
+    //    出站 ∪ **进站**（§2.7.2 d）⇒ 终点站也拿得到密钥、也够资格 ⇒ 旧判据挡不住它，
+    //    它会占住 `_activeDeviceID` 单槽把当时的持有方挤掉，违反 §3.1「同一 deviceID
+    //    指令方向同一时刻只有一个发送端」。拒绝路径的静默理由与上面同一段，不变。
     if (!isInitiatorFor(targetDeviceID)) {
         return;
     }
