@@ -363,7 +363,9 @@ OpsShell {
         if (a.kind === "cancelHandover") {
             // 取消/撤回签出：同样是纯管理动作。`cancelHandover` 的幂等口径见 `_cancelHandover`
             //（404 视为已被他端处理＝成功）。
-            if (a.handoverId) _cancelHandover(a.handoverId)
+            // ‼️ 必须带失败反馈（2026-10-06 审查 §1③）：上面那个确认框是**先 close 再派发**的，
+            //    所以失败时框已经没了——不报的话操作员看到的与"撤回成功"逐字相同。
+            if (a.handoverId) _cancelHandoverWithFeedback(a.handoverId)
             _pendingAction = null
             return
         }

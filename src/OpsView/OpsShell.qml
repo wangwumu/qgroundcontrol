@@ -1320,36 +1320,104 @@ Item {
     // 动作统一成功即 _poll()（乐观刷新按钮态/landing_accepted，防 2s 轮询窗内重复点按 409 噪音）。
     // 弹框类动作带 onDone(success)：失败返回 false → 调用方保留弹框供重试（防瞬时失败后无入口再确认）。
     // 404 视为"已被他端处理"＝成功（幂等收口）。
+    //
+    // ‼️ 「成功码」**逐端点各读各的后端**，不共用一个数字（2026-10-06 修）。本文件三个弹框动作
+    //    打的是 `Accept`/`Reject`/`Cancel`，三者都回 `200`；`Propose` 回的是 **`201 Created`**
+    //    （`handlers/ops.go` 的 ROUTE 与 LANDING 两条成功路径都是 `StatusCreated`）。
+    //    ⚠️ 这条**只能**逐端点回后端读，不能从"旁边三个动作判 200 且工作正常"推出来——
+    //       它们本来就是不同的 handler。
     function _proposeHandover(taskId, phaseTo) {
         _post("/api/tasks/" + taskId + "/handover", { phase_to: phaseTo },
-              function(status) {
-                  if (status === 200) _poll()
-                  else console.warn("OpsView propose", status)
+              function(status, data) {
+                  // ⚠️ 这里原判 `status === 200`，而 `Propose` **从不回 200** ⇒ `_poll()` 一次都
+                  //    没执行过，成功也落进 `console.warn`。上面那句"成功即 _poll() 防重复点按
+                  //    噪音"因此**从未生效**：点完【移交降落指挥】后，按钮态与 `landing_accepted`
+                  //    要等下一次 2s 轮询才变，那个窗口里再点一次就是一次 409。
+                  if (status === 201) { _poll(); return }
+                  // ‼️ 失败必须说出来（2026-10-06，审查 C1）。`Propose` 的每个 409 都带一句**各不相同**
+                  //    的 `error`（已有生效中的交接 / 任务状态非 IN_FLIGHT / 尚未签入本航班 /
+                  //    降落机场无操作员 / 降落机场不可推导…，见 `handlers/ops.go` 各分支），
+                  //    而 `_send` 早把响应体解析好当第二参传下来了（本函数此前只接了第一个）。
+                  //    只留 `console.warn` 一个状态码的后果不是"日志少一行"：操作员看到的是
+                  //    **按钮点了没反应**，于是「闸拦住了」与「网线断了」在下游一模一样——
+                  //    可这两件事该做的处置相反（等两秒再点 / 去给降落机场开操作员账号）。
+                  //    成功路径**不弹框**：`_poll()` 刚把下一步入口变出来，弹框会盖住它。
+                  //
+                  // ‼️ 原因句走 `OpsCommon.handoverActionErrorText`（2026-10-06 审查 §1②订正）。
+                  //    本处原自己拼过一份三元式，于是同一件事有了**两份实现**——而下面 `_acceptHandover`
+                  //    那段注释恰恰自称"同一机制、单点保证"，这正是它自己警告的漂移形态。
+                  //    两份实现的差别不是措辞：`status === 0`（`_apiBase` 为空或断网）时旧式给的是
+                  //    「服务端未返回原因（**HTTP 0**）」，把"根本没发出去"说成"服务端没给原因"，
+                  //    而库函数对同一格给的是正确的「操作未送达服务端，请重试」。
+                  var reason = OpsCommon.handoverActionErrorText(status, data)
+                  console.warn("OpsView propose", status, reason)
+                  QGroundControl.showMessageDialog(opsShell, qsTr("移交未完成"), reason)
               })
     }
+    // ‼️ 下面三个函数失败时**把服务端说的原因带出去**（2026-10-06，审查 C1 另半边）。
+    //    端点各自的错误集合见 `OpsCommon.handoverActionErrorText` 的注释（五类，不止"未送达"）。
+    //    `data` 一直都在——`_send` 早把它解析好当第二参传下来了（与 `_proposeHandover` 同一机制），
+    //    此前只是被这三个函数的**单参签名**吞掉。故回调改成 `onDone(ok, errText)`：
+    //    ⚠️ **恒传两个实参**（成功时 `errText` 是空串，不是把第二个参数整个省掉）——
+    //       调用点一律用 `if (ok) return` 分流，别依赖 arity。
+    //    ⚠️ 404 之外的失败**不再**一律报"未送达"，理由与后果逐条写在上面的库函数处。
     function _acceptHandover(handoverId, onDone) {
         _post("/api/handovers/" + handoverId + "/accept", null,
-              function(status) {
+              function(status, data) {
                   if (status === 200) _poll()
-                  else console.warn("OpsView accept", status)
-                  if (onDone) onDone(status === 200 || status === 404)
+                  else console.warn("OpsView accept", status, data ? data.error : "")
+                  if (onDone) {
+                      var ok = status === 200 || status === 404
+                      onDone(ok, ok ? "" : OpsCommon.handoverActionErrorText(status, data))
+                  }
               })
     }
     function _rejectHandover(handoverId, onDone) {
         _post("/api/handovers/" + handoverId + "/reject", { reason: "" },
-              function(status) {
+              function(status, data) {
                   if (status === 200) _poll()
-                  else console.warn("OpsView reject", status)
-                  if (onDone) onDone(status === 200 || status === 404)
+                  else console.warn("OpsView reject", status, data ? data.error : "")
+                  if (onDone) {
+                      var ok = status === 200 || status === 404
+                      onDone(ok, ok ? "" : OpsCommon.handoverActionErrorText(status, data))
+                  }
               })
     }
     function _cancelHandover(handoverId, onDone) {
         _post("/api/handovers/" + handoverId + "/cancel", null,
-              function(status) {
+              function(status, data) {
                   if (status === 200) _poll()
-                  else console.warn("OpsView cancel", status)
-                  if (onDone) onDone(status === 200 || status === 404)
+                  else console.warn("OpsView cancel", status, data ? data.error : "")
+                  if (onDone) {
+                      var ok = status === 200 || status === 404
+                      onDone(ok, ok ? "" : OpsCommon.handoverActionErrorText(status, data))
+                  }
               })
+    }
+
+    /// 撤回/取消交接，**失败时给操作员可见反馈**。两个视图共用（`RomView` 与 `OpsView`）。
+    ///
+    /// ‼️ 为什么必须有这一层（2026-10-06 审查 §1③）：`_cancelHandover` 的 `onDone` 是**可选**的，
+    ///    而它原先的**两个调用点一个都没传** ⇒ `if (onDone)` 整段跳过，失败只剩一行 `console.warn`。
+    ///    后果与 `_checkinFromCard` 那段注释写的是同一个病，但更坏：
+    ///      · `OpsView`：`actionConfirmDialog` 是**先 close 再派发**（`_execPendingAction` 随即
+    ///        把 `_pendingAction` 置空）⇒ 框已关、又无新提示 ⇒ 与「撤回成功」在界面上**逐字相同**；
+    ///      · `RomView`：本视图**没有任何弹窗设施**（见其卡片上那段注释）⇒ 按钮点了没反应。
+    ///    而撤回失败最常见的两种恰恰**必须**说出来：403「仅提出方可撤回，或交接已处理」
+    ///    （对方恰在你点确认的那两秒里签入了）与 500——不说，操作员就会反复重试一个已终结的交接。
+    ///
+    /// ‼️ 住骨架的理由与 `_checkinFromCard` 同：错误提示只有一套机制，而骨架是两个视图共同的
+    ///    祖先 ⇒ 写在这里＝只写一份、两边同时有。各视图各写一份就会漏边——本轮漏的就是这一边。
+    ///
+    /// ⚠️ 用 `showMessageDialog` 而**不复用** `handoverDialog`（`_checkinFromCard` 那边复用了）：
+    ///    两者的前提不同——`_checkinFromCard` 只在"名下还有这条待办"时才开框，因为那**有重试对象**；
+    ///    而撤回失败的典型语义正是"这条已经不是你提的 PENDING 了"，多半已不在 `_handoverById` 里
+    ///    ⇒ 开一个没有对象的框，它的按钮会 POST `/handovers/undefined/...`。故这里**只报不给重试**。
+    function _cancelHandoverWithFeedback(handoverId) {
+        _cancelHandover(handoverId, function(ok, err) {
+            if (ok) return
+            QGroundControl.showMessageDialog(opsShell, qsTr("撤回未完成"), err)
+        })
     }
 
     /// 求一次交接弹框的锚点并记账。**两个打开点都先走这里**（`_checkinFromCard` 与
@@ -1389,12 +1457,14 @@ Item {
     ///    界面已自洽），而一个没有对象的弹框，它的按钮会 POST `/handovers/undefined/accept`。
     function _checkinFromCard(handoverId, task) {
         if (handoverId === undefined) return
-        _acceptHandover(handoverId, function(ok) {
+        _acceptHandover(handoverId, function(ok, err) {
             if (ok) return
             var h = task ? _handoverById[task.task_id] : undefined
             if (!h) return
-            // 文案与弹框内 accept 失败那句**逐字相同**：两处同因同果，分开写就会漂移。
-            _handoverActionError = qsTr("操作未送达服务端，请重试；仍失败请通知对方人工处理")
+            // 与弹框内 accept 失败那句**逐字相同**：两处同因同果，分开写就会漂移。
+            // ‼️ 2026-10-06 起"同因"由 `OpsCommon.handoverActionErrorText` 单点保证（原因句共用），
+            //    本行只留后缀——原先靠两处人工照抄一整句，后端每加一种错误就多一处可漂移的地方。
+            _handoverActionError = err + qsTr("；仍失败请通知对方人工处理")
             _confirmHandover = h
             _setHandoverAnchor(h.task_id)
             handoverDialog.open()
@@ -2450,9 +2520,9 @@ Item {
                 Item { Layout.fillWidth: true }
                 Button {
                     text: qsTr("拒绝")
-                    onClicked: _rejectHandover(OpsCommon.handoverId(_confirmHandover), function(ok) {
+                    onClicked: _rejectHandover(OpsCommon.handoverId(_confirmHandover), function(ok, err) {
                         if (ok) handoverDialog.close()
-                        else _handoverActionError = qsTr("操作未送达服务端，请重试；仍失败请通知提出方撤回重提")
+                        else _handoverActionError = err + qsTr("；仍失败请通知提出方撤回重提")
                     })
                 }
                 Button {
@@ -2460,9 +2530,9 @@ Item {
                     onClicked: {
                         var mine = _confirmHandover && OpsCommon.isMine(_confirmHandover, AuthController.userId)
                         var act = mine ? _cancelHandover : _acceptHandover
-                        act(OpsCommon.handoverId(_confirmHandover), function(ok) {
+                        act(OpsCommon.handoverId(_confirmHandover), function(ok, err) {
                             if (ok) handoverDialog.close()
-                            else _handoverActionError = qsTr("操作未送达服务端，请重试；仍失败请通知对方人工处理")
+                            else _handoverActionError = err + qsTr("；仍失败请通知对方人工处理")
                         })
                     }
                 }

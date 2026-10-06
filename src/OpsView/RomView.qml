@@ -332,7 +332,7 @@ OpsShell {
                     // 点整项由骨架写 _selectedTaskId 并发 taskSelected（机位同步是站点视图的事）
                     onTaskSelected: function(task) { romView.selectTask(task) }
                     onHandoverProposed: function(taskId, phase) { romView._proposeHandover(taskId, phase) }
-                    onHandoverCancelRequested: function(handoverId) { romView._cancelHandover(handoverId) }
+                    onHandoverCancelRequested: function(handoverId) { romView._cancelHandoverWithFeedback(handoverId) }
                     // 【签入】接管本航班（ROUTE 相位）。**不弹窗**（同族先例见 OpsView 那一处注释）；
                     // 失败反馈走 `_checkinFromCard`——它住在骨架里，本视图因此不必自备错误提示机制
                     // （本视图除了下面那条陈旧提示条之外没有任何弹窗设施）。

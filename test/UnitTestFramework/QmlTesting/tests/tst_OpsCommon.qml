@@ -3473,4 +3473,99 @@ TestCase {
         verify(Array.isArray(OpsCommon.initiatorDeviceIds(null)), "null ⇒ 空数组，且不得抛错")
     }
 
+    //=========================================================================
+    // 交接操作失败的原因句（2026-10-06，审查 C1）
+    //
+    // 三个端点（`gcs_server/handlers/ops.go` 的 `Accept`/`Reject`/`Cancel`）的错误集合
+    // 是 **400/403/404/409/500 五类**，而调用点原先一律报「操作未送达服务端」——
+    // 那句话**只在 `status === 0` 时成立**。本组钉的就是这条分界。
+    //=========================================================================
+
+    /// ‼️ 本组的核心格：**除了 `status === 0`，任何状态码都不许说"未送达"**。
+    /// 遍历的正是"服务端已答复"这一整类：403（权限）/409（竞态）/500（故障）会**带 error**，
+    /// 500/502 也可能不带（反代吐 HTML ⇒ `_send` 的 `JSON.parse` 失败 ⇒ `data` 为 `null`）。
+    /// 退化实现（恒返回「操作未送达服务端，请重试」）会让本格全红——这正是本次要防的形状。
+    /// ⚠️ 为什么这不是"文案测试"：403 被说成"没送到"时，操作员会一直重试一个**权限**问题；
+    ///    409 被说成"没送到"时，本该刷新却反复重试。两者该做的处置**相反**。
+    function test_handoverActionErrorText_neverClaimsUndeliveredWhenServerReplied() {
+        var replied = [
+            { s: 400, d: { error: "无效交接 id" } },
+            { s: 403, d: { error: "非降落机场操作员" } },
+            { s: 409, d: { error: "交接已被处理或已超时" } },
+            { s: 500, d: { error: "database is locked" } },
+            { s: 502, d: null },
+            { s: 500, d: null }
+        ]
+        for (var i = 0; i < replied.length; i++) {
+            var t = OpsCommon.handoverActionErrorText(replied[i].s, replied[i].d)
+            verify(t && t.indexOf("未送达") < 0,
+                   "HTTP " + replied[i].s + " 是服务端**已答复**，不得报成「未送达」：实得「" + t + "」")
+        }
+    }
+
+    /// 只有 `status === 0` 才说"未送达"——那是 `_send` 在 `_apiBase` 为空、
+    /// 或请求根本没发出去时回调的码（见 `_send` 里那句 `onDone(0, null)`）。
+    /// ⚠️ 与上一格是**两半**：只留上一格的话，一个恒返回状态码兜底的实现也能全绿，
+    ///    而那会让"网线断了"和"权限不够"在操作员眼里长得一样。
+    function test_handoverActionErrorText_zeroMeansNotDelivered() {
+        var t = OpsCommon.handoverActionErrorText(0, null)
+        verify(t.indexOf("未送达") >= 0, "status=0 是唯一该说「未送达」的一格，实得「" + t + "」")
+    }
+
+    /// 服务端给了 `error` ⇒ **逐字透出**，不再由前端改写。
+    /// 为什么必须逐字：这几句（「非降落机场操作员」）本就是给人看的完整句子，
+    /// 前端再译一层只会与后端漂移——后端每加一处分支，前端那张映射表就漏一处，**漏了不报错**。
+    /// ⚠️ 判据用 403/409 的**具体文案**而非"非空"：用非空的话，把 `error` 前面拼一段
+    ///    固定话术（或整个换成"操作失败"）也照样全绿。
+    function test_handoverActionErrorText_passesServerReasonVerbatim() {
+        compare(OpsCommon.handoverActionErrorText(403, { error: "非降落机场操作员" }),
+                "非降落机场操作员")
+        compare(OpsCommon.handoverActionErrorText(409, { error: "交接已被处理或已超时" }),
+                "交接已被处理或已超时")
+    }
+
+    /// ‼️ **5xx 不得透出服务端原文**（2026-10-06 审查 §1①）。
+    ///
+    /// 为什么必须单列一格：上面那格只断言"不说未送达"，于是把 `database is locked`
+    /// **原样渲染进交接弹框照样全绿**——而那正是本仓三个端点 500 出口的形态
+    /// （`ops.go` 的 `Accept`/`Reject`/`Cancel` 共 10 处裸 `err.Error()`）。
+    /// 操作员读到的是英文库内部措辞，而调用点还会在它后面拼一句「；仍失败请通知对方人工处理」
+    /// ——**处置说反了**：那是本地瞬时锁争用，正确动作是过几秒**自己重试**，不是去找人。
+    ///
+    /// ⚠️ 与 `..._passesServerReasonVerbatim` 是**互补的两半**，缺一不可：
+    ///    只留本格 ⇒ 一个"4xx 也收敛成固定话术"的实现会漏网（那会丢掉「非降落机场操作员」
+    ///    这类**可行动**的原因）；只留那格 ⇒ 本条泄漏漏网。两格一起才钉住"**分档**透出"。
+    /// ⚠️ 判据取"不含原文"而**不是**"等于某句固定话术"：本格管的是**不泄漏**，不是**措辞**
+    ///    ——将来改文案不该让本格变红。
+    function test_handoverActionErrorText_doesNotLeakRawServerErrorOn5xx() {
+        var raw = [
+            "database is locked",
+            "no such table: table_task_operation_history",
+            "sql: database is closed",
+            "UNIQUE constraint failed: table_task_handover.task_id"
+        ]
+        for (var i = 0; i < raw.length; i++) {
+            var t = OpsCommon.handoverActionErrorText(500, { error: raw[i] })
+            verify(t.indexOf(raw[i]) < 0,
+                   "5xx 的 error 是给机器看的原文，不得透给操作员：实得「" + t + "」")
+            verify(t && t.length > 0, "收敛之后仍要给一句话，不能返回空串")
+        }
+        // 整个 5xx 档，不只看 500：网关侧 502/503/504 的正文也可能被 `JSON.parse` 成对象。
+        verify(OpsCommon.handoverActionErrorText(503, { error: "upstream connect error" })
+                   .indexOf("upstream connect error") < 0,
+               "5xx 整档都收敛，只挡 500 不够")
+    }
+
+    /// ‼️ 服务端答复了却**没带** `error` ⇒ 给状态码，**不许替它猜原因**。
+    /// 这条路径真实存在：反代 502/504 吐 HTML ⇒ `JSON.parse` 失败 ⇒ `data` 为 `null`。
+    /// ⚠️ 顺带钉住 `data` 不是对象时不得抛：`data.error` 在字符串上求值是 `undefined`，
+    ///    落在同一兜底（实际 `_send` 只给对象或 `null`，这两格是防御性的）。
+    function test_handoverActionErrorText_fallsBackToStatusCode() {
+        var t = OpsCommon.handoverActionErrorText(502, null)
+        verify(t.indexOf("502") >= 0, "无 error 时至少要说明是哪个状态码，实得「" + t + "」")
+        verify(OpsCommon.handoverActionErrorText(502, "HTML").indexOf("502") >= 0,
+               "data 非对象（如解析失败留下的原串）不得抛错，且走同一兜底")
+        verify(OpsCommon.handoverActionErrorText(502, {}).indexOf("502") >= 0,
+               "data 是空对象（无 error 键）同样走兜底")
+    }
 }
