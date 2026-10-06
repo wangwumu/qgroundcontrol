@@ -687,7 +687,13 @@ ColumnLayout {
                         }
                         // ── 监控员视图 ──
                         Button {
-                            // 仅无 PENDING(LANDING) 交接时可发起（防重复 409；已有交接可走"撤回交接"）
+                            // 仅**本相位没有生效中的交接**时可发起（防重复 409；已有交接可走"撤回交接"）。
+                            // 生效中 = PENDING ∪ ACCEPTED，两半各一条判据，缺一即漏：
+                            //   · PENDING   → `pendingPhase`（正等降落机场签入）
+                            //   · ACCEPTED  → 2026-10-06 补。改前只判 PENDING，于是降落机场**已经签入**
+                            //     之后这个按钮还在，点下去后端 201、库里多出一条 PENDING ⇒ 降落机场
+                            //     会再收到一次它已经签过的签入请求。后端同日加的闸就挡这件事
+                            //     （`Propose` 里 `status IN ('PENDING','ACCEPTED')`）。
                             // ‼️ `signedIn` 是 2026-09-24 补的闸（缺口③）：改前只判 `IN_FLIGHT`，
                             //    于是**飞机还没交给监控员时**他就能把降落指挥交给降落机场——责任链
                             //    中间断了一格，而此刻起飞机场侧看到的仍是"责任在监控员手上"。
@@ -697,10 +703,34 @@ ColumnLayout {
                             //       两处一旦漂移就是"两个按钮同时出现"或"一个都不出现"。
                             // ⚠️ 后端 `Propose` 的 LANDING 分支有同一道闸（防绕过界面直接 POST），
                             //    两处必须同时存在：前端管"看得见/点得动"，后端管"做不做得到"。
+                            //
+                            // ‼️ ACCEPTED 这一半为什么用 `landingState`（**非**单调）而不是
+                            //    `landingAccepted`（单调）：问的不是同一件事。`OpsCommon` 那两处
+                            //    门控（`monitorHoldsControl` / `siteHoldsControl`）问的是"**是否曾经**
+                            //    签入过"——那必须单调，否则 `landing_state` 被打回 PENDING 时两侧
+                            //    同时持有上行权（nonce 重复，规范 §2.5）。这里问的是"**此刻**这一
+                            //    相位还有没有活着的交接单"——`landing_state`（最近一条的状态）正是
+                            //    这个语义。后端闸补上之后它事实上也不会再被打回 PENDING。
+                            //    ⚠️ 另：本组件被两个视图各实例化一次，`modelData` 形状不同
+                            //    （RomView 吃 `opsRouteTaskItem`，站点视图吃 `opsOverviewItem`）。
+                            //    **本条只在监控员视图成立，别读成"两个形状通用"**——
+                            //    整个合取里 `signedIn` 与 `landingState` **同时**存在**只在
+                            //    `opsRouteTaskItem` 上**：`signed_in` 不下发在 `opsOverviewItem`
+                            //    上（所以站点视图判起飞档读的是 `checkout_state`，见 `OpsCommon`
+                            //    的 `siteHoldsControl` 头注），而 `landing_accepted` 又只下发在
+                            //    站点那个形状上。两个字段错开，交集恰好只剩监控员这一个形状。
+                            //    站点视图那一侧由上面第一个合取项 `panel.isRouteMonitor` 挡住；
+                            //    即便那道闸没了，`signedIn` 在**缺字段**时返回 `false`（不是
+                            //    undefined）⇒ 合取恒假、按钮仍不出现。**两重门都得在，别省成一处。**
+                            //    ⚠️ 但 `landingState` 在缺字段时返回 `""`，而 `"" !== "ACCEPTED"`
+                            //    为 **true** ⇒ 这一项单独看是 **fail-open** 的，**不能**当门用。
+                            //    ⚠️ 引注一律用**函数名**不用行号：`OpsCommon.js` 行号会被增删行顶偏
+                            //    （本条原引 `OpsCommon:503-504` 就已经指到了相反的内容）。
                             visible: !panel.showSiteActions && panel.isRouteMonitor
                                      && modelData.status === "IN_FLIGHT"
                                      && OpsCommon.signedIn(modelData)
                                      && !OpsCommon.pendingPhase(modelData, "LANDING", panel.handoverById)
+                                     && OpsCommon.landingState(modelData) !== "ACCEPTED"
                             height: 24; padding: 0
                             text: qsTr("移交降落指挥")
                             onClicked: panel.handoverProposed(modelData.task_id, "LANDING")
