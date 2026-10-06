@@ -14,6 +14,7 @@
 #include <QtCore/QDateTime>
 #include <QtCore/QDir>
 #include <QtCore/QFile>
+#include <QtCore/QPointer>
 #include <QtCore/QRegularExpression>
 #include <QtCore/QTemporaryDir>
 #include <QtTest/QSignalSpy>
@@ -110,6 +111,52 @@ void PlanMasterControllerTest::_testActiveVehicleChanged()
     // This signal was affected by the defect - it wouldn't reach the subscriber. Here
     // we make sure it does.
     QVERIFY(spyMissionManager.onlyEmittedOnce("error"));
+}
+
+void PlanMasterControllerTest::_testStartStaticActiveVehicleAfterVehicleDestroyed()
+{
+    // Regression test for a use-after-free: a PlanMasterController created without start()
+    // (so it never connects to MultiVehicleManager::activeVehicleChanged) that is reused
+    // across two Vehicle lifetimes via startStaticActiveVehicle(vehicle, false).
+    // This is how OpsView's OpsRouteSync.qml uses its PlanMasterController: a bare
+    // `PlanMasterController {}` instance which is re-bound to a new vehicle every time the
+    // active vehicle reappears (e.g. after the PX4 is restarted).
+    // With raw pointers, the first vehicle's destruction left _managerVehicle and
+    // _missionManager dangling, and the second startStaticActiveVehicle() dereferenced the
+    // freed MissionManager inside MissionController::start().
+
+    // Deliberately NOT started: this controller never tracks the active vehicle.
+    PlanMasterController strayController;
+
+    _connectMockLink(MAV_AUTOPILOT_PX4);
+    Vehicle* vehicle1 = MultiVehicleManager::instance()->activeVehicle();
+    QVERIFY(vehicle1);
+
+    strayController.startStaticActiveVehicle(vehicle1, false);
+    QVERIFY2(strayController.managerVehicle() == vehicle1,
+             "strayController should be bound to the first vehicle");
+
+    // Track vehicle1's destruction independently of its address: the heap can hand the same
+    // address to the next Vehicle, and then comparing against the raw pointer proves nothing.
+    QPointer<Vehicle> vehicle1Guard(vehicle1);
+
+    // Destroying vehicle1 destroys its MissionManager as well.
+    _disconnectMockLink();
+    QVERIFY2(vehicle1Guard.isNull(), "vehicle1 should have been destroyed by _disconnectMockLink");
+
+    // The controller was never told the vehicle went away, so its lifetime tracking is the
+    // only thing that can notice. It must stop handing out the destroyed vehicle.
+    QVERIFY2(strayController.managerVehicle() != vehicle1,
+             "strayController still points at the destroyed vehicle");
+
+    _connectMockLink(MAV_AUTOPILOT_PX4);
+    Vehicle* vehicle2 = MultiVehicleManager::instance()->activeVehicle();
+    QVERIFY(vehicle2);
+
+    // Used to segfault here.
+    strayController.startStaticActiveVehicle(vehicle2, false);
+    QVERIFY2(strayController.managerVehicle() == vehicle2,
+             "strayController should be bound to the second vehicle");
 }
 
 void PlanMasterControllerTest::_testDirtyFlagsMatrix_data()

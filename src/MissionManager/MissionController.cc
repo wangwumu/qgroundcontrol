@@ -41,7 +41,6 @@ MissionController::MissionController(PlanMasterController* masterController, QOb
     : PlanElementController (masterController, parent)
     , _controllerVehicle    (masterController->controllerVehicle())
     , _managerVehicle       (masterController->managerVehicle())
-    , _missionManager       (masterController->managerVehicle()->missionManager())
     , _visualItems          (new QmlObjectListModel(this))
     , _planViewSettings     (SettingsManager::instance()->planViewSettings())
     , _appSettings          (SettingsManager::instance()->appSettings())
@@ -73,7 +72,7 @@ MissionController::~MissionController()
 
 void MissionController::_resetMissionFlightStatus(void)
 {
-    _flightStatusCalc.reset(_controllerVehicle, _managerVehicle, _missionContainsVTOLTakeoff);
+    _flightStatusCalc.reset(_controllerVehicle, _managedVehicle(), _missionContainsVTOLTakeoff);
     _missionFlightStatus = _flightStatusCalc.status();
 
     emit missionPlannedDistanceChanged(_missionFlightStatus.plannedDistance);
@@ -91,7 +90,7 @@ void MissionController::start(bool flyView)
 {
     qCDebug(MissionControllerLog) << "start flyView" << flyView;
 
-    _managerVehicleChanged(_managerVehicle);
+    _managerVehicleChanged(_managedVehicle());
     connect(_masterController, &PlanMasterController::managerVehicleChanged, this, &MissionController::_managerVehicleChanged);
 
     PlanElementController::start(flyView);
@@ -112,7 +111,7 @@ void MissionController::_init(void)
 // Called when new mission items have completed downloading from Vehicle
 void MissionController::_newMissionItemsAvailableFromVehicle(bool removeAllRequested)
 {
-    qCDebug(MissionControllerLog) << "_newMissionItemsAvailableFromVehicle flyView:count" << _flyView << _missionManager->missionItems().count();
+    qCDebug(MissionControllerLog) << "_newMissionItemsAvailableFromVehicle flyView:count" << _flyView << _missionManager()->missionItems().count();
 
     // Fly view always reloads on _loadComplete
     // Plan view only reloads if:
@@ -124,7 +123,7 @@ void MissionController::_newMissionItemsAvailableFromVehicle(bool removeAllReque
     // 未登录时不进入此分支，下面的原条件一字未改。
     if (!_itemsRequested && AuthController::backendLoggedIn()) {
         qCDebug(MissionControllerLog) << "_newMissionItemsAvailableFromVehicle: backend logged in, skipping auto plan load, count"
-                                      << _missionManager->missionItems().count();
+                                      << _missionManager()->missionItems().count();
         _itemsRequested = false;
         return;
     }
@@ -139,7 +138,7 @@ void MissionController::_newMissionItemsAvailableFromVehicle(bool removeAllReque
 
         _setupNewVisualItems();
 
-        const QList<MissionItem*>& newMissionItems = _missionManager->missionItems();
+        const QList<MissionItem*>& newMissionItems = _missionManager()->missionItems();
         qCDebug(MissionControllerLog) << "loading from vehicle: count"<< newMissionItems.count();
 
         int i=0;
@@ -189,7 +188,7 @@ void MissionController::loadFromVehicle(void)
         qCCritical(MissionControllerLog) << "MissionControllerLog::loadFromVehicle called while syncInProgress";
     } else {
         _itemsRequested = true;
-        _managerVehicle->missionManager()->loadFromVehicle();
+        _managedVehicle()->missionManager()->loadFromVehicle();
     }
 }
 
@@ -208,7 +207,7 @@ void MissionController::sendToVehicle(void)
     // 加密链路：确定航线 + 选定无人机时触发建链（规范第三部分「QGC 地面站」契约）。
     MAVLinkCrypto::CryptoController* const crypto = MAVLinkCrypto::CryptoController::instance();
     if (crypto->cryptoEnabled()) {
-        crypto->beginLinkingForSystemID(static_cast<uint8_t>(_managerVehicle->id()));
+        crypto->beginLinkingForSystemID(static_cast<uint8_t>(_managedVehicle()->id()));
         if (crypto->state() == MAVLinkCrypto::CryptoController::State::Linking) {
             // 建链异步进行中（密钥未缓存，正从 gcs_server 拉取）：
             // 立即发送会产生明文帧（未 Active），接收端在全加密链路上会丢弃 → 首次航线上传必丢。
@@ -226,7 +225,7 @@ void MissionController::sendToVehicle(void)
         if (crypto->state() != MAVLinkCrypto::CryptoController::State::Active) {
             // Standby：未触发建链（deviceID↔systemID 映射未知，无法取密钥）
             qCWarning(MissionControllerLog) << "crypto: no device mapping for vehicle"
-                                            << _managerVehicle->id() << ", abort plan upload";
+                                            << _managedVehicle()->id() << ", abort plan upload";
             return;
         }
         // Active：链路就绪，直接发送
@@ -239,9 +238,9 @@ void MissionController::_sendPlanItemsToVehicle(void)
     if (_visualItems->count() == 1) {
         // This prevents us from sending a possibly bogus home position to the vehicle
         QmlObjectListModel emptyModel;
-        sendItemsToVehicle(_managerVehicle, &emptyModel);
+        sendItemsToVehicle(_managedVehicle(), &emptyModel);
     } else {
-        sendItemsToVehicle(_managerVehicle, _visualItems);
+        sendItemsToVehicle(_managedVehicle(), _visualItems);
     }
     setDirty(false);
 }
@@ -1231,7 +1230,7 @@ void MissionController::_recalcMissionFlightStatus()
 
     qCDebug(MissionControllerLog) << "_recalcMissionFlightStatus";
 
-    _flightStatusCalc.recalc(_visualItems, _settingsItem, _controllerVehicle, _managerVehicle, _appSettings, _planViewSettings, _missionContainsVTOLTakeoff);
+    _flightStatusCalc.recalc(_visualItems, _settingsItem, _controllerVehicle, _managedVehicle(), _appSettings, _planViewSettings, _missionContainsVTOLTakeoff);
     _missionFlightStatus = _flightStatusCalc.status();
     _minAMSLAltitude = _flightStatusCalc.minAMSLAltitude();
     _maxAMSLAltitude = _flightStatusCalc.maxAMSLAltitude();
@@ -1666,34 +1665,52 @@ void MissionController::_itemCommandChanged(void)
 void MissionController::_managerVehicleChanged(Vehicle* managerVehicle)
 {
     if (_managerVehicle) {
-        _missionManager->disconnect(this);
-        _managerVehicle->disconnect(this);
+        // 只断开还活着的那个：QPointer 非空即说明代管载具尚在，它的任务管理器也随之尚在。
+        // 载具已销毁时根本不进这里 —— QPointer 已自动置空，硬解引用就是空指针崩溃
+        // （原裸指针版本正是崩在这两行）。
+        _missionManager()->disconnect(this);
+        _managedVehicle()->disconnect(this);
         _managerVehicle = nullptr;
-        _missionManager = nullptr;
     }
 
-    _managerVehicle = managerVehicle;
-    if (!_managerVehicle) {
-        qWarning() << "MissionController::managerVehicleChanged managerVehicle=NULL";
-        return;
-    }
+    // 传入 nullptr 表示"当前没有代管载具"：既可能是首次 start() 时还没有活动载具，
+    // 也可能是上一架被 MultiVehicleManager 销毁后 QPointer 置空。
+    // 回落到离线控制载具 —— 与 PlanMasterController::_activeVehicleChanged() 的 nullptr
+    // 分支同口径。
+    _managerVehicle = managerVehicle ? managerVehicle : _controllerVehicle;
 
-    _missionManager = _managerVehicle->missionManager();
-    connect(_missionManager, &MissionManager::newMissionItemsAvailable, this, &MissionController::_newMissionItemsAvailableFromVehicle);
-    connect(_missionManager, &MissionManager::sendComplete,             this, &MissionController::_managerSendComplete);
-    connect(_missionManager, &MissionManager::removeAllComplete,        this, &MissionController::_managerRemoveAllComplete);
-    connect(_missionManager, &MissionManager::inProgressChanged,        this, &MissionController::_inProgressChanged);
-    connect(_missionManager, &MissionManager::progressPctChanged,       this, &MissionController::_progressPctChanged);
-    connect(_missionManager, &MissionManager::currentIndexChanged,      this, &MissionController::_currentMissionIndexChanged);
-    connect(_missionManager, &MissionManager::lastCurrentIndexChanged,  this, &MissionController::resumeMissionIndexChanged);
-    connect(_missionManager, &MissionManager::resumeMissionReady,       this, &MissionController::resumeMissionReady);
-    connect(_missionManager, &MissionManager::resumeMissionUploadFail,  this, &MissionController::resumeMissionUploadFail);
-    connect(_managerVehicle, &Vehicle::defaultCruiseSpeedChanged,       this, &MissionController::_recalcMissionFlightStatusSignal, Qt::QueuedConnection);
-    connect(_managerVehicle, &Vehicle::defaultHoverSpeedChanged,        this, &MissionController::_recalcMissionFlightStatusSignal, Qt::QueuedConnection);
-    connect(_managerVehicle, &Vehicle::vehicleTypeChanged,              this, &MissionController::complexMissionItemsChanged);
+    MissionManager* const missionManager = _missionManager();
+    connect(missionManager, &MissionManager::newMissionItemsAvailable, this, &MissionController::_newMissionItemsAvailableFromVehicle);
+    connect(missionManager, &MissionManager::sendComplete,             this, &MissionController::_managerSendComplete);
+    connect(missionManager, &MissionManager::removeAllComplete,        this, &MissionController::_managerRemoveAllComplete);
+    connect(missionManager, &MissionManager::inProgressChanged,        this, &MissionController::_inProgressChanged);
+    connect(missionManager, &MissionManager::progressPctChanged,       this, &MissionController::_progressPctChanged);
+    connect(missionManager, &MissionManager::currentIndexChanged,      this, &MissionController::_currentMissionIndexChanged);
+    connect(missionManager, &MissionManager::lastCurrentIndexChanged,  this, &MissionController::resumeMissionIndexChanged);
+    connect(missionManager, &MissionManager::resumeMissionReady,       this, &MissionController::resumeMissionReady);
+    connect(missionManager, &MissionManager::resumeMissionUploadFail,  this, &MissionController::resumeMissionUploadFail);
+    connect(_managedVehicle(), &Vehicle::defaultCruiseSpeedChanged,    this, &MissionController::_recalcMissionFlightStatusSignal, Qt::QueuedConnection);
+    connect(_managedVehicle(), &Vehicle::defaultHoverSpeedChanged,     this, &MissionController::_recalcMissionFlightStatusSignal, Qt::QueuedConnection);
+    connect(_managedVehicle(), &Vehicle::vehicleTypeChanged,           this, &MissionController::complexMissionItemsChanged);
 
     emit complexMissionItemsChanged();
     emit resumeMissionIndexChanged();
+}
+
+Vehicle* MissionController::_managedVehicle(void) const
+{
+    // _managerVehicle 是 QPointer：代管载具被 MultiVehicleManager 销毁后自动置空。
+    // 此时回落到离线控制载具 —— 与 PlanMasterController::_activeVehicleChanged() 的
+    // nullptr 分支同口径。
+    // 回落放在**读点**而非只放在赋值点：从不调 start() 的 PlanMasterController 不转发
+    // 销毁通知，从载具死到新载具到的这段窗口里本函数照样会被调到。
+    return _managerVehicle ? _managerVehicle.data() : _controllerVehicle;
+}
+
+MissionManager* MissionController::_missionManager(void) const
+{
+    // 现取而不缓存：任务管理器的宿主就是代管载具，随它一同销毁。
+    return _managedVehicle()->missionManager();
 }
 
 void MissionController::_inProgressChanged(bool inProgress)
@@ -1769,7 +1786,7 @@ int MissionController::resumeMissionIndex(void) const
     int resumeIndex = 0;
 
     if (_flyView) {
-        resumeIndex = _missionManager->lastCurrentIndex() + (_controllerVehicle->firmwarePlugin()->sendHomePositionToVehicle() ? 0 : 1);
+        resumeIndex = _missionManager()->lastCurrentIndex() + (_controllerVehicle->firmwarePlugin()->sendHomePositionToVehicle() ? 0 : 1);
         if (resumeIndex > 1 && resumeIndex != _visualItems->value<VisualMissionItem*>(_visualItems->count() - 1)->sequenceNumber()) {
             // Resume at the item previous to the item we were heading towards
             resumeIndex--;
@@ -1786,7 +1803,7 @@ int MissionController::currentMissionIndex(void) const
     if (!_flyView) {
         return -1;
     } else {
-        int currentIndex = _missionManager->currentIndex();
+        int currentIndex = _missionManager()->currentIndex();
         if (!_controllerVehicle->firmwarePlugin()->sendHomePositionToVehicle()) {
             currentIndex++;
         }
@@ -1811,7 +1828,7 @@ void MissionController::_currentMissionIndexChanged(int sequenceNumber)
 
 bool MissionController::syncInProgress(void) const
 {
-    return _missionManager->inProgress();
+    return _missionManager()->inProgress();
 }
 
 bool MissionController::dirty(void) const
@@ -1873,7 +1890,7 @@ void MissionController::removeAllFromVehicle(void)
         qCCritical(MissionControllerLog) << "MissionControllerLog::removeAllFromVehicle called while syncInProgress";
     } else {
         _itemsRequested = true;
-        _missionManager->removeAll();
+        _missionManager()->removeAll();
     }
 }
 
@@ -1887,7 +1904,7 @@ void MissionController::resumeMission(int resumeIndex)
     if (!_controllerVehicle->firmwarePlugin()->sendHomePositionToVehicle()) {
         resumeIndex--;
     }
-    _missionManager->generateResumeMission(resumeIndex);
+    _missionManager()->generateResumeMission(resumeIndex);
 }
 
 QGeoCoordinate MissionController::plannedHomePosition(void) const
@@ -1947,7 +1964,7 @@ bool MissionController::showPlanFromManagerVehicle (void)
         // false，等同步完成的信号到达时本文 :125 的登录闸会把它当成"载具自动装载"拦掉——按钮点了没反应。
         // GeoFenceController::showPlanFromManagerVehicle 同形（其 :372），三处必须一致。
         _itemsRequested = true;
-        if (!_managerVehicle->initialPlanRequestComplete()) {
+        if (!_managedVehicle()->initialPlanRequestComplete()) {
             // The vehicle hasn't completed initial load, we can just wait for newMissionItemsAvailable to be signalled automatically
             qCDebug(MissionControllerLog) << "showPlanFromManagerVehicle: !initialPlanRequestComplete, wait for signal";
             return true;
@@ -2456,13 +2473,13 @@ void MissionController::_firstItemAdded(void)
 
 MissionController::SendToVehiclePreCheckState MissionController::sendToVehiclePreCheck(void)
 {
-    if (_managerVehicle->isOfflineEditingVehicle()) {
+    if (_managedVehicle()->isOfflineEditingVehicle()) {
         return SendToVehiclePreCheckStateNoActiveVehicle;
     }
-    if (_managerVehicle->armed() && _managerVehicle->flightMode() == _managerVehicle->missionFlightMode()) {
+    if (_managedVehicle()->armed() && _managedVehicle()->flightMode() == _managedVehicle()->missionFlightMode()) {
         return SendToVehiclePreCheckStateActiveMission;
     }
-    if (_controllerVehicle->firmwareType() != _managerVehicle->firmwareType() || QGCMAVLink::vehicleClass(_controllerVehicle->vehicleType()) != QGCMAVLink::vehicleClass(_managerVehicle->vehicleType())) {
+    if (_controllerVehicle->firmwareType() != _managedVehicle()->firmwareType() || QGCMAVLink::vehicleClass(_controllerVehicle->vehicleType()) != QGCMAVLink::vehicleClass(_managedVehicle()->vehicleType())) {
         return SendToVehiclePreCheckStateFirwmareVehicleMismatch;
     }
     return SendToVehiclePreCheckStateOk;

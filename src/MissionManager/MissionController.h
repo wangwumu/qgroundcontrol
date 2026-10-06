@@ -3,6 +3,7 @@
 #include <QtCore/QHash>
 #include <QtCore/QFile>
 #include <QtCore/QPersistentModelIndex>
+#include <QtCore/QPointer>
 #include <QtCore/QVariant>
 #include <QtPositioning/QGeoCoordinate>
 #include <QtQmlIntegration/QtQmlIntegration>
@@ -402,9 +403,24 @@ private:
     void                    _sendPlanItemsToVehicle             (void);
 
 private:
+    /// 代管载具 —— **永不为 nullptr**。_managerVehicle 是 QPointer：载具被
+    /// MultiVehicleManager 销毁（链路全部移除 ⇒ deleteLater）时自动置空。但光在赋值点
+    /// 回落不够 —— 本控制器不总能收到销毁通知（例如从不调 start() 的
+    /// PlanMasterController），那段窗口里读点照样会被调到（QML 直接读 syncInProgress），
+    /// 所以回落放在**读点**上。定义在 .cc：QPointer::data() 要 static_cast 到 Vehicle*，
+    /// 本头文件只有前向声明。
+    Vehicle* _managedVehicle(void) const;
+    /// 代管载具的任务管理器 —— **永不为 nullptr**。它是代管载具的子对象，随载具一同
+    /// 销毁，故**不保存**，一律经 _managedVehicle() 现取。这样"永不为空"是结构性的，
+    /// 不依赖"记得在每个赋值点回落"这条约定。
+    MissionManager* _missionManager(void) const;
+
     Vehicle*                    _controllerVehicle =            nullptr;
-    Vehicle*                    _managerVehicle =               nullptr;
-    MissionManager*             _missionManager =               nullptr;
+    /// QPointer: 代管载具可能在任何时刻被 MultiVehicleManager 销毁（链路全部移除 ⇒
+    /// deleteLater），而本控制器不总是能收到通知。用裸指针会留下悬垂，
+    /// _managerVehicleChanged() 里的 disconnect 就是踩在这上面崩的。
+    /// ⚠️ 本成员可空，类内一律经 _managedVehicle() / _missionManager() 读。
+    QPointer<Vehicle>           _managerVehicle;
     QmlObjectListModel*         _visualItems =                  nullptr;
     QPersistentModelIndex       _planFileGroupIndex;            ///< Persistent index for "Plan File" group in tree
     QPersistentModelIndex       _defaultsGroupIndex;            ///< Persistent index for "Defaults" group in tree

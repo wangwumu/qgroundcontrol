@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QtCore/QPointer>
 #include <QtPositioning/QGeoCoordinate>
 #include <QtQmlIntegration/QtQmlIntegration>
 
@@ -59,8 +60,18 @@ private slots:
     void _managerVehicleChanged     (Vehicle* managerVehicle);
 
 private:
-    Vehicle*            _managerVehicle =       nullptr;
-    RallyPointManager*  _rallyPointManager =    nullptr;
+    /// 代管载具 —— **永不为 nullptr**。_managerVehicle 是 QPointer：载具被
+    /// MultiVehicleManager 销毁后自动置空；此时回落到离线控制载具。回落放在**读点**
+    /// 而非只放在赋值点：从不调 start() 的 PlanMasterController 不转发销毁通知，
+    /// 从载具死到新载具到的这段窗口里读点照样会被调到（QML 直接读 syncInProgress）。
+    /// 定义在 .cc：QPointer::data() 要 static_cast 到 Vehicle*，本头文件只有前向声明。
+    Vehicle* _managedVehicle(void) const;
+    /// 返航点管理器 —— **永不为 nullptr**。它是代管载具的子对象，随载具一同销毁，
+    /// 故**不保存**，一律经 _managedVehicle() 现取。
+    RallyPointManager* _rallyPointManager(void) const;
+
+    /// ⚠️ 本成员可空，类内一律经 _managedVehicle() / _rallyPointManager() 读。
+    QPointer<Vehicle>   _managerVehicle;
     bool                _dirty =                false;
     QmlObjectListModel  _points;
     QObject*            _currentRallyPoint =    nullptr;

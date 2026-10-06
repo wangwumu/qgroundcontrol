@@ -90,6 +90,15 @@ void PlanMasterController::start(void)
     _updatePlanCreatorsList();
 }
 
+Vehicle* PlanMasterController::_managedVehicle(void) const
+{
+    // _managerVehicle 是 QPointer：代管载具被 MultiVehicleManager 销毁后自动置空。
+    // 此时回落到离线控制载具 —— 与 _activeVehicleChanged() 的 nullptr 分支同口径。
+    // 本函数因此**永不为空**，类内所有"基于代管载具干活"的调用点都走它，
+    // 免得在每个 Q_INVOKABLE / 信号回调里各加一道空值守卫。
+    return _managerVehicle ? _managerVehicle.data() : _controllerVehicle;
+}
+
 void PlanMasterController::startStaticActiveVehicle(Vehicle* vehicle, bool deleteWhenSendCompleted)
 {
     _flyView = true;
@@ -102,7 +111,11 @@ void PlanMasterController::startStaticActiveVehicle(Vehicle* vehicle, bool delet
 
 void PlanMasterController::_activeVehicleChanged(Vehicle* activeVehicle)
 {
-    if (_managerVehicle == activeVehicle) {
+    // _managerVehicle 是 QPointer：活动载具被销毁后它会自动置空，而此刻 activeVehicle
+    // 同样是 nullptr —— 两个空指针"相等"并不表示已经配置好了，恰恰相反，这正是需要
+    // 回落到离线控制载具、并通知下游（managerVehicleChanged）的那一刻。所以只有两者
+    // 都指向同一架**活着的**载具时才提前返回。
+    if (_managerVehicle && (_managerVehicle == activeVehicle)) {
         // We are already setup for this vehicle
         return;
     }
@@ -202,7 +215,7 @@ void PlanMasterController::_activeVehicleChanged(Vehicle* activeVehicle)
 
 void PlanMasterController::loadFromVehicle(void)
 {
-    SharedLinkInterfacePtr sharedLink = _managerVehicle->vehicleLinkManager()->primaryLink().lock();
+    SharedLinkInterfacePtr sharedLink = _managedVehicle()->vehicleLinkManager()->primaryLink().lock();
     if (sharedLink) {
         if (sharedLink->linkConfiguration()->isHighLatency()) {
             QGC::showAppMessage(tr("Download not supported on high latency links."));
@@ -306,7 +319,7 @@ void PlanMasterController::_sendRallyPointsComplete(void)
 
 void PlanMasterController::sendToVehicle(void)
 {
-    SharedLinkInterfacePtr sharedLink = _managerVehicle->vehicleLinkManager()->primaryLink().lock();
+    SharedLinkInterfacePtr sharedLink = _managedVehicle()->vehicleLinkManager()->primaryLink().lock();
     if (sharedLink) {
         if (sharedLink->linkConfiguration()->isHighLatency()) {
             QGC::showAppMessage(tr("Upload not supported on high latency links."));
@@ -717,7 +730,7 @@ void PlanMasterController::_autoLoadPlanFromManagerVehicle(void)
 
 void PlanMasterController::_showPlanFromManagerVehicle(void)
 {
-    if (!_managerVehicle->initialPlanRequestComplete()) {
+    if (!_managedVehicle()->initialPlanRequestComplete()) {
         // We need to wait until initial load is complete before we show anything.
         return;
     }
@@ -804,7 +817,7 @@ void PlanMasterController::_updatePlanCreatorsList(void)
         return;
     }
 
-    const auto vehicleClass = _managerVehicle->vehicleClass();
+    const auto vehicleClass = _managedVehicle()->vehicleClass();
 
     // Only rebuild if the vehicle class actually changed
     if (_planCreators && _planCreatorsVehicleClass == vehicleClass) {

@@ -22,7 +22,6 @@ QMap<QString, FactMetaData*> GeoFenceController::_metaDataMap;
 GeoFenceController::GeoFenceController(PlanMasterController* masterController, QObject* parent)
     : PlanElementController         (masterController, parent)
     , _managerVehicle               (masterController->managerVehicle())
-    , _geoFenceManager              (masterController->managerVehicle()->geoFenceManager())
     , _breachReturnAltitudeFact     (0, _breachReturnAltitudeFactName, FactMetaData::valueTypeDouble)
     , _breachReturnDefaultAltitude  (SettingsManager::instance()->appSettings()->defaultMissionItemAltitude()->rawValue().toDouble())
 {
@@ -75,34 +74,54 @@ void GeoFenceController::setBreachReturnPoint(const QGeoCoordinate& breachReturn
 void GeoFenceController::_managerVehicleChanged(Vehicle* managerVehicle)
 {
     if (_managerVehicle) {
-        _geoFenceManager->disconnect(this);
-        _managerVehicle->disconnect(this);
-        _managerVehicle->parameterManager()->disconnect(this);
+        // 只断开还活着的那个：QPointer 非空即说明代管载具尚在，它的围栏管理器与参数
+        // 管理器也随之尚在。载具已销毁时根本不进这里 —— QPointer 已自动置空，
+        // 硬解引用就是空指针崩溃（原裸指针版本正是崩在这三行）。
+        _geoFenceManager()->disconnect(this);
+        _managedVehicle()->disconnect(this);
+        _managedVehicle()->parameterManager()->disconnect(this);
         _managerVehicle = nullptr;
-        _geoFenceManager = nullptr;
     }
 
-    _managerVehicle = managerVehicle;
-    if (!_managerVehicle) {
-        qWarning() << "GeoFenceController::managerVehicleChanged managerVehicle=nullptr";
-        return;
-    }
+    // 传入 nullptr 表示"当前没有代管载具"：既可能是首次 start() 时还没有活动载具，
+    // 也可能是上一架被 MultiVehicleManager 销毁后 QPointer 置空。
+    // 回落到离线控制载具 —— 与 PlanMasterController::_activeVehicleChanged() 的 nullptr
+    // 分支同口径。
+    _managerVehicle = managerVehicle ? managerVehicle : _masterController->controllerVehicle();
 
-    _geoFenceManager = _managerVehicle->geoFenceManager();
-    connect(_geoFenceManager, &GeoFenceManager::loadComplete,                   this, &GeoFenceController::_managerLoadComplete);
-    connect(_geoFenceManager, &GeoFenceManager::sendComplete,                   this, &GeoFenceController::_managerSendComplete);
-    connect(_geoFenceManager, &GeoFenceManager::removeAllComplete,              this, &GeoFenceController::_managerRemoveAllComplete);
-    connect(_geoFenceManager, &GeoFenceManager::inProgressChanged,              this, &GeoFenceController::syncInProgressChanged);
+    GeoFenceManager* const geoFenceManager = _geoFenceManager();
+    connect(geoFenceManager, &GeoFenceManager::loadComplete,                    this, &GeoFenceController::_managerLoadComplete);
+    connect(geoFenceManager, &GeoFenceManager::sendComplete,                    this, &GeoFenceController::_managerSendComplete);
+    connect(geoFenceManager, &GeoFenceManager::removeAllComplete,               this, &GeoFenceController::_managerRemoveAllComplete);
+    connect(geoFenceManager, &GeoFenceManager::inProgressChanged,               this, &GeoFenceController::syncInProgressChanged);
 
-    (void) connect(_managerVehicle, &Vehicle::capabilityBitsChanged, this, [this](uint64_t capabilityBits) {
+    (void) connect(_managedVehicle(), &Vehicle::capabilityBitsChanged, this, [this](uint64_t capabilityBits) {
         Q_UNUSED(capabilityBits);
         emit supportedChanged(supported());
     });
 
-    connect(_managerVehicle->parameterManager(), &ParameterManager::parametersReadyChanged, this, &GeoFenceController::_parametersReady);
+    connect(_managedVehicle()->parameterManager(), &ParameterManager::parametersReadyChanged, this, &GeoFenceController::_parametersReady);
     _parametersReady();
 
     emit supportedChanged(supported());
+}
+
+Vehicle* GeoFenceController::_managedVehicle(void) const
+{
+    // _managerVehicle 是 QPointer：代管载具被 MultiVehicleManager 销毁后自动置空。
+    // 此时回落到离线控制载具 —— 与 PlanMasterController::_activeVehicleChanged() 的
+    // nullptr 分支同口径。
+    // 回落放在**读点**而非只放在赋值点：从不调 start() 的 PlanMasterController 不转发
+    // 销毁通知，从载具死到新载具到的这段窗口里本函数照样会被调到
+    // （supported() 读 capabilityBits、paramCircularFence() 读参数列表都经它）。
+    return _managerVehicle ? _managerVehicle.data() : _masterController->controllerVehicle();
+}
+
+GeoFenceManager* GeoFenceController::_geoFenceManager(void) const
+{
+    // 现取而不缓存：围栏管理器的宿主就是代管载具，随它一同销毁。
+    // 缓存一份就多一个会悬垂的空位，而现取天然满足"永不为空"。
+    return _managedVehicle()->geoFenceManager();
 }
 
 bool GeoFenceController::load(const QJsonObject& json, QString& errorString)
@@ -221,7 +240,7 @@ void GeoFenceController::removeAllFromVehicle(void)
     } else if (syncInProgress()) {
         qCCritical(GeoFenceControllerLog) << "GeoFenceController::removeAllFromVehicle called while syncInProgress";
     } else {
-        _geoFenceManager->removeAll();
+        _geoFenceManager()->removeAll();
     }
 }
 
@@ -233,7 +252,7 @@ void GeoFenceController::loadFromVehicle(void)
         qCCritical(GeoFenceControllerLog) << "GeoFenceController::loadFromVehicle called while syncInProgress";
     } else {
         _itemsRequested = true;
-        _geoFenceManager->loadFromVehicle();
+        _geoFenceManager()->loadFromVehicle();
     }
 }
 
@@ -245,14 +264,14 @@ void GeoFenceController::sendToVehicle(void)
         qCCritical(GeoFenceControllerLog) << "GeoFenceController::sendToVehicle called while syncInProgress";
     } else {
         qCDebug(GeoFenceControllerLog) << "GeoFenceController::sendToVehicle";
-        _geoFenceManager->sendToVehicle(_breachReturnPoint, _polygons, _circles);
+        _geoFenceManager()->sendToVehicle(_breachReturnPoint, _polygons, _circles);
         setDirty(false);
     }
 }
 
 bool GeoFenceController::syncInProgress(void) const
 {
-    return _geoFenceManager->inProgress();
+    return _geoFenceManager()->inProgress();
 }
 
 bool GeoFenceController::dirty(void) const
@@ -333,8 +352,8 @@ void GeoFenceController::_managerLoadComplete(void)
     }
 
     if (_flyView || _itemsRequested || isEmpty()) {
-        _setReturnPointFromManager(_geoFenceManager->breachReturnPoint());
-        _setFenceFromManager(_geoFenceManager->polygons(), _geoFenceManager->circles());
+        _setReturnPointFromManager(_geoFenceManager()->breachReturnPoint());
+        _setFenceFromManager(_geoFenceManager()->polygons(), _geoFenceManager()->circles());
         setDirty(false);
         emit loadComplete();
     }
@@ -370,7 +389,7 @@ bool GeoFenceController::showPlanFromManagerVehicle(void)
         return true;    // stops further propagation of showPlanFromManagerVehicle due to error
     } else {
         _itemsRequested = true;
-        if (!_managerVehicle->initialPlanRequestComplete()) {
+        if (!_managedVehicle()->initialPlanRequestComplete()) {
             // The vehicle hasn't completed initial load, we can just wait for loadComplete to be signalled automatically
             qCDebug(GeoFenceControllerLog) << "showPlanFromManagerVehicle: !initialPlanRequestComplete, wait for signal";
             return true;
@@ -474,7 +493,7 @@ void GeoFenceController::clearAllInteractive(void)
 
 bool GeoFenceController::supported(void) const
 {
-    return _managerVehicle->capabilityBits() & MAV_PROTOCOL_CAPABILITY_MISSION_FENCE;
+    return _managedVehicle()->capabilityBits() & MAV_PROTOCOL_CAPABILITY_MISSION_FENCE;
 }
 
 /* Returns the radius of the "paramCircularFence"
@@ -482,33 +501,33 @@ bool GeoFenceController::supported(void) const
  * this code should ideally live in the firmware plugin since it is specific to apm and px4 firmwares */
 double GeoFenceController::paramCircularFence(void)
 {
-    if(_managerVehicle->isOfflineEditingVehicle()){
+    if(_managedVehicle()->isOfflineEditingVehicle()){
         return 0;
     }
 
-    if(_managerVehicle->px4Firmware()){
-        if(!_managerVehicle->parameterManager()->parameterExists(ParameterManager::defaultComponentId, _px4ParamCircularFence)){
+    if(_managedVehicle()->px4Firmware()){
+        if(!_managedVehicle()->parameterManager()->parameterExists(ParameterManager::defaultComponentId, _px4ParamCircularFence)){
             return 0;
         }
 
-        return _managerVehicle->parameterManager()->getParameter(ParameterManager::defaultComponentId, _px4ParamCircularFence)->rawValue().toDouble();
+        return _managedVehicle()->parameterManager()->getParameter(ParameterManager::defaultComponentId, _px4ParamCircularFence)->rawValue().toDouble();
     }
 
-    if(_managerVehicle->apmFirmware())
+    if(_managedVehicle()->apmFirmware())
     {
-        if (!_managerVehicle->parameterManager()->parameterExists(ParameterManager::defaultComponentId, _apmParamCircularFenceRadius) ||
-            !_managerVehicle->parameterManager()->parameterExists(ParameterManager::defaultComponentId, _apmParamCircularFenceEnabled) ||
-            !_managerVehicle->parameterManager()->parameterExists(ParameterManager::defaultComponentId, _apmParamCircularFenceType)){
+        if (!_managedVehicle()->parameterManager()->parameterExists(ParameterManager::defaultComponentId, _apmParamCircularFenceRadius) ||
+            !_managedVehicle()->parameterManager()->parameterExists(ParameterManager::defaultComponentId, _apmParamCircularFenceEnabled) ||
+            !_managedVehicle()->parameterManager()->parameterExists(ParameterManager::defaultComponentId, _apmParamCircularFenceType)){
             return 0;
         }
 
-        bool apm_fence_enabled = _managerVehicle->parameterManager()->getParameter(ParameterManager::defaultComponentId, _apmParamCircularFenceEnabled)->rawValue().toBool();
-        bool apm_fence_type_circle = (1 << 1) & _managerVehicle->parameterManager()->getParameter(ParameterManager::defaultComponentId, _apmParamCircularFenceType)->rawValue().toUInt();
+        bool apm_fence_enabled = _managedVehicle()->parameterManager()->getParameter(ParameterManager::defaultComponentId, _apmParamCircularFenceEnabled)->rawValue().toBool();
+        bool apm_fence_type_circle = (1 << 1) & _managedVehicle()->parameterManager()->getParameter(ParameterManager::defaultComponentId, _apmParamCircularFenceType)->rawValue().toUInt();
 
         if(!apm_fence_enabled || !apm_fence_type_circle)
             return 0;
 
-        return _managerVehicle->parameterManager()->getParameter(ParameterManager::defaultComponentId, _apmParamCircularFenceRadius)->rawValue().toDouble();
+        return _managedVehicle()->parameterManager()->getParameter(ParameterManager::defaultComponentId, _apmParamCircularFenceRadius)->rawValue().toDouble();
     }
 
     return 0;
@@ -540,14 +559,14 @@ void GeoFenceController::_parametersReady(void)
 
     // then connect to needed paremters
     // While checking they exist to avoid errors
-    ParameterManager* _paramManager = _managerVehicle->parameterManager();
+    ParameterManager* _paramManager = _managedVehicle()->parameterManager();
 
-    if(_managerVehicle->isOfflineEditingVehicle()){
+    if(_managedVehicle()->isOfflineEditingVehicle()){
         emit paramCircularFenceChanged();
         return;
     }
 
-    if(_managerVehicle->px4Firmware()){
+    if(_managedVehicle()->px4Firmware()){
         if(!_paramManager->parameterExists(ParameterManager::defaultComponentId, _px4ParamCircularFence)){
             emit paramCircularFenceChanged();
             return;
@@ -556,7 +575,7 @@ void GeoFenceController::_parametersReady(void)
         _px4ParamCircularFenceFact = _paramManager->getParameter(ParameterManager::defaultComponentId, _px4ParamCircularFence);
         connect(_px4ParamCircularFenceFact, &Fact::rawValueChanged, this, &GeoFenceController::paramCircularFenceChanged);
     }
-    else if(_managerVehicle->apmFirmware())
+    else if(_managedVehicle()->apmFirmware())
     {
         if (!_paramManager->parameterExists(ParameterManager::defaultComponentId, _apmParamCircularFenceRadius) ||
             !_paramManager->parameterExists(ParameterManager::defaultComponentId, _apmParamCircularFenceEnabled) ||

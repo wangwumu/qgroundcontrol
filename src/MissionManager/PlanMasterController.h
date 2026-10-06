@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QtCore/QObject>
+#include <QtCore/QPointer>
 #include <QtQmlIntegration/QtQmlIntegration>
 
 #include "MissionController.h"
@@ -128,7 +129,11 @@ public:
     QJsonDocument saveToJson();
 
     Vehicle* controllerVehicle(void) { return _controllerVehicle; }
-    Vehicle* managerVehicle(void) { return _managerVehicle; }
+    /// 契约：**永不为 nullptr**。代管载具被销毁（QPointer 置空）或尚无活动载具时，
+    /// 回落到离线控制载具 —— 与 _activeVehicleChanged() 的 nullptr 分支同口径。
+    /// QML 直接在这个返回值上取属性（PlanView.qml 的 `managerVehicle.isOfflineEditingVehicle`），
+    /// 返回空会在 QML 侧变成 TypeError。
+    Vehicle* managerVehicle(void) { return _managedVehicle(); }
 
     static constexpr int kPlanFileVersion = 1;
     static constexpr const char* kPlanFileType = "Plan";
@@ -183,9 +188,16 @@ private:
     void _setDirtyForUploadUnitTest(bool dirtyForUpload) { _dirtyForUpload = dirtyForUpload; }
 #endif
 
+    /// 代管载具，被 MultiVehicleManager 销毁时自动置空。
+    /// ⚠️ 本成员可空，**外部一律经 managerVehicle() / _managedVehicle() 读**；
+    /// 类内部只有"是否已经绑过一架活着的载具"这类判断才直接读它
+    /// （_activeVehicleChanged() 里的比较与 disconnect）。
+    /// 定义在 .cc：QPointer::data() 要 static_cast 到 Vehicle*，本头文件只有前向声明。
+    Vehicle* _managedVehicle(void) const;
+
     MultiVehicleManager* _multiVehicleMgr = nullptr;
     Vehicle* _controllerVehicle = nullptr;    ///< Offline controller vehicle
-    Vehicle* _managerVehicle = nullptr;       ///< Either active vehicle or _controllerVehicle if none
+    QPointer<Vehicle> _managerVehicle;        ///< Either active vehicle or _controllerVehicle if none
     bool _flyView = true;
     bool _offline = true;
     MissionController _missionController;

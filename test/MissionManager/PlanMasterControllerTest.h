@@ -15,6 +15,7 @@ private slots:
     void _testMissionPlannerFileLoad();
     void _testTakeoffTextFileLoad();
     void _testActiveVehicleChanged();
+    void _testStartStaticActiveVehicleAfterVehicleDestroyed();
     void _testDirtyFlagsMatrix_data();
     void _testDirtyFlagsMatrix();
 

@@ -18,7 +18,6 @@ QGC_LOGGING_CATEGORY(RallyPointControllerLog, "PlanManager.RallyPointController"
 RallyPointController::RallyPointController(PlanMasterController* masterController, QObject* parent)
     : PlanElementController (masterController, parent)
     , _managerVehicle               (masterController->managerVehicle())
-    , _rallyPointManager    (masterController->managerVehicle()->rallyPointManager())
 {
     connect(&_points, &QmlObjectListModel::countChanged, this, &RallyPointController::containsItemsChanged);
 }
@@ -41,30 +40,50 @@ void RallyPointController::start(bool flyView)
 void RallyPointController::_managerVehicleChanged(Vehicle* managerVehicle)
 {
     if (_managerVehicle) {
-        _rallyPointManager->disconnect(this);
-        _managerVehicle->disconnect(this);
+        // 只断开还活着的那个：QPointer 非空即说明代管载具尚在，它的返航点管理器也随之
+        // 尚在。载具已销毁时根本不进这里 —— QPointer 已自动置空，硬解引用就是空指针
+        // 崩溃（原裸指针版本正是崩在这两行）。
+        _rallyPointManager()->disconnect(this);
+        _managedVehicle()->disconnect(this);
         _managerVehicle = nullptr;
-        _rallyPointManager = nullptr;
     }
 
-    _managerVehicle = managerVehicle;
-    if (!_managerVehicle) {
-        qWarning() << "RallyPointController::managerVehicleChanged managerVehicle=NULL";
-        return;
-    }
+    // 传入 nullptr 表示"当前没有代管载具"：既可能是首次 start() 时还没有活动载具，
+    // 也可能是上一架被 MultiVehicleManager 销毁后 QPointer 置空。
+    // 回落到离线控制载具 —— 与 PlanMasterController::_activeVehicleChanged() 的 nullptr
+    // 分支同口径。
+    _managerVehicle = managerVehicle ? managerVehicle : _masterController->controllerVehicle();
 
-    _rallyPointManager = _managerVehicle->rallyPointManager();
-    connect(_rallyPointManager, &RallyPointManager::loadComplete,       this, &RallyPointController::_managerLoadComplete);
-    connect(_rallyPointManager, &RallyPointManager::sendComplete,       this, &RallyPointController::_managerSendComplete);
-    connect(_rallyPointManager, &RallyPointManager::removeAllComplete,  this, &RallyPointController::_managerRemoveAllComplete);
-    connect(_rallyPointManager, &RallyPointManager::inProgressChanged,  this, &RallyPointController::syncInProgressChanged);
+    RallyPointManager* const rallyPointManager = _rallyPointManager();
+    connect(rallyPointManager, &RallyPointManager::loadComplete,       this, &RallyPointController::_managerLoadComplete);
+    connect(rallyPointManager, &RallyPointManager::sendComplete,       this, &RallyPointController::_managerSendComplete);
+    connect(rallyPointManager, &RallyPointManager::removeAllComplete,  this, &RallyPointController::_managerRemoveAllComplete);
+    connect(rallyPointManager, &RallyPointManager::inProgressChanged,  this, &RallyPointController::syncInProgressChanged);
 
-    (void) connect(_managerVehicle, &Vehicle::capabilityBitsChanged, this, [this](uint64_t capabilityBits) {
+    (void) connect(_managedVehicle(), &Vehicle::capabilityBitsChanged, this, [this](uint64_t capabilityBits) {
         Q_UNUSED(capabilityBits);
         emit supportedChanged(supported());
     });
 
     emit supportedChanged(supported());
+}
+
+Vehicle* RallyPointController::_managedVehicle(void) const
+{
+    // _managerVehicle 是 QPointer：代管载具被 MultiVehicleManager 销毁后自动置空。
+    // 此时回落到离线控制载具 —— 与 PlanMasterController::_activeVehicleChanged() 的
+    // nullptr 分支同口径。
+    // 回落放在**读点**而非只放在赋值点：从不调 start() 的 PlanMasterController 不转发
+    // 销毁通知，从载具死到新载具到的这段窗口里本函数照样会被调到
+    // （supported() 读 capabilityBits 就经它）。
+    return _managerVehicle ? _managerVehicle.data() : _masterController->controllerVehicle();
+}
+
+RallyPointManager* RallyPointController::_rallyPointManager(void) const
+{
+    // 现取而不缓存：返航点管理器的宿主就是代管载具，随它一同销毁。
+    // 缓存一份就多一个会悬垂的空位，而现取天然满足"永不为空"。
+    return _managedVehicle()->rallyPointManager();
 }
 
 bool RallyPointController::load(const QJsonObject& json, QString& errorString)
@@ -139,7 +158,7 @@ void RallyPointController::removeAllFromVehicle(void)
     } else if (syncInProgress()) {
         qCCritical(RallyPointControllerLog) << "RallyPointController::removeAllFromVehicle called while syncInProgress";
     } else {
-        _rallyPointManager->removeAll();
+        _rallyPointManager()->removeAll();
     }
 }
 
@@ -151,7 +170,7 @@ void RallyPointController::loadFromVehicle(void)
         qCCritical(RallyPointControllerLog) << "RallyPointController::loadFromVehicle called while syncInProgress";
     } else {
         _itemsRequested = true;
-        _rallyPointManager->loadFromVehicle();
+        _rallyPointManager()->loadFromVehicle();
     }
 }
 
@@ -168,13 +187,13 @@ void RallyPointController::sendToVehicle(void)
         for (int i=0; i<_points.count(); i++) {
             rgPoints.append(qobject_cast<RallyPoint*>(_points[i])->coordinate());
         }
-        _rallyPointManager->sendToVehicle(rgPoints);
+        _rallyPointManager()->sendToVehicle(rgPoints);
     }
 }
 
 bool RallyPointController::syncInProgress(void) const
 {
-    return _rallyPointManager->inProgress();
+    return _rallyPointManager()->inProgress();
 }
 
 void RallyPointController::setDirty(bool dirty)
@@ -187,7 +206,7 @@ void RallyPointController::setDirty(bool dirty)
 
 QString RallyPointController::editorQml(void) const
 {
-    return _rallyPointManager->editorQml();
+    return _rallyPointManager()->editorQml();
 }
 
 void RallyPointController::_managerLoadComplete(void)
@@ -206,8 +225,8 @@ void RallyPointController::_managerLoadComplete(void)
     if (_flyView || _itemsRequested || isEmpty()) {
         _points.clearAndDeleteContents();
         QObjectList pointList;
-        for (int i=0; i<_rallyPointManager->points().count(); i++) {
-            pointList.append(new RallyPoint(_rallyPointManager->points()[i], this));
+        for (int i=0; i<_rallyPointManager()->points().count(); i++) {
+            pointList.append(new RallyPoint(_rallyPointManager()->points()[i], this));
         }
         _points.swapObjectList(pointList);
         setDirty(false);
@@ -255,7 +274,7 @@ void RallyPointController::addPoint(QGeoCoordinate point)
 
 bool RallyPointController::supported(void) const
 {
-    return _managerVehicle->capabilityBits() & MAV_PROTOCOL_CAPABILITY_MISSION_RALLY;
+    return _managedVehicle()->capabilityBits() & MAV_PROTOCOL_CAPABILITY_MISSION_RALLY;
 }
 
 void RallyPointController::removePoint(QObject* rallyPoint)
@@ -307,7 +326,7 @@ bool RallyPointController::showPlanFromManagerVehicle (void)
         // false，等 _loadComplete 信号到达时本文 :200 的登录闸会把它当成"载具自动装载"拦掉——按钮点了没反应。
         // GeoFenceController::showPlanFromManagerVehicle 同形（其 :372），三处必须一致。
         _itemsRequested = true;
-        if (!_managerVehicle->initialPlanRequestComplete()) {
+        if (!_managedVehicle()->initialPlanRequestComplete()) {
             // The vehicle hasn't completed initial load, we can just wait for loadComplete to be signalled automatically
             qCDebug(RallyPointControllerLog) << "showPlanFromManagerVehicle: !initialPlanRequestComplete, wait for signal";
             return true;

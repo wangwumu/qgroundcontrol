@@ -1,5 +1,7 @@
 #pragma once
 
+#include <QtCore/QPointer>
+
 #include "ComplexMissionItem.h"
 #include "Fact.h"
 #include "CameraSection.h"
@@ -86,7 +88,10 @@ private slots:
     void _updateFlyViewHomePosition             (const QGeoCoordinate& homePosition);
 
 private:
-    Vehicle*        _managerVehicle =                   nullptr;
+    /// QPointer: 代管载具可能先于本对象被销毁。本类只在构造期用它（connect 一次
+    /// homePositionChanged、取一次 homePosition），之后不再读；换 QPointer 是为了不留
+    /// 悬垂 —— 与 MissionController / GeoFenceController / RallyPointController 同一处根因。
+    QPointer<Vehicle>   _managerVehicle;
     QGeoCoordinate  _plannedHomePositionCoordinate;     // Does not include altitude
     Fact            _plannedHomePositionAltitudeFact;
     int             _sequenceNumber =                   0;
