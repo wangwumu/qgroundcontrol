@@ -2504,7 +2504,7 @@ Item {
     //-------------------------------------------------------------------------
     // 交接确认弹框（pending 到达自动弹出）——两个视图共用，故留在骨架
     //-------------------------------------------------------------------------
-    Dialog {
+    OpsDialog {
         id: handoverDialog
         parent: opsShell
         // 宽度与右边栏一致、右边缘贴窗口右缘、上部与**那条交接对应的任务卡片**下缘对齐——
@@ -2529,37 +2529,51 @@ Item {
             spacing: 8
             Text {
                 Layout.fillWidth: true
-                // 深色正文 `#1f2937`，白底 **14.68:1**（WCAG 及格线 4.5:1）。
-                // 原为 `#e6edf7`——那是**深色卡片**上的正文色，本框却渲染在 `Dialog` 的**浅色底**
-                // 上（实测 `palette.window = #ffffff`，理由见 `actionConfirmDialog` 那条注释），
-                // 白底上只剩 **1.18:1**，用户 2026-09-28 实测"看不见"。
-                // ⚠️ 与本文件另几处 `#e6edf7`（深色底上的浅色文字）**不冲突**：那些是对的，
-                //    只有本框要反过来。
-                color: "#1f2937"; font.pixelSize: 13
+                // ‼️ 本条取值是本框的**三度翻转**（2026-10-08），别再翻回去：
+                //    ① 原为 `#e6edf7` —— 那是**深色卡片**上的正文色，而本框那时渲染在 `Dialog` 的
+                //       平台默认**浅底**（实测 `palette.window = #ffffff`）上 ⇒ 只剩 1.18:1，
+                //       用户 2026-09-28 实测「看不见」；
+                //    ② 改成深灰 `#1f2937`（白底 14.68:1 —— 那时是对的）；
+                //    ③ 本轮本框并入**深色底**（`OpsDialog`）⇒ 深灰只剩 **1.02:1**，**又看不见了**，
+                //       比第 ① 版还糟 ⇒ 改回 `#e6edf7`（深绿底上 **12.18:1**）。
+                //    结论与另三个框**同一条**：**字色跟着底走**。三次翻转里没有哪一次是"色值错了"，
+                //    每一次都是**底色变了、字色没跟着变**。
+                color: "#e6edf7"; font.pixelSize: 13
                 wrapMode: Text.Wrap
-                text: _confirmHandover
-                    ? qsTr("%1 · %2 请求把任务「%3」移交 %4")
-                        .arg(_confirmHandover.uav_no || _confirmHandover.task_no)
-                        .arg(_confirmHandover.proposed_by_name || _confirmHandover.proposed_by)
-                        .arg(_confirmHandover.task_no)
-                        .arg(OpsCommon.phaseToLabel(_confirmHandover.phase_to))
-                    : ""
+                // 正文**条目化**（用户 2026-10-08 第四轮：「站点提示签入的对话框，也要此风格」）。
+                // 原为一句叙事：「%1 · %2 请求把任务「%3」移交 %4」。
+                // ⚠️ 条目名与 `slotDialog` / `actionConfirmDialog` 统一（「飞行任务：」「无人机：」）。
+                // ‼️ 拆行后，原来那个 `uav_no || task_no` 的**兜底合流必须拆开**：它会在无人机号
+                //    缺失时拿任务号顶上同一个位置 ⇒ 条目化后「无人机：」后面会显示一个**任务号**。
+                //    现在两个字段各有各的行，缺就显 `—`。
+                text: {
+                    var h = _confirmHandover
+                    if (!h) return ""
+                    return qsTr("飞行任务：%1\n无人机：%2\n提出人：%3\n移交到：%4")
+                        .arg(h.task_no ? h.task_no : "—")
+                        .arg(h.uav_no ? h.uav_no : "—")
+                        .arg(h.proposed_by_name || h.proposed_by || "—")
+                        .arg(OpsCommon.phaseToLabel(h.phase_to))
+                }
             }
             Text {
                 Layout.fillWidth: true
-                // 常态深蓝 `#1565c0`（白底 **5.75:1**，与签出确认框的提示语同色）；超时转深红
-                // `#c62828`（**5.62:1**）。原为琥珀 `#ffc107`——白底只剩 **1.63:1**，即用户报的
-                // "黄字"，与 `landBlockDialog` 那次是同一个病根（琥珀是深色卡片上的提示色，
-                // 不属于浅色的 `Dialog`）。
-                color: _confirmHandover && OpsCommon.isTimeout(_confirmHandover, opsShell._now) ? "#c62828" : "#1565c0"
+                // 常态 `#9fb3d4`（深绿底 **6.75:1**）；**超时**转 `#ff6b6b`（**5.17:1**）——
+                // 两档都过 AA 4.5:1，且「亮红比蓝灰跳」这层语义区分仍然成立。
+                // ⚠️ 白底时代那对 `#1565c0`(5.75) / `#c62828`(5.62) 在深绿底上只剩
+                //    **2.50** / **2.55**，直接搬过来等于看不清（实算表见 `OpsDialog.qml`）。
+                // ⚠️ 琥珀 `#ffc107` 在深底上其实有 8.80:1（够用），本行仍不用它 —— 它是卡片里
+                //    「警示条」的专用色，而本行是"剩余时间"这类**中性信息**，用它会误导成告警。
+                color: _confirmHandover && OpsCommon.isTimeout(_confirmHandover, opsShell._now) ? "#ff6b6b" : "#9fb3d4"
                 font.pixelSize: 12
                 text: _confirmHandover ? qsTr("剩余 ") + OpsCommon.remainingSec(_confirmHandover, opsShell._now) : ""
             }
             // 操作失败提示：瞬时网络失败时保留弹框供重试（配合 _seenHandovers 去重，关框即无再确认入口）
             Text {
                 Layout.fillWidth: true
-                // 深红 `#c62828`（白底 **5.62:1**）。原为 `#ff6b6b`——白底只剩 **2.78:1**。
-                color: "#c62828"; font.pixelSize: 12
+                // 亮红 `#ff6b6b` —— 深绿底 `#0f2f2c` 上 **5.17:1**（过 AA 4.5:1），与卡片里的错误红同值。
+                // ⚠️ 白底时代的 `#c62828` 在深绿底上只剩 **2.55:1**（实算表见 `OpsDialog.qml`）。
+                color: "#ff6b6b"; font.pixelSize: 12
                 wrapMode: Text.Wrap
                 visible: _handoverActionError !== ""
                 text: _handoverActionError

@@ -67,6 +67,17 @@ OpsShell {
     property var  _slotListValue:  []
     property string _slotRangeKey: ""   // 上一轮**几何指纹**（只含参与算圆的字段）
     property var  _assignSlotTask: null    // 机位选择弹框当前任务
+    // 机位选择弹框的**两种用途**（同一个 `Dialog` 复用，别新开一个）：
+    //   "assign" = 【指定机位】：选中即 `POST /assign-slot` 落库（原行为，未动）。
+    //   "land"   = 【降落】/【切换多旋翼降落】的**第一步**：**只选、不写库**。
+    //             用户 2026-10-08 裁定「**确认执行时才写**」⇒ 落库推迟到红绿确认框的
+    //             「确认执行」那一下（`_commitLand`）。
+    // ‼️ 两种用途**必须分开**，不能在 "land" 档里提前 POST：那样"选完机位又点【取消】"
+    //    也会在库里留下一次机位变更（库里已改、飞机没动、界面上不留任何痕）。
+    property string _slotDialogMode: "assign"
+    // mode === "land" 时走哪条降落路（`OpsCommon.LAND_KIND_KEEP_FW` / `LAND_KIND_TO_MC`）。
+    // 由 `_beginLandFlow` 写、由 `slotDialog` 的 delegate 读、塞进 `_pendingAction.kind`。
+    property string _slotDialogLandKind: ""
     // 红绿确认动作。八个 kind 的载荷**不统一**，别照一个形状去读：
     //   takeoff / keepFwLand / land / mcRescueLand / park / checkout / return → {kind, task}
     //   cancelHandover                                                       → {kind, handoverId, task}（task 可能为 undefined）
@@ -311,6 +322,123 @@ OpsShell {
                   }
               })
     }
+    //-------------------------------------------------------------------------
+    // 【降落】/【切换多旋翼降落】的**两步入口**（用户 2026-10-08 裁定）
+    //-------------------------------------------------------------------------
+    // 用户原话：「选择"降落"按钮后，应该弹出一个界面选择机位，而不是这个确认提示。在选择完
+    // 机位后，才可以弹出在合格确认对话框。」「这个对话框框中的解释性文字不需要，把对话框改成
+    // 一个类似任务卡片的风格，提示的内容有三行： 任务：,无人机：,机位。」
+    // 以及 AskUserQuestion 的第三条裁定：「**确认执行时才写**」。
+    // ⇒ 四步：点【降落】→ 选机位（**只选，一个字节都不写库**）→ 红绿确认框（卡片式三行）→
+    //    「确认执行」时**才** `POST /assign-slot`，成功后再走 `_execLand`（机位校验 →
+    //    `POST /land` → 统一降落链）。
+    //
+    // ‼️ 为什么"点【降落】时必须先选机位"，而不是直接拿列表里已有的 `assign_slot_id`：
+    //    改前弹的直接是确认框，正文只有一句「将发出降落指令…」+ 任务号/无人机号，
+    //    **一个字都没提落点是哪个机位** —— 操作员是在确认一个他没看见的落点。
+    //    先选机位，落点就是他自己刚点的那一个。
+    // ⚠️ 列表项上的 `assign_slot_id` **仍是**【降落】/【切换多旋翼降落】的 `enabled` 判据
+    //    （见 `TaskListPanel.qml`），语义随之变成"**本站已为该任务预占过机位**，才允许走这条
+    //    路"；预占过与否**不影响**这次重新选择 —— 选中的机位会**覆盖**它。
+    //
+    // `cardBottomY` 是**已经过 `mapToItem` 换算到 opsView 坐标系**的下缘（与另外七个
+    // `onXxxRequested` 逐字同款），确认框的 `y` 绑的就是它：先选机位、后弹确认框，中间隔着
+    // 一次用户操作，所以这个锚点要由本函数**先存下来**再等（`_confirmAnchorY` 的声明注释写的
+    // "每次点动作都会重写，所以关闭时不必清空"在这里仍然成立）。
+    function _beginLandFlow(task, kind, cardBottomY) {
+        if (!task) return
+        _confirmAnchorY = cardBottomY
+        _assignSlotError = ""
+        _assignSlotTask = task
+        _slotDialogLandKind = kind
+        _slotDialogMode = "land"
+        slotDialog.open()
+    }
+    /// 确认框正文用**卡片式三行**（而不是解释性长句）的那两档：F1 保持固定翼 / F2 切换多旋翼。
+    /// ‼️ **不含 F3**（`mcRescueLand`）：救济档的正文是**另一套版式**（见 `_isRescueKind`）——
+    ///    它以「重要提示：」起头、整段是醒目警示（用户 2026-10-06 第 7 条「位置、姿态、高度
+    ///    不可预测」那条路的验收内容），下面才是条目行；而且救济**不选机位**（用原任务已指定的
+    ///    机位），压根凑不出「机位：」这一行。
+    function _isLandSummaryKind(a) {
+        return !!a && (a.kind === "keepFwLand" || a.kind === "land")
+    }
+    /// 救济档（F3，界面上叫**「直接降落」**）的正文版式（用户 2026-10-08 第五轮）：
+    ///   「重要提示：」+ **悬挂缩进**的长警示语，下接「任务：」「无人机：」两行条目。
+    /// ‼️ 与 `_isLandSummaryKind` **并列而不是包含**：两套版式的行数、行名、配色都不同
+    ///    （救济没有「机位：」行 —— 它用原任务已指定的机位，操作员不选）。
+    function _isRescueKind(a) {
+        return !!a && a.kind === "mcRescueLand"
+    }
+    /// 「任务：」那一行的取值。
+    /// ‼️ **刻意不用 `OpsCommon.taskNo()`**：那个函数**优先取 `uav_no`**
+    ///    （`task.uav_no ? task.uav_no : task.task_no`，"航班号"语义），而本行要的是**任务号**。
+    ///    照搬它会让弹框里「任务：」与「无人机：」两行**显示同一个值**（云端库实测两者确实不同：
+    ///    task 91106 = `task_no: TASK_DXK_001` / `uav_no: UAV-10001048`），
+    ///    而用户要的就是三行各说一件事。
+    function _landConfirmTaskNo(a) {
+        return (a && a.task && a.task.task_no) ? a.task.task_no : "—"
+    }
+    /// 「无人机：」那一行的取值（取 `uav_no`，与任务卡上「航班：」那一行同源）。
+    function _landConfirmUAVNo(a) {
+        return (a && a.task && a.task.uav_no) ? a.task.uav_no : "—"
+    }
+    /// 「机位：」那一行的取值 —— 就是操作员**上一步刚选中的那个机位**。
+    /// ⚠️ 取 `a.slot`（用户选的那个）而**不是** `a.task.assign_slot_id`：此刻库还没写
+    ///    （用户裁定「确认执行时才写」），列表项上那个 id 是**旧的**，拿它显示等于在确认框里
+    ///    报一个不是本次落点的机位。
+    function _landConfirmSlotCode(a) {
+        return (a && a.slot && a.slot.slot_code) ? a.slot.slot_code : "—"
+    }
+    /// 把**本次选中的机位**盖到任务对象的一个**副本**上，再交给 `_execLand` / `_startLandFlow`。
+    ///
+    /// ‼️ 为什么要副本：那两个函数读的是 `task.assign_slot_*`（`_execLand` 的坐标闸、
+    ///    `_startLandFlow` 的落点/进近点、`_landingTaskId`），而列表项是 `_poll()` 每 2s 换一次
+    ///    的只读快照，**不能就地改**（改了也只会被下一次轮询冲掉，还会污染列表渲染）。
+    /// ‼️ **全量拷贝再覆写三个字段，不写白名单**：那两条链还要读 `task_id` / `status` /
+    ///    `device_id`（`_vehicleForTask`）/ `uav_id` / `uav_no`…，白名单漏一个字段就是一处
+    ///    **静默**失效 —— `_assignSlot` 里那次"传数字而不是传对象"的教训（`_retargetLandingSlot`
+    ///    整段永不执行、零报错）就是这么来的。
+    /// ⚠️ `heading` 必须一起盖：F1（保持固定翼）要用机位**朝向**算进近点，用旧机位的朝向会算出
+    ///    一个与新机位无关的进近点，而 `_startLandFlow` 一旦算出 `p` 就会照发。
+    function _taskWithSlot(task, slot) {
+        var t = {}
+        for (var k in task) t[k] = task[k]
+        t.assign_slot_id = slot.id
+        t.assign_slot_lat = slot.lat
+        t.assign_slot_lon = slot.lon
+        t.assign_slot_heading = slot.heading
+        return t
+    }
+    /// 「确认执行」那一下：**先写库、再下指令**（本项目的工程口径，与 `_execReturn` 同向）。
+    ///
+    /// ‼️ 写库放在这里而不是选机位那一步，是用户 2026-10-08 的逐字裁定（「确认执行时才写」）；
+    ///    代价是"选了机位又点取消"不留痕 —— 正是这条裁定要的效果。
+    /// ‼️ 写库**失败不许静默**：`_assignSlot` 的失败分支只把原因写进 `_assignSlotError`，
+    ///    而此刻选机位框和确认框**都已经关了** ⇒ 不重开的话，操作员看到的就是"点了确认执行、
+    ///    什么都没发生"（那正是本项目反复防的静默失败形状）。重开选机位框有两个作用：
+    ///    把那句红字显示出来，并让他就地改选一个机位。
+    function _commitLand(a) {
+        var task = a ? a.task : null
+        var slot = a ? a.slot : null
+        if (!task || !slot) return
+        var kind = a.kind
+        _assignSlotError = ""
+        _assignSlotTask = task
+        _assignSlot(task, slot.id, function(ok) {
+            if (!ok) {
+                // ⚠️ 落库**没成功**，所以这条降落路到此为止：绝不能继续 `_execLand`
+                //    （`POST /land` 会把任务写成 LANDING，而落点仍是库里的旧机位 ⇒
+                //    又一次"库里记 A、飞机降 B"）。
+                _slotDialogMode = "land"
+                _slotDialogLandKind = kind
+                slotDialog.open()
+                return
+            }
+            _assignSlotTask = null
+            _execLand(_taskWithSlot(task, slot), kind)
+        })
+    }
+
     // 红绿确认弹窗的标题/提示语（kind: takeoff / land / park / checkout / cancelHandover / return）。
     //
     // ‼️ 抽成函数是为了**消灭嵌套三元式的兜底分支**：原来标题是
@@ -336,22 +464,39 @@ OpsShell {
     function _pendingConfirmHint() {
         var a = _pendingAction
         if (!a) return ""
+        // ‼️ 降落两档（F1 保持固定翼 / F2 切换多旋翼）**不走本函数**：它们的正文已按用户
+        //    2026-10-08 的要求换成**卡片式三行摘要**（`_isLandSummaryKind` + `actionConfirmDialog`
+        //    里那个深色 `Rectangle`），解释性长句删掉。
+        //    这里返回空串，而不是把旧文案留在 `case` 里：留着的话，一旦那个 `visible` 判据哪天
+        //    被写坏（QML 里 `undefined && x` 这类**静默**失效），界面会重新冒出一句既不该出现、
+        //    又与本轮实际落点无关的长句，而没有任何东西会报错。
+        // ⚠️ 被删掉的那两句留档（别以为是手滑）：
+        //    keepFwLand: 「将发出降落指令：无人机保持固定翼飞向接机机位，在该机位上空转换并降落在该机位（不可撤销）」
+        //    land:       「将发出降落指令：先切换为多旋翼，随后飞向接机机位并在该机位降落（不可撤销）」
+        //    它们两条的历史教训**仍然成立**，将来任何新文案都要守：① 文案必须与**实际落点**一致
+        //    （2026-09-29 的错句是「随后返回起飞点、降落回原机位」，那是旧实现 PX4 RTL ⇒ home 的
+        //    行为，改接机机位后没跟着改 ⇒ 操作员照着一句过时的话去确认一个不可撤销的动作）；
+        //    ② 不许写做不到的承诺（2026-10-07 删掉"并原地盘旋"——统一链第 ② 步不再切 Hold，
+        //    转换在飞行中做，飞机本来就不盘旋）。
+        if (_isLandSummaryKind(a)) return ""
+        // ‼️ 救济档（F3）2026-10-08 第五轮**也搬走了**，理由与 F1/F2 同理（正文已结构化）。
+        //    ⚠️ 必须是**提前 return**，不能只删掉 `switch` 里那个 `case`：删了 case 它会落到
+        //    `default` ⇒ 弹框正文明晃晃写着「无法识别的操作类型」。这是 QML 里那种**不报错**
+        //    的失效（`switch` 有 default 兜底，永远不抛）。
+        if (_isRescueKind(a)) return ""
         var h = ""
         switch (a.kind) {
         case "takeoff":        h = qsTr("将发出起飞指令：无人机升空后沿该航线飞行"); break
-        case "keepFwLand":     h = qsTr("将发出降落指令：无人机保持固定翼飞向接机机位，在该机位上空转换并降落在该机位（不可撤销）"); break
-        // ‼️ 这句必须与**实际落点**一致（2026-09-29 改）。原句是「随后返回起飞点、降落回原机位」
-        //    ——那是旧实现（`guidedModeRTL` ⇒ PX4 RTL ⇒ home）的真实行为，而现在改成 Guided
-        //    飞向**接机机位**。文案不改的话，操作员是照着一句**已经过时**的话去确认一个
-        //    不可撤销的动作（点完确认，飞机就真飞了）。
-        // （2026-10-07 再改：删去"并原地盘旋"。统一链里第 ② 步**不再切 Hold**（设计稿 §9.8.5），
-        //   转换是在飞行中做的，飞机不盘旋 —— 留着一句做不到的承诺，比不写更坏。）
-        case "land":           h = qsTr("将发出降落指令：先切换为多旋翼，随后飞向接机机位并在该机位降落（不可撤销）"); break
-        // ‼️ 救济档的**首句**是用户 2026-10-06 第 7 条要的「醒目提示」的落点：
-        //    「当需要救济的时候，飞机的**位置、姿态、高度等参数都是不可预测的**」。
-        //    提示落在**文案**里，不落在按钮配色里 —— 按钮配色只能表达"这个动作危险"，
+        // ‼️ 救济档的 `case` 在 2026-10-08 第五轮**删掉了** —— 它已由上面的 `_isRescueKind`
+        //    提前 return 走掉。⚠️ 被删掉的那句**留档**（别以为是手滑）：
+        //      「【救济功能】跳过全部降落校验、不写数据库、不占用接机机位；请先在主界面确认
+        //        无人机位置与姿态（不可撤销）\n将发出降落指令：先切换为多旋翼，随后飞向接机
+        //        机位并在该机位降落」
+        //    它承载的用户要求（2026-10-06 第 7 条「救济时位置、姿态、高度不可预测」要醒目）
+        //    **没有废**：新文案首句「本功能为救济功能，当飞机不可控时才能使用」说的是同一件事，
+        //    而且更狠 —— 旧句在讲"这条路做了什么"，新句在讲"什么时候才准用"。
+        //    提示仍然落在**文案**里、不落在按钮配色里：按钮配色只能表达"这个动作危险"，
         //    表达不了"你正在用一条不校验、不写库的路"，而后者才是操作员此刻必须知道的事。
-        case "mcRescueLand":   h = qsTr("【救济功能】跳过全部降落校验、不写数据库、不占用接机机位；请先在主界面确认无人机位置与姿态（不可撤销）\n将发出降落指令：先切换为多旋翼，随后飞向接机机位并在该机位降落"); break
         case "park":           h = qsTr("将终结本任务并对无人机下电停泊（不可撤销）"); break
         // ⚠️ 一条 qsTr 只放**一个字符串字面量**：写成 `qsTr("甲" + "乙")` 时 lupdate 抽不出来，
         // 译文表里永远缺这一条，界面上就它一个不跟着语言走。
@@ -364,17 +509,32 @@ OpsShell {
         // `task` 可能缺失（老调用点只传 id），此时不编造编号，直接说明缺了什么。
         var t = a.task
         if (!t) return h + qsTr("\n（未能取到任务信息，请确认操作对象后再执行）")
+        // ‼️ `OpsCommon.taskNo(t)` **不能**用在这里：它**优先返回 `uav_no`**
+        //    （`task.uav_no ? task.uav_no : task.task_no`），照搬会让这一行显示成
+        //    「任务「UAV-10001048」 · 无人机 UAV-10001048」—— 同一个值说两遍。
+        //    `_landConfirmTaskNo` 的注释里记过同一条教训（云端库实测两者确实不同）。
         return qsTr("%1\n任务「%2」 · 无人机 %3")
-            .arg(h).arg(OpsCommon.taskNo(t)).arg(t.uav_no ? t.uav_no : "—")
+            .arg(h).arg(t.task_no ? t.task_no : "—").arg(t.uav_no ? t.uav_no : "—")
     }
 
-    /// 确认弹窗正文的颜色。默认深蓝；**救济**那一档用深红。
+    /// 确认弹窗正文那一行的颜色。**现在只剩五档**走它（起飞/停泊/签出/取消/回航）——
+    /// 降落两档（F1/F2）与救济档（F3）的正文都已换成结构化块，各有自己的字色。
     ///
-    /// 两个色值在白底（`Dialog` 的背景）上的对比度是**实算**的（WCAG 相对亮度公式，
-    /// python 一行脚本可复现）：`#1565c0` 5.75:1、`#c62828` 5.62:1 —— 都过 AA 的 4.5:1。
-    /// ⚠️ 不要改成琥珀系：`#ffc107` 白底仅 **1.63:1**，用户 2026-09-28 已明确反馈"非常不明显"。
+    /// ‼️ 这里原来有一条「救济档用亮红 `#ff6b6b`」的分支，2026-10-08 第五轮救济档搬走后
+    ///    **它永远不生效了**（`_pendingConfirmHint()` 对救济档恒返回空串）⇒ 按"不留死分支"
+    ///    删掉。救济的醒目色改落在 `actionConfirmDialog` 那个「重要提示：」块上（同为 `#ff6b6b`）。
+    ///    ⚠️ 保留它的"防御价值"是假的：那一行对救济档**根本不显示**，写坏 `_isRescueKind`
+    ///    也只会让**另一个块**不显示，与这个色值无关。
+    ///
+    /// ‼️ 色值是**实算**的（WCAG 相对亮度公式，本机 python 一行可复现），
+    ///    基准是**本框当前的底色**深绿 `#0f2f2c`（`OpsDialog.qml`）：`#9fb3d4` **6.75:1**，过 AA 4.5:1。
+    /// ⚠️ 白底时代那对值**已经不能用了**（2026-10-08 第四轮本框并入深色底）：
+    ///      `#1565c0` 深蓝在深绿底上只剩 **2.50:1**、`#c62828` 深红只剩 **2.55:1**
+    ///      （它们在白底上分别是 5.75 / 5.62）—— 直接搬过来等于看不清。
+    /// ⚠️ 琥珀系 `#ffc107` 在浅底上是 1.63:1（用户 2026-09-28 反馈"非常不明显"），
+    ///    但在**深底**上是 **8.80:1**；本行仍不用它，是为了与卡片里的警示条区分开。
     function _pendingConfirmHintColor() {
-        return (_pendingAction && _pendingAction.kind === "mcRescueLand") ? "#c62828" : "#1565c0"
+        return "#9fb3d4"
     }
 
     // 红绿确认动作执行（kind: takeoff→DB 落库 + 起飞指令；
@@ -415,10 +575,15 @@ OpsShell {
                 if (status === 200) _guidedTakeoff(task)
                 else console.warn("OpsView takeoff", status)
             })
-        } else if (a.kind === "land") {
-            _execLand(task, OpsCommon.LAND_KIND_TO_MC)
-        } else if (a.kind === "keepFwLand") {
-            _execLand(task, OpsCommon.LAND_KIND_KEEP_FW)
+        } else if (a.kind === "land" || a.kind === "keepFwLand") {
+            // F1 / F2：**先写库、再走降落链**，写库这一步由 `_commitLand` 里的
+            // `POST /assign-slot` 完成（用户 2026-10-08「确认执行时才写」）。
+            // ‼️ 不能像改前那样直接 `_execLand(task, kind)`：那时的 `task` 是**列表项快照**，
+            //    它的 `assign_slot_*` 是**旧的**（本轮选中的机位在 `a.slot` 里，还没落库）
+            //    ⇒ 会拿旧落点去校验、去飞。
+            // ⚠️ `_commitLand` 是**异步**的（先发 POST），本函数末尾那句 `_pendingAction = null`
+            //    不影响它：`a` 是形参、按值传进闭包，与 `_pendingAction` 是不是空无关。
+            _commitLand(a)
         } else if (a.kind === "mcRescueLand") {
             _startLandFlow(OpsCommon.LAND_KIND_MC_RESCUE, task)
         } else if (a.kind === "park") {
@@ -1917,15 +2082,18 @@ OpsShell {
                             opsView._pendingAction = {kind:"takeoff", task:task}
                             actionConfirmDialog.open()
                         }
+                        // ‼️ 这两档与另外六个不同：**先弹机位选择框，再弹确认框**（用户 2026-10-08）。
+                        //    所以这里不进 `_pendingAction` / 不开 `actionConfirmDialog` —— 那两步
+                        //    都推迟到操作员选完机位之后（`slotDialog` 的 delegate → `_commitLand`）。
+                        // ⚠️ 锚点仍在这一刻算好传进去：等选完机位再算，`cardBottomY` 早就没有意义了
+                        //    （卡片可能已被 `_poll()` 换掉）。
                         onLandRequested: function(task, cardBottomY) {
-                            opsView._confirmAnchorY = taskListPanel.mapToItem(opsView, 0, cardBottomY).y
-                            opsView._pendingAction = {kind:"land", task:task}
-                            actionConfirmDialog.open()
+                            opsView._beginLandFlow(task, OpsCommon.LAND_KIND_TO_MC,
+                                                   taskListPanel.mapToItem(opsView, 0, cardBottomY).y)
                         }
                         onKeepFwLandRequested: function(task, cardBottomY) {
-                            opsView._confirmAnchorY = taskListPanel.mapToItem(opsView, 0, cardBottomY).y
-                            opsView._pendingAction = {kind:"keepFwLand", task:task}
-                            actionConfirmDialog.open()
+                            opsView._beginLandFlow(task, OpsCommon.LAND_KIND_KEEP_FW,
+                                                   taskListPanel.mapToItem(opsView, 0, cardBottomY).y)
                         }
                         onMcRescueLandRequested: function(task, cardBottomY) {
                             opsView._confirmAnchorY = taskListPanel.mapToItem(opsView, 0, cardBottomY).y
@@ -1937,7 +2105,25 @@ OpsShell {
                             opsView._pendingAction = {kind:"park", task:task}
                             actionConfirmDialog.open()
                         }
-                        onAssignSlotRequested: function(task) { opsView._assignSlotError = ""; opsView._assignSlotTask = task; slotDialog.open() }
+                        // 【指定机位】= 机位选择框的**另一种用途**：选中即写库（原行为）。
+                        // ‼️ `_slotDialogMode` 必须在这里复位成 "assign"：不复位的话，走过一次
+                        //    【降落】之后它一直停在 "land" ⇒ 点【指定机位】选中的机位**不会落库**、
+                        //    而是弹出一个降落确认框。那是一条**不出错、只做错事**的路径。
+                        onAssignSlotRequested: function(task, cardBottomY) {
+                            opsView._slotDialogMode = "assign"
+                            opsView._slotDialogLandKind = ""
+                            opsView._assignSlotError = ""
+                            opsView._assignSlotTask = task
+                            // ‼️ 锚点与另外八个动作**同款**（用户 2026-10-08 第三轮：
+                            //    「位置，我们的惯例是显示在对应任务卡片的下方」）。
+                            //    改前这里**不设**锚点 ⇒ `_confirmAnchorY` 会停在上一次动作留下的
+                            //    值上（或初值 -1）⇒ 机位框要么贴着一张不相干的卡片、要么落到屏幕正中。
+                            //    ⚠️ 与 `onLandRequested`/`onKeepFwLandRequested` 那条的区别只是
+                            //    时机：那两条设完锚点还要等一次"选机位"才弹确认框，本条的框**就是**
+                            //    这一步，所以设完立刻 `open()`。
+                            opsView._confirmAnchorY = taskListPanel.mapToItem(opsView, 0, cardBottomY).y
+                            slotDialog.open()
+                        }
                         onHandoverProposed: function(taskId, phase) { opsView._proposeHandover(taskId, phase) }
                         // 用户 2026-09-23：「执行"签出"、"取消"、"回航"都需要弹窗确认」。
                         // ‼️ 三者都是**先落库、再下指令**——写库那步在服务端事务里（见 `_execReturn`），
@@ -2030,10 +2216,19 @@ OpsShell {
     //-------------------------------------------------------------------------
     // 降落被阻止弹框（发出降落指令前机位空闲校验未通过 / 指令下发失败时弹出）
     //-------------------------------------------------------------------------
-    Dialog {
+    OpsDialog {
         id: landBlockDialog
         parent: opsView
-        width: 400
+        // ‼️ 2026-10-08 第四轮：并入共用皮肤（`OpsDialog`），宽度与右栏一致、贴窗口右缘。
+        //    改前 `width: 400` 是**硬编码**，而且 `x`/`y` **都没写** ⇒ `Dialog` 缺省落 (0,0)，
+        //    表现在界面上就是**屏幕左上角**（同一个坑 `actionConfirmDialog` 于 2026-09-28
+        //    已经踩过一次，当时只修了那一个框，本框一直漏着）。
+        //    ⚠️ `y` **不读 `_confirmAnchorY`**：本框由"降落校验未通过/指令下发失败"弹出，
+        //       触发它的**不是某张卡片上的按钮** ⇒ 没有锚点来源，读了只会用到上一次动作
+        //       留下的残值、贴着一张不相干的卡片。故直接垂直居中。
+        width: opsView.rightPanelWidth
+        x: opsView.width - width
+        y: (opsView.height - height) / 2
         modal: true
         title: qsTr("降落被阻止")
 
@@ -2042,16 +2237,22 @@ OpsShell {
             spacing: 8
             Text {
                 Layout.fillWidth: true
+                // 亮红 `#ff6b6b` —— 深绿底 `#0f2f2c` 上 **5.17:1**，过 AA 4.5:1，
+                // 与卡片里的错误红同值（本框换深色底后本行**不用改**，原本就是深底家族的色）。
                 color: "#ff6b6b"; font.pixelSize: 13
                 wrapMode: Text.Wrap
                 text: qsTr("降落操作已被阻止，请人工确认机位/状态后重试。")
             }
             Text {
                 Layout.fillWidth: true
-                // 深蓝 `#1565c0`，白底上 **5.75:1**（WCAG 及格线 4.5:1）。
-                // 原为琥珀 `#ffc107`——那是**深色卡片**上的提示色（任务卡的通知条同族），
-                // 搬到 `Dialog` 的浅色底上只剩 **1.63:1**，用户 2026-09-28 反馈"非常不明显"。
-                color: "#1565c0"; font.pixelSize: 12
+                // ‼️ 本行取值的**三度翻转**（2026-10-08），别再翻回去：
+                //    ① 原为琥珀 `#ffc107` —— 落在浅底 `Dialog` 上只剩 1.63:1，用户 2026-09-28
+                //       反馈"非常不明显"；
+                //    ② 改成深蓝 `#1565c0`（白底 5.75:1，那时是对的）；
+                //    ③ 本轮本框并入深色底（`OpsDialog`）⇒ 深蓝只剩 **2.50:1**，改回深底家族的
+                //       次要色 `#9fb3d4`（**6.75:1**）。
+                //    结论同 `slotDialog`：**字色跟着底走**，没有哪个色值"天生正确"。
+                color: "#9fb3d4"; font.pixelSize: 12
                 wrapMode: Text.Wrap
                 text: opsView._landBlockReason
             }
@@ -2059,22 +2260,79 @@ OpsShell {
     }
 
     //-------------------------------------------------------------------------
-    // 机位选择弹框（SITE_ATC 指定降落机位）
+    // 机位选择弹框（SITE_ATC）——**两种用途共用**：见 `_slotDialogMode` 的声明注释。
+    //   "assign"：【指定机位】，选中即写库（原行为）。
+    //   "land"  ：【降落】/【切换多旋翼降落】的第一步，**只选、不写库**。
     //-------------------------------------------------------------------------
-    Dialog {
+    OpsDialog {
         id: slotDialog
         parent: opsView
-        width: 360
+        // ‼️ 宽度与右边栏一致（用户 2026-10-08 第四轮：「宽度有与右边栏宽度等宽」）。
+        //    原为**硬编码 360**。而右边栏是**可变宽**的 —— `rightPanelWidth` = 站点视图下
+        //    `min(510, max(340, 机位图所需宽))`（见本文件顶部 `rightPanelWidth` 的声明）
+        //    ⇒ 机位图宽时弹框比栏窄、机位图窄时又比栏宽，两边永远对不齐。
+        //    与 `actionConfirmDialog` / `handoverDialog` 逐字同款。
+        // ⚠️ 宽度变成可变值后，下面机位格 `Flow` 的**列数会随栏宽变**（原注释按 360 算的
+        //    固定 3 列已失效）—— 这是 `Flow` 的正常行为，不需要按宽度补分支。
+        width: opsView.rightPanelWidth
         modal: true
-        title: qsTr("指定降落机位")
+        // ‼️ 位置与 `actionConfirmDialog` **逐字同款**：贴右边栏、上部对齐**触发它的那张任务卡片**
+        //    的下缘（留 6px，卡片靠下时向上收，别顶出屏幕底）。用户 2026-10-08 第三轮：
+        //    「位置，我们的惯例是显示在对应任务卡片的下方」。
+        //    改前本框 `x`/`y` **都没写** ⇒ `Dialog` 缺省落在 (0,0)，看起来在**屏幕左上角**
+        //    （同一个坑 `actionConfirmDialog` 在 2026-09-28 已经踩过一次）。
+        //    锚点由 `_beginLandFlow` / `onAssignSlotRequested` 在 `open()` 之前写入
+        //    —— 两个入口都写，缺一个就会用到上一次动作的残留值。
+        x: opsView.width - width
+        y: opsView._confirmAnchorY < 0
+           ? (opsView.height - height) / 2
+           : Math.min(opsView._confirmAnchorY + 6, opsView.height - height - 12)
+        title: opsView._slotDialogMode === "land" ? qsTr("选择降落机位") : qsTr("指定降落机位")
+        // ‼️ 深色卡片皮肤（底 `#0f2f2c` / 描边 `#26a69a` / **覆写 `header`**）已**上移**到
+        //    `OpsDialog.qml` —— 本框 2026-10-08 第三轮时只在这里写了一份；第四轮四个框
+        //    （选择机位 / 确认 / 交接 / 降落被阻止）统一走那个组件，改配色只改那一处。
+        // ⚠️ 第三轮写在这里的那句警告「**只改本框**；`actionConfirmDialog` 保持平台默认浅底，
+        //    它另外六档跟着翻会一起失效」**已被第四轮推翻**：现在**四个框全是深底**。
+        //    它连同它的理由一并作废，别照它去回退。正确做法不是「别翻」，而是翻的时候
+        //    **把框内字色一起翻**（浅底那套色搬到深绿底上的实算对比度见 `OpsDialog.qml`）。
 
         ColumnLayout {
             width: parent.width
             spacing: 6
             Text {
                 Layout.fillWidth: true
+                // 正文两行**条目化**（用户 2026-10-08 第四轮：「提示内容要条目化，具体的显示
+                // 两行，第一行：飞行任务：，第二行：无人机：」）。两种用途（land / assign）
+                // **同版式** —— 它们在界面上本来是同一个框，不该因为入口不同换一套排版。
+                // ⚠️ 动作说明（「选择降落机位」/「指定降落机位」）**不写在这里**：它已经在
+                //    `title` 上，正文再写一遍就是同一块地方说两遍。
+                // ‼️ 第一行必须取 `t.task_no`，**不能**用 `OpsCommon.taskNo(t)`：那个函数
+                //    **优先返回 `uav_no`**（`task.uav_no ? task.uav_no : task.task_no`，
+                //    「航班号」语义）⇒ 两行会显示**同一个值**。同一条教训见 `_landConfirmTaskNo`。
+                //    （本轮之前 `assign` 分支正是 `OpsCommon.taskNo(t)`，两行同值。）
+                // ⚠️ 条目名与 `actionConfirmDialog` 的三行摘要**用词一致**（「飞行任务：」/
+                //    「无人机：」）—— 两个框一前一后出现，读起来要是同一套。
                 color: "#e6edf7"; font.pixelSize: 12
-                text: opsView._assignSlotTask ? qsTr("任务 %1 指定降落机位：").arg(OpsCommon.taskNo(opsView._assignSlotTask)) : ""
+                wrapMode: Text.Wrap
+                text: {
+                    var t = opsView._assignSlotTask
+                    if (!t) return ""
+                    return qsTr("飞行任务：%1\n无人机：%2")
+                        .arg(t.task_no ? t.task_no : "—")
+                        .arg(t.uav_no ? t.uav_no : "—")
+                }
+            }
+            // 空态：本站一个可用机位都没有（全被占用 / 全未核准 / 机场压根没建机位）。
+            // ‼️ 必须有：本轮把两颗降落按钮改成**恒可点**（因为点下去第一步就是选机位）⇒
+            //    "点开发现是空的"从不可达变成**可达**。没有这行，用户看到的是一个空框，
+            //    分不清是"本站没机位"还是"界面卡住了"。
+            Text {
+                Layout.fillWidth: true
+                visible: opsView._slots.length === 0
+                // 琥珀 `#ffc107` —— 深色底上的警示色（与卡片里那两条警示同值）。
+                color: "#ffc107"; font.pixelSize: 12
+                wrapMode: Text.Wrap
+                text: qsTr("本站暂无可选机位（机位须已核准且空闲）。")
             }
             // 指派失败原因（保留弹框可换机位重试）
             Text {
@@ -2086,15 +2344,94 @@ OpsShell {
             }
             Flow {
                 Layout.fillWidth: true
-                spacing: 6
+                // 3 列 × 104 + 2 × 8 = 328 ≤ 内容宽（360 − Dialog 两侧 padding 24）⇒ 恰好三列。
+                spacing: 8
                 Repeater {
                     model: opsView._slots
+                    // ‼️ 机位格改成**卡片式**（用户 2026-10-08 第三轮「机位列表也要优化」）。
+                    //    原为平台默认按钮（浅色圆角 + 深字 + `slot_code（占用）` 一行平铺），
+                    //    落在本轮新换的深色框里既刺眼又和任务卡片是两个世界。
+                    //    现改为与任务卡片同族的小卡：深底 / 描边 / 浅字，**三态可辨**：
+                    //      不可用（暗底暗字 + 原因） / 当前已指派（蓝描边 + 「当前机位」） /
+                    //      可选（常态，悬停转青绿）。
                     delegate: Button {
-                        width: 96; height: 32
-                        text: modelData.slot_code + opsView._slotAssignHint(modelData)
+                        id: slotBtn
+                        width: 104; height: 44
                         enabled: opsView._slotAssignable(modelData)
+                        // 「当前已指派」= 这条任务**库里**那个 `assign_slot_id`（旧值）。
+                        // ⚠️ 本框**不预选**它、也不把它当作默认提交值（用户裁定「确认执行时才写」，
+                        //    选中谁就是谁）—— 只做**标记**，让操作员一眼看出"不改的话飞机落在哪"。
+                        readonly property bool _isCurrent:
+                            !!opsView._assignSlotTask
+                            && modelData.id === opsView._assignSlotTask.assign_slot_id
+                        background: Rectangle {
+                            radius: 4
+                            border.width: 1
+                            // 底色三态：不可用（比卡底更暗，视觉下沉） > 悬停（青绿压暗） > 常态卡底。
+                            color: !slotBtn.enabled ? "#131c2e"
+                                   : (slotBtn.hovered ? "#16403a" : "#16233c")
+                            // 描边优先级：不可用（最暗的蓝灰） < 常态 < 悬停青绿 < **当前机位蓝**
+                            // ——「当前」是这块格子里信息量最大的一格，不能被悬停盖掉。
+                            // 蓝色取 `#2f6bd8`，与任务卡片"已选中"的边框同值。
+                            border.color: !slotBtn.enabled ? "#243349"
+                                          : (slotBtn._isCurrent ? "#2f6bd8"
+                                             : (slotBtn.hovered ? "#26a69a" : "#2a4a6b"))
+                        }
+                        contentItem: Column {
+                            spacing: 2
+                            anchors.centerIn: parent
+                            Text {
+                                anchors.horizontalCenter: parent.horizontalCenter
+                                text: modelData.slot_code
+                                color: slotBtn.enabled ? "#e6edf7" : "#5c6b85"
+                                font.pixelSize: 13
+                                font.bold: slotBtn._isCurrent
+                                horizontalAlignment: Text.AlignHCenter
+                            }
+                            Text {
+                                anchors.horizontalCenter: parent.horizontalCenter
+                                // 第二行：**不可用原因优先**（占用/未核准/维护/故障），
+                                // 没有原因时才是「当前机位」，两者都没有就不占位。
+                                // ⚠️ 顺序不能反：一个"当前但已被占用"的机位若显示「当前机位」，
+                                //    操作员会以为它可用。
+                                text: {
+                                    var h = opsView._slotAssignHint(modelData)
+                                    if (h !== "") return h
+                                    return slotBtn._isCurrent ? qsTr("当前机位") : ""
+                                }
+                                visible: text !== ""
+                                color: slotBtn.enabled ? "#9fb3d4" : "#5c6b85"
+                                font.pixelSize: 10
+                                horizontalAlignment: Text.AlignHCenter
+                            }
+                        }
                         onClicked: {
-                            if (opsView._assignSlotTask) opsView._assignSlot(opsView._assignSlotTask, modelData.id, function(ok) {
+                            if (!opsView._assignSlotTask) return
+                            if (opsView._slotDialogMode === "land") {
+                                // 【降落】第一步：**只选、一个字节都不发**。
+                                // ‼️ 落库在 `_commitLand` 里、由红绿确认框的「确认执行」触发
+                                //    （用户 2026-10-08 逐字裁定「确认执行时才写」）。提前发的话，
+                                //    "选完机位又点【取消】"也会在库里留下一次机位变更。
+                                var kind = opsView._slotDialogLandKind
+                                // 防御：`mode === "land"` 而 `kind` 为空说明有人漏设了配对的那一格
+                                // （两者只在 `_beginLandFlow` / `_commitLand` / `onAssignSlotRequested`
+                                // 三处同写）。此时**什么都不做**，不要带着空 kind 去开确认框 ——
+                                // `_execPendingAction` 会把空 kind 落进"一个分支都不匹配"，表现为
+                                // 「点了确认执行、什么都没发生、零报错」。
+                                if (!kind) {
+                                    console.warn("OpsView 降落：_slotDialogLandKind 为空，本次未发起")
+                                    return
+                                }
+                                var t = opsView._assignSlotTask
+                                slotDialog.close()
+                                opsView._assignSlotTask = null
+                                // 机位取 `slot`（本次**选中**的这个，供确认框第三行显示）；
+                                // 此刻库里那个 `assign_slot_id` 还是旧的，故意不看它。
+                                opsView._pendingAction = { kind: kind, task: t, slot: modelData }
+                                actionConfirmDialog.open()
+                                return
+                            }
+                            opsView._assignSlot(opsView._assignSlotTask, modelData.id, function(ok) {
                                 if (ok) { slotDialog.close(); opsView._assignSlotTask = null }
                             })
                         }
@@ -2110,7 +2447,7 @@ OpsShell {
     // 也要确认）。交接的**受理**（签入/驳回）仍走 handoverDialog——那是另一回事。
     // 红=确认执行（危险动作警示）、绿=取消（安全退出）。未来专用控制台做大红/大绿实体按钮。
     //-------------------------------------------------------------------------
-    Dialog {
+    OpsDialog {
         id: actionConfirmDialog
         parent: opsView
         // 宽度与右边栏一致、右边缘贴窗口右缘（用户 2026-09-28）。原先没写 `x`/`y`，`Dialog` 缺省
@@ -2131,14 +2468,117 @@ OpsShell {
             spacing: 12
             Text {
                 Layout.fillWidth: true
-                // 深蓝 `#1565c0`，白底上 **5.75:1**。原为琥珀 `#ffc107`（白底仅 **1.63:1**），
-                // 用户 2026-09-28 反馈"非常不明显"。理由与上方 `landBlockDialog` 那条同源：
-                // 琥珀是深色卡片上的提示色，不属于浅色的 `Dialog`。
-                // （2026-10-07：救济档改用 `#c62828` 深红，理由见 `_pendingConfirmHintColor`。
-                //   深蓝仍是除救济外所有档的默认色。）
+                // ‼️ 本行取值的**三度翻转**（2026-10-08），别再翻回去：
+                //    ① 原为琥珀 `#ffc107` —— 落在浅底 `Dialog` 上只剩 1.63:1，用户 2026-09-28
+                //       反馈「非常不明显」；
+                //    ② 改成深蓝 `#1565c0`（白底 5.75:1；救济档深红 `#c62828` 5.62:1）—— 那时是对的；
+                //    ③ 本轮本框并入**深色底**（`OpsDialog`）⇒ 深蓝只剩 **2.50:1**、深红只剩 **2.55:1**，
+                //       两个都不及格 ⇒ 换成深底家族，现值与实算值见 `_pendingConfirmHintColor`。
+                //    结论与 `slotDialog` / `landBlockDialog` **同一条**：**字色跟着底走**，
+                //    没有哪个色值天生正确，错的是把某个底上量过的色搬到另一个底上。
                 color: opsView._pendingConfirmHintColor(); font.pixelSize: 13
                 wrapMode: Text.Wrap
                 text: opsView._pendingConfirmHint()
+                // ‼️ 降落两档（F1/F2）与救济档（F3）**都不显示这行**：它们的正文换成了下面
+                //    各自的结构化块（第四轮「解释性文字不需要」／第五轮救济档重写）。
+                //    `_pendingConfirmHint()` 对这三档恒返回空串，此处再叠一道 `visible` ——
+                //    空串也占 `ColumnLayout` 的一行高度。
+                // ⚠️ 剩下**五档**（起飞/停泊/签出/取消/回航）继续走这里。
+                visible: !opsView._isLandSummaryKind(opsView._pendingAction)
+                         && !opsView._isRescueKind(opsView._pendingAction)
+            }
+            // ── 降落两档（F1 保持固定翼 / F2 切换多旋翼）的正文：**三行条目**（用户 2026-10-08）──
+            // 第二轮原话：「把对话框改成一个类似任务卡片的风格，提示的内容有三行： 任务：,无人机：,机位。」
+            // 第四轮又要求：「选择完机位后，进入确认界面的**风格也要与此相同**」（同 `slotDialog`）。
+            // ‼️ 于是这里**去掉了原来那个内嵌的 `#16233c` 矩形块**：
+            //    · 第二轮那时整个 `Dialog` 还是平台默认的**浅底**，正文里套一块深色卡是"像任务卡"
+            //      的唯一做法；
+            //    · 第四轮整个框本身就是深色卡片了（`OpsDialog`），再套一层同族深色块
+            //      **看不出边界**（`#16233c` 与框底 `#0f2f2c` 几乎同亮度），
+            //      而且和 `slotDialog` 的两行纯文字对不上 —— 那才叫"风格不同"。
+            // ⚠️ 条目名与 `slotDialog` **用词一致**：「飞行任务：」/「无人机：」。第二轮用户写的是
+            //    「任务：」，第四轮写的是「飞行任务：」—— 本轮统一取**后者**，因为这两个框在界面
+            //    上是一前一后出现的、同一个字段不该有两个名字。
+            // ⚠️ 第三行取的是操作员**上一步刚选中的**机位（`_landConfirmSlotCode`），不是库里的
+            //    `assign_slot_id` —— 此刻库还没写（用户裁定「确认执行时才写」）。
+            Column {
+                Layout.fillWidth: true
+                visible: opsView._isLandSummaryKind(opsView._pendingAction)
+                spacing: 5
+                Text {
+                    width: parent.width
+                    color: "#e6edf7"; font.pixelSize: 12
+                    elide: Text.ElideMiddle
+                    text: qsTr("飞行任务：") + opsView._landConfirmTaskNo(opsView._pendingAction)
+                }
+                Text {
+                    width: parent.width
+                    color: "#e6edf7"; font.pixelSize: 12
+                    elide: Text.ElideMiddle
+                    text: qsTr("无人机：") + opsView._landConfirmUAVNo(opsView._pendingAction)
+                }
+                Text {
+                    width: parent.width
+                    color: "#e6edf7"; font.pixelSize: 12
+                    elide: Text.ElideMiddle
+                    text: qsTr("机位：") + opsView._landConfirmSlotCode(opsView._pendingAction)
+                }
+            }
+            // ── 救济档（F3「直接降落」）的正文（用户 2026-10-08 第五轮）──
+            // 用户原话：「第一行，"重要提示："，本功能为救济功能，当飞机不可控时才能使用，它将跳过
+            //   一切状态和检查和状态，直接控制无人机在机位上降落。使用此功能，可能导致货台数据不一致，
+            //   需要通知相关人员处理。（这行比较长，这行后不能从头显示，需要在重要提示：后面显示，
+            //   以表示与上一行是一组内容）；第二行，任务：；第三行，无人机：」
+            // ⚠️ 上面这段**逐字照录**（含「状态和检查和状态」，疑似原文重复）—— 文案是需求内容，
+            //    我按原样实现，不替用户改写；已在交付里单列一条请他确认。
+            //
+            // ‼️ 悬挂缩进（hanging indent）用 `RowLayout` + 两个 `Text` 实现，**不是**在长文案里
+            //    手打空格：`Text` 没有 CSS 的 `text-indent` / `padding-left` 那套，插空格既数不准，
+            //    也会随字体/缩放漂移。`spacing: 0` ⇒ 第二个 `Text` 的左边缘**正好**落在
+            //    「重要提示：」的右边缘 ⇒ 换行后的**每一行都从那里起**，正是用户要的
+            //    "与上一行是一组"。
+            // ‼️ `Layout.alignment: Qt.AlignTop` 两边都要写：不写时右列多行会把左列按竖直居中
+            //    摆，「重要提示：」会飘到文案中段，看起来就不像一句话的开头了。
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 0
+                visible: opsView._isRescueKind(opsView._pendingAction)
+                Text {
+                    Layout.alignment: Qt.AlignTop
+                    text: qsTr("重要提示：")
+                    // 深绿底 `#0f2f2c` 上实算 5.17:1，过 AA 4.5:1（与 `_pendingConfirmHintColor`
+                    // 注释里那份表同源）。加粗让"这是警示"在第一眼就成立。
+                    color: "#ff6b6b"; font.pixelSize: 13; font.bold: true
+                }
+                Text {
+                    Layout.fillWidth: true
+                    Layout.alignment: Qt.AlignTop
+                    color: "#ff6b6b"; font.pixelSize: 13
+                    wrapMode: Text.Wrap
+                    // ⚠️ 整段与「重要提示：」**同色**：用户说的是"一组内容"，缩进已经在版式上
+                    //    分组了，颜色再拆开反而把这个组拆散。救济的醒目色就是这么来的。
+                    text: qsTr("本功能为救济功能，当飞机不可控时才能使用，它将跳过一切状态和检查和状态，直接控制无人机在机位上降落。使用此功能，可能导致货台数据不一致，需要通知相关人员处理。")
+                }
+            }
+            // 条目的**两行**：与 `slotDialog`、降落两档同款（纯文字、深底浅字、可省略中间）。
+            // 取值复用 `_landConfirmTaskNo` / `_landConfirmUAVNo` —— 救济档的 `_pendingAction`
+            // 同样带着 `task`（`OpsView.qml` 里那处 `{kind:"mcRescueLand", task:task}`）。
+            Column {
+                Layout.fillWidth: true
+                visible: opsView._isRescueKind(opsView._pendingAction)
+                spacing: 5
+                Text {
+                    width: parent.width
+                    color: "#e6edf7"; font.pixelSize: 12
+                    elide: Text.ElideMiddle
+                    text: qsTr("任务：") + opsView._landConfirmTaskNo(opsView._pendingAction)
+                }
+                Text {
+                    width: parent.width
+                    color: "#e6edf7"; font.pixelSize: 12
+                    elide: Text.ElideMiddle
+                    text: qsTr("无人机：") + opsView._landConfirmUAVNo(opsView._pendingAction)
+                }
             }
             RowLayout {
                 Layout.fillWidth: true
@@ -2164,3 +2604,4 @@ OpsShell {
         }
     }
 }
+

@@ -131,23 +131,26 @@ ColumnLayout {
     // 输出
     //-------------------------------------------------------------------------
     signal taskSelected(var task)
-    // ‼️ 下面**八个**信号（起飞/保持固定翼降落/切换多旋翼降落/MC方式降落/停泊/签出/回航/取消交接）
-    //    各多带一个 `cardBottomY`：确认框要
+    // ‼️ 下面**九个**信号（起飞/保持固定翼降落/切换多旋翼降落/直接降落/停泊/签出/回航/取消交接/
+    //    **指定机位**）各多带一个 `cardBottomY`：它们弹出的框要
     //    贴在**触发它的那张卡片**下缘（用户 2026-09-28 要求）。视图侧算不出这个位置——纵向
     //    `ListView` 会覆写 delegate 的 `x`/`y`，直接读 `card.y` 拿到的是**列表内的逻辑位置**，
     //    与屏幕位置无关。所以在这里用 `mapToItem` 求卡片下缘（相对本组件），回传后由视图侧
     //    再换算成窗口坐标。取值一律走 `cardBottomYOf()`，别在各处重写这个表达式。
-    //    ⚠️ 只给**弹这个确认框的八个**加：`taskSelected`/`assignSlotRequested` 不弹框，
-    //    `handoverProposed`/`checkinRequested` 弹的是别的东西，给它们加会让"哪些信号要定位"
-    //    失去单一口径。
+    //    ⚠️ `assignSlotRequested` 是 2026-10-08 用户第三轮**补进来的**：他要求机位选择框也守
+    //    这条惯例——「位置，我们的惯例是显示在对应任务卡片的下方」。改前它不给锚点，弹框
+    //    落在 (0,0)（屏幕左上角）。它是**唯一**一个不弹"红绿确认框"而弹别的东西却仍需定位的信号。
+    //    ⚠️ 仍不给的：`taskSelected`（不弹框，只是选中）；`handoverProposed`/`checkinRequested`
+    //    弹的是别的东西，给它们加会让"哪些信号要定位"失去单一口径。
     signal takeoffRequested(var task, real cardBottomY)
     signal landRequested(var task, real cardBottomY)
     /// F1「降落」：保持固定翼进近、正常降落（走闸 + 写库）。设计稿 §9.8.2 组合 ①。
     signal keepFwLandRequested(var task, real cardBottomY)
-    /// F3「MC方式降落」：先转多旋翼、**救济**路径（不走闸、不读写数据库）。设计稿 §9.8.2 组合 ③。
+    /// F3「直接降落」（原名「MC方式降落」，用户 2026-10-08 改名）：先转多旋翼、**救济**路径
+    /// （不走闸、不读写数据库）。设计稿 §9.8.2 组合 ③。
     signal mcRescueLandRequested(var task, real cardBottomY)
     signal parkRequested(var task, real cardBottomY)
-    signal assignSlotRequested(var task)
+    signal assignSlotRequested(var task, real cardBottomY)
     signal handoverProposed(int taskId, string phase)
     // `task` 是可选的第二个载荷（用户 2026-09-23 要求取消/撤回也弹窗确认，弹窗里要写出是哪一单）。
     // 消费端少收后面的参数是合法的，RomView 因此不必跟着改（它只收 `handoverId`）。
@@ -545,7 +548,21 @@ ColumnLayout {
                         text: card._checkinNotice
                     }
                     // 操作按钮行
-                    Row {
+                    // ‼️ **`Flow` 而不是 `Row`**（2026-10-08 用户报「按钮超出了卡片的宽度」）：
+                    //    `Row` **既不换行也不裁剪** —— 子项总宽超过 `width` 时直接**溢出到卡片右缘
+                    //    之外**，第 4 颗起就被画在卡片外（用户截图里"MC方式降落"后面那颗）。
+                    //    当时最坏情况是到站卡同时亮 **4 颗**：降落 / 切换多旋翼降落 /
+                    //    直接降落 / 指定机位。
+                    //    ⇒ 2026-10-08 第三轮之后**同一场景只剩 2 颗**（降落 / 切换多旋翼降落）：
+                    //    用户把同场的【指定机位】删了（点降落第一步就是选机位），而【直接降落】
+                    //    的判据是 `LANDING`、与这两颗的 `IN_FLIGHT` 不同场。
+                    //    ⚠️ **仍不要把 `Flow` 改回 `Row`**：按钮数变少不等于溢出问题消失 ——
+                    //    `LANDING` 那一态（直接降落 / 指定机位 / 停泊）与出站各态同样是多颗并存。
+                    //    `Flow` 放不下就折行；卡片高度是 `taskBody.height + 12`（自适应）⇒ 折行后
+                    //    卡片**自动长高**，不裁不溢。
+                    // ⚠️ 也不要改成 `Row` + 手工算宽度：任何"按最坏情况预留宽度"的算法都会
+                    //    在别的状态下留出一段空白，而 `Flow` 对任意组合都对。
+                    Flow {
                         width: parent.width
                         spacing: 6
                         // ── 站点视图：出站 ──
@@ -622,7 +639,13 @@ ColumnLayout {
                             //    同一个状态下，一条路能点、另一条不能点？
                             visible: card._inboundActionable
                                      && modelData.status === "IN_FLIGHT"
-                            enabled: modelData.assign_slot_id ? true : false
+                            // ‼️ 恒可点（2026-10-08 用户第三轮）：点下去**第一步就是选机位**
+                            //    （`OpsView._beginLandFlow` → 机位选择框）⇒"库里有没有已指派机位"
+                            //    不再是这条路的前置条件——选中的机位会**覆盖**旧值，没有旧值一样走得通。
+                            //    改前这里判 `assign_slot_id`，与同一轮被删掉的【指定机位】按钮合起来
+                            //    会造出**死锁**：从未指派过机位的任务，两颗降落按钮灰着、而指派它的
+                            //    入口已经不存在了。判据变迁的完整留档在下面 F2 那颗的同名位置。
+                            enabled: true
                             height: 24; padding: 0
                             text: qsTr("降落")
                             onClicked: panel.keepFwLandRequested(modelData, panel.cardBottomYOf(card))
@@ -654,37 +677,77 @@ ColumnLayout {
                             //    `landing_accepted` 的任务会冒出这个按钮。详见那边函数的头注。
                             visible: card._inboundActionable
                                      && modelData.status === "IN_FLIGHT"
-                            // 可点判据 = **实际指派的降落机位**（`assign_slot_id`，与后端 Land/CheckLandingSlot
-                            // 同一子查询口径）。‼️ 不能用 `landing_slot_id`：那是**落地后的快照**（只有 `Park` 写，
-                            // 写时状态已 COMPLETED），飞行/回航阶段**恒为 NULL** ⇒ 按钮**永远点不了**。
-                            //（2026-09-28 修。这是"判据字段在真实数据里恒为默认值"那类缺陷，编译/qmllint/离屏全发现不了。）
+                            // ‼️ 可点判据 2026-10-08（用户第三轮）**改为恒可点**，历史留档如下：
+                            //    改前 = `assign_slot_id ? true : false`（**实际指派的降落机位**，
+                            //    与后端 Land/CheckLandingSlot 同一子查询口径）。
+                            //    改的理由：点下去第一步就是选机位（`_beginLandFlow`），选中的机位会
+                            //    **覆盖**旧值 ⇒"有没有旧值"不再是前置条件。而**留着这条判据**会与同一轮
+                            //    删掉的【指定机位】按钮合起来造出**死锁** —— 从未指派过机位的任务，
+                            //    按钮灰着，而指派它的入口已经没了。
+                            //    ⚠️ 这条判据的由来仍须记住：**不能用 `landing_slot_id`** —— 那是**落地后
+                            //    的快照**（只有 `Park` 写，写时状态已 COMPLETED），飞行/回航阶段**恒为 NULL**
+                            //    ⇒ 按钮**永远点不了**。（2026-09-28 修。属"判据字段在真实数据里恒为默认值"
+                            //    那类缺陷，编译/qmllint/离屏全发现不了。）
                             // 机位是否空闲、机场是否已核准**不在列表里预判**——那是会过期的快照，
                             // 由点击后的 `/landing-slot-check` 判定，否则会弹出错误的阻止理由。
-                            enabled: modelData.assign_slot_id ? true : false
+                            enabled: true
                             height: 24; padding: 0
                             text: qsTr("切换多旋翼降落")
                             onClicked: panel.landRequested(modelData, panel.cardBottomYOf(card))
                         }
                         Button {
-                            // F3「MC方式降落」= 先转多旋翼 + **救济**入口。
-                            // ‼️ **卡片级**常驻：`visible` / `enabled` **不加任何机型/状态/机位闸**。
-                            //    理由（用户 2026-10-06 第 7 条逐字）：「当需要救济的时候，飞机的
-                            //    位置、姿态、高度等参数都是不可预测的」—— 一个按正常状态设计的闸，
-                            //    在异常状态下恰好会把救济挡在门外。凡"点了也白点"的情形，由
-                            //    `_startLandFlow` 弹**可见的失败**（Task 4），不由按钮静默禁用。
-                            // ⚠️ 「常驻」是指**卡片级**：卡片本身只在任务出现在列表里时才存在，
-                            //    这条不改变任务的可见性规则。
-                            // ‼️ **但必须挂 `panel.showSiteActions`**（2026-10-08 终局审查 F4 修）。
-                            //    它不是状态闸 —— 是**视图级**的「这个面板有没有站点操作权」，
-                            //    与用户那条「不因飞机状态异常而藏起来」不冲突（同排每一颗站点动作
-                            //    按钮都挂在它上面，F1/F2 是经 `card._inboundActionable` 间接挂的）。
-                            //    不加的后果：`RomView.qml` 硬编码 `showSiteActions: false`，且**没有**
-                            //    接 `onMcRescueLandRequested` ⇒ 监控员视图每一张卡片上都有一颗
-                            //    可点、点了**什么都不发生**（无弹窗、无请求、无报错）的救济按钮。
+                            id: rescueLandBtn
+                            // F3「直接降落」= 先转多旋翼 + **救济**入口。
+                            //
+                            // ‼️ 文案与出现条件由用户 2026-10-08 裁定**逐字**改为（原为
+                            //    「MC方式降落」+ 卡片级无条件常驻）：
+                            //    「"把MC方式降落"，改为"直接降落"，文字颜色改为红色。它的出现一定是
+                            //     已经执行过降落（无论是在正常降落，还是转化为mc方式降落）后的界面
+                            //     上，可以在确认降落成功前，以及执行过降落后的各个界面中」
+                            //    以及紧接的澄清：「"发出过降落指令"，可以理解为真正向无人机发出了
+                            //     指令，而不是界面上的按钮，另外，已经确认正常降落，也不再需要显示
+                            //     该按钮」。
+                            //    ⇒ 判据 ＝ **已发出降落指令** ∧ **尚未确认落地**。
+                            //
+                            // ‼️ 为什么取 `status === "LANDING"` 这一档，而不取更严的"指令确实离机"：
+                            //    `LANDING` 是 `POST /tasks/:id/land` 的**唯一写点**（见
+                            //    `task-landing-status-single-writer`）⇒ 它就是"指令已发出"在库里的
+                            //    **唯一表达**，且**不依赖飞机应答**。取更严的判据（等 PX4 回帧确认）会
+                            //    让「通信断了」这一**最常见**的救济场景恰好把按钮藏掉 —— 正撞用户
+                            //    2026-10-06 第 7 条「当需要救济的时候，飞机的参数都是不可预测的」。
+                            //
+                            // ⚠️ `!card._onGround` 是"已确认正常降落"那一半（用户同一条裁定后半句）。
+                            //    它读 `Vehicle::flying`，**无遥测时恒 false** ⇒ fail-open（偏向**显示**
+                            //    这颗按钮）：通信断了正是要救济的时刻，宁可多给一颗按钮。
+                            // ⚠️ `panel.showSiteActions` 这一格**保留**（2026-10-08 终局审查 F4，
+                            //    与用户本轮裁定不冲突）。它不是状态闸，是**视图级**的「这个面板有没有
+                            //    站点操作权」：`RomView.qml` 硬编码 `showSiteActions: false`，且**没有**
+                            //    接 `onMcRescueLandRequested` ⇒ 不挂的话监控员视图会有一颗可点、
+                            //    点了**什么都不发生**（无弹窗、无请求、无报错）的救济按钮。
+                            //
+                            // ⚠️ **动作本身的口径一个字都没变**：救济 ＝ 不读库、不写库、不占用接机
+                            //    机位、直接向 PX4 发（用户 2026-10-08 C1 裁定）。本轮收窄的只是
+                            //    **按钮什么时候出现在界面上**。
                             visible: panel.showSiteActions
+                                     && modelData.status === "LANDING"
+                                     && !card._onGround
                             enabled: true
                             height: 24; padding: 0
-                            text: qsTr("MC方式降落")
+                            text: qsTr("直接降落")
+                            // 红字（用户 2026-10-08 逐字「文字颜色改为红色」）。取 `#ff3b3b`
+                            // ——它已经是本卡片深色底上验证过的红（`_timedOut` 的边框/「超时」字同值），
+                            // 不新引入一个没在深色底上量过的色号。
+                            // ‼️ 用 `id` 取字，**不是** `parent.text` ——`contentItem` 的 `parent` 在
+                            //    qmllint 眼里是 `QQuickItem`（无 `text`/`font`），照抄别处那句会新增
+                            //    两条 `missing-property` 告警；而 `id` 指向的 Button 是确定的
+                            //    （`Text.font` 绑定到按钮 font 也是 QQC2 里 `contentItem` 的官方写法）。
+                            contentItem: Text {
+                                text: rescueLandBtn.text
+                                font: rescueLandBtn.font
+                                color: "#ff3b3b"
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                            }
                             onClicked: panel.mcRescueLandRequested(modelData, panel.cardBottomYOf(card))
                         }
                         Button {
@@ -694,10 +757,26 @@ ColumnLayout {
                             //    ⚠️ 那个 `IN_FLIGHT` 原先"由 `isInbound` 的外层保证"，2026-10-02
                             //    外层放宽后不再有保证 ⇒ 已提升为**显式**合取项（与 `_inboundActionable`
                             //     逐字相同，正是收敛要的效果）。
-                            visible: card._inboundActionable
+                            // ‼️ 2026-10-08 用户第三轮裁定：**签入后不再显示这一格**。
+                            //    原话「在降落站点，签入后，任务卡片上显示两个降落按钮，还有一个选择
+                            //    机位按钮，因为降落后面就是选择机位，所以在这个界面上，选择机位按钮
+                            //    可以删除」⇒ 判据从 `_inboundActionable` 收窄为「**两颗降落按钮不在场**
+                            //    的那些态」。
+                            //    两颗降落按钮的到场条件是 `_inboundActionable && status === "IN_FLIGHT"`
+                            //    ⇒ 取反后本按钮只剩 `LANDING` 态（**已发出降落指令、尚未落地**）。
+                            //    ⚠️ `LANDING` 这一格**不能一并删掉**：那时在场的是【直接降落】，它走的是
+                            //    "原任务已指定的机位"、**不弹选机位框**（救济的定义之一）⇒ 想改落点就仍
+                            //    需要一个独立入口。
+                            //    ⚠️ 写成 `status !== "IN_FLIGHT"` 而不是"两颗按钮可见性表达式的镜像取反"：
+                            //    镜像写法会让两处判据只能靠肉眼保持互补。`_inboundActionable` 为真时
+                            //    `status` 只有 IN_FLIGHT / LANDING 两种（见 `OpsCommon.inboundActionable`
+                            //    的 `LANDING || (IN_FLIGHT && landingAccepted)`），故两者恰好互补、不重不漏。
+                            //    ⚠️ 机位选择框的锚点（`cardBottomY`）必须在这里传：用户第三轮明确
+                            //    「位置，我们的惯例是显示在对应任务卡片的下方」。
+                            visible: card._inboundActionable && modelData.status !== "IN_FLIGHT"
                             height: 24; padding: 0
                             text: qsTr("指定机位")
-                            onClicked: panel.assignSlotRequested(modelData)
+                            onClicked: panel.assignSlotRequested(modelData, panel.cardBottomYOf(card))
                         }
                         Button {
                             // 6.0-B 停泊门控：已落地可停泊；载具在线但未落地→置灰"停泊（待落地）"；
