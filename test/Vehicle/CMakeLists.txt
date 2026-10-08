@@ -35,6 +35,8 @@ target_sources(${CMAKE_PROJECT_NAME}
         VehicleDistanceSensorFactGroupTest.h
         VehicleLinkManagerTest.cc
         VehicleLinkManagerTest.h
+        VtolLandingMissionTest.cc
+        VtolLandingMissionTest.h
 )
 
 if(NOT QGC_DISABLE_APM_PLUGIN)
@@ -68,3 +70,4 @@ add_qgc_test(SendMavCommandWithSignallingTest LABELS Integration Vehicle)
 add_qgc_test(SetEstimatorOriginTest LABELS Integration Vehicle)
 add_qgc_test(VehicleDistanceSensorFactGroupTest LABELS Integration Vehicle)
 add_qgc_test(VehicleLinkManagerTest LABELS Integration Vehicle SERIAL)
+add_qgc_test(VtolLandingMissionTest LABELS Integration Vehicle)

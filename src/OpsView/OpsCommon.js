@@ -2406,11 +2406,21 @@ function vtolTransitionDone(vtolState) {
 
 /// 飞机是否已飞抵**接机机位**（方案 A 的到达判定）。回的必是布尔。
 ///
-/// 用户 2026-09-29 裁定：降落落点从 `home`（= 起飞点）改为**接机机位坐标**，走
-/// `guidedModeGotoLocation(机位坐标)` → **本函数回 true** → `guidedModeLand()`。
-/// ⇒ 本函数回 true 的那一刻，程序会**发出降落**。
+/// 用户 2026-09-29 裁定：降落落点从 `home`（= 起飞点）改为**接机机位坐标**。
+/// 本函数只回答「飞机到没到那个坐标」这一问，不承担任何后续动作。
 ///
-/// ‼️ 所以假阳性的代价是不对称的：说"到了"而其实没到 ⇒ 飞机在多旋翼模式下 `AUTO.LAND`
+/// ⚠️ 本函数**当前没有生产调用方**：它原有的两处调用 —— 一处是「转多旋翼后回航」那个
+///    函数（已删除），一处是 `_landFlowTick` 的 `"goto"` 支 —— 随降落统一链一起退役
+///    （设计稿 §9.8，2026-10-07）。那两处走的是「Guided 飞向坐标 → Guided 降落」那条
+///    应用层驱动链，已整条删除；取而代之的是「上传两航点 + 切 AUTO_MISSION」交 PX4 自主。
+///    保留本体是因为它是纯函数、且下面这批单测直接钉着它
+///    （同 `Vehicle::hoverAndTransitionToMultirotor` 的处理）。
+///
+///    ‼️ 本注释刻意不写那两个已退役的 Guided 接口名与那个已删函数名 ——
+///    `src/OpsView/` 全目录（含注释）对这些名字保持零出现，是 Task 4 的静态判据之一；
+///    想知道原先是谁在调它，用 `git log -S` 查那次提交。
+///
+/// ‼️ 假阳性的代价是不对称的：说"到了"而其实没到 ⇒ 飞机在多旋翼模式下 `AUTO.LAND`
 ///    是**原地降落**（`PX4-Autopilot/src/modules/navigator/land.cpp` 里唯一的
 ///    `DO_REPOSITION` 是"中止降落"用的，不是水平接近）⇒ 落在机位之外的任意位置，
 ///    违反用户 2026-09-28 定的红线「除非要坠机了，否则飞机只能在机位上降落」。
@@ -2436,4 +2446,104 @@ function reachedSlot(lat, lon, slotLat, slotLon, radiusM) {
     // 0 哨兵与越界值一并拦下（与包围盒/范围圈同一口径，见 `isValidWaypoint`）。
     if (!isValidWaypoint(lat, lon) || !isValidWaypoint(slotLat, slotLon)) return false
     return _greatCircleM(lat, lon, slotLat, slotLon) <= radiusM
+}
+
+// ============================================================================
+// 降落端统一框架（设计稿 §9.8）
+// ============================================================================
+//
+// F1 / F2 / F3 三条路 = 两个**正交维度**的三种组合（§9.8.2）：
+//
+//                 进近方式：保持 FW       先转 MC
+//   正常降落       F1「降落」              F2「切换多旋翼降落」
+//   救济          （不存在）               F3「MC方式降落」
+//
+// 「保持 FW + 救济」这一格**不存在**：保持 FW 进近需要一段几百米的直线空间和
+// 可预测的航迹，而救济的触发前提恰恰是「位置、姿态、高度都不可预测」
+// （用户 2026-10-07 逐字）——两条硬约束互斥。
+//
+// ‼️ 下面两个函数是这两个维度在**全仓的唯一编码处**。QML 只许调它们，不许在别处
+//    再写一份 `kind === "..."` 的判据 —— 否则将来加一条路时，两处判据会各自演化出
+//    不同答案。同形的教训见 `OpsView.qml` 的 `_pendingConfirmTitle` 头注：
+//    「加了三个 kind 之后，新的三种会静默落进最后那一档」。
+
+/// F1「降落」：保持固定翼进近，落地交 PX4 自主。正常降落（读库、写库）。
+var LAND_KIND_KEEP_FW = "keepFwLand"
+
+/// F2「切换多旋翼降落」：先转多旋翼再进近。正常降落（读库、写库）。
+///
+/// ⚠️ 取值 `"land"` 是**沿用**既有的 `_pendingAction.kind` 字面量，不是新造的名字：
+///    历史调用点全部落在 F2 语义上。改这个字面量会让所有既有 case 静默落进 default。
+var LAND_KIND_TO_MC = "land"
+
+/// F3「MC方式降落」（救济）：先转多旋翼再进近，**不读库、不写库**（§9.7 定义第 2 条）。
+var LAND_KIND_MC_RESCUE = "mcRescueLand"
+
+/// F1 的进近点距接机机位的偏移量，单位米。
+///
+/// ‼️ **这不是一个可调参数**，是「唯一有全链路证据的取值」的固化 —— §9.5.3 的实测表里，
+///    「P 距机位 300 m」是唯一被端到端验证过的取值（两个相反方向各成功一次）；
+///    「P == 机位（偏移 0）」只过了 PX4 的校验，全链路降落**未实测**。
+/// ‼️ §9.5.3 明确「**不必为降落端再定一个距离常数**」⇒ 本值**不进**后端运营常数、
+///    **不进** `PlanViewSettings`、**不是** `vtol_landing_transition_distance` 的替代品
+///    （那个常数按 §9.5.8 不该存在）。
+///    它只回答「P 摆在哪」，**不回答「什么时候转换」** —— 后者由 PX4 的 `NAV_ACC_RAD` 管
+///    （§9.5.3 / §9.5.4：触发判据对着机位、不对着 P）。
+/// ⛔ 不要把它做成设置项，也不要把「必须 ≥ 300 m」写进给用户的说明（§9.5.3 末）。
+var LAND_FW_APPROACH_OFFSET_M = 300
+
+/// `MAV_CMD_DO_VTOL_TRANSITION` —— 请求 VTOL 转换。参数 1 是目标状态。
+/// 取自 MAVLink 生成的头文件（本仓 `build/_deps/mavlink-build/include/mavlink/`）。
+/// ⚠️ 本值与下面要引的 `MAV_VTOL_STATE_*` **不在同一个头文件里**（本次构建实测）：
+///    `MAV_CMD_DO_VTOL_TRANSITION` 在 `all/all.h`，`MAV_VTOL_STATE_MC` 在 `common/common.h`。
+///    这两份都是**构建产物**，行号会随依赖更新漂移 ⇒ 要核就现搜，别照抄行号。
+/// ⚠️ 与 `MAV_VTOL_STATE_*` 同处一族，但**别按数值猜**：`MAV_VTOL_STATE_MC` 是 3 不是 2
+///    （2 是 `TRANSITION_TO_MC`，转换途中那一档 —— 发错了就变成"要求它正在转换"）。
+var MAV_CMD_DO_VTOL_TRANSITION = 3000
+
+/// 进近方式维度：本 kind 是否「先转多旋翼再进近」。
+///
+/// F2 与 F3 为真，F1 为假。**未知 kind 回 `false`** —— 这里保守的方向是
+/// 「不要擅自转 MC」：转 MC 是不可逆的机体动作，而"不转"最坏只是航线不合预期。
+function landKindTransitionToMc(kind) {
+    return kind === LAND_KIND_TO_MC || kind === LAND_KIND_MC_RESCUE
+}
+
+/// 统一链第 ① 步（§9.8.4）：由 kind、机位坐标、机位朝向算出**落点与进近点**。
+///
+/// 落点恒为**接机机位**（§9.7 定义第 1 条：无条件 ≠ 随便落）。
+/// 进近点 P 随进近方式变，两格各有实测支撑：
+///   保持 FW ⇒ 机位沿「机位朝向」偏 `LAND_FW_APPROACH_OFFSET_M`（§9.5.3）
+///   先转 MC ⇒ **P = 机位同坐标**（§9.7 三次实测 #2/#3/#4）
+///
+/// `slotHeadingDeg` 是后端 `assign_slot_heading`（接机机位表 `table_slot.heading` 的真实值，
+/// 后端一直下发，只是 QGC 侧此前从未读取）。
+/// ⚠️ 多数机位的该值是占位 0 ⇒ 算出的方向无意义。**这不影响正确性**：
+///    §9.5.4 的排除性实测已证「P 不决定转换时机」，P 只承担「让航线过 PX4
+///    `FeasibilityChecker` 的『首项不能是降落航点』那道校验」（§9.5.2）。
+///    读朝向只是为了**让 P 不随机**，不是为了进近几何。
+/// ⚠️ 先转 MC 那一支**不读朝向**（§9.5.9 第 1、2 条：降落端不管朝向）
+///    ⇒ 朝向缺失也照样能算出 P。
+///
+/// 回 `{ lat, lon }`；**朝向**不可用（仅限 F1）、或 kind 未知时回 `null`。
+///
+/// ‼️ **坐标是不是 0/0 不是本函数的判据**。F1/F2 的 0/0 闸在 `_execLand` 入口处
+///    （那条路读库，手里有业务上下文）；F3 是救济，**零闸** —— §9.7 逐字「不推演
+///    『尚未指派』的中间窗口，本节因此不设『坐标是否为 0』之类的前置校验」。
+///    本函数只回答「由 kind + 机位算出 P」；这个坐标是不是业务上有效的机位，是**调用方**的事。
+///    ⇒ `0/0` 是**合法输入**：先转 MC 那一支原样传出，保持 FW 那一支照常算出偏 300 m 的 P。
+///    NaN 与越界由 C++ 侧 `QGeoCoordinate::isValid()` 在组 `MissionItem` 时挡 ——
+///    那是**输入合法性**，不是业务状态判据，与上面那条分工不冲突。
+/// ‼️ **调用方必须把 `null` 当失败处理**，不许拿它去组航线 —— 那会变成 (0,0)。
+function landApproachPoint(kind, slotLat, slotLon, slotHeadingDeg) {
+    if (kind === LAND_KIND_TO_MC || kind === LAND_KIND_MC_RESCUE) {
+        return { lat: slotLat, lon: slotLon }
+    }
+    if (kind === LAND_KIND_KEEP_FW) {
+        // 复用起飞端的球面偏移几何（`takeoffTransitionPoint` 只算距离与方位，
+        // 与"起飞/降落"的语义无关）。朝向非数字时它回 null，正是本函数要的契约。
+        return takeoffTransitionPoint(slotLat, slotLon, slotHeadingDeg,
+                                      LAND_FW_APPROACH_OFFSET_M)
+    }
+    return null
 }

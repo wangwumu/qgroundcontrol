@@ -402,7 +402,9 @@ protected:
 
     /// Sets the vehicle to the specified flight mode with validation and retries
     ///     @return: true - vehicle in specified flight mode, false - flight mode change failed
+public:
     bool _setFlightModeAndValidate(Vehicle *vehicle, const QString &flightMode) const;
+protected:
 
     virtual QString _internalParameterMetaDataFile(const Vehicle* /*vehicle*/) const { return QString(); }
     virtual MAV_AUTOPILOT _autopilotType() const { return MAV_AUTOPILOT_GENERIC; }

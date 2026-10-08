@@ -41,6 +41,7 @@
 #include "MAVLinkLogManager.h"
 #include "MAVLinkProtocol.h"
 #include "MissionCommandTree.h"
+#include "MissionItem.h"
 #include "MissionManager.h"
 #include "MultiVehicleManager.h"
 #include "ParameterManager.h"
@@ -1081,7 +1082,7 @@ void Vehicle::_handleExtendedSysState(mavlink_message_t& message)
         break;
     }
 
-    // ⚠️ 机型闸：非 VTOL 机体走不进这一块 ⇒ `_vtolState` **永远是初值 0**（`Vehicle.h:982`），
+    // ⚠️ 机型闸：非 VTOL 机体走不进这一块 ⇒ `_vtolState` **永远是初值 0**（`Vehicle.h:1026`），
     //    `vtolStateChanged` 也一次都不发。
     //    当前唯一的消费方是「切换多旋翼降落」链路（`OpsView.OpsView.qml` / `TaskListPanel.qml`），
     //    而那条链路只在 VTOL 上成立，所以这个前提眼下够用。
@@ -2524,10 +2525,14 @@ void Vehicle::setVtolInFwdFlight(bool vtolInFwdFlight)
 
 bool Vehicle::hoverAndTransitionToMultirotor()
 {
-    // ⚠️ 机型闸：本函数**没有** `vtol()` 前置检查（2026-09-29 审查 C1）。调用方
-    //    `OpsView._switchToMultirotorThenReturn` 也没有。用户 2026-09-29 裁定**暂只处理 VTOL**
-    //    ⇒ 此处只标注、不加闸。非 VTOL 机体上调用它的后果见 `_handleExtendedSysState` 里
-    //    `if (vtol())` 那段的注记（30 秒必超时、飞机悬停在原地）。
+    // ⚠️ 机型闸：本函数**没有** `vtol()` 前置检查（2026-09-29 审查 C1）。用户 2026-09-29
+    //    裁定**暂只处理 VTOL** ⇒ 此处只标注、不加闸。非 VTOL 机体上调用它的后果见
+    //    `_handleExtendedSysState` 里 `if (vtol())` 那段的注记。
+    //    ⚠️ 「30 秒必超时、飞机悬停在原地」这句话描述的是**旧调用方**（`OpsView` 里那个
+    //       已退役的「切 Hold → 转 MC → RTL」链路）的后果，那个调用方在降落统一链里已被删掉。
+    //       本函数在当前树里**没有生产调用方**：统一链走 `Vehicle::startVtolLandingMission`，
+    //       由它自己发转换命令。函数体与 `Vehicle.h` 里那条 `Q_INVOKABLE` 声明都还在
+    //       （那处上方英文注释描述的仍是旧的 Hold→RTL 机制，未随本次退役更新）。
     //
     // Leave RTL before the back-transition. Re-issuing RTL while already in RTL is the same
     // navigator mode, so NavigatorMode::run() takes the on_active() branch and the RTL state
@@ -2564,6 +2569,209 @@ bool Vehicle::hoverAndTransitionToMultirotor()
                    true,              // show errors
                    MAV_VTOL_STATE_MC, // transition state
                    0, 0, 0, 0, 0, 0); // param 2-7 unused
+    return true;
+}
+
+QList<MissionItem*> Vehicle::createVtolLandingMissionItems(double approachLat, double approachLon,
+                                                           double slotLat, double slotLon,
+                                                           double altRel)
+{
+    QList<MissionItem*> items;
+
+    // 第 0 项：占位。在 PX4 路径上它必被 `PlanManager::writeMissionItems` 删掉（见头文件注释）。
+    // 类型选 `MAV_CMD_NAV_WAYPOINT` 而不是别的：它是最无害的导航项 —— 万一某个固件不删第 0 项，
+    // 飞机也只是先飞一个普通航点，不会凭空触发降落。
+    items.append(new MissionItem(0,
+                                 MAV_CMD_NAV_WAYPOINT,
+                                 MAV_FRAME_GLOBAL_RELATIVE_ALT,
+                                 0.0, 0.0, 0.0, qQNaN(),
+                                 approachLat, approachLon, altRel,
+                                 true,     // autoContinue
+                                 false,    // isCurrentItem —— 由 PlanManager 按 firstIndex 重设
+                                 nullptr));
+
+    // 第 1 项：进近点。删掉占位后它成为首项 ⇒ **必须不是降落航点**，
+    // 否则 PX4 的 FeasibilityChecker 拒收（`navigator_mis_starts_w_landing2`）。
+    items.append(new MissionItem(1,
+                                 MAV_CMD_NAV_WAYPOINT,
+                                 MAV_FRAME_GLOBAL_RELATIVE_ALT,
+                                 0.0, 0.0, 0.0, qQNaN(),
+                                 approachLat, approachLon, altRel,
+                                 true,
+                                 false,
+                                 nullptr));
+
+    // 第 2 项：接机机位上的 VTOL 降落。
+    items.append(new MissionItem(2,
+                                 MAV_CMD_NAV_VTOL_LAND,
+                                 MAV_FRAME_GLOBAL_RELATIVE_ALT,
+                                 0.0, 0.0, 0.0, qQNaN(),
+                                 slotLat, slotLon, altRel,
+                                 true,
+                                 false,
+                                 nullptr));
+
+    return items;
+}
+
+bool Vehicle::startVtolLandingMission(double approachLat, double approachLon,
+                                      double slotLat, double slotLon)
+{
+    // ---- 参数闸：每一条都必须变成可见失败，不许静默 return ----
+
+    // ⚠️ 这里**只**挡输入合法性（NaN / 越界），**不**挡 (0, 0)：
+    //    (0, 0) 是合法坐标，「有没有可用接机机位」是**业务**判据，由 QML 侧按路径分别把关 ——
+    //    正常降落的两条路判、救济路刻意不判（§9.7 定义第 2 条：不看数据库状态）。
+    if (!QGeoCoordinate(approachLat, approachLon).isValid() ||
+        !QGeoCoordinate(slotLat, slotLon).isValid()) {
+        emit vtolLandingMissionFinished(false, tr("降落航线未发出：坐标无效。"));
+        return false;
+    }
+
+    if (!_missionManager) {
+        emit vtolLandingMissionFinished(false, tr("降落航线未发出：内部错误（航线管理器不可用）。"));
+        return false;
+    }
+
+    // `PlanManager::writeMissionItems` 的第一条提前 return：离线编辑机型。
+    // 它**不删**传入的 QList ⇒ 必须在调用前自判，否则那三项无人释放。
+    if (isOfflineEditingVehicle()) {
+        emit vtolLandingMissionFinished(false, tr("降落航线未发出：无人机未连接。"));
+        return false;
+    }
+
+    // 第二条提前 return：上一次航线写入尚未结束。同样不删传入的 QList。
+    if (_missionManager->inProgress()) {
+        emit vtolLandingMissionFinished(false, tr("降落航线未发出：上一次航线写入尚未完成，请稍后重试。"));
+        return false;
+    }
+
+    // 高度：取**这一刻**飞机的相对高度（相对 home，米），进近点与机位两点同值。
+    Fact* const altFact = altitudeRelative();
+    const double altRel = altFact ? altFact->rawValue().toDouble() : qQNaN();
+    if (!qIsFinite(altRel)) {
+        // 失链、或尚未收到 `GLOBAL_POSITION_INT` 时该 Fact 被置 NaN。
+        emit vtolLandingMissionFinished(false, tr("降落航线未发出：相对高度数据不可用。"));
+        return false;
+    }
+
+    MissionManager* const missionManager = _missionManager;
+
+    // ‼️ 切模式必须等 `sendComplete`：上传是异步事务（MISSION_COUNT → 逐项 → 等 ACK），
+    //    在 ACK 回来之前切模式，飞控的 dataman 里还没有新航线。
+    //
+    // 两个连接都是**一次性**的（`Qt::SingleShotConnection`）—— 否则同一架飞机的下一次降落
+    // 会接到上一次留下的残连接，把结果报两遍。
+    //
+    // 两个信号的先后不保证：`error` 可能先到、`sendComplete(true)` 随后也到。
+    // 调用方（QML）按阶段位挡住重复回报，这里不为它做去重。
+    //
+    // ⚠️ 但 `Qt::SingleShotConnection` **只保证「发过就断」，不保证「一定会发」**（M4）：
+    //    异常路径下 `sendComplete` 可能**永不到**（上传事务被放弃、link 在中途断开），
+    //    那条连接就留在 `missionManager` 上。下一次降落（或 Task 4 的改派重传）进来时，
+    //    会先撞上这条上一次遗留的连接 —— 同一次失败报两遍，且第二遍用的还是**旧**的闭包。
+    //    所以每次进来都要让上一次那两条连接**失效**。
+    //
+    //    ‼️ 治法：**代次计数**，不 `disconnect`。每次进来把 `_vtolLandGen` 递增，两个
+    //    lambda 各捕获自己的代次，回调首行比对 —— 不匹配即为被取代的遗留回调，直接丢弃。
+    //    （与 `_vtolReqSeq`/`_vtolSettledSeq` 同一手法：不销毁旧连接，只让它认不出自己。）
+    //
+    //    ⛔ **绝不能用 `disconnect(missionManager, &PlanManager::error, this, nullptr)`。**
+    //    那个写法（`nullptr` 作 slot ⇒ Qt 语义为「任意 slot」）会断开 `this` 在该信号上的
+    //    **全部**连接，而 `Vehicle.cc` 里有两条**既有**连接正是接在 `this`（Vehicle）上的：
+    //        :248  &MissionManager::error        → Vehicle::_missionManagerError
+    //        :251  &MissionManager::sendComplete → Vehicle::_clearCameraTriggerPoints
+    //    它们与本函数接的是**同一个信号** —— `MissionManager : public PlanManager`
+    //    （`MissionManager.h:9`）且未重声明这两个信号，故 `MissionManager::sendComplete`
+    //    就是 `PlanManager::sendComplete`。一旦断掉就是**永久**断开：
+    //    `_missionManagerError`（`Vehicle.cc:1641`，弹用户可见的
+    //    「Mission transfer failed. Error: …」）此后对**任何常规航线上传失败**都不再上报。
+    //    ⚠️ 这个坑极易漏看 —— 按 `PlanManager::sendComplete|PlanManager::error` 去 grep
+    //    `Vehicle.cc` 是**零命中**，因为那两条写作 `MissionManager::…`：同一个信号的两种拼法。
+    const quint64 gen = ++_vtolLandGen;
+
+    connect(missionManager, &PlanManager::error, this,
+            [this, gen](int errorCode, const QString& errorMsg) {
+                if (gen != _vtolLandGen) return;
+                emit vtolLandingMissionFinished(false,
+                    tr("降落航线写入出错（%1）：%2").arg(errorCode).arg(errorMsg));
+            },
+            Qt::SingleShotConnection);
+
+    connect(missionManager, &PlanManager::sendComplete, this,
+            [this, gen](bool error) {
+                if (gen != _vtolLandGen) return;
+                if (error) {
+                    emit vtolLandingMissionFinished(false, tr("降落航线上传失败，飞机未收到航线。"));
+                    return;
+                }
+
+                // ④ 切自动任务模式。守法与 `hoverAndTransitionToMultirotor` 同形：
+                // 先用 `setFlightModeCustom` 预检（**纯查表、无副作用**），预检失败 ⇒
+                // 一个字节都没发，必须变成可见失败 —— `setFlightMode()` 自己返回 void
+                // 且有两条静默失败路径（查表失败 `qCWarning`、primary link 没了 `qCDebug`）。
+                const QString missionMode = _firmwarePlugin->missionFlightMode();
+                uint8_t  baseMode   = 0;
+                uint32_t customMode = 0;
+                if (missionMode.isEmpty() ||
+                    !setFlightModeCustom(missionMode, &baseMode, &customMode)) {
+                    emit vtolLandingMissionFinished(false,
+                        tr("降落航线已上传，但本固件没有对应的自动任务模式，飞机不会执行。"));
+                    return;
+                }
+
+                // ‼️ **必须回读确认**（设计稿 §9.5.6 / §9.5.10）。只发 `setFlightMode` 不够：
+                //    §9.5.10 实测「PX4 拒绝以降落航点开头的航线」时，上传期**照回
+                //    `MISSION_ACK=0`**，但它把航线标成不可用、**切模式的命令被拒** ⇒
+                //    界面无痕、飞机不动。所以"上传成功"不能只凭 ACK，
+                //    **唯一判定是「模式真的切过去了」**。
+                //
+                //    `_setFlightModeAndValidate` 是**全仓既有的唯一一处**回读实现
+                //    （`FirmwarePlugin.cc:246-274`）：
+                //      ① `vehicle->flightMode() == flightMode` ⇒ **立即返回 true**。
+                //         这一支不是"偷懒"——「Mission 模式已 active 时上传即载入、切模式
+                //         命令是冗余的」正是 §9.7 实验 #4 的实测结论，本支就是它的代码形态。
+                //      ② 否则最多 3 轮 × 13 × 100 ms 等 `flightMode()` 变过去。
+                //    它**内部自己调 `vehicle->setFlightMode()`** ⇒ 这里不要再调一次
+                //    （再调一次会多出一条 SET_MODE，并让本用例的计数断言失去意义）。
+                //
+                // ⚠️ 它在本改动集里已被挪成 **public**（`FirmwarePlugin.h` 里那对
+                //    `public:` / `protected:` 夹层就是这处改动）—— 原先它是 `protected`，
+                //    而 `Vehicle` 不是 `FirmwarePlugin` 的子类，够不着。
+                //
+                // ⚠️ 本调用最坏阻塞 GUI 线程约 3.9 s。这与 `PX4FirmwarePlugin::startMission`
+                //    （`:570` 那处 `_setFlightModeAndValidate` 调用）的既有行为同量级，可接受。
+                //
+                // ⚠️ **不要**改用 `PX4FirmwarePlugin::startMission()`。理由**不是**「它会解锁」
+                //    —— `_armVehicleAndValidate`（`FirmwarePlugin.cc:222`）的**首行**就是
+                //    `if (vehicle->armed()) return true;`：飞行中调用它立即返回，既不阻塞、
+                //    也不发解锁/上锁命令。（`startMission` 里那处调用在 `:570`；计划早先写的
+                //    `:558` 是 `startTakeoff` 体内的同名调用，两个函数，别混。）
+                //    真正的理由有两条：
+                //      ① 它把「切模式」与「解锁」**绑成一个动作**，而本流程只要前者；
+                //      ② 它 `void` 无返回值，失败时走 `QGC::showAppMessage`（全局提示）——
+                //         本流程要的是 `vtolLandingMissionFinished` 这条**可被调用方捕获**的通路。
+                if (!_firmwarePlugin->_setFlightModeAndValidate(this, missionMode)) {
+                    emit vtolLandingMissionFinished(false,
+                        tr("降落航线已上传，但飞控未回读到自动任务模式，飞机不会执行。"
+                           "请在界面上确认无人机当前模式后再决定下一步。"));
+                    return;
+                }
+                emit vtolLandingMissionFinished(true, QString());
+            },
+            Qt::SingleShotConnection);
+
+    // ③ 上传。**必须垫第 0 项**（见 `createVtolLandingMissionItems` 的注释）。
+    const QList<MissionItem*> items =
+        createVtolLandingMissionItems(approachLat, approachLon, slotLat, slotLon, altRel);
+
+    // `writeMissionItems` 是同步的，且只有两种结局：要么把全部项接进自己的 `_writeMissionItems`
+    // （源码注释逐字「PlanManager takes control of passed MissionItem」），要么因上面已自判的
+    // 两条闸提前 return 而**一个都不接**。GUI 线程内从自判到这里没有事件循环重入点
+    // ⇒ 不存在「自判通过、调用时又变成提前 return」的窗口，因此不需要事后清理
+    //（事后清理反而危险：已被接管的项由 PlanManager 释放）。
+    missionManager->writeMissionItems(items);
+
     return true;
 }
 

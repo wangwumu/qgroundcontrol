@@ -27,7 +27,7 @@ ColumnLayout {
     id: panel
     spacing: 0
 
-    // 卡片下缘相对**本组件**的 y，随六个"要弹确认框"的信号回传给视图侧。
+    // 卡片下缘相对**本组件**的 y，随八个"要弹确认框"的信号回传给视图侧。
     // ‼️ 必须走 `mapToItem`：纵向 `ListView` 会覆写 delegate 的 `x`/`y`，`card.y` 是列表内的
     //    逻辑位置（`card.x` 恒为 0），与屏幕上的位置无关 —— 直接读它会让确认框定位到别处。
     function cardBottomYOf(cardItem) {
@@ -131,16 +131,21 @@ ColumnLayout {
     // 输出
     //-------------------------------------------------------------------------
     signal taskSelected(var task)
-    // ‼️ 下面**六个**信号（起飞/降落/停泊/签出/回航/取消交接）各多带一个 `cardBottomY`：确认框要
+    // ‼️ 下面**八个**信号（起飞/保持固定翼降落/切换多旋翼降落/MC方式降落/停泊/签出/回航/取消交接）
+    //    各多带一个 `cardBottomY`：确认框要
     //    贴在**触发它的那张卡片**下缘（用户 2026-09-28 要求）。视图侧算不出这个位置——纵向
     //    `ListView` 会覆写 delegate 的 `x`/`y`，直接读 `card.y` 拿到的是**列表内的逻辑位置**，
     //    与屏幕位置无关。所以在这里用 `mapToItem` 求卡片下缘（相对本组件），回传后由视图侧
     //    再换算成窗口坐标。取值一律走 `cardBottomYOf()`，别在各处重写这个表达式。
-    //    ⚠️ 只给**弹这个确认框的六个**加：`taskSelected`/`assignSlotRequested` 不弹框，
+    //    ⚠️ 只给**弹这个确认框的八个**加：`taskSelected`/`assignSlotRequested` 不弹框，
     //    `handoverProposed`/`checkinRequested` 弹的是别的东西，给它们加会让"哪些信号要定位"
     //    失去单一口径。
     signal takeoffRequested(var task, real cardBottomY)
     signal landRequested(var task, real cardBottomY)
+    /// F1「降落」：保持固定翼进近、正常降落（走闸 + 写库）。设计稿 §9.8.2 组合 ①。
+    signal keepFwLandRequested(var task, real cardBottomY)
+    /// F3「MC方式降落」：先转多旋翼、**救济**路径（不走闸、不读写数据库）。设计稿 §9.8.2 组合 ③。
+    signal mcRescueLandRequested(var task, real cardBottomY)
     signal parkRequested(var task, real cardBottomY)
     signal assignSlotRequested(var task)
     signal handoverProposed(int taskId, string phase)
@@ -602,14 +607,35 @@ ColumnLayout {
                         }
                         // ── 站点视图：进站（accept 交接走 handoverDialog，此处无行内确认按钮）──
                         Button {
+                            // F1「降落」= 保持固定翼进近 + 正常降落。
+                            // ‼️ `visible` / `enabled` 与下面 F2 那颗**逐字相同**（设计稿 §9.8.2 的裁定）
+                            //    —— 两条路的**入口条件**没有区别，区别在「进近方式」这个执行维
+                            //    （设计稿 §9.8.2 的两个正交维度），不由入口条件区分。
+                            //    将来若有人想给这两颗不同的可见性，先回答：凭什么同一架飞机、
+                            //    同一个状态下，一条路能点、另一条不能点？
+                            visible: card._inboundActionable
+                                     && modelData.status === "IN_FLIGHT"
+                            enabled: modelData.assign_slot_id ? true : false
+                            height: 24; padding: 0
+                            text: qsTr("降落")
+                            onClicked: panel.keepFwLandRequested(modelData, panel.cardBottomYOf(card))
+                        }
+                        Button {
                             // ⚠️ **机型闸没有**（2026-09-29 审查 C1）：`visible` 与 `enabled` 都不看该载具是不是
-                            //    VTOL。非 VTOL 机体上点它会一路走到 30 秒超时 —— 飞机已被 Hold 拽出航线悬停，
-                            //    而 RTL 从未发出。见 `OpsView.qml` 里「切换多旋翼降落」那段的头注。
+                            //    VTOL。非 VTOL 机体上点它，`_vtolState` 恒为 0 ⇒ `vtolTransitionDone(0)`
+                            //    恒为 false ⇒ 会先发一条转换命令、然后走满 30 秒转换超时，弹
+                            //    「切换多旋翼未完成」。见 `OpsView.qml` 里降落统一链那段的头注。
+                            //    ‼️ 旧注释在这里写的是「飞机已被 Hold 拽出航线悬停，而 RTL 从未发出」——
+                            //    那是**已退役**的「切 Hold → 转 MC → RTL」链路的后果。统一链的 ②③④
+                            //    只发「转 MC / 上传两航点 / 切 AUTO_MISSION」三条，**不切 Hold、不发 RTL**
+                            //    （设计稿 §9.8.5）⇒ QGC 侧已不存在「把飞机拽出航线」这一步。
+                            //    ⚠️ 非 VTOL 机体收到那条转换命令后 PX4 如何处置，**未实测**。
                             //    用户 2026-09-29 裁定**暂只处理 VTOL** ⇒ 只标注、不加闸。
                             //    将来加闸的取值点：`card._uav ? card._uav.vtol : false`（`card` 已持有该载具）。
                             // 6.0-E 切换多旋翼降落：仅已签入(LANDING)（landing_accepted）且 DB 仍 IN_FLIGHT 时出现；
-                            // 点按→红绿确认→机位校验→POST /tasks/:id/land（LANDING 唯一写路径）→脱离回航、
-                            // 转多旋翼、重新发出回航（落点仍是原机位）。见 `OpsView._switchToMultirotorThenReturn`。
+                            // 点按→红绿确认→机位校验→POST /tasks/:id/land（LANDING 唯一写路径）→转多旋翼、
+                            // 上传两航点 [WAYPOINT@进近点, VTOL_LAND@机位]、切 AUTO_MISSION，之后由 PX4 自主飞回降落。
+                            // 见 `OpsView._startLandFlow`。
                             // ‼️ 判据收敛到 `_inboundActionable`（＝本站已接管降落指挥）**叠加** `IN_FLIGHT`：
                             //    与原判据 `isInbound && IN_FLIGHT && landingAccepted` 逐值等价
                             //    （`_inboundActionable` 是 `LANDING || (IN_FLIGHT && landingAccepted)`，
@@ -631,6 +657,28 @@ ColumnLayout {
                             height: 24; padding: 0
                             text: qsTr("切换多旋翼降落")
                             onClicked: panel.landRequested(modelData, panel.cardBottomYOf(card))
+                        }
+                        Button {
+                            // F3「MC方式降落」= 先转多旋翼 + **救济**入口。
+                            // ‼️ **卡片级**常驻：`visible` / `enabled` **不加任何机型/状态/机位闸**。
+                            //    理由（用户 2026-10-06 第 7 条逐字）：「当需要救济的时候，飞机的
+                            //    位置、姿态、高度等参数都是不可预测的」—— 一个按正常状态设计的闸，
+                            //    在异常状态下恰好会把救济挡在门外。凡"点了也白点"的情形，由
+                            //    `_startLandFlow` 弹**可见的失败**（Task 4），不由按钮静默禁用。
+                            // ⚠️ 「常驻」是指**卡片级**：卡片本身只在任务出现在列表里时才存在，
+                            //    这条不改变任务的可见性规则。
+                            // ‼️ **但必须挂 `panel.showSiteActions`**（2026-10-08 终局审查 F4 修）。
+                            //    它不是状态闸 —— 是**视图级**的「这个面板有没有站点操作权」，
+                            //    与用户那条「不因飞机状态异常而藏起来」不冲突（同排每一颗站点动作
+                            //    按钮都挂在它上面，F1/F2 是经 `card._inboundActionable` 间接挂的）。
+                            //    不加的后果：`RomView.qml` 硬编码 `showSiteActions: false`，且**没有**
+                            //    接 `onMcRescueLandRequested` ⇒ 监控员视图每一张卡片上都有一颗
+                            //    可点、点了**什么都不发生**（无弹窗、无请求、无报错）的救济按钮。
+                            visible: panel.showSiteActions
+                            enabled: true
+                            height: 24; padding: 0
+                            text: qsTr("MC方式降落")
+                            onClicked: panel.mcRescueLandRequested(modelData, panel.cardBottomYOf(card))
                         }
                         Button {
                             // 指定机位：签入(LANDING)后可预占（后端 AssignSlot 门控 IN_FLIGHT+ACCEPTED LANDING 或 LANDING）

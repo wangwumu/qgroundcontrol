@@ -66,6 +66,7 @@ class LinkInterface;
 class MAVLinkLogManager;
 class MavCommandQueue;
 class MessageIntervalManager;
+class MissionItem;
 class MissionManager;
 class ParameterManager;
 class RequestMessageCoordinator;
@@ -769,6 +770,10 @@ public slots:
     void _offlineFirmwareTypeSettingChanged (QVariant varFirmwareType); // Should only be used by MissionControler to set firmware from Plan file
     void _offlineVehicleTypeSettingChanged  (QVariant varVehicleType);  // Should only be used by MissionController to set vehicle type from Plan file
     Q_INVOKABLE void sendGripperAction(GRIPPER_ACTIONS gripperOption);
+    /// ⚠️ **当前树里没有生产调用方**（降落统一链 §9.8 走 `startVtolLandingMission`）。
+    ///    本函数与下面这段说明保留原样，描述的是它**自己**仍会做的事；
+    ///    「so the caller can …」那句针对的调用方（旧「切 Hold → 转 MC → RTL」链）已退役。
+    ///
     /// Switches to Hold and commands a VTOL back-transition to multirotor.
     /// Re-issuing RTL while already in RTL is the same navigator mode, so on_activation() never
     /// runs and the RTL state machine is not restarted. Leaving RTL first is what makes the
@@ -778,6 +783,36 @@ public slots:
     ///         surface a visible failure instead of waiting for a transition that will not happen.
     ///         Also: no `vtol()` precondition — non-VTOL airframes must not call this (2026-09-29).
     Q_INVOKABLE bool hoverAndTransitionToMultirotor();
+
+    /// 走降落端统一链（设计稿 §9.8.4）的 ③④ 步：上传两航点
+    /// `[WAYPOINT@进近点, VTOL_LAND@机位]`，上传成功后切自动任务模式（PX4 上是 `AUTO_MISSION`）。
+    /// 此后由 PX4 自主完成飞回与降落，QGC 不再发任何指令。
+    ///
+    /// ‼️ 高度取**调用这一刻**的 `altitudeRelative()`（相对 home，米），进近点与机位两点同值。
+    ///    依据 §9.7 的三次 SITL 实测：三次都取「上传时飞机的相对高度」，全部成功落地。
+    ///
+    /// 结果一律经 `vtolLandingMissionFinished` 回报 —— **不静默**。
+    /// `ok == false` 时 `message` 是可直接展示给用户的失败原因。
+    ///
+    /// @return false ＝ **一个字节都没发**（参数闸没过）。调用方必须把它变成可见失败，
+    ///         不许当成功继续等落地 —— 那会让操作员看着一架不会动的飞机。
+    Q_INVOKABLE bool startVtolLandingMission(double approachLat, double approachLon,
+                                             double slotLat, double slotLon);
+
+    /// 组出一条降落航线：`[占位项, WAYPOINT@进近点, VTOL_LAND@机位]`。
+    ///
+    /// ‼️ **第 0 项是占位、在 PX4 路径上必被删掉**：PX4 的 `sendHomePositionToVehicle()` 返回
+    ///    false（源码注释逐字「PX4 stack does not want home position sent in the first position.
+    ///    Subsequent sequence numbers must be adjusted.」）⇒ `PlanManager::writeMissionItems`
+    ///    取 `skipFirstItem = true` ⇒ `delete missionItems[0]`，其余项 `setSequenceNumber(seq - 1)`。
+    ///    **不垫这一项，两航点会被删成单航点 `VTOL_LAND`**，PX4 在 `FeasibilityChecker` 里以
+    ///    `navigator_mis_starts_w_landing2` 拒收 —— 而上传层**仍回 `MISSION_ACK = 0`**，
+    ///    界面无痕、飞机不动（设计稿 §9.5.2 / §9.5.10）。
+    ///
+    /// 调用方取得返回列表里各项的所有权。
+    static QList<MissionItem*> createVtolLandingMissionItems(double approachLat, double approachLon,
+                                                             double slotLat, double slotLon,
+                                                             double altRel);
 
 signals:
     void coordinateChanged              (QGeoCoordinate coordinate);
@@ -794,6 +829,8 @@ signals:
     /// 载荷为 `MAV_VTOL_STATE_*` 原始值。**不要**改成 `bool`：`TRANSITION_TO_MC`(2)
     /// 与 `MC`(3) 必须可区分，否则"正在转"会被当成"转完了"（发出回航的时机就错了）。
     void vtolStateChanged               (int vtolState);
+    /// 降落航线（统一链 ③④ 步）的结果。`ok == false` 时 `message` 为可直接展示的失败原因。
+    void vtolLandingMissionFinished       (bool ok, const QString& message);
     void prearmErrorChanged             (const QString& prearmError);
     void soloFirmwareChanged            (bool soloFirmware);
     void defaultCruiseSpeedChanged      (double cruiseSpeed);
@@ -1173,6 +1210,11 @@ public:
     TerrainProtocolHandler* _terrainProtocolHandler = nullptr;
 
     MissionManager*                 _missionManager             = nullptr;
+    /// 降落航线事务的**代次**。每次进 `startVtolLandingMission` 递增；两个一次性 lambda
+    /// 各捕获自己的代次、回调首行比对 —— 目的是让**上一次遗留的残连接**失效，
+    /// 而**不是**去 `disconnect` 它（那个写法会连带断开 `Vehicle.cc:248` / `:251`
+    /// 两条既有连接，见 `.cc` 里那段 ⛔ 注释）。
+    quint64 _vtolLandGen = 0;
     GeoFenceManager*                _geoFenceManager            = nullptr;
     RallyPointManager*              _rallyPointManager          = nullptr;
     VehicleLinkManager*             _vehicleLinkManager         = nullptr;
