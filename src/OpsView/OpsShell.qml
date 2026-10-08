@@ -124,7 +124,17 @@ Item {
     //    都是"跨不出去、只能注入"的求值函数。
     property var  _handoverAnchorFn: null
     property real _handoverAnchorY: -1
-    property int   _now:           Date.now()
+    // ‼️ 必须是 `real`（double），**不能是 `int`**：`Date.now()` 是**毫秒** epoch（≈1.79e12），
+    //    而 QML 的 `int` 是 **32 位有符号**（上限 2147483647）——赋值时按 ToInt32 **取模 2³²**。
+    //    2026-10-08 实测（Qt 6.11.1 的 `qml` 运行时）：1791426741618 → 425379186。
+    //    两个后果都不报错：
+    //      ① `OpsCommon.remainingSec` 的交接倒计时显示成 ≈1.79e9 秒（用户实报
+    //         「待降落指挥确认：1791001640s」），而且**斜率仍对**（每秒减 1）⇒ 看起来
+    //         像个正常倒计时，只是起点错了六个数量级；
+    //      ② `OpsCommon.isTimeout` 判的是 `nowMs > deadline` ⇒ 4.25e8 > 1.79e12 **恒假**
+    //         ⇒ 本地的超时红条与「超时」字永不触发（真正到点作废交接的是后端 `scanTimeout`，
+    //         10 秒一轮，所以界面表现是"到点那一行确实会消失，但全程没有红色告警"）。
+    property real  _now:           Date.now()
     property string _handoverActionError: ""  // 交接确认/拒绝/撤回失败提示（handoverDialog 保留可重试）
     // 本站站点 id 来自登录响应 role_sites 单值（AuthController.siteId，仅内存），不再从任务反推。
     property var   _mySiteId:       AuthController.siteId

@@ -449,14 +449,20 @@ ColumnLayout {
                             text: qsTr("航线性质：") + OpsCommon.routeNature(modelData)
                         }
                     }
-                    // 交接状态徽标
-                    // 提出方姓名取 `card._handover.proposed_by_name`（**交接对象**上的字段）——
-                    // 两个来源都带它（`opsHandoverInfo` 与 `/handovers/pending` 的项各有一份，
-                    // 都是服务端 join `table_user.display_name` 得来的）。
-                    // ‼️ 原代码写的是 `modelData.proposed_by_name`——**任务项上压根没有这个字段**
-                    //    （`opsOverviewItem`/`opsRouteTaskItem` 都没有，它只在交接对象里），
-                    //    故恒为 `undefined`，非本人提出时这一段恒渲染成空串：
-                    //    徽标成了「待接管确认 ·  · 28s」，**两个角色都一样**，且不报错。
+                    // 交接状态徽标：`待〈目标相位〉确认：〈剩余秒数〉s`（例「待降落指挥确认：300s」）。
+                    // ‼️ 2026-10-08 用户裁定：**删掉中间那段「谁提出的」**。改前是
+                    //    `待〈相位〉确认 · 〈我提出｜对方姓名〉 · 〈N〉s`；现在航线侧与站点侧**同文**
+                    //    （本行是两侧共用的同一处表达式，中间段一删，两边就都只剩相位与秒数）。
+                    //    被删掉的原文留档（别以为是手滑）：
+                    //      `OpsCommon.isMine(card._handover, AuthController.userId) ? qsTr("我提出")
+                    //       : (card._handover.proposed_by_name ? card._handover.proposed_by_name : "")`
+                    //    它自己的来历也一并留档：原代码读的是 `modelData.proposed_by_name`，而
+                    //    **任务项上压根没有这个字段**（`opsOverviewItem`/`opsRouteTaskItem` 都没有，
+                    //    它只在交接对象里）⇒ 恒为 `undefined`，非本人提出时那段渲染成空串
+                    //    （「待接管确认 ·  · 28s」，**两个角色都一样**，且不报错）；后改为读
+                    //    交接对象上的字段才对，本次连同这段文案一起删除。
+                    //    ⚠️ `OpsCommon.isMine` 本身**没有作废**，仍在用：本文件 `:797` 的【撤回】
+                    //    可见性、`OpsShell.qml` 交接弹框的「撤回 / 确认接管」。
                     // ‼️ 2026-09-24（裁定 丙）：**等我动手**那一侧加底色与描边。改前两个角色看到的是
                     //    同一行 11px 无底色小字，而「待我确认」是需要立刻行动的状态、混在航班列表里
                     //    极易漏掉（超时扫描器 10 秒一轮，人还没看见就已经作废了）；提出方那侧只是在
@@ -484,9 +490,10 @@ ColumnLayout {
                             color: card._timedOut ? "#ff3b3b" : "#ffc107"
                             font.pixelSize: 11
                             wrapMode: Text.Wrap
+                            // ‼️ 全角冒号「：」，不是 ` · `；秒数由 `OpsCommon.remainingSec` 带 `s` 后缀
+                            //    （超时后它回「超时」，整行读作「待降落指挥确认：超时」）。
                             text: card._handover ? (qsTr("待") + OpsCommon.phaseToLabel(card._handover.phase_to) +
-                                  qsTr("确认 · ") + (OpsCommon.isMine(card._handover, AuthController.userId) ? qsTr("我提出") : (card._handover.proposed_by_name ? card._handover.proposed_by_name : "")) +
-                                  qsTr(" · ") + OpsCommon.remainingSec(card._handover, panel.nowMs)) : ""
+                                  qsTr("确认：") + OpsCommon.remainingSec(card._handover, panel.nowMs)) : ""
                         }
                     }
                     // 签出提示条（驳回理由 / 超时说明）
