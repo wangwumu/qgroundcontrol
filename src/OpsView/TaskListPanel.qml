@@ -554,8 +554,9 @@ ColumnLayout {
                     //    当时最坏情况是到站卡同时亮 **4 颗**：降落 / 切换多旋翼降落 /
                     //    直接降落 / 指定机位。
                     //    ⇒ 2026-10-08 第三轮之后**同一场景只剩 2 颗**（降落 / 切换多旋翼降落）：
-                    //    用户把同场的【指定机位】删了（点降落第一步就是选机位），而【直接降落】
-                    //    的判据是 `LANDING`、与这两颗的 `IN_FLIGHT` 不同场。
+                    //    【指定机位】的 `visible` 收窄到不含 `IN_FLIGHT` ⇒ 在本场景**不可见**
+                    //    （‼️ 是**收窄**不是删除 —— 见下面 `LANDING` 那一态它照旧在场），
+                    //    而【直接降落】的判据是 `LANDING`、与这两颗的 `IN_FLIGHT` 不同场。
                     //    ⚠️ **仍不要把 `Flow` 改回 `Row`**：按钮数变少不等于溢出问题消失 ——
                     //    `LANDING` 那一态（直接降落 / 指定机位 / 停泊）与出站各态同样是多颗并存。
                     //    `Flow` 放不下就折行；卡片高度是 `taskBody.height + 12`（自适应）⇒ 折行后
@@ -642,9 +643,14 @@ ColumnLayout {
                             // ‼️ 恒可点（2026-10-08 用户第三轮）：点下去**第一步就是选机位**
                             //    （`OpsView._beginLandFlow` → 机位选择框）⇒"库里有没有已指派机位"
                             //    不再是这条路的前置条件——选中的机位会**覆盖**旧值，没有旧值一样走得通。
-                            //    改前这里判 `assign_slot_id`，与同一轮被删掉的【指定机位】按钮合起来
-                            //    会造出**死锁**：从未指派过机位的任务，两颗降落按钮灰着、而指派它的
-                            //    入口已经不存在了。判据变迁的完整留档在下面 F2 那颗的同名位置。
+                            //    改前这里判 `assign_slot_id`，那道前置**单独**只是把按钮误灰；会在整条
+                            //    链上合成**死锁**的是它与【指定机位】入口**同时**收紧 —— 从未指派过机位
+                            //    的任务，两颗降落按钮灰着、而指派它的入口也不可点。
+                            //    ‼️ 但那只是**条件**，2026-10-08 那一轮**没有**发生：同轮只把那颗按钮的
+                            //    `visible` 从 `_inboundActionable`（**含 IN_FLIGHT**）**收窄**为
+                            //    `card._inboundActionable && modelData.status !== "IN_FLIGHT"`、**并未删除**
+                            //    ⇒ IN_FLIGHT 段照旧可点，死锁当时不成立。判据变迁的完整留档在下面 F2 那颗的
+                            //    同名位置。
                             enabled: true
                             height: 24; padding: 0
                             text: qsTr("降落")
@@ -681,9 +687,13 @@ ColumnLayout {
                             //    改前 = `assign_slot_id ? true : false`（**实际指派的降落机位**，
                             //    与后端 Land/CheckLandingSlot 同一子查询口径）。
                             //    改的理由：点下去第一步就是选机位（`_beginLandFlow`），选中的机位会
-                            //    **覆盖**旧值 ⇒"有没有旧值"不再是前置条件。而**留着这条判据**会与同一轮
-                            //    删掉的【指定机位】按钮合起来造出**死锁** —— 从未指派过机位的任务，
-                            //    按钮灰着，而指派它的入口已经没了。
+                            //    **覆盖**旧值 ⇒"有没有旧值"不再是前置条件。而**留着这条判据**会与
+                            //    【指定机位】入口**同时**收紧时合成**死锁** —— 从未指派过机位的任务，
+                            //    按钮灰着，而指派它的入口也不可点。
+                            //    ‼️ 但那只是**条件**：2026-10-08 同轮只把【指定机位】的 `visible` 从
+                            //    `_inboundActionable`（**含 IN_FLIGHT**）**收窄**为
+                            //    `card._inboundActionable && modelData.status !== "IN_FLIGHT"`、**并未删除**
+                            //    ⇒ IN_FLIGHT 段照旧可点，死锁当时不成立。
                             //    ⚠️ 这条判据的由来仍须记住：**不能用 `landing_slot_id`** —— 那是**落地后
                             //    的快照**（只有 `Park` 写，写时状态已 COMPLETED），飞行/回航阶段**恒为 NULL**
                             //    ⇒ 按钮**永远点不了**。（2026-09-28 修。属"判据字段在真实数据里恒为默认值"
@@ -751,7 +761,8 @@ ColumnLayout {
                             onClicked: panel.mcRescueLandRequested(modelData, panel.cardBottomYOf(card))
                         }
                         Button {
-                            // 指定机位：签入(LANDING)后可预占（后端 AssignSlot 门控 IN_FLIGHT+ACCEPTED LANDING 或 LANDING）
+                            // 指定机位：飞行中**指派**落点（**非占用**；后端 AssignSlot 门控 IN_FLIGHT+ACCEPTED LANDING
+                            // 或 LANDING。⚠️ **界面**显示面 2026-10-08 用户第三轮已收窄为只剩 `LANDING` 态，见下）
                             // ‼️ `_inboundActionable` 的判据**逐字**取自本按钮原来那句的中段
                             //    （`LANDING || (IN_FLIGHT && landingAccepted)`）⇒ 收敛不改变行为。
                             //    ⚠️ 那个 `IN_FLIGHT` 原先"由 `isInbound` 的外层保证"，2026-10-02

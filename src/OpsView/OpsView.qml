@@ -275,7 +275,7 @@ OpsShell {
     // 站点飞控动作（机位 / 起飞 / 降落 / 停泊）
     //-------------------------------------------------------------------------
     // `task` 整个传进来（而不是只传 `task_id`）：`_retargetLandingSlot` 要读 `task.status`
-    // 才分得清"正常预占机位"与"降落流程中止后照提示来改派"（见那里的注释）。
+    // 才分得清"正常**指派**机位"与"降落流程中止后照提示来改派"（见那里的注释）。
     function _assignSlot(task, slotId, onDone) {
         var taskId = task.task_id
         // ‼️ **正在下降时拒绝改派** —— 判据取遥测 `landing`，而且必须在发 POST **之前**拒绝
@@ -286,8 +286,14 @@ OpsShell {
         //       换成 `landing` 属性，语义见 `_landFlowTick` 里关于 `Vehicle::_setLanding` 那段。
         //    原先是在 POST **之后**才由 `_retargetLandingSlot` 弹一句「本次改派未生效」——可那时
         //    库里的 `assign_slot_id` **已经改成新机位了**。后果不是"提示没说清楚"，而是：
-        //    飞机降在**旧**机位，而落地时 `ops.Park` 写的是 `landing_slot_id = assign_slot_id`
-        //    （即**新**机位，见 `handlers/ops.go` 的 `parkSlot := assignedSlotID`）
+        //    飞机降在**旧**机位，而库里的机位登记已经跟着改派走了 —— 两半都错，且**旧机位的
+        //    登记丢失比原先更早**（2026-10-08 方案 (a) 之后）：
+        //      ① `handlers/ops.go` 的 `AssignSlot` 在 `LANDING` 段**同事务**把
+        //         `uav.current_slot_id` 从旧机位迁到新机位 ⇒ **改派事务提交的那一刻**旧机位
+        //         就没有任何占用登记了（方案 (a) 之前这一步不存在，登记要到 ② 才丢）；
+        //      ② 落地时 `ops.Park` 写的是 `landing_slot_id = assign_slot_id`
+        //         （即**新**机位，见 `handlers/ops.go` 的 `parkSlot := assignedSlotID`）
+        //         —— 连快照也记成新机位。
         //    ⇒ **旧机位没有任何占用登记** ⇒ 下一架执行降落时 `CheckLandingSlot` 判它
         //    `free: true`，被放行到**一架已经停在那儿的飞机**上。
         //    fail-closed 是刻意的：这个窗口只有几十秒，代价是**可逆的**（等落地完成再指定），
@@ -337,9 +343,20 @@ OpsShell {
     //    改前弹的直接是确认框，正文只有一句「将发出降落指令…」+ 任务号/无人机号，
     //    **一个字都没提落点是哪个机位** —— 操作员是在确认一个他没看见的落点。
     //    先选机位，落点就是他自己刚点的那一个。
-    // ⚠️ 列表项上的 `assign_slot_id` **仍是**【降落】/【切换多旋翼降落】的 `enabled` 判据
-    //    （见 `TaskListPanel.qml`），语义随之变成"**本站已为该任务预占过机位**，才允许走这条
-    //    路"；预占过与否**不影响**这次重新选择 —— 选中的机位会**覆盖**它。
+    // ⚠️ 列表项上的 `assign_slot_id` **不是**【降落】/【切换多旋翼降落】的 `enabled` 判据 ——
+    //    理由在**降落链的顺序**：点按钮 → 弹出选择机位框（`_beginLandFlow` 的
+    //    `slotDialog.open()`）→ 选完**并确认后**才写库。"选机位"发生在点击**之后**，所以"库里
+    //    有没有已指派机位"**不可能**是点击的**前置**；拿它当判据就是把顺序搞反了。
+    //    历史留档：这两颗按钮确实拿 `assign_slot_id` 当过判据（2026-09-29 引入、2026-10-08 删）。
+    //    那道前置**单独**只是把按钮误灰；会在整条链上合成**死锁**的是它与【指定机位】入口
+    //    **同时**收紧 —— 从未指派过机位的任务两颗降落按钮灰着，而指派它的入口也不可点。
+    //    ‼️ 但这只是**条件**，2026-10-08 那一轮**没有**发生：同轮只把【指定机位】的 `visible`
+    //    从 `_inboundActionable`（**含 IN_FLIGHT**）**收窄**为
+    //    `card._inboundActionable && modelData.status !== "IN_FLIGHT"`、**并未删除**那颗按钮
+    //    —— IN_FLIGHT 段照旧可点 ⇒ 死锁当时不成立。要把 `visible` 再收到连 IN_FLIGHT 也拦掉、
+    //    且本判据又被改回来，死锁才成立（判据变迁的完整留档见 `TaskListPanel.qml` 两颗按钮处）。
+    //    本列表项上的它现在只用于**回显当前落点**，不门控。
+    // ⚠️ 口径：`assign_slot_id` 是「**指派**」（计划落点，**非占用**）；占用判据是 `current_uav_no`。
     //
     // `cardBottomY` 是**已经过 `mapToItem` 换算到 opsView 坐标系**的下缘（与另外七个
     // `onXxxRequested` 逐字同款），确认框的 `y` 绑的就是它：先选机位、后弹确认框，中间隔着
@@ -1147,7 +1164,7 @@ OpsShell {
         // 取其一即可；另一格留着是因为它才是"是不是这架飞机"的那一问。
         if (_landPhase === "" || _landingTaskId !== taskId) {
             // ‼️ 这一支**不能静默**（2026-09-29 审查 C1）。两种情形必须分开：
-            //   (a) 任务不在 LANDING：这是最常见、也是最正常的「飞行中预占机位」——飞机还在飞，
+            //   (a) 任务不在 LANDING：这是最常见、也是最正常的「飞行中**指派**机位」（**非占用**）——飞机还在飞，
             //       改派只改库、飞机不参与，此处什么都不做**正是对的**。
             //   (b) 任务已是 LANDING 却没有在途流程：说明此前那次降落**中止过**
             //       （转换超时 / 坐标不可用 / 未飞抵 / 未确认降落 / 并发被拒…）。而
@@ -1763,9 +1780,23 @@ OpsShell {
         if (seq <= _vtolSettledSeq) return
         _vtolSettledSeq = seq
         _vtolTimeoutTimer.stop()
-        // ‼️ **「内置 300」这个字面量在 QGC 侧只有这一处**（设计稿 §7.4）。
-        //    ⚠️ 跨语言/跨文件的相等关系**没有判据**：迁移里的种子值、Go 的
-        //    `defaultVtolTakeoffTransitionDistance`、这一处，三处要人工同改。
+        // ‼️ 「内置 300」这个兜底字面量全链**共四处**，改值时四处都要人工同改
+        //    （设计稿 §7.4；跨语言/跨文件的相等关系**没有判据**）：
+        //      ① 迁移里的种子值（`db/migrate.go` 写入 `table_operational_constant` 的 300）
+        //      ② Go 的 `defaultVtolTakeoffTransitionDistance`（`handlers/operational_constant.go`）
+        //      ③ 这一处（`_vtolTransitionDistance` 取不到时的归一化）
+        //      ④ `OpsRouteSync.qml` 里 `transitionM` 取不到时的归一化（同仓，同一个 300）
+        //    ⚠️ 2026-10-08 订正：原注释写「QGC 侧只有这一处」「三处要人工同改」——**两处都错**，
+        //    漏掉了同仓的 ④（`src/OpsView/OpsRouteSync.qml` 的 `transitionM = 300`）。
+        //    ⚠️ **边界：链外还有第 5 个同量纲字面量，改上面四处时不必动它** ——
+        //    `src/Settings/PlanView.SettingsGroup.json` 的 `vtolTransitionDistance` 默认值也是 300.0。
+        //    它自 2026-10-06 起对本项目的起飞转换点**已不生效**（改它无效，界面无提示，
+        //    设计稿 §10.1 登记过的已知代价），但**不能删**：上游 Plan 视图仍有两个读者
+        //    （`MissionManager/TakeoffMissionItem.cc` 的起飞点默认距离、
+        //    `MissionManager/VTOLLandingComplexItem.cc` 的降落地距离默认值）。
+        //    在这里点明它，是为了让上面「共四处」这个断言有**明确的排除范围**——
+        //    否则第 5 个字面量会让「共四处」读起来像是漏数了。详见本文件「VTOL 起飞转换距离
+        //    （运营常数）」那段（`_vtolTransitionDistance` 属性定义处）的完整边界论证。
         _vtolTransitionDistance = (ok && isFinite(v) && v >= 100) ? v : 300
         // 在途期间被 `_syncRouteForTask()` 挡下的那些任务，现在补建。
         // （该函数已存在，`Component.onCompleted` 与 `on_TasksChanged` 都在调它。）
@@ -2112,7 +2143,7 @@ OpsShell {
                         }
                         // ‼️ 这两档与另外六个不同：**先弹机位选择框，再弹确认框**（用户 2026-10-08）。
                         //    所以这里不进 `_pendingAction` / 不开 `actionConfirmDialog` —— 那两步
-                        //    都推迟到操作员选完机位之后（`slotDialog` 的 delegate → `_commitLand`）。
+                        //    都推迟到操作员选完机位**并确认后**（`slotDialog` 的 delegate → `_commitLand`）。
                         // ⚠️ 锚点仍在这一刻算好传进去：等选完机位再算，`cardBottomY` 早就没有意义了
                         //    （卡片可能已被 `_poll()` 换掉）。
                         onLandRequested: function(task, cardBottomY) {
