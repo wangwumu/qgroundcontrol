@@ -2479,18 +2479,13 @@ var LAND_KIND_TO_MC = "land"
 /// F3「MC方式降落」（救济）：先转多旋翼再进近，**不读库、不写库**（§9.7 定义第 2 条）。
 var LAND_KIND_MC_RESCUE = "mcRescueLand"
 
-/// F1 的进近点距接机机位的偏移量，单位米。
-///
-/// ‼️ **这不是一个可调参数**，是「唯一有全链路证据的取值」的固化 —— §9.5.3 的实测表里，
-///    「P 距机位 300 m」是唯一被端到端验证过的取值（两个相反方向各成功一次）；
-///    「P == 机位（偏移 0）」只过了 PX4 的校验，全链路降落**未实测**。
-/// ‼️ §9.5.3 明确「**不必为降落端再定一个距离常数**」⇒ 本值**不进**后端运营常数、
-///    **不进** `PlanViewSettings`、**不是** `vtol_landing_transition_distance` 的替代品
-///    （那个常数按 §9.5.8 不该存在）。
-///    它只回答「P 摆在哪」，**不回答「什么时候转换」** —— 后者由 PX4 的 `NAV_ACC_RAD` 管
-///    （§9.5.3 / §9.5.4：触发判据对着机位、不对着 P）。
-/// ⛔ 不要把它做成设置项，也不要把「必须 ≥ 300 m」写进给用户的说明（§9.5.3 末）。
-var LAND_FW_APPROACH_OFFSET_M = 300
+// ⚠️ 这里**曾经**有一个 `LAND_FW_APPROACH_OFFSET_M = 300`（F1 的进近点偏移量，硬编码）。
+//    2026-10-09 用户裁定①把它**移进后端运营常数表**：`vtol_landing_pushout_distance`，
+//    初值 400 m，由 `OpsView.qml` 取回后**当实参传进来**（本文件是 `.pragma library`，
+//    读不到任何 QML 属性）。
+//    ⇒ 本文件**不再持有**这个量的取值，只持有「它该怎么用」。别在这里再加一个同名的硬编码
+//      兜底 —— 兜底在 `OpsView.qml` 的 `_onVtolDistancesArrived()`，与后端
+//      `handlers/operational_constant.go` 同口径。
 
 /// `MAV_CMD_DO_VTOL_TRANSITION` —— 请求 VTOL 转换。参数 1 是目标状态。
 /// 取自 MAVLink 生成的头文件（本仓 `build/_deps/mavlink-build/include/mavlink/`）。
@@ -2509,41 +2504,106 @@ function landKindTransitionToMc(kind) {
     return kind === LAND_KIND_TO_MC || kind === LAND_KIND_MC_RESCUE
 }
 
-/// 统一链第 ① 步（§9.8.4）：由 kind、机位坐标、机位朝向算出**落点与进近点**。
+/// 统一链第 ① 步（§9.8.4）：由 kind、机位坐标、以及（仅 F1）**飞机**的位置与航向
+/// 算出**落点与进近点**。
 ///
 /// 落点恒为**接机机位**（§9.7 定义第 1 条：无条件 ≠ 随便落）。
-/// 进近点 P 随进近方式变，两格各有实测支撑：
-///   保持 FW ⇒ 机位沿「机位朝向」偏 `LAND_FW_APPROACH_OFFSET_M`（§9.5.3）
-///   先转 MC ⇒ **P = 机位同坐标**（§9.7 三次实测 #2/#3/#4）
+/// 进近点 P 随进近方式变：
+///   先转 MC（F2/F3）⇒ **P = 机位同坐标**（§9.7 三次实测 #2/#3/#4）
+///   保持 FW（F1）  ⇒ **P = 飞机当前位置沿飞机当前航向偏 `pushoutM` 米**（2026-10-09 用户裁定①）
 ///
-/// `slotHeadingDeg` 是后端 `assign_slot_heading`（接机机位表 `table_slot.heading` 的真实值，
-/// 后端一直下发，只是 QGC 侧此前从未读取）。
-/// ⚠️ 多数机位的该值是占位 0 ⇒ 算出的方向无意义。**这不影响正确性**：
-///    §9.5.4 的排除性实测已证「P 不决定转换时机」，P 只承担「让航线过 PX4
-///    `FeasibilityChecker` 的『首项不能是降落航点』那道校验」（§9.5.2）。
-///    读朝向只是为了**让 P 不随机**，不是为了进近几何。
-/// ⚠️ 先转 MC 那一支**不读朝向**（§9.5.9 第 1、2 条：降落端不管朝向）
-///    ⇒ 朝向缺失也照样能算出 P。
+/// ‼️ F1 的原点与方位**在 2026-10-09 变了**：改前是「机位沿**机位朝向**偏 300 m」，
+///    改后是「**飞机**沿**飞机航向**偏 `pushoutM`」。改变的目的不是几何本身 ——
+///    飞机在接机机位附近做**小半径盘旋**时，旧口径算出的 P 可能落在盘旋圈**内**，
+///    航线第一条腿不足以把它从盘旋中改出；新口径把 P 摆在飞机正前方几百米处，
+///    第一条腿就**把飞机从盘旋中拉直**、留出转弯半径（用户 2026-10-09 逐字口径）。
+///    ⇒ 「P 从哪来」这一维的取值来源**同时换了原点、方位、距离**三者，不是只换距离。
 ///
-/// 回 `{ lat, lon }`；**朝向**不可用（仅限 F1）、或 kind 未知时回 `null`。
+/// ⚠️ **机位朝向（`table_slot.heading`）从此不再参与降落**：
+///    F2/F3 按 §9.5.9 第 1、2 条本来就不读朝向，F1 改后改读**飞机**航向
+///    ⇒ 旧的 `slotHeadingDeg` 形参已删。
+///    ‼️ **订正（2026-10-10 审查 C-1）**：这里原写「后端仍在下发 `assign_slot_heading`，
+///    那字段现在只有**起飞端**（`takeoffSlotHeading()`）在消费」—— 那句话**两半都错**：
+///      · `takeoffSlotHeading()` 读的是 `task.current_slot_heading`（见上面那个函数），
+///        与本字段是**两个不同的字段**；
+///      · `assign_slot_heading` 在 QGC 仓里**只写不读**。它唯一的出现是 `OpsView.qml` 的
+///        `_taskWithSlot`（往传给 `_execLand`/`_startLandFlow` 的临时副本上盖值），
+///        而**那个副本的唯一读者就是本函数的第四个实参** —— 随本次改动被删掉了
+///        ⇒ 该字段已成死数据（`OpsView.qml` 那处写入 2026-10-10 一并删除）。
+///    ⚠️ 后端仍在响应体里下发它（`gcs_server/handlers/ops.go:157`）—— 那是**下行字段**，
+///      与本条无关，别把它读成"还有人在消费"。
+///    留这段订正而不是直接删句：下一个人若在别处撞见 `assign_slot_heading`，
+///    需要知道它**已经没有消费方**，而不是去 `takeoffSlotHeading` 里找一个不存在的调用。
 ///
-/// ‼️ **坐标是不是 0/0 不是本函数的判据**。F1/F2 的 0/0 闸在 `_execLand` 入口处
-///    （那条路读库，手里有业务上下文）；F3 是救济，**零闸** —— §9.7 逐字「不推演
-///    『尚未指派』的中间窗口，本节因此不设『坐标是否为 0』之类的前置校验」。
-///    本函数只回答「由 kind + 机位算出 P」；这个坐标是不是业务上有效的机位，是**调用方**的事。
-///    ⇒ `0/0` 是**合法输入**：先转 MC 那一支原样传出，保持 FW 那一支照常算出偏 300 m 的 P。
+/// `fwOrigin` = `{ lat, lon, headingDeg, pushoutM }`，**只有 F1 读它**：
+///    · `lat` / `lon` —— 飞机当前位置（QML 侧读 `vehicle.coordinate`），
+///    · `headingDeg` —— 飞机当前航向（QML 侧读 `vehicle.heading.value`），
+///    · `pushoutM`   —— 推远距离，来自运营常数 `vtol_landing_pushout_distance`。
+/// ⚠️ **F2/F3 那两支不读它**（函数体里在碰 `fwOrigin` 之前就 `return` 了）——
+///    所以「F2/F3 该传什么」**不是**一份契约，传 `null`、传真对象、传垃圾都行。
+///    ‼️ 调用方 `_startLandFlow` 因此**无条件**构造它再传进来，**没有** `kind === ...` 判据：
+///    在这里写一份"哪种 kind 需要飞机状态"的判据，等于把本文件钉成全仓唯一编码处的
+///    那个维度**再写一遍**（本函数头注 + `landKindTransitionToMc` 那条规矩）。
+///    ⇒ 别把本行改回「F2/F3 传 `null`」那种**读起来像要求**的措辞：调用点不遵守它，
+///      而"两条判据各自演化"正是上面那条规矩要防的事。
+///
+/// 回 `{ lat, lon }`；kind 未知、或 F1 的 `fwOrigin` 不可用时回 `null`。
+///    F1 下 `fwOrigin` 的三条闸（缺一不可，任一不过都回 `null`）：
+///      ① 坐标 —— 走 `isValidWaypoint`（**不是** `coordinate.isValid`：那个对 (0,0) 为真）；
+///      ② 航向 —— 有限数即可，**判不出「没填」**（见下）；
+///      ③ 距离 —— 有限且 **> 0**。`takeoffTransitionPoint` 把 `distM === 0` 当**合法**
+///         （起飞端确实需要「偏移 0」这一档），但**降落端不是**：`pushoutM === 0` 会让
+///         P 落在飞机正上方 ⇒ 航线第一条腿零长度 ⇒ 恰好退回本改动要消灭的那个形状，
+///         而且**全程静默**（PX4 照收、界面无痕）⇒ 必须在这里挡掉。
+///
+/// ‼️ **航向没有「存活」判据，这是刻意的、也是本函数唯一一处"看不出来"的地方。**
+///    `VehicleFactGroup` 的 `heading` Fact 没有 `defaultValue` ⇒ 首帧 ATTITUDE 之前
+///    `vehicle.heading.value` 就是 `0`，而 `0°` 是**合法正北** —— 两者在数值上**不可分辨**。
+///    `OpsCommon.js:2328`（`takeoffSlotHeading` 的注释）已明文禁止拿 `heading === 0` 当"没填"。
+///    ⇒ 这里**不假装**能分辨：航向只做"是不是数"这一道，真正的"遥测在不在这架飞机上"
+///      由 **①的飞机坐标**代理（坐标有效 ⇔ 已收到过 GPS 位置 ⇔ 链路与遥测在流）。
+///      二者不同帧（航向来自 `ATTITUDE`、坐标来自 `GLOBAL_POSITION_INT`），这个代理
+///      **不是等价**，只是同一时刻两者同时缺失的概率极低；代价是理论上存在
+///      "坐标有效但航向还停在初值 0"的一瞬 ⇒ 那一次算出的 P 会朝正北，
+///      而它是**一次有限偏差**、不是静默失败（操作员看得到飞机往哪飞）。
+///
+/// ‼️ **坐标是不是 0/0 不是本函数的判据**。本函数只回答「由 kind + 机位 + 飞机算出 P」；
+///    这个坐标是不是业务上有效的机位，是**调用方**的事 ⇒ `0/0` 对 F2/F3 仍是**合法输入**、
+///    原样传出。
+///    ‼️ **订正（2026-10-10 审查 I-5）：原句写「F3 是救济，零闸」，已被实现推翻。**
+///       三条路**都要过** `_startLandFlow` 开头那道**落点**坐标闸（`OpsView.qml` 里
+///       `isValidWaypoint(slotLat, slotLon)` 那一段：落点不可用 ⇒ 弹可见的失败、不发航线）；
+///       `_execLand` 那条另有一道读库时的闸。说「F3 零闸」会让人以为救济路的坐标可以从
+///       任何地方来 —— 事实相反：它恰恰是三条路里**最后**拿到闸的那条
+///       （2026-10-08 终局审查 F2 加），因为只有它绕过 `_execLand` 直达本函数。
+///       §9.7 逐字「不推演『尚未指派』的中间窗口，本节因此不设『坐标是否为 0』之类的前置
+///       校验」说的是**业务状态**判据不该有；而"机位坐标有没有正常取回"是那条裁定赖以
+///       成立的**前提**，不是它禁止的东西（完整论证见 `OpsView.qml` 那道闸上方的注释）。
+///    ⚠️ 同一批改动里 `tst_OpsLandingCommon.qml` 已把这句话标为「已被推翻」，本行此前是
+///       **唯一**没跟上的那一处 ⇒ 三份文件曾并存两套口径。
+///    ⚠️ F1 那一支不同：它的**原点**是飞机坐标，而 `0/0` 的飞机不是"未指派"而是"数据错"
+///       ⇒ 走上面 ① 的闸、回 `null`。
 ///    NaN 与越界由 C++ 侧 `QGeoCoordinate::isValid()` 在组 `MissionItem` 时挡 ——
 ///    那是**输入合法性**，不是业务状态判据，与上面那条分工不冲突。
 /// ‼️ **调用方必须把 `null` 当失败处理**，不许拿它去组航线 —— 那会变成 (0,0)。
-function landApproachPoint(kind, slotLat, slotLon, slotHeadingDeg) {
+function landApproachPoint(kind, slotLat, slotLon, fwOrigin) {
     if (kind === LAND_KIND_TO_MC || kind === LAND_KIND_MC_RESCUE) {
         return { lat: slotLat, lon: slotLon }
     }
     if (kind === LAND_KIND_KEEP_FW) {
+        if (!fwOrigin) return null
         // 复用起飞端的球面偏移几何（`takeoffTransitionPoint` 只算距离与方位，
-        // 与"起飞/降落"的语义无关）。朝向非数字时它回 null，正是本函数要的契约。
-        return takeoffTransitionPoint(slotLat, slotLon, slotHeadingDeg,
-                                      LAND_FW_APPROACH_OFFSET_M)
+        // 与"起飞/降落"的语义无关）—— 变的是**实参从哪来**，几何本身没变。
+        // ⚠️ 用 `isValidWaypoint` 而**不是** `isFinite`：飞机坐标为 0/0 时后者放行，
+        //    算出的 P 会落在几内亚湾。同一**判据**起飞端也内联写过一份
+        //    （`takeoffSlotHeading` 的 `_finiteNumber` + `lat === 0 || lon === 0`）。
+        //    ⚠️ 是同一个判据、**不是**同一个函数（2026-10-10 审查 S-5 订正）：
+        //      `takeoffSlotHeading` 里**没有** `isValidWaypoint` 的调用，别去那边找。
+        if (!isValidWaypoint(fwOrigin.lat, fwOrigin.lon)) return null
+        if (!_finiteNumber(fwOrigin.headingDeg)) return null
+        if (!_finiteNumber(fwOrigin.pushoutM) || fwOrigin.pushoutM <= 0) return null
+        return takeoffTransitionPoint(fwOrigin.lat, fwOrigin.lon,
+                                      fwOrigin.headingDeg, fwOrigin.pushoutM)
     }
     return null
 }

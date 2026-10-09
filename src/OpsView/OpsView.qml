@@ -415,15 +415,20 @@ OpsShell {
     ///    `device_id`（`_vehicleForTask`）/ `uav_id` / `uav_no`…，白名单漏一个字段就是一处
     ///    **静默**失效 —— `_assignSlot` 里那次"传数字而不是传对象"的教训（`_retargetLandingSlot`
     ///    整段永不执行、零报错）就是这么来的。
-    /// ⚠️ `heading` 必须一起盖：F1（保持固定翼）要用机位**朝向**算进近点，用旧机位的朝向会算出
-    ///    一个与新机位无关的进近点，而 `_startLandFlow` 一旦算出 `p` 就会照发。
+    /// ⚠️ **`heading` 不再盖上**（2026-10-10 订正）：原文说「F1（保持固定翼）要用机位**朝向**
+    ///    算进近点，用旧机位的朝向会算出一个与新机位无关的进近点」—— 那句在 2026-10-09 之后
+    ///    **已不成立**：F1 改读**飞机**航向，机位朝向在降落端**再无任何消费方**
+    ///    （详见 `OpsCommon.landApproachPoint` 头注）。
+    ///    原先这里盖的 `t.assign_slot_heading` 因此成了**只写不读的死字段**，而留着一行
+    ///    "看起来还有用"的赋值，正是让人不去追查它为什么死了的那种写法。
+    ///    ⚠️ 后端仍在响应体里下发 `assign_slot_heading`（`handlers/ops.go:157`）—— 那是
+    ///      **下行字段**（后端 → QGC），与本函数在这个临时副本上写什么完全无关。
     function _taskWithSlot(task, slot) {
         var t = {}
         for (var k in task) t[k] = task[k]
         t.assign_slot_id = slot.id
         t.assign_slot_lat = slot.lat
         t.assign_slot_lon = slot.lon
-        t.assign_slot_heading = slot.heading
         return t
     }
     /// 「确认执行」那一下：**先写库、再下指令**（本项目的工程口径，与 `_execReturn` 同向）。
@@ -683,8 +688,11 @@ OpsShell {
     //    而改派机位那条路拿到的是 `task.task_id` / `task.uav_id`（数据库主键）——两者是
     //    **不同的 id 空间**。比错的形状是"恒不相等"，表现为改派永远不生效且**不报错**。
     property int _landingTaskId: 0
-    // 本流程属于三条路里的哪一条（`OpsCommon.LAND_KIND_*`）。**进近方式**维度的唯一载体：
-    // `_retargetLandingSlot` 重算进近点时要按它选公式，事后从坐标反推不出来。
+    // 本流程**当前生效**的进近方式（`OpsCommon.LAND_KIND_*`）。语义是"此刻走的是哪条路"，
+    // **不是**"操作员当初点的哪个按钮"—— 所以别只读入口那个 `kind` 就以为它定终身。
+    // ⚠️ 2026-10-10 订正：原文写「`_retargetLandingSlot` 重算进近点时要按它选公式，
+    //    事后从坐标反推不出来」。那句在 2026-10-09 裁定②之后**已不成立** ——
+    //    改派**无条件**把它改写成 F2（见 `_retargetLandingSlot`），不再按原值分叉。
     property string _landKind: ""
     // 降落流程的阶段位，**三值**：`""`（空闲）/ `"transition"`（等转多旋翼）/
     // `"autonomous"`（③④ 已发出，此后由 PX4 自主飞回并降落）。
@@ -698,7 +706,10 @@ OpsShell {
     property real _landTargetLat: 0
     property real _landTargetLon: 0
     // 进近点 P 的快照。取值随 `_landKind` 变（两种取值的依据见 `OpsCommon.landApproachPoint`）。
-    // 与落点分开存：F1 时两者**不同**（P 是机位沿朝向偏 300 m 那一点），事后算不回来。
+    // 与落点分开存：F1 时两者**不同** —— P 是**飞机**沿**飞机当前航向**偏
+    // `_vtolLandingPushoutDistance` 米那一点，**事后算不回来**（飞机早飞走了，那个位置取不回来）。
+    // ⚠️ 2026-10-09 用户裁定①之前，这里写的是「机位沿**机位朝向**偏 300 m」——
+    //    原点、方位、距离**三者全换**了，不只是数字。
     property real _landApproachLat: 0
     property real _landApproachLon: 0
     // 当前阶段的截止时刻（`Date.now()` 毫秒）。上传段与自主段**共用**这一个字段，
@@ -713,7 +724,7 @@ OpsShell {
     //    但它把截止时刻改成了上传档 ⇒ 用 `_landUploaded` 分叉，会把「实际只等了 60 秒」
     //    报成「等了 600 秒」。两问各自独立，就得分两个字段。
     // ‼️ 与 `_landUploaded` 一样：超时分支里的读取必须发生在 `_clearLandFlow()` **之前**
-    //    （那是这些字段的唯一清零点），顺序颠倒后两种超时永远报同一条文案。
+    //    （那是这些字段的**终态**清零点），顺序颠倒后两种超时永远报同一条文案。
     property bool _landWaitingForUpload: false
     // ‼️ **本流程里见过飞机在空中没有**（2026-10-08 终局审查 F3 修）。
     //    `_landFlowTick` 的完成判据是 `!flying && !armed`（＝"已落地且已上锁"），
@@ -725,6 +736,16 @@ OpsShell {
     //    ⇒ 只有**先见过它在空中**，才认那条完成判据；否则一路走到超时，弹可见的
     //      「未确认降落」。语义上这也更准：「完成」应该是"飞出去又回来了"，而不是"从没飞过"。
     property bool _landSawAirborne: false
+    // ‼️ **本流程经历过改派重传没有**（用户 2026-10-09 裁定②之后新增）。
+    //    它只回答一件事：`_uploadLandingMission()` 这一趟要不要清 `_landUploaded`。
+    //    为什么这个"是不是重传"的信息传不进去：改派走的可能是**转多旋翼**那条路
+    //    （原 kind 是 F1 时），而那条路的 ③④ 由 `_mcCheckTransitionComplete()` 触发 ——
+    //    中间隔着一次异步等待（等 `vtolStateChanged`）⇒ 只能落成流程状态。
+    //    置真点：`_retargetLandingSlot` 改写快照之后（唯一一处）。
+    //    清零：终态清零点＝`_clearLandFlow()`；此外 `_startLandFlow` 进流程时也**显式**
+    //    置回 false（那一行是刻意的"首传声明"，不是终止路径，理由见那里的注释）。
+    //    ⚠️ 别把它当成"改派过"的通用标志去别处用 —— 它的语义窄到只有上面那一问。
+    property bool _landRetransmit: false
     // 等待转换完成的超时。机型脚本的 `VT_F_TRANS_DUR` 是 10 秒，这里留三倍余量。
     readonly property int _mcSwitchTimeoutMs: 30000
     // 从发出上传到收到完成确认的超时。
@@ -765,11 +786,31 @@ OpsShell {
             //    「不能静默」那句直接相反。
             //    只有 `_landPhase === ""`（流程早已收场、本 Timer 是野的）才可以静默。
             if (_landPhase === "") return
+            // ‼️ **先读后清**（2026-10-10 审查 I-1 修）：`_clearLandFlow()` 是这些字段的终态
+            //    清零点，必须把 `_landRetransmit` 读出来再清。它分的是本 Timer 的两种**来路**，
+            //    而两者的差别恰恰是"此刻机上有没有一条正在执行的航线"：
+            //      · 首传（`_startLandFlow` ② 调进来）⇒ 一条都没有，飞机确实无路可飞；
+            //      · 改派（`_retargetLandingSlot` 调进来）⇒ **旧航线还在机上飞**，
+            //        而库里 `assign_slot_id` 已经是新机位了。
+            //    照旧一律说「降落航线未发出」，会把后者报成一句**反向**的话 —— 症状与
+            //    `_assignSlot` 那道闸要防的「库里记新机位、飞机降旧机位」完全同类。
+            var wasRetransmit = _landRetransmit
             var vehLost = !_landingVehicle
             _clearLandFlow()
             if (vehLost) {
-                QGroundControl.showMessageDialog(opsView, qsTr("切换多旋翼未完成"),
-                    qsTr("等待转换完成期间与无人机失去联系，无法确认转换是否完成，降落航线未发出。请确认无人机状态后再操作。"))
+                if (wasRetransmit) {
+                    QGroundControl.showMessageDialog(opsView, qsTr("切换多旋翼未完成"),
+                        qsTr("等待转换完成期间与无人机失去联系，无法确认转换是否完成，新航线未发出，本次改派未生效。请确认无人机状态后再操作。"))
+                } else {
+                    QGroundControl.showMessageDialog(opsView, qsTr("切换多旋翼未完成"),
+                        qsTr("等待转换完成期间与无人机失去联系，无法确认转换是否完成，降落航线未发出。请确认无人机状态后再操作。"))
+                }
+                return
+            }
+            if (wasRetransmit) {
+                QGroundControl.showMessageDialog(opsView, qsTr("改派未生效"),
+                    qsTr("已发出切换指令，但无人机在 %1 秒内未报告转换完成，新航线未发出，本次改派未生效。无人机仍按原航线飞向原机位。")
+                        .arg(Math.round(_mcSwitchTimeoutMs / 1000)))
                 return
             }
             // 不能静默：此刻飞机既没飞向接机机位也没降落，还在原地盘旋，操作员必须知道指令没发出去。
@@ -886,23 +927,55 @@ OpsShell {
                          "slot=", slotLat, slotLon)
             return
         }
-        var p = OpsCommon.landApproachPoint(kind, slotLat, slotLon, task.assign_slot_heading)
+        // 「飞机现在在哪、朝哪」+ 推远距离 —— **只有 F1 用得上，但无条件构造**：
+        // 判「本 kind 要不要飞机状态」等于在这里再写一份 `kind === ...`，而
+        // `OpsCommon.js` 里那两个维度函数被明文钉成**全仓唯一编码处**（"QML 只许调它们"）。
+        // F2/F3 拿到它也不看 —— `landApproachPoint` 那两个分支在函数最前面就 return 了。
+        //
+        // ⚠️ 两者的**来源不同**（2026-10-10 审查 S-6 订正）：`v.coordinate` 是 `Vehicle`
+        //    **自己**的 Q_PROPERTY（`Vehicle.h:152`）；`v.heading` 才是从 `VehicleFactGroup`
+        //    继承来的 `Fact`。**无效坐标不会抛异常**：
+        //    Qt 对未定位的 `QGeoCoordinate` 回 NaN，而 0/0 又是哨兵 ⇒ 两道都由
+        //    `landApproachPoint` 里的 `isValidWaypoint` 拦下。
+        // ⚠️ `pushoutM` 取的是**归一化之后**的属性（`_onVtolDistancesArrived` 保证它
+        //    要么 ≥ 100、要么 400）—— 但 `-1`（首次响应还没回来）会原样传进去并被
+        //    `landApproachPoint` 的 `> 0` 闸挡下 ⇒ 落到下面的失败支，**不会**静默用 0。
+        var fwOrigin = {
+            lat: v.coordinate.latitude,
+            lon: v.coordinate.longitude,
+            headingDeg: v.heading.value,
+            pushoutM: _vtolLandingPushoutDistance
+        }
+        var p = OpsCommon.landApproachPoint(kind, slotLat, slotLon, fwOrigin)
         if (!p) {
             // ⚠️ 坐标判据**不在这里**（见 `OpsCommon.landApproachPoint`：0/0 是它的合法输入），
-            //    能落进本支的**只剩一种**：F1（保持固定翼），
-            //    且该机位**朝向**不可用。F2/F3 恒返回机位坐标本身，**永不为 null**。
+            //    能落进本支的**只剩一种**：F1（保持固定翼），且**飞机的**位置或航向不可用
+            //    （或推远距离还没取到）。F2/F3 恒返回机位坐标本身，**永不为 null**。
             //    F1 在这一格算不出 P，而 **P ≠ 机位**的保持固定翼航线从未被端到端验证过
-            //    （§9.5.3 实测表只覆盖了偏移 300 m 那一档）⇒ 不许回落成 P = 机位，直接报失败。
+            //    ⇒ 不许回落成 P = 机位，直接报失败。
+            // ⚠️ 2026-10-09 起本支的**根因变了**：改前是"机位朝向不可用"（机位表里的
+            //    `heading` 字段），改后是"飞机状态不可用"（飞机没定位 / 航向拿不到 / 常数没到）。
+            //    文案必须跟着变 —— 照旧说"机位朝向"会把操作员指向一个已经无关的字段。
             QGroundControl.showMessageDialog(opsView, qsTr("降落航线未发出"),
-                qsTr("无法由接机机位算出进近点（「保持固定翼」需要机位朝向，该朝向不可用），降落未发出。"))
+                qsTr("无法算出进近点：「保持固定翼」降落需要无人机当前的位置与航向，此刻至少有一项不可用（也可能是降落推远距离尚未取回）。请确认无人机已定位、链路正常后重试。"))
             console.warn("OpsView 降落进近点计算失败 kind=", kind,
-                         "slot=", slotLat, slotLon, "heading=", task.assign_slot_heading)
+                         "slot=", slotLat, slotLon,
+                         "uavCoord=", v.coordinate.latitude, v.coordinate.longitude,
+                         "uavHeading=", v.heading.value,
+                         "pushoutM=", _vtolLandingPushoutDistance)
             return
         }
         // ‼️ 快照写在**并发闸之后**。此后一律读快照、不回读 `task`。
         _landingVehicle = v
         _landingTaskId = task.task_id
         _landKind = kind
+        // ‼️ 本流程**不是**改派重传。这一行是"首传"的显式声明，不是冗余：
+        //    `_uploadLandingMission()` 靠它决定要不要清 `_landUploaded`，而那个标志是
+        //    `_onLandingMissionFinished` 分辨"首传失败（清场）"与"改派失败（保流程）"的
+        //    唯一依据。虽然 `_clearLandFlow()` 与 `_landingVehicle` 同生共死、此刻它必为 false，
+        //    但那是**隐含**不变量 —— 写出来才对得住"新增流程状态字段时必须在这里清掉它"
+        //    那条规矩的另一半。
+        _landRetransmit = false
         _landTargetLat = slotLat
         _landTargetLon = slotLon
         _landApproachLat = p.lat
@@ -913,32 +986,47 @@ OpsShell {
         // 逐字「也许已经是 mc 了」：已经是 MC 就不发那条命令、不等，直接进 ③④。
         if (OpsCommon.landKindTransitionToMc(kind)
                 && !OpsCommon.vtolTransitionDone(v.vtolState)) {
-            _landPhase = "transition"
-            // ⚠️ 停掉可能还活着的 `landFlowTimer`。本 Timer 只在自主段里有意义
-            //    （`_landFlowTick` 判落地、判超时），`"transition"` 段由 `mcSwitchTimer` 计时。
-            //    这是**第一道**；**第二道**在 `_landFlowTick` 里按阶段位分流。
-            //    两道都要：只靠第二道时，野 Timer 仍会每 500 ms 空转一次。
-            landFlowTimer.stop()
-            mcSwitchTimer.restart()
-            // ‼️ 只发转换命令、**不切 Hold**（设计稿 §9.8.5）。统一链里 ② 后面跟的是 ④ 的
-            //    AUTO_MISSION **真转换**（inactive→active），导航状态机会照样重建 ⇒ 原实现里
-            //    那个 Hold 的用途（把导航模式挪开，让后续的 Guided 指令能重建状态机）不再需要。
-            //    既有对照：`Vehicle::hoverAndTransitionToMultirotor()` 发的是**同一条命令**，
-            //    差别只在它前面多切一次 Hold。
-            //    `showError = true`：命令被拒时由 QGC 内建的错误通道弹提示 —— `sendCommand`
-            //    返回 void，QML 侧判不了返回值，"让失败可见"这件事只能压在 `showError` 上。
-            v.sendCommand(1, OpsCommon.MAV_CMD_DO_VTOL_TRANSITION, true,
-                          OpsCommon.MAV_VTOL_STATE_MC, 0, 0, 0, 0, 0, 0)
-            // 发完自查一次：`vtolStateChanged` 只在状态**变化**时发，而"本来就是 MC"上面已排除
-            // ⇒ 这里不会重复触发。若命令生效极快、回调已跑过，本次自查会被
-            // `_mcCheckTransitionComplete` 的阶段闸挡掉。
-            _mcCheckTransitionComplete()
+            _beginMcTransition(v)
             return
         }
 
         // ---- 不需要转 ⇒ 直接进 ③④ ----
         _landPhase = "autonomous"
         _uploadLandingMission()
+    }
+    /// ② 转多旋翼：要求飞机从固定翼切到多旋翼，并进入 `"transition"` 段等它转完。
+    ///
+    /// ‼️ **前置判据由调用方负责**（本函数不再判一遍）：`landKindTransitionToMc(_landKind)`
+    ///    为真、且 `!vtolTransitionDone(v.vtolState)`。抽成函数是因为**有两个调用方**：
+    ///    · `_startLandFlow` 的 ②（正常降落的 F2/F3）；
+    ///    · `_retargetLandingSlot` 的**改派**（用户 2026-10-09 裁定②：「改派机位强制修改为
+    ///      与『转换为 mc 方式降落』相同逻辑」）。
+    ///    两处若各写一份，"发哪条命令 / 进哪个阶段 / 停哪个计时器"会各自演化出不同答案。
+    ///
+    /// 本函数**只**负责「发命令 + 转入等待段」，不碰任何快照 —— 快照由调用方在调它**之前**
+    /// 写好，因为转换完成后 `_mcCheckTransitionComplete()` 会读快照去上传航线。
+    function _beginMcTransition(v) {
+        if (!v) return
+        _landPhase = "transition"
+        // ⚠️ 停掉可能还活着的 `landFlowTimer`。本 Timer 只在自主段里有意义
+        //    （`_landFlowTick` 判落地、判超时），`"transition"` 段由 `mcSwitchTimer` 计时。
+        //    这是**第一道**；**第二道**在 `_landFlowTick` 里按阶段位分流。
+        //    两道都要：只靠第二道时，野 Timer 仍会每 500 ms 空转一次。
+        landFlowTimer.stop()
+        mcSwitchTimer.restart()
+        // ‼️ 只发转换命令、**不切 Hold**（设计稿 §9.8.5）。统一链里 ② 后面跟的是 ④ 的
+        //    AUTO_MISSION **真转换**（inactive→active），导航状态机会照样重建 ⇒ 原实现里
+        //    那个 Hold 的用途（把导航模式挪开，让后续的 Guided 指令能重建状态机）不再需要。
+        //    既有对照：`Vehicle::hoverAndTransitionToMultirotor()` 发的是**同一条命令**，
+        //    差别只在它前面多切一次 Hold。
+        //    `showError = true`：命令被拒时由 QGC 内建的错误通道弹提示 —— `sendCommand`
+        //    返回 void，QML 侧判不了返回值，"让失败可见"这件事只能压在 `showError` 上。
+        v.sendCommand(1, OpsCommon.MAV_CMD_DO_VTOL_TRANSITION, true,
+                      OpsCommon.MAV_VTOL_STATE_MC, 0, 0, 0, 0, 0, 0)
+        // 发完自查一次：`vtolStateChanged` 只在状态**变化**时发，而"本来就是 MC"上面已由
+        // 调用方排除 ⇒ 这里不会重复触发。若命令生效极快、回调已跑过，本次自查会被
+        // `_mcCheckTransitionComplete` 的阶段闸挡掉。
+        _mcCheckTransitionComplete()
     }
     /// ③④：上传两航点 + 切自动任务模式。两者都在 C++ 出口里（Task 2），本函数只发起与计时。
     ///
@@ -951,7 +1039,15 @@ OpsShell {
     function _uploadLandingMission() {
         var v = _landingVehicle
         if (!v) { _clearLandFlow(); return }
-        _landUploaded = false
+        // ‼️ `_landUploaded` 的语义是「**本流程曾经**成功上传过」—— 它不是"本次上传成没成"
+        //    （那一问是 `_landWaitingForUpload`）。而 `_onLandingMissionFinished` 拿它分辨
+        //    「首传失败 ⇒ 清场」与「改派重传失败 ⇒ 保流程继续」，依据正是"以前成功过没有"。
+        //    ⇒ **改派重传这一趟不能把它清零**：清了之后，一次改派失败会被当成首传失败，
+        //      把一条**仍在正常执行**的流程整段清掉 —— 机上还飞着旧航线，界面却说
+        //      「降落航线未发出、流程已停止」（2026-10-08 评审 I-1 警告过的那个形状）。
+        //    ⚠️ 改派走"转多旋翼"那条路时，本函数是由 `_mcCheckTransitionComplete()`
+        //      隔一次异步等待才调到的 ⇒ 判据只能读流程状态 `_landRetransmit`，不能走参数。
+        if (!_landRetransmit) _landUploaded = false
         _landWaitingForUpload = true
         _landDeadlineMs = Date.now() + _landUploadTimeoutMs
         landFlowTimer.restart()
@@ -1003,7 +1099,11 @@ OpsShell {
     ///    "这架飞机走到哪一步了"）。终止路径散布在多个函数里，漏清任何一处，症状都是「下一次
     ///    点降落时行为诡异」——而那种缺陷 QML 既编译不出来、离屏也测不到。
     ///    ⇒ **新增终止分支时必须调它，不要手写那几行赋值；新增流程状态字段时必须在这里清掉它**
-    ///    （本函数是这些状态的唯一清零点）。
+    ///    （本函数是这些状态的**终态**清零点）。
+    ///    ⚠️ 「终态」二字是 2026-10-10 订正的：`_startLandFlow` 里另有一处**显式**置回
+    ///       `_landRetransmit = false`，那是"进入流程时的首传声明"、不是终止路径。
+    ///       （不写「唯一」是因为那句会被那一行证伪，而按一句已被证伪的话去核对，
+    ///         给出的是一份虚假的安心。）
     /// （刻意不列举"是哪几个函数、哪几个字段"：那种清单每加一次调用点就腐烂一次，而照着腐烂
     ///   的清单核对会给出一份虚假的安心。）
     function _clearLandFlow() {
@@ -1021,6 +1121,7 @@ OpsShell {
         _landUploaded = false
         _landWaitingForUpload = false
         _landSawAirborne = false
+        _landRetransmit = false
     }
     /// 转换完成（或本来就已是多旋翼）⇒ 飞向**接机机位**，而不是回家。
     ///
@@ -1128,15 +1229,29 @@ OpsShell {
             return
         }
         if (Date.now() >= _landDeadlineMs) {
-            // ‼️ **先读后清**：`_clearLandFlow()` 是这些字段的唯一清零点，顺序颠倒会让两种
+            // ‼️ **先读后清**：`_clearLandFlow()` 是这些字段的终态清零点，顺序颠倒会让两种
             //    超时永远报同一条文案（`_landWaitingForUpload` 会被清成 false，于是上传档的
             //    超时也报自主段那一条）。
             var awaitingUpload = _landWaitingForUpload
+            var wasRetransmit = _landRetransmit
             _clearLandFlow()
             if (awaitingUpload) {
-                QGroundControl.showMessageDialog(opsView, qsTr("降落航线未发出"),
-                    qsTr("在 %1 秒内未收到航线上传完成的确认，飞机未收到降落航线。请检查链路后重试。")
-                        .arg(Math.round(_landUploadTimeoutMs / 1000)))
+                // ‼️ 上传档超时**说不准"飞机没收到"**（2026-10-10 审查 I-2 修）：超时的语义是
+                //    「确认没回来」，**不是**「上传失败」—— 航线完全可能已经在机上。
+                //    原文案把它报成既成事实，于是同一个物理结果在这里被说成"飞机未收到降落
+                //    航线"，而在 `_onLandingMissionFinished` 那一格被说成"仍飞向原机位"，
+                //    两条路径**互相矛盾**。
+                if (wasRetransmit) {
+                    // 改派这一格更确定：`_retargetLandingSlot` 那道 `_landUploaded` 闸保证
+                    // 改派只发生在"航线已在机上"之后 ⇒ **旧航线必然还在机上飞**。
+                    QGroundControl.showMessageDialog(opsView, qsTr("改派未生效"),
+                        qsTr("在 %1 秒内未收到新航线上传完成的确认，本次改派未生效。无人机仍按原航线飞向原机位，请检查链路后重试。")
+                            .arg(Math.round(_landUploadTimeoutMs / 1000)))
+                } else {
+                    QGroundControl.showMessageDialog(opsView, qsTr("未确认航线上传"),
+                        qsTr("在 %1 秒内未收到航线上传完成的确认，无法确认飞机是否已收到降落航线。请检查链路，并在主界面确认无人机状态。")
+                            .arg(Math.round(_landUploadTimeoutMs / 1000)))
+                }
             } else {
                 QGroundControl.showMessageDialog(opsView, qsTr("未确认降落"),
                     qsTr("降落航线已发出，但无人机在 %1 秒内未报告完成着陆。请在主界面确认无人机状态。")
@@ -1190,24 +1305,25 @@ OpsShell {
             return
         }
         // ---- `transition` 段（② 已发出、③ 尚未上传）：只换快照，**不重传** ----
-        // ‼️ **两个快照都要换**。③ 上传时读的是 `_landApproach*`（`_uploadLandingMission`），
-        //    而且它**从不重算** —— 只换 `_landTarget*` 会让飞机朝一个与新机位无关的方向做
-        //    进近段（F1 的 P 本就落在**旧机位**朝向的 300 m 射线上）。
+        // ‼️ **四个快照都要换**。③ 上传时读的是 `_landApproach*`（`_uploadLandingMission`），
+        //    而且它**从不重算** —— 只换 `_landTarget*` 会让飞机按一条落点与进近点对不上的
+        //    航线飞。
+        // ‼️ 2026-10-09 用户裁定②落地：改派**一律**改成「转换为 MC 方式降落」那一支
+        //    ⇒ `_landKind` 在这里就改写成 F2，P 与落点**同坐标**。原实现按 `_landKind`
+        //    分叉、还带一个「新机位朝向不可用 ⇒ 改派不完整」的失败支 —— 它**已经不可达**：
+        //    F1 根本不进本段（不发 ②，`_landPhase` 直接是 `autonomous`），而 F2/F3 的
+        //    `landApproachPoint` 恒返回机位坐标本身、**永不为 null**。连同"机位朝向"
+        //    一起删掉，别留一句指向已无关字段的文案。
+        // ⚠️ 这里**不置** `_landRetransmit`：本段 ③ 还没上传过，`_landUploaded` 此刻必为假，
+        //    而那个标志的唯一作用是"别把它清零"—— 没有东西可保护。此后 ③ 由
+        //    `_mcCheckTransitionComplete()` 触发，若那次上传失败，`_landUploaded` 仍是假
+        //    ⇒ 走「首传失败 ⇒ 清场」，而它**确实是首传**，判对了。
         if (_landPhase === "transition") {
-            var ta = OpsCommon.landApproachPoint(_landKind, s.lat, s.lon, s.heading)
+            _landKind = OpsCommon.LAND_KIND_TO_MC
             _landTargetLat = s.lat
             _landTargetLon = s.lon
-            if (!ta) {
-                // ⚠️ **不回滚落点**。`_assignSlot` 的 POST 已经成功，库里的 `assign_slot_id`
-                //    就是新机位；把 `_landTarget*` 退回旧机位会让局面变成「库里记新机位、
-                //    飞机降旧机位」—— 那正是 `_assignSlot` 那道闸要防的错。此处保留旧进近点、
-                //    把事实说出来，改派本身**不算失败**（落点已经改了）。
-                QGroundControl.showMessageDialog(opsView, qsTr("改派不完整"),
-                    qsTr("新机位的朝向不可用，算不出新的进近点。落点已改为新机位，进近段仍按原方向飞。"))
-                return
-            }
-            _landApproachLat = ta.lat
-            _landApproachLon = ta.lon
+            _landApproachLat = s.lat
+            _landApproachLon = s.lon
             return
         }
 
@@ -1236,35 +1352,44 @@ OpsShell {
                 qsTr("降落已开始，本次改派未生效。"))
             return
         }
-        // 新机位的进近点要按**本流程的进近方式**重算：F1 的 P 随朝向偏移 300 m，
-        // 不重算会让飞机朝一个与新机位无关的方向做进近段。
-        // ⚠️ 用 `s.lat/s.lon`（**新**机位）算，四个快照在算成功之后**一次性**改写：算不出进近点
-        //    就一个快照都不动 —— 那样飞机仍按机上那条旧航线飞向原机位，下面那句「本次改派
-        //    未生效，无人机仍飞向原机位」才是字面为真的。
-        // ‼️ 重传时传的落点必须是**新**机位：`_landTarget*` 若不跟着改，航线的落点还是旧机位，
+        // ---- 落点与进近点：都改成**新机位**，且本流程从此走 F2（转换 MC 降落）----
+        // ‼️ 用户 2026-10-09 裁定②逐字：「改派机位强制修改为与『转换为 mc 方式降落』
+        //    相同逻辑」。改前是"按本流程原有的进近方式重算 P"，改后**一律**改成 F2 语义 ——
+        //    落点与进近点同为**新机位坐标**（F2 的 `landApproachPoint` 返回两点同值）。
+        //    ⚠️ 于是这里不再有"算不出进近点"这一格：F2 支恒返回机位坐标本身、**永不为 null**
+        //      （`s.lat/s.lon` 的有效性已由上面 `isValidWaypoint` 那道闸保证）。
+        // ‼️ 四个快照**一次性**改写：漏掉 `_landTarget*` 会让航线的落点还是旧机位，
         //    而库里 `assign_slot_id` 已经是新机位 —— 正是 `_assignSlot` 那道闸要防的
         //    「库里记新机位、飞机降旧机位」。
-        var na = OpsCommon.landApproachPoint(_landKind, s.lat, s.lon, s.heading)
-        if (!na) {
-            QGroundControl.showMessageDialog(opsView, qsTr("改派未生效"),
-                qsTr("新机位的朝向或坐标不可用，算不出进近点。本次改派未生效，无人机仍飞向原机位。"))
-            return
-        }
+        _landKind = OpsCommon.LAND_KIND_TO_MC
         _landTargetLat = s.lat
         _landTargetLon = s.lon
-        _landApproachLat = na.lat
-        _landApproachLon = na.lon
-        // ⚠️ **不要重置 `_landUploaded`**：它是 `_onLandingMissionFinished` 分辨
-        //    「首传失败（清场）」与「改派重传失败（保流程）」的唯一依据。重置了，
-        //    改派失败会被当成首传失败，把一条仍在正常执行的流程清掉。
-        // ⚠️ 但**截止档位要跟着改回上传档**（`_landWaitingForUpload`）：重传就是一次新的上传，
-        //    等的仍是 `sendComplete`。它和 `_landUploaded` 是两问，别合并（评审 I-1）。
-        _landWaitingForUpload = true
-        _landDeadlineMs = Date.now() + _landUploadTimeoutMs
-        landFlowTimer.restart()
-        // ⚠️ 不看返回值（同 `_uploadLandingMission`）：失败经信号回来，这里再判会弹两次。
-        lv.startVtolLandingMission(_landApproachLat, _landApproachLon,
-                                   _landTargetLat, _landTargetLon)
+        _landApproachLat = s.lat
+        _landApproachLon = s.lon
+        // ‼️ **本趟是重传**：`_uploadLandingMission()` 靠它**不清** `_landUploaded` ——
+        //    那个标志是 `_onLandingMissionFinished` 分辨「首传失败（清场）」与
+        //    「改派重传失败（保流程）」的唯一依据。清零了，一次改派失败会把一条仍在正常
+        //    执行的流程整段清掉。
+        // ⚠️ 截止档位（`_landWaitingForUpload` / `_landDeadlineMs` / `landFlowTimer`）
+        //    **不在这里写**：重传就是一次新的上传，`_uploadLandingMission()` 会设全它们，
+        //    与首传走**同一条**代码。改前这里是手写那几行的（评审 I-1 的由来）。
+        _landRetransmit = true
+        // 原流程若是 F1（保持固定翼），飞机此刻**还是固定翼** ⇒ 必须转过去。
+        // ⚠️ 转 MC 是**不可逆**的机体动作，这里刻意不问"要不要"—— 裁定②就是要它转。
+        //    已经是 MC 的（原流程本就是 F2/F3）跳过这步，直接重传。
+        // ‼️ **这里不判 kind**（2026-10-10 审查 S-1 修）：上面刚把 `_landKind` 写成
+        //    `LAND_KIND_TO_MC`，而 `landKindTransitionToMc(LAND_KIND_TO_MC)` **恒为真**
+        //    （`OpsCommon.js` 里那个函数就是按成分支定义的）⇒ 原写法
+        //    `landKindTransitionToMc(_landKind) && …` 是一个**恒真项**：读起来像
+        //    "按 kind 分叉"，实际分不了叉。裁定②之下改派**一律**要转 MC，
+        //    条件就只剩"当前还不是 MC"这半边。
+        //    ⚠️ **别照抄到这个形状的别处**：`_startLandFlow` 里那一处的 kind 是入口实参、
+        //       三种都可能，那处**必须**判。
+        if (!OpsCommon.vtolTransitionDone(lv.vtolState)) {
+            _beginMcTransition(lv)
+            return
+        }
+        _uploadLandingMission()
     }
     // 正常降落的唯一写路径（F1「降落」与 F2「切换多旋翼降落」共用，`kind` 区分进近方式）：
     // 接机机位坐标校验 → 机位空闲校验 → POST /tasks/:id/land（DB→LANDING）→ `_startLandFlow`。
@@ -1565,6 +1690,39 @@ OpsShell {
     // **不再重置**——该常数全局同值、与是哪架飞机无关，重置只会给所有飞机多开一个
     // 「不建 sync」的窗口，带不来任何正确性。
     property real _vtolTransitionDistance: -1
+
+    //── 「保持固定翼」降落的进近点推远距离（运营常数，2026-10-09 用户裁定①）────────
+    //
+    // ‼️ **与上面那个不是同一个量，别合并、别互相顶替。** 两个键同在
+    //    `table_operational_constant`、同由 `GET /api/operational-constants` 下发，
+    //    但回答的是两个不同的问题：
+    //      · `vtol_takeoff_transition_distance` —— 起飞转换点，原点是 **`home`**、
+    //        方位取**机位朝向**（两者都是静态量），消费方是 `OpsRouteSync.qml`；
+    //      · `vtol_landing_pushout_distance` —— F1 降落的进近点 P，原点是
+    //        **飞机当前位置**、方位取**飞机当前航向**（两者都会动），
+    //        消费方是本文件 `_startLandFlow`（经 `OpsCommon.landApproachPoint`）。
+    //    ⇒ 后者的取值**每次降落各算一次**，不是可缓存的几何。
+    //
+    // ⚠️ **不开第二个 XHR**：两个键在同一张表、同一次响应里回来。开第二个请求就要配
+    //    第二套闩 / 序号 / 超时计时器，而它们要防的是**同一件事**（Qt 6.11 的 QML XHR
+    //    没有 `xhr.timeout`，超时只能自己兜）⇒ 两套会各自演化出不同的超时口径。
+    //    ⚠️ 也别拿"反正降落时才用得上、到时再单独取一次"当理由：降落流程里那次取回
+    //    是**异步**的，而 `_startLandFlow` 是**同步**算 P 的 —— P 等不起一个 XHR。
+    //
+    // 初值 `-1` = 还没取到（同 `_vtolTransitionDistance` 的约定）。**归一化后不会是 `-1`**：
+    // `_onVtolDistancesArrived()` 四条落定路径都会给它一个有效值。`-1` 只在
+    // 「`_onVehicleConnected` 已发请求、响应还没回来」这个窗口里存在 ——
+    // 该窗口 ≤ 超时 5 s，且起点是**飞机连上 QGC**，早于任何一次降落操作。
+    // `_startLandFlow` 仍必须自己判它（见那里），因为窗口存在 ⇒ 就有落在窗口里的调用。
+    //
+    // 兜底 400 全链**共三处**，改值时三处都要人工同改（跨语言/跨文件的相等关系**没有判据**）：
+    //   ① 迁移里的种子值（`uavm/gcs_server/db/migrate.go` 的 v42 写入的 400）
+    //   ② Go 的 `defaultVtolLandingPushoutDistance`（`handlers/operational_constant.go`）
+    //   ③ 这一处（`_onVtolDistancesArrived()` 里取不到时的归一化）
+    // ⚠️ 对照：起飞那个常数**多一处**（`OpsRouteSync.qml` 里 `transitionM` 的兜底），
+    //    因为起飞端的消费方在那个文件里。**数字对不上不是漏数**：降落端没有第四个落点。
+    property real _vtolLandingPushoutDistance: -1
+
     // 闩：已经为**这个 Vehicle 对象**取过（含在途）。`null` = 还没为任何飞机取过。
     property var  _vtolDistanceAskedFor: null
     // 请求序号：每发一次取值请求 +1；回调带着**自己那次的序号**回来。
@@ -1583,14 +1741,16 @@ OpsShell {
     ///    但 **5 s 内零回调**：无 `ontimeout`、无 `readyState === DONE`、无 `onerror`
     ///    ⇒ 请求**永远挂着**，回调永远不来。⚠️ 别用「读回等于所设」当它生效的判据。
     ///    对照臂（同一份脚本里对正常应答的服务端）：2 ms 拿到 `status 200`，机制本身没问题。
-    ///    ⇒ 超时只能由 QML 侧自己的 `Timer` 兜。见 `_onVtolDistanceArrived()`（它会停表）。
+    ///    ⇒ 超时只能由 QML 侧自己的 `Timer` 兜。见 `_onVtolDistancesArrived()`（它会停表）。
     Timer {
         id: _vtolTimeoutTimer
         interval: 5000
         repeat: false
-        // 迟到的应答由 `_onVtolDistanceArrived` 里的 `seq` 判据丢弃，所以这里
+        // 迟到的应答由 `_onVtolDistancesArrived` 里的 `seq` 判据丢弃，所以这里
         // 直接报「当前在途的那一次的序号」即可。
-        onTriggered: opsView._onVtolDistanceArrived(opsView._vtolReqSeq, false, NaN)
+        // ⚠️ 两个 NaN 是**两个键各自的**"没取到"：本 Timer 超时意味着整次响应都没回来，
+        //    两个键一起走兜底，不能只兜一个（只兜一个会让另一个停在 `-1`）。
+        onTriggered: opsView._onVtolDistancesArrived(opsView._vtolReqSeq, false, NaN, NaN)
     }
 
     /// 取出任务对应的同步器（没有就造一个）。**幂等**：已存在时直接返回旧的。
@@ -1707,8 +1867,8 @@ OpsShell {
         //    —— 会让航线**永远建不出来**，因为补调走的正是这条路：
         //        XHR 回来 → _syncRoutesForAlreadyConnected() → _onVehicleConnected(同一架)
         //        → 闩命中 → return ⇒ 任务循环根本没跑到。
-        //    （`_fetchVtolTransitionDistance` 内部自己判闩，所以这句是幂等的。）
-        _fetchVtolTransitionDistance(vehicle)
+        //    （`_fetchVtolDistances` 内部自己判闩，所以这句是幂等的。）
+        _fetchVtolDistances(vehicle)
         var ts = _tasks
         if (!ts) return
         for (var i = 0; i < ts.length; i++) {
@@ -1719,7 +1879,10 @@ OpsShell {
         }
     }
 
-    /// 取一次 VTOL 起飞转换距离（设计稿 §7.3）。
+    /// 取一次 VTOL 的**两个**距离常数（起飞转换距离 + 降落进近点推远距离；设计稿 §7.3）。
+    ///
+    /// ‼️ **一次请求取两个键**，理由见 `_vtolLandingPushoutDistance` 的声明注释：
+    ///    同表同响应，开第二个请求就要配第二套闩/序号/超时。
     ///
     /// **内部自己判闩**：每个 Vehicle 对象只发 1 次（含在途）。调用方每次都调它，
     /// 由它决定这次要不要真的发 —— 这样 `_onVehicleConnected()` 的任务循环
@@ -1732,14 +1895,14 @@ OpsShell {
     ///    ⚠️ 超时**不能用 `xhr.timeout`**（Qt 6.11 的 QML XHR 没实现它，见
     ///    `_vtolTimeoutTimer` 的注释与那里的实测）⇒ 由那个 Timer 兜。
     ///    也因此这里不走 `OpsShell._get`（它没带超时能力）。
-    function _fetchVtolTransitionDistance(vehicle) {
+    function _fetchVtolDistances(vehicle) {
         if (_vtolDistanceAskedFor === vehicle) return
         _vtolDistanceAskedFor = vehicle
         _vtolReqSeq += 1
         var seq = _vtolReqSeq
         if (_apiBase === "") {
             // gcs_server 地址没配 ⇒ 不必干等超时，直接走同一个落定出口。
-            _onVtolDistanceArrived(seq, false, NaN)
+            _onVtolDistancesArrived(seq, false, NaN, NaN)
             return
         }
         var xhr = new XMLHttpRequest()
@@ -1749,33 +1912,42 @@ OpsShell {
         xhr.onreadystatechange = function() {
             if (xhr.readyState !== XMLHttpRequest.DONE) return
             var ok = (xhr.status >= 200 && xhr.status < 300)
-            var v = NaN
+            var vTakeoff = NaN
+            var vPushout = NaN
             if (ok && xhr.responseText && xhr.responseText.length) {
                 try {
                     var data = JSON.parse(xhr.responseText)
                     var items = data ? data.items : null
+                    // ⚠️ **不能 `break`**（改前那个单键实现是取的第一个命中就跳出）：
+                    //    两个键在同一次响应里，跳早了另一个就恒拿不到。
+                    // ⚠️ 键**不在响应里**时两个变量保持 `NaN` ⇒ 落定出口按"取不到"走兜底，
+                    //    不会误当成 0（`Number(undefined)` 才是 NaN，这里连 `Number` 都没调）。
                     for (var i = 0; items && i < items.length; i++) {
-                        if (items[i] && items[i].key === "vtol_takeoff_transition_distance") {
-                            v = Number(items[i].value)
-                            break
+                        var it = items[i]
+                        if (!it || !it.key) continue
+                        if (it.key === "vtol_takeoff_transition_distance") {
+                            vTakeoff = Number(it.value)
+                        } else if (it.key === "vtol_landing_pushout_distance") {
+                            vPushout = Number(it.value)
                         }
                     }
                 } catch (e) {
-                    console.warn("OpsView: 运营常数响应非 JSON，起飞转换距离退回内置 300")
+                    console.warn("OpsView: 运营常数响应非 JSON，两个 VTOL 距离均退回内置值")
                 }
             }
-            _onVtolDistanceArrived(seq, ok, v)
+            _onVtolDistancesArrived(seq, ok, vTakeoff, vPushout)
         }
         // 网络错（连接被拒、DNS 失败…）走这里；**「服务端不响应」不走这里**，
         // 那条路由 `_vtolTimeoutTimer` 兜（`xhr.timeout` 在 Qt 6.11 无效）。
-        xhr.onerror = function() { _onVtolDistanceArrived(seq, false, NaN) }
+        xhr.onerror = function() { _onVtolDistancesArrived(seq, false, NaN, NaN) }
         _vtolTimeoutTimer.restart()
         xhr.send(null)
     }
 
+
     /// 取值**落定**（成功、超时、网络错、地址未配，四条路都走这里）：
-    /// 按 `seq` 去重 ⇒ §7.4 归一化 ⇒ 补调被挡下的建 sync。
-    function _onVtolDistanceArrived(seq, ok, v) {
+    /// 按 `seq` 去重 ⇒ §7.4 归一化（**两个键各归一化一次**）⇒ 补调被挡下的建 sync。
+    function _onVtolDistancesArrived(seq, ok, vTakeoff, vPushout) {
         // 一次请求有三个落定点，谁先到谁算数、后到的丢弃（`seq` 只增 ⇒ `<=` 即已落定）。
         if (seq <= _vtolSettledSeq) return
         _vtolSettledSeq = seq
@@ -1797,7 +1969,29 @@ OpsShell {
         //    在这里点明它，是为了让上面「共四处」这个断言有**明确的排除范围**——
         //    否则第 5 个字面量会让「共四处」读起来像是漏数了。详见本文件「VTOL 起飞转换距离
         //    （运营常数）」那段（`_vtolTransitionDistance` 属性定义处）的完整边界论证。
-        _vtolTransitionDistance = (ok && isFinite(v) && v >= 100) ? v : 300
+        _vtolTransitionDistance = (ok && isFinite(vTakeoff) && vTakeoff >= 100) ? vTakeoff : 300
+        // 降落推远距离：兜底 400，判据与起飞那一行**同形**（`isFinite` + 下限 100）。
+        // ‼️ 与起飞**共用同一个下限 100**，不是又拍了一个数：两个键同表、同量纲、同量级
+        //    （都是"VTOL 转换/进近的几百米推远"），且下限要回答的是同一个问题——
+        //    「小于 100 m 的推远对本用途还有意义吗」：起飞端是"84 项的朝向需要一段可见的
+        //    位移"，降落端是"P 要落在盘旋圈外、第一条腿能把飞机拉直" ⇒ 都不是。
+        // ⚠️ 这三处（迁移种子 / Go 常量 / 本行）就是降落端的**全部**落点，与起飞端的四处
+        //    **不同数**：起飞端多出 `OpsRouteSync.qml` 那一处，因为它的消费方在那个文件里。
+        //    详见 `_vtolLandingPushoutDistance` 的声明注释。
+        // ⚠️ 归一化**不是** `landApproachPoint` 那道闸的替代：归一化保证"这个属性不会是
+        //    0 或负数"，而 `landApproachPoint` 挡的是"传进来的 `pushoutM` 是 0 或负数"
+        //    （它是纯函数、拿不到本属性，两处各守各的输入面）。
+        // ‼️ 兜底**不能静默**（2026-10-10 审查 I-3 修）：运维把该常数改成 80（> 0，但低于本行
+        //    下限 100）时，服务端**原样下发** 80，而这里悄悄换成 400 —— 界面无痕，排查者会以为
+        //    「我改了常数但系统没反应」。与上面那个 catch（`:1880`）的处置同级：至少留一行日志。
+        //    ⚠️ 首次响应还没回来时 `vPushout` 是 `NaN`（键不在响应里则保持初值），
+        //      也会走这里 —— 那属**正常**路径，日志照打，因为它同样是"本属性此刻不等于表里
+        //      那个值"这一件事，只是原因不同。
+        if (!(ok && isFinite(vPushout) && vPushout >= 100)) {
+            console.warn("OpsView VTOL 降落推远距离不用表里的值、退回内置 400：ok=", ok,
+                         "pushout=", vPushout)
+        }
+        _vtolLandingPushoutDistance = (ok && isFinite(vPushout) && vPushout >= 100) ? vPushout : 400
         // 在途期间被 `_syncRouteForTask()` 挡下的那些任务，现在补建。
         // （该函数已存在，`Component.onCompleted` 与 `on_TasksChanged` 都在调它。）
         _syncRoutesForAlreadyConnected()
