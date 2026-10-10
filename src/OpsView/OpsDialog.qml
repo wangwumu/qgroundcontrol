@@ -37,19 +37,52 @@ import QtQuick.Controls
 
     \note 使用者只需给 `id` / `parent` / `width` / `x` / `y` / `title` 和正文；
     `background` 与 `header` **不要再在本组件实例里覆写**（同一处有两个定义会打架）。
+    要换色系**不覆写**，改传下面那个 `alert` 开关。
+
+    ---- 告警档（用户 2026-10-10 第五轮）----
+
+    用户原话：「告警类提示款不应该与其他提示框采用相同色系；……背景和边框改为黄色系
+    颜色，背景为淡黄色。文字使用与背景反差较大的颜色」。
+
+    ⇒ 这里多一个 `alert` 开关，**只换色系、不换结构**。判据不是"重要不重要"，是
+    **这个框要不要人做决定**：要（确认/拒绝/接管）＝深绿卡；只是**告知**一件事、
+    看完就走（「交接已结束」通知，5 秒自关）＝淡黄告警卡。前者是对话，后者是广播。
+
+    ‼️ 换的不止边框：**底、边、标题、正文四处一起换**。只把边框改成黄的、正文留着
+    `#e6edf7`，就是文件头上一条纪律（"只改背景"）的镜像错误，结果同样是看不见的字。
+    淡黄底 `#fff8e1` 上的实算值（同一套 WCAG 公式，本机 python 可复现）：
+
+        正文 `#3e2723` 深棕   → **13.01:1**
+        标题 `#7a4f01` 深琥珀 → **6.71:1**（14px bold 属小文本，过 AA 4.5:1）
+        边框 `#d48806`        → **2.70:1**（非文字，比 `#f9a825` 的 1.85 才压得住 1px 描边）
+        ✗ 沿用深底家族的 `#e6edf7` → **1.11:1**（等于看不见）
+
+    深绿档的四个原值**一个都没动**（正文 12.18 / 边框 4.79，同一脚本可复核）。
 */
 Dialog {
     id: opsDialogRoot
 
-    // ‼️ 深色卡片底 —— 色值与 `TaskListPanel.qml` 的**进站任务卡片**
-    //    （`inboundCardColor` / `inboundCardBorderColor`）**同值**。
-    //    降落站点的任务卡就是进站卡，所以用户说的"跟降落卡片风格相同"= 这一组色。
-    //    改配色时 `TaskListPanel.qml` 与这里要**一起看**。
+    /// 告警档开关（用户 2026-10-10）。`false`（缺省）＝深绿卡片家族，动作弹框用；
+    /// `true` ＝淡黄告警卡片，**只告知、不需决定**的提示用。
+    /// ‼️ 实例**只传这个开关**，不传色值 —— 色值全部留在本文件，见上面那段纪律。
+    property bool alert: false
+
+    // 四个色值仍**只在本文件定义一处**。改配色改这里，不会漏改某一个实例。
+    readonly property color cardColor:   alert ? "#fff8e1" : "#0f2f2c"
+    /// 深绿档的边色与 `TaskListPanel.qml` 的**进站任务卡片**
+    /// （`inboundCardColor` / `inboundCardBorderColor`）**同值** ——
+    /// 降落站点的任务卡就是进站卡，用户说的"跟降落卡片风格相同"= 这一组。
+    /// 改深绿档配色时 `TaskListPanel.qml` 与这里要**一起看**；告警档与之无关。
+    readonly property color borderColor: alert ? "#d48806" : "#26a69a"
+    readonly property color titleColor:  alert ? "#7a4f01" : "#e6edf7"
+    /// 正文字色，**跟着底走**（见文件头那张实算表）。
+    readonly property color bodyColor:   alert ? "#3e2723" : "#e6edf7"
+
     background: Rectangle {
-        color: "#0f2f2c"
+        color: opsDialogRoot.cardColor
         radius: 4
         border.width: 1
-        border.color: "#26a69a"
+        border.color: opsDialogRoot.borderColor
     }
 
     // ‼️ `text: opsDialogRoot.title` 而不是裸写 `title`：`header` 的求值作用域在派生
@@ -60,7 +93,7 @@ Dialog {
             id: opsDialogTitle
             anchors { left: parent.left; right: parent.right; top: parent.top; margins: 10 }
             text: opsDialogRoot.title
-            color: "#e6edf7"; font.pixelSize: 14; font.bold: true
+            color: opsDialogRoot.titleColor; font.pixelSize: 14; font.bold: true
             elide: Text.ElideRight
         }
     }

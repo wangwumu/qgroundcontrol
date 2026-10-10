@@ -2753,6 +2753,12 @@ Item {
            ? (opsShell.height - height) / 2
            : Math.min(opsShell._handoverAnchorY + 6, opsShell.height - height - 12)
         modal: false
+        // ‼️ 告警档（用户 2026-10-10 第五轮）：「告警类提示框不应该与其他提示框采用
+        //    相同色系」。分档判据不是"重要不重要"，是**要不要人做决定** ——
+        //    `handoverDialog` 是等你选【取消】还是【回航】的**对话**，这个是**广播**
+        //    （只告知、5 秒自关、没有任何可选项）⇒ 换色系，让人一眼看出"这条不用回"。
+        // ⚠️ 色值一个都不在这里写：全在 `OpsDialog.qml`，这里只传开关。
+        alert: true
         title: qsTr("交接已结束")
 
         // 用户 2026-10-10 明示「这个通知框在 5 秒后自动关闭」。
@@ -2765,10 +2771,11 @@ Item {
             spacing: 8
             Text {
                 Layout.fillWidth: true
-                // 深绿底 `#0f2f2c` 上的正文色（12.18:1，实算表见 `OpsDialog.qml`）——与
-                // `handoverDialog` 同一条纪律：**字色跟着底走**。白底时代那套 `#1f2937` /
-                // `#1565c0` 搬到这个底上分别是 1.02:1 / 2.50:1，等于看不见。
-                color: "#e6edf7"; font.pixelSize: 13
+                // 字色由告警档给出（淡黄底上的 `#3e2723`，13.01:1），不写死在这里 ——
+                // 与 `handoverDialog` 同一条纪律：**字色跟着底走**。那条纪律的反面教材
+                // 就在本行原来的值上：深底家族的 `#e6edf7` 搬到淡黄底只有 1.11:1，
+                // 等于看不见（实算表在 `OpsDialog.qml` 文件头）。
+                color: handoverGoneDialog.bodyColor; font.pixelSize: 13
                 wrapMode: Text.Wrap
                 text: _handoverGoneText
             }
