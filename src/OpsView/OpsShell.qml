@@ -2771,10 +2771,9 @@ Item {
             spacing: 8
             Text {
                 Layout.fillWidth: true
-                // 字色由告警档给出（淡黄底上的 `#3e2723`，13.01:1），不写死在这里 ——
-                // 与 `handoverDialog` 同一条纪律：**字色跟着底走**。那条纪律的反面教材
-                // 就在本行原来的值上：深底家族的 `#e6edf7` 搬到淡黄底只有 1.11:1，
-                // 等于看不见（实算表在 `OpsDialog.qml` 文件头）。
+                // 字色由告警档给出（暗黄底 `#6b4e00` 上的 `#fff8e1`，7.28:1），不写死在这里 ——
+                // 与 `handoverDialog` 同一条纪律：**字色跟着底走**。用户第六轮把底压暗，
+                // 框里每个字色就都得跟着翻一遍（实算表在 `OpsDialog.qml` 文件头）。
                 color: handoverGoneDialog.bodyColor; font.pixelSize: 13
                 wrapMode: Text.Wrap
                 text: _handoverGoneText
