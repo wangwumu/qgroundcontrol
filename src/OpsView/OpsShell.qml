@@ -737,7 +737,12 @@ Item {
     }
 
     //---- 接口封装 ----
-    function _fetchOverview() {
+    /// `onDone`（可选）：本次响应**成功且已走完全部赋值**之后回调一次 —— 唯一使用者是
+    /// `_markGoneConfirmHandover` 的**定向刷新**（"task 数据一到就结算，不等下一轮 2s"）。
+    /// ‼️ 失败路径（非 200 / 非数组）**不调**：宁可让兜底慢一轮，也**不要**拿一份残留数据
+    ///    去判"交接为什么消失"（回航会被误报成取消，见那个函数的注释）。
+    /// 省略时行为与从前**逐字相同**（`_poll` 就不传）。
+    function _fetchOverview(onDone) {
         _get("/api/ops/overview?view=" + opsShell.overviewView, function(status, data) {
             if (status !== 200 || !Array.isArray(data)) { console.warn("OpsView overview", status); return }
             //---- 签出释出（站点视图专属）----
@@ -888,6 +893,15 @@ Item {
             // ‼️ 一条航线都没有时不套：`routeBounds` 会返回 null、套不出东西，此时地图中心
             //    由 `center` 绑定链里的 `_mySiteCoord` 兜底给出（那条路不需要套视野）。
             if (!routeLayersEnabled && _taskGeom.length > 0) _requestRoutesFit()
+            // ‼️ 放在回调的**最末尾** —— 定向刷新要的是"赋值全部走完"的这一刻。
+            //    上方指纹守卫没赋值时（内容与上轮逐字相同）回调同样是**正确**的：那种情况下
+            //    判因依据本身没变，用哪一份都一样。
+            // ⚠️ `qmllint` 会对**这一行**报 2 条 `Unqualified access`，是**静态分析误报**、
+            //    不是真问题：逐字节相同的写法在 `_fetchRouteTasks` 的收尾处、以及既有的
+            //    `_fetchMyRoutes` 里**都不报**（同一文本换个位置结果就不同）；且离屏夹具实测
+            //    "具名方法 + 参数 + 深嵌套匿名回调里引用它"在 Qt 运行时照常解析（JS 的函数
+            //    参数就是局部绑定）。**别为了消这两条告警去改写法。**
+            if (onDone) onDone()
         })
         return true
     }
@@ -1003,6 +1017,26 @@ Item {
         _goneHandoverPending = h
         _clearConfirmHandover()
         handoverDialog.close()
+        // ‼️ 关框之后**立刻**再定向拉一次 task 数据，用**这一次**的回调去结算 —— 不再干等下一轮
+        //    `_poll`（2s）。用户 2026-10-10 报的"签入框先消失、约 2s 后才弹警告框，非常不连贯"
+        //    就是这段等待观感上的代价。
+        //
+        //    为什么这样**仍然是准的**：本次请求是在"交接已经消失"之后才发出去的 ⇒ 它带回来的
+        //    `disposition` / `signed_in` 必然是**消失之后**的值。而推迟一轮要的就是这个
+        //    —— `handoverGoneReason` 判「站点方已选择回航」要读 `task.disposition === "RETURNING"`，
+        //    用消失**之前**那份数据会把**回航误报成「已取消」**（两句话要监控员做的下一件事正好
+        //    相反：取消 ⇒ 可以重新签出；回航 ⇒ 不用管）。⇒ 延迟由"最坏一轮 2s"降为"一次往返"，
+        //    **不拿准确性换连贯性**。
+        //
+        //    ⚠️ 拉哪个源必须与 `_settleGoneConfirmHandover` 的取数口径**同源**
+        //       （`routeLayersEnabled ? _routeTasks : _tasks`）—— 拉错源 == 没拉。
+        //    ⚠️ 两个 fetch 在**失败路径都不调 `onDone`** ⇒ 不结算 ⇒ 自动退回 `_fetchPending`
+        //       里那一步的兜底（**原样保留**）。故最坏只是退化成改动前那个 2s，**不会更慢**，
+        //       也绝不会拿一份失败响应的残留数据去判因。
+        //    ⚠️ 定向刷新与下一轮兜底**谁先到谁结算**，另一个是 no-op（`_settleGoneConfirmHandover`
+        //       自己判 `_goneHandoverPending` 是否为空）⇒ **不会重复弹框**。
+        if (routeLayersEnabled) _fetchRouteTasks(_settleGoneConfirmHandover)
+        else                    _fetchOverview(_settleGoneConfirmHandover)
     }
 
     /// 结算上一轮挂起的那条：算文案、弹通知框。
@@ -1113,7 +1147,10 @@ Item {
 
     /// ③ 2s 轮询。**失败不动缓存**（§2.2：地图上飞机消失会被误读成"飞机没了"，陈旧好过空白），
     /// 只把 `_routeTasksStale` 置起来给故障提示条用（§2.4）。
-    function _fetchRouteTasks() {
+    /// `onDone`（可选）：语义与 `_fetchOverview` 的那个**逐字相同** —— 成功且赋值走完才调
+    /// 一次，失败（非 200 / 结构不符）**不调**。唯一使用者同样是 `_markGoneConfirmHandover`
+    /// 的定向刷新。
+    function _fetchRouteTasks(onDone) {
         _get("/api/ops/route-tasks", function(status, data) {
             if (status !== 200 || !data || !Array.isArray(data.devices) || !Array.isArray(data.tasks)) {
                 console.warn("OpsShell route-tasks", status)
@@ -1144,6 +1181,10 @@ Item {
             _routeUpdatedAt = new Date()
             _routeTasksStale = false
             opsShell.routeTasksUpdated()
+            // ‼️ 末尾（理由同 `_fetchOverview` 里那句）。 ⚠️ 本函数**有**内容指纹守卫，
+            //    内容没变时不重新赋值 `_routeTasks` —— 那不影响判因：指纹没变 == 内容没变
+            //    == 判因依据没变，此时回调读到的旧对象与新对象**判出来是同一档**。
+            if (onDone) onDone()
         })
     }
 
