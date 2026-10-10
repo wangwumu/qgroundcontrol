@@ -18,7 +18,7 @@ import QtQuick.Shapes
 
     当前使用者（全部 `OpsDialog` 实例已逐个核过，共 5 个）：
       · 加：`OpsView.qml` 的 `landBlockDialog`（降落被阻止 —— 两条文字、无可选项）
-      · 加：`OpsShell.qml` 的 `handoverGoneDialog`（交接已结束 —— 只告知、5 秒自关）
+      · 加：`OpsShell.qml` 的 `handoverGoneDialog`（交接已结束 —— 只告知、10 秒自关）
       · 不加：`slotDialog`（选择机位 —— 用户点名排除）、`actionConfirmDialog`、
               `handoverDialog`（后两个都在等一个决定）
 
