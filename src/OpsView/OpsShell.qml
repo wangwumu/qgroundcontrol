@@ -136,6 +136,22 @@ Item {
     //         10 秒一轮，所以界面表现是"到点那一行确实会消失，但全程没有红色告警"）。
     property real  _now:           Date.now()
     property string _handoverActionError: ""  // 交接确认/拒绝/撤回失败提示（handoverDialog 保留可重试）
+    // 「那条交接在你眼皮底下消失了」通知框（`handoverGoneDialog`）的正文。
+    /// ‼️ 为什么**存成属性**而不是让通知框自己从 `_confirmHandover` 算：关框那一刻
+    ///    `_confirmHandover` 已经被清空（那是 watcher 能工作的前提，见
+    ///    `_markGoneConfirmHandover` 的 ①）——通知框只能读一份**事先算好**的文案。
+    /// ⚠️ 与 `_handoverActionError` 同族、同生命周期：都在"这个框要显示什么"的范围内。
+    property string _handoverGoneText: ""
+    // 已发现「在眼皮底下消失」、但**归因所需的任务数据还没到**的那条交接（见
+    // `_markGoneConfirmHandover` / `_settleGoneConfirmHandover`）。null = 没有挂起项。
+    /// ‼️ 为什么必须挂起一轮而不是当场定性：`_poll()` 里 `_fetchOverview` / `_fetchRouteTasks`
+    ///    与 `_fetchPending` 是**并发发起**的，而后者的查询轻得多（一条 JOIN 的小查询 vs
+    ///    `/ops/route-tasks` 那组）⇒ 它**先回来**是常态。此刻手里的 `_tasks` / `_routeTasks`
+    ///    仍是**上一轮**的 ⇒ `signed_in` / `disposition` 都还是"事件发生前"的值，
+    ///    当场定性会把**回航**和**被接管**统统误报成「站点方已取消交接」。
+    ///    推迟一轮之后，手里的那份数据必然是**它消失之后**取的（同轮同发，见 `_poll`）⇒
+    ///    三档才都读得准。
+    property var _goneHandoverPending: null
     // 本站站点 id 来自登录响应 role_sites 单值（AuthController.siteId，仅内存），不再从任务反推。
     property var   _mySiteId:       AuthController.siteId
     // 站点视图右栏的两个勾选框（出站 / 进站，默认都勾）。
@@ -907,8 +923,111 @@ Item {
             var map = {}
             for (var i = 0; i < data.length; i++) map[data[i].task_id] = data[i]
             _handoverById = map
+            // ‼️ 三步的顺序不能改：
+            //    ① 先**结算上一轮**挂起的那条（此刻 task 数据已齐，见 `_settleGoneConfirmHandover`）；
+            //    ② 再处理**本轮**新消失的（只能关框 + 挂起，**不定性**）；
+            //    ③ 最后才弹新待办 —— 反过来会被 `_notifyNewPending` 换掉 `_confirmHandover`，
+            //       于是②看到的"还开着的那条"已经不是原来那条了。
+            _settleGoneConfirmHandover()
+            _markGoneConfirmHandover(map)
             _notifyNewPending(data)
         })
+    }
+
+    /// `_confirmHandover` 的**唯一**清空点。两个调用它的地方在语义上是同一件事——
+    /// "框里那条交接不再是当前对象了"：
+    ///   · 我自己处理成功（`_onHandoverActionSucceeded`）；
+    ///   · 它在眼皮底下消失（`_markGoneConfirmHandover`）。
+    /// ⚠️ 顺手复位 `_handoverActionError`：那是**上一条**交接的失败提示，留着会让下一条
+    ///    交接的框一打开就顶着别人的红字（它与 `_confirmHandover` 同生命周期，
+    ///    而 `_notifyNewPending` 里那行单独的清零只覆盖"自动弹框"那一路）。
+    function _clearConfirmHandover() {
+        _confirmHandover = null
+        _handoverActionError = ""
+    }
+
+    /// 交接动作**成功**后的收尾：框里若正开着**同一条**，一并关掉并清账。
+    ///
+    /// ‼️ 与 `_markGoneConfirmHandover` 是**互斥的两半**，靠 `_confirmHandover` 是否为空区分：
+    ///    走过这里之后它为 null ⇒ 下一轮 `_fetchPending` 看到"名单里没有它"时**不再**动作。
+    ///    漏掉这一步的后果是**净负收益**：用户每成功处理一次交接，都会收到一条
+    ///    「交接已由他人接管」——而被"接管"的正是他自己。比不通知更坏。
+    ///
+    /// ⚠️ 判 id 相等而不是无条件清空：`_cancelHandoverWithFeedback` 走的是**卡片上**的
+    ///    【撤回】，它撤的那条未必是框里开着的那条。无条件清空会顺手把一个**还开着、
+    ///    且仍然有效**的框的账目抹掉（框留在屏幕上、`_confirmHandover` 却为 null ⇒
+    ///    它的按钮 POST 到 `/handovers/undefined/...`）。这正是 `handoverId` 那条注释里
+    ///    记录过的形状。
+    /// ⚠️ `if (!handoverId) return` 是防御：id 缺失时**不清**（交接 id 是自增主键，
+    ///    0 不可能是合法值），宁可留一个会被 watcher 正常收掉的框，也不要清错对象。
+    function _onHandoverActionSucceeded(handoverId) {
+        if (!handoverId) return
+        if (OpsCommon.handoverId(_confirmHandover) !== handoverId) return
+        _clearConfirmHandover()
+        handoverDialog.close()
+    }
+
+    /// 框里那条交接**在眼皮底下消失**了 ⇒ 把框自己关掉，并挂起等下一轮归因
+    /// （2026-10-10，用户报「操作哪个都有二义性」）。
+    ///
+    /// 为什么必须自己关：框里的按钮指着 `_confirmHandover`，而它已不在 pending 名单里
+    /// ⇒ 点【确认接管】会 POST 到一条已终结的交接上。后端回 404，而前端把 404 当
+    /// **幂等成功**（`_acceptHandover` 的 `status === 200 || status === 404`）⇒ 静默关框、
+    /// 一个字都不说：监控员既不知道站点方做了什么，也不知道自己**没有**接管成功。
+    /// 这正是"两个按钮都有二义性"的来源。
+    ///
+    /// ‼️ **关框与归因分成两步**（本函数关框，`_settleGoneConfirmHandover` 下一轮归因）：
+    ///    此刻手里的 `_tasks` / `_routeTasks` 还是上一轮的（理由见 `_goneHandoverPending`
+    ///    那条属性注释），**当场定性必然误报**。关框不依赖任何 task 数据，可以立刻做。
+    ///
+    /// ‼️ 三条前提，少一条就是"框乱关"或"永远不关"：
+    ///   ① `_confirmHandover` 为空即返回 —— **这一条是防误报的关键**。我自己点
+    ///      【拒绝】/【确认接管】/【撤回】成功后 `_poll()` 会刷新，那条交接**也**会从
+    ///      名单里消失 ⇒ 不判它就会在每次成功操作后弹一条假通知。配套是
+    ///      `_onHandoverActionSucceeded` 先清账，**不在本函数里补判据**。
+    ///   ② 只对 `phase_to === "ROUTE"` 生效（本轮范围，见下面那段）。
+    ///   ③ 失败响应**走不到这里**：`_fetchPending` 非 200 时在上一行就 `return` 了、
+    ///      根本不动 `_handoverById` ⇒ 断网不会把框误关。这是既有行为，
+    ///      **别**改成"失败也重建映射"，那会把一次网络抖动变成一次误关框。
+    function _markGoneConfirmHandover(map) {
+        var h = _confirmHandover
+        if (!h) return
+        // 本轮只覆盖 ROUTE 档（用户 2026-10-10 选定）。降落机场侧的 LANDING 交接**共用**
+        // 本骨架的 `handoverDialog`，但"消失"在两个角色那里含义不同（那边是**接收方**，
+        // 提出方撤回后它的出口是等对方重提，而不是"我被抢先了"）
+        // ⇒ 这一侧**没有**跟着改：**有意差别，不是漏做**。
+        // ⚠️ 将来要覆盖降落机场侧，改的就是这一行（判据、通知文案、
+        //    `_handoverAnchorFn` 那一路都要一并看），**不要**在别处再写一份 watcher。
+        if (h.phase_to !== "ROUTE") return
+        if (map && map[h.task_id]) return
+        _goneHandoverPending = h
+        _clearConfirmHandover()
+        handoverDialog.close()
+    }
+
+    /// 结算上一轮挂起的那条：算文案、弹通知框。
+    ///
+    /// 位置在 `_fetchPending` 成功回调的**最前面**，且读的是**当前**的 `_tasks` /
+    /// `_routeTasks` —— 那两份数据与上一轮那次 `_fetchPending` 同轮同发（`_poll`），
+    /// 而那一轮已经看到交接消失 ⇒ 它们必然是**消失之后**取的，`signed_in` /
+    /// `disposition` 都已到位。这一轮延迟就是"数据对齐"的代价，2 秒，不可省。
+    ///
+    /// ⚠️ 任务项从**当前视图的数据源**取，不是恒取 `_tasks`（同 `_selectedTask()` 的分流）。
+    ///    监控员视图若读 `_tasks` 就是**恒判不准**，理由是实的：`/ops/overview` 的
+    ///    `opsOverviewItem` 里**根本没有 `signed_in` 这个键**（只有 `opsRouteTaskItem`
+    ///    与 `opsMonitorDevice` 有，见 `gcs_server/handlers/ops.go`）⇒ 那两档永远读不到，
+    ///    四档里只剩「超时」判得准，**回航与被接管会被一起误报成「取消」**。
+    ///    另有第二条：`view=route` 在非 `IN_FLIGHT` 阶段回 0 行 ⇒ `taskById` 也回 null。
+    ///    这两条都不报错，只是结论悄悄错档。
+    ///    `taskById` 回 null 时判据本身仍安全（落兜底档，不抛）。
+    function _settleGoneConfirmHandover() {
+        var h = _goneHandoverPending
+        if (!h) return
+        _goneHandoverPending = null
+        var task = OpsCommon.taskById(routeLayersEnabled ? _routeTasks : _tasks, h.task_id)
+        _handoverGoneText = OpsCommon.handoverGoneText(
+                    OpsCommon.handoverGoneReason(h, task, _now), h)
+        handoverGoneDialog.open()
     }
     //---- 航线缓存（设计文档 §1.2/§1.3/§1.4；仅 `routeLayersEnabled` 时调用）----
     /// ① 全部负责航线。**失败不清空已成功的缓存**（§2.2：刷新时保留旧值直到新值到手）。
@@ -1418,6 +1537,11 @@ Item {
                   else console.warn("OpsView accept", status, data ? data.error : "")
                   if (onDone) {
                       var ok = status === 200 || status === 404
+                      // ‼️ 成功就**先收尾框**，再回调调用点（2026-10-10）。收尾放在这里而不是
+                      //    各调用点，是因为这三个函数共有四个调用点（弹框两个按钮、卡片【签入】、
+                      //    卡片【撤回】），漏掉任何一个都会让那个入口在成功后**多收一条假通知**
+                      //    ——而这类漏项不会报错，只会表现为"每次成功都弹一句别人接管了"。
+                      if (ok) _onHandoverActionSucceeded(handoverId)
                       onDone(ok, ok ? "" : OpsCommon.handoverActionErrorText(status, data))
                   }
               })
@@ -1429,6 +1553,7 @@ Item {
                   else console.warn("OpsView reject", status, data ? data.error : "")
                   if (onDone) {
                       var ok = status === 200 || status === 404
+                      if (ok) _onHandoverActionSucceeded(handoverId)
                       onDone(ok, ok ? "" : OpsCommon.handoverActionErrorText(status, data))
                   }
               })
@@ -1440,6 +1565,7 @@ Item {
                   else console.warn("OpsView cancel", status, data ? data.error : "")
                   if (onDone) {
                       var ok = status === 200 || status === 404
+                      if (ok) _onHandoverActionSucceeded(handoverId)
                       onDone(ok, ok ? "" : OpsCommon.handoverActionErrorText(status, data))
                   }
               })
@@ -2584,9 +2710,13 @@ Item {
                 Item { Layout.fillWidth: true }
                 Button {
                     text: qsTr("拒绝")
+                    // ‼️ 成功分支**什么都不做**（2026-10-10）：关框与清账已由
+                    //    `_onHandoverActionSucceeded` 在动作函数**内部**做掉。这里再关一次
+                    //    虽无害，但会让"谁负责关这个框"多出一个落点——本轮要消掉的正是这类
+                    //    多落点（弹框两个按钮 + 卡片两个入口，四处各关一次必然漂移）。
                     onClicked: _rejectHandover(OpsCommon.handoverId(_confirmHandover), function(ok, err) {
-                        if (ok) handoverDialog.close()
-                        else _handoverActionError = err + qsTr("；仍失败请通知提出方撤回重提")
+                        if (ok) return
+                        _handoverActionError = err + qsTr("；仍失败请通知提出方撤回重提")
                     })
                 }
                 Button {
@@ -2595,13 +2725,71 @@ Item {
                         var mine = _confirmHandover && OpsCommon.isMine(_confirmHandover, AuthController.userId)
                         var act = mine ? _cancelHandover : _acceptHandover
                         act(OpsCommon.handoverId(_confirmHandover), function(ok, err) {
-                            if (ok) handoverDialog.close()
-                            else _handoverActionError = err + qsTr("；仍失败请通知对方人工处理")
+                            if (ok) return   // 同上：关框由 `_onHandoverActionSucceeded` 单点负责
+                            _handoverActionError = err + qsTr("；仍失败请通知对方人工处理")
                         })
                     }
                 }
             }
         }
+    }
+
+    /// 「那条交接在你眼皮底下消失了」的**通知框**（2026-10-10，用户要求
+    /// 「关掉这个界面后，可以弹出一个通知框（也在交接确认的位置和尺寸）」）。
+    ///
+    /// ‼️ 位置与尺寸**逐字同** `handoverDialog`：同一个 `_handoverAnchorY`、同一个
+    ///    `rightPanelWidth`、同一条 `Math.min(..., opsShell.height - height - 12)` 收边。
+    ///    它是**接替**那个框出现的——换个地方弹，监控员会以为是另一件事。
+    /// ⚠️ 与 `handoverDialog` 唯一的差别是 `modal: false`：它**只是告知**，不该挡住
+    ///    监控员接下来的操作（交接确认框挡住是对的，那是在等一个决定）。二者可以同时
+    ///    存在（同一轮里旧框作废、新待办又到），此时非 modal 的这个不会被 `_notifyNewPending`
+    ///    开的新框"卡住"。
+    OpsDialog {
+        id: handoverGoneDialog
+        parent: opsShell
+        width: opsShell.rightPanelWidth
+        x: opsShell.width - width
+        y: opsShell._handoverAnchorY < 0
+           ? (opsShell.height - height) / 2
+           : Math.min(opsShell._handoverAnchorY + 6, opsShell.height - height - 12)
+        modal: false
+        title: qsTr("交接已结束")
+
+        // 用户 2026-10-10 明示「这个通知框在 5 秒后自动关闭」。
+        // ⚠️ 用 `restart()` 而**不是** `start()`：`start()` 在计时器已运行时是**空操作**
+        //    ⇒ 连着弹两次时，第二次会继承上一次的剩余时间，表现为"第二个通知一闪而过"。
+        onOpened: handoverGoneTimer.restart()
+
+        ColumnLayout {
+            width: parent.width
+            spacing: 8
+            Text {
+                Layout.fillWidth: true
+                // 深绿底 `#0f2f2c` 上的正文色（12.18:1，实算表见 `OpsDialog.qml`）——与
+                // `handoverDialog` 同一条纪律：**字色跟着底走**。白底时代那套 `#1f2937` /
+                // `#1565c0` 搬到这个底上分别是 1.02:1 / 2.50:1，等于看不见。
+                color: "#e6edf7"; font.pixelSize: 13
+                wrapMode: Text.Wrap
+                text: _handoverGoneText
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 8
+                Item { Layout.fillWidth: true }
+                // 手动出口：5 秒对正在看别处的人是必要的，对已经读完的人是多等的 5 秒。
+                Button {
+                    text: qsTr("知道了")
+                    onClicked: handoverGoneDialog.close()
+                }
+            }
+        }
+    }
+
+    Timer {
+        id: handoverGoneTimer
+        interval: 5000
+        repeat: false
+        onTriggered: handoverGoneDialog.close()
     }
 
     /// 「选中的那条航班」。**数据源随视图分流**，不是恒取 `_tasks`：

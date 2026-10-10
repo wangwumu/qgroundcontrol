@@ -3568,4 +3568,121 @@ TestCase {
         verify(OpsCommon.handoverActionErrorText(502, {}).indexOf("502") >= 0,
                "data 是空对象（无 error 键）同样走兜底")
     }
+
+    //=========================================================================
+    // handoverGoneReason / handoverGoneText：交接在监控员眼皮底下消失
+    // （2026-10-10，用户报「操作哪个都有二义性」）
+    //
+    //   .qml 站点方在监控员确认接管**之前**按了【取消】或按了【回航】⇒ 后端把那条
+    //   PENDING 交接终结掉 ⇒ `/handovers/pending` 下一轮就不再返回它。而
+    //   `handoverDialog` 是**由那条交接打开**的，框里的按钮仍指着它 ⇒ 点【确认接管】
+    //   会打到一条已终结的交接上：后端 404，而前端把 404 当**幂等成功**收口
+    //   （`_acceptHandover` 的 `status === 200 || status === 404`）⇒ 静默关框，
+    //   一个字的解释都没有。本轮让框**自己关掉**，并说明是**谁**、**做了什么**。
+    //
+    //   ‼️ 本组的重点是四档的**优先级**，不是文案。判据的取值集合见
+    //      `OpsCommon.handoverGoneReason` 上方那段（含"为什么 signed_in 必须排第一"）。
+    //=========================================================================
+
+    /// 与 `/handovers/pending` 项**同形**：`opsPendingItem` 的键 ＋ 后端 join 出来的
+    /// `task_no` / `uav_no` / `proposed_by_name`（弹框正文也用它们，见 `handoverDialog`）。
+    /// ⚠️ 主键字段名是 `handover_id`（不是 `id`）——`handoverId()` 正是为这两套名字存在的。
+    function _goneHandover(deadlineAt) {
+        return { handover_id: 7, task_id: 91103, phase_to: "ROUTE", status: "PENDING",
+                 proposed_by: 16, proposed_by_name: "站点操作员",
+                 task_no: "QGC-001", uav_no: "UAV-001",
+                 deadline_at: deadlineAt !== undefined ? deadlineAt : _GONE_DEADLINE }
+    }
+
+    /// 与 `opsRouteTaskItem` 同形的最小任务项：**只列本组真正读到的两个键**。
+    /// 多写会让下一个人以为判据还看了别的字段，从而不敢动它们。
+    /// ⚠️ `signed_in` 归一成**真 bool**（`=== true`）：后端下发的是布尔，但老缓存 /
+    ///    夹具手抖给出 `undefined` 时，判据必须是确定的一档而不是"取决于怎么写"。
+    function _goneTask(signedIn, disposition) {
+        return { task_id: 91103, status: "IN_FLIGHT",
+                 signed_in: signedIn === true, disposition: disposition || "" }
+    }
+
+    /// 期限串取**无时区 UTC 裸串**形状（后端两种写法都长这样），解析口径见 `utcNaiveMs`。
+    readonly property string _GONE_DEADLINE: "2026-09-24 03:04:05"
+    /// 两个固定的"现在"：期限**内**（早 5s）与已**过期**（晚 5s）。
+    /// ‼️ 写成 `Date.UTC` 的毫秒值 ⇒ 与跑测试的机器时区无关（同 `test_utcNaiveMs_*` 那条纪律）。
+    readonly property real _GONE_BEFORE: Date.UTC(2026, 8, 24, 3, 4, 0)
+    readonly property real _GONE_AFTER:  Date.UTC(2026, 8, 24, 3, 4, 10)
+
+    /// 四档各归其位。**四格必须一起在**：少任何一格，一个"永远返回同一档"的实现
+    /// 都能在剩下的格子里全绿（`landingNotice` 那组的同一条教训）。
+    function test_handoverGoneReason_fourTiers() {
+        compare(OpsCommon.handoverGoneReason(_goneHandover(), _goneTask(false, ""), _GONE_BEFORE),
+                "CANCELLED", "期内、无人签入、无回航 ⇒ 站点方取消签出")
+        compare(OpsCommon.handoverGoneReason(_goneHandover(), _goneTask(false, "RETURNING"), _GONE_BEFORE),
+                "RETURNING", "期内、站点方按了回航 ⇒ 回航")
+        compare(OpsCommon.handoverGoneReason(_goneHandover(), _goneTask(true, ""), _GONE_BEFORE),
+                "TAKEN_ELSEWHERE", "期内、已有人签入 ⇒ 被他人接管")
+        compare(OpsCommon.handoverGoneReason(_goneHandover(), _goneTask(false, ""), _GONE_AFTER),
+                "TIMEOUT", "过期、无人接管、无回航 ⇒ 超时作废")
+    }
+
+    /// ‼️ **本组最关键的一格**：`signed_in`（已有人签入）必须压过 `isTimeout`。
+    ///
+    /// 这个组合**真实可达**，不是防御性摆设：后端把过期 PENDING 置 TIMEOUT 的是
+    /// `scanTimeout` 的**10 秒一轮**扫描（`OPS_HANDOVER_TIMEOUT` 默认 30 秒），
+    /// 而在 deadline 已过、扫描还没轮到的那几秒里 `Accept` **仍会成功**——它只查
+    /// `status='PENDING'`，**不查期限**。于是这条交接是**被人接管**终结的。
+    ///
+    /// 写反了（TIMEOUT 优先）的后果是**方向性**的：监控员读到「交接已超时作废」，
+    /// 而事实是**已经有同事接管了**——两句话要他做的下一件事相反（"可以重新签出" vs
+    /// "不用管了"），且这个误报恰好会让人**重复发起**一次已经完成的接管。
+    function test_handoverGoneReason_takenBeatsTimeout() {
+        compare(OpsCommon.handoverGoneReason(_goneHandover(), _goneTask(true, ""), _GONE_AFTER),
+                "TAKEN_ELSEWHERE", "已签入 ＋ 已过期 ⇒ 报接管，不报超时")
+        compare(OpsCommon.handoverGoneReason(_goneHandover(), _goneTask(true, "RETURNING"), _GONE_AFTER),
+                "TAKEN_ELSEWHERE", "三者同真时同样以「已签入」为准（它是最强的结论）")
+        // ‼️ 阴性对照，缺了它上一行是恒真：同一条过期交接，**只是没人签入**。
+        compare(OpsCommon.handoverGoneReason(_goneHandover(), _goneTask(false, "RETURNING"), _GONE_AFTER),
+                "RETURNING", "无人签入时回航仍压过超时——回航是**人做过的动作**，比「到点了」更该说")
+    }
+
+    /// 缺数据不得抛错，也不得静默滑进一个**看起来像结论**的档。
+    /// `task` 为 null 在真实路径上存在：那条任务已不在监控员列表里（`taskById` 回 null）。
+    function test_handoverGoneReason_survivesMissingInputs() {
+        compare(OpsCommon.handoverGoneReason(null, null, _GONE_BEFORE), "CANCELLED",
+                "无交接 ⇒ 兜底档，且不得抛")
+        compare(OpsCommon.handoverGoneReason(_goneHandover(), null, _GONE_AFTER), "TIMEOUT",
+                "任务行缺失时仍能凭**期限**判出超时（这一档本来就不依赖 task）")
+        compare(OpsCommon.handoverGoneReason(_goneHandover(), null, _GONE_BEFORE), "CANCELLED",
+                "任务行缺失 ＋ 期内 ⇒ 落兜底档（不猜、不抛）")
+        compare(OpsCommon.handoverGoneReason({ handover_id: 7, phase_to: "ROUTE" }, _goneTask(false, ""), _GONE_BEFORE),
+                "CANCELLED", "`deadline_at` 缺失 ⇒ isTimeout 为假，落期内分支")
+    }
+
+    /// 四句**各不相同**，且都点名了是哪条任务。
+    /// ⚠️ 判据取"四句互不相等"而**不是**逐句比对固定文案：本组管的是**分档**，
+    ///    不是**措辞**——将来润色文案不该让本格变红。
+    function test_handoverGoneText_fourDistinctSentences() {
+        var h = _goneHandover()
+        var reasons = ["TAKEN_ELSEWHERE", "RETURNING", "TIMEOUT", "CANCELLED"]
+        var seen = []
+        for (var i = 0; i < reasons.length; i++) {
+            var t = OpsCommon.handoverGoneText(reasons[i], h)
+            verify(t && t.length > 0,
+                   reasons[i] + " 必须有话说——空串等于又退回「静默关框」，本轮就白做了")
+            verify(t.indexOf("undefined") < 0 && t.indexOf("NaN") < 0,
+                   reasons[i] + " 的文案混进了 undefined/NaN：「" + t + "」")
+            verify(seen.indexOf(t) < 0,
+                   reasons[i] + " 与前面某一档是同一句，分档等于白做：「" + t + "」")
+            verify(t.indexOf("QGC-001") >= 0,
+                   reasons[i] + " 未点名是哪条任务，监控员无从对照：「" + t + "」")
+            seen.push(t)
+        }
+        verify(OpsCommon.handoverGoneText("谁也没定义过这一档", h) !== "",
+               "未知 reason 也要给一句话（后端将来加档时不能变成一个空框）")
+    }
+
+    /// 任务号缺失（后端 join 不到）时不得把 `undefined` 渲染进正文。
+    function test_handoverGoneText_withoutTaskNoDegradesGracefully() {
+        var t = OpsCommon.handoverGoneText("CANCELLED", { handover_id: 7 })
+        verify(t && t.indexOf("undefined") < 0, "缺任务号仍要能读：「" + t + "」")
+        verify(OpsCommon.handoverGoneText("CANCELLED", null) !== "", "交接为 null 也要能读")
+    }
 }

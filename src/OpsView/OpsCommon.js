@@ -378,6 +378,85 @@ function isTimeout(handover, nowMs) {
 
 
 //--------------------------------------------------------------------------
+// 交接「在监控员眼皮底下消失」的归因（2026-10-10，用户报「操作哪个都有二义性」）
+//--------------------------------------------------------------------------
+
+// 一条 PENDING 交接从 `/handovers/pending` 里**消失**的原因分档。
+//
+// 为什么需要它：`handoverDialog` 是**由那条交接打开**的，框里的按钮仍指着它。
+// 站点方在监控员确认接管**之前**按了【取消】或【回航】，后端就把那条 PENDING 终结掉
+// ⇒ 下一轮 pending 名单里没有它了，而框还开着 ⇒ 点【确认接管】打到一条已终结的交接上：
+// 后端 404，而前端把 404 当**幂等成功**收口（`_acceptHandover` 的
+// `status === 200 || status === 404`）⇒ **静默关框、一个字都不说**。
+// 本函数供 OpsShell 在框"自己关掉"时给出**是哪一种**，好让通知框说清楚。
+//
+// ‼️ **优先级就是本函数的主要设计**（自上而下，先命中先返回）：
+//
+//   1. `TAKEN_ELSEWHERE`（`signedIn`）——**必须排第一**，这条最反直觉：
+//      后端把过期 PENDING 置 TIMEOUT 的是 `scanTimeout` 的 **10 秒一轮**扫描
+//      （`OPS_HANDOVER_TIMEOUT` 默认 30 秒），而在 deadline 已过、扫描还没轮到的
+//      那几秒里 `Accept` **仍会成功**——它只查 `status='PENDING'`，**不查期限**。
+//      ⇒ "已过期"与"已被人签入"可以**同时为真**，而那条交接是**被人接管**终结的。
+//      把 `TIMEOUT` 排在前面就是**方向性**误报：监控员读到「已超时作废」（可以重新
+//      签出），事实却是**已有同事接管**（不用管了）——两句话要他做的下一件事相反，
+//      且这个误报恰好促使人**重复发起**一次已经完成的接管。
+//
+//   2. `RETURNING`（`task.disposition`）——回航是**人做过的动作**。它与 `TIMEOUT`
+//      也可能同真（站点方在超时边缘按了回航），此时说"回航"信息量更大。
+//      ⚠️ 本函数**不**读 `landing_accepted`：回航会顺手插一条 ACCEPTED 的 LANDING
+//      交接（`closeReturnLoopTx` ③），那个字段在**每一次**回航里都为真 ⇒ 拿它当归因
+//      判据会让它抢走别的档，且它并不比 `disposition` 更专一。
+//      `disposition === 'RETURNING'` 才是回航的**唯一**标记：改降/迫降那条路的
+//      `ReportDisposition` **不调用** `closeReturnLoopTx`，但它同样只看这一个字段
+//      ⇒ 两侧口径同源（这也是"只有 `/return` 会走到 `closeReturnLoopTx`"的另一面）。
+//
+//   3. `TIMEOUT`——`isTimeout` 用的 `deadlineMs` 与弹框倒计时**同一个**解析口径
+//      （`utcNaiveMs`）⇒ 框上写着"超时"的那一刻，这里给的就是 `TIMEOUT`，不会打架。
+//
+//   4. `CANCELLED`——兜底档：站点方按了【取消】（撤回签出），**以及**任何本函数认不出
+//      的消失方式（含 `task` 为 null：那条任务已不在监控员列表里，`taskById` 回 null）。
+//      ⚠️ 正因为它是兜底，它的话术取**最保守**的那句——只说"取消了"，不替后端断言
+//      责任归属。将来后端加一种终结方式时界面给的是这句而不是空白：不精确，但**不会
+//      把监控员引向一个错误的动作**。
+//
+// 参数：`handover` 是那条交接（`handover` 也可为 null，其唯一作用见 `handoverGoneText`）；
+//       `task` 是它对应的**任务项**（调用点用 `taskById` 取，取不到传 null）；
+//       `nowMs` 是**毫秒**（`opsShell._now` 那条 `property real`——‼️ 不能用 `int`，
+//       理由见那里的注释：`Date.now()` 会被 ToInt32 取模，超时判定随之恒假）。
+// 返回四个字符串常量之一，**恒为字符串**（调用点直接喂 `handoverGoneText`）。
+function handoverGoneReason(handover, task, nowMs) {
+    // ‼️ 走 `signedIn` 而**不是**裸读 `task.signed_in`：那是全设计**唯一**一处签入判据，
+    //    这里再抄一份就是第二份会漂移的判据（而漂移时没有任何东西会报错）。
+    if (signedIn(task)) return "TAKEN_ELSEWHERE"
+    if (task && task.disposition === "RETURNING") return "RETURNING"
+    if (isTimeout(handover, nowMs)) return "TIMEOUT"
+    return "CANCELLED"
+}
+
+// 上面那四档给操作员看的一句话。`handover` 在这里只用来**点名是哪条任务**。
+//
+// ⚠️ 四句必须都存在且**互不相同**：这一整个改动的目的就是"别让监控员面对一个没有任何
+//    解释就消失的框"——某一档返回空串，等于那一档又退回了静默。用例
+//    `test_handoverGoneText_fourDistinctSentences` 钉着"非空 + 四句互异 + 点名任务"。
+// ⚠️ `task_no` 缺失时**整段前缀都不要**，不要渲染「飞行任务 —：」这类占位：那是后端
+//    join 不到时的异常态，凭空多一个破折号只会让人以为有个叫"—"的任务。
+function handoverGoneText(reason, handover) {
+    var taskNo = (handover && handover.task_no) ? handover.task_no : ""
+    var prefix = taskNo ? qsTr("飞行任务 ") + taskNo + qsTr("：") : ""
+    switch (reason) {
+    case "TAKEN_ELSEWHERE":
+        return prefix + qsTr("交接已由他人接管，这条无需再处理")
+    case "RETURNING":
+        return prefix + qsTr("站点方已选择回航，飞机正在返回起飞机场")
+    case "TIMEOUT":
+        return prefix + qsTr("交接已超时作废，站点方可重新签出")
+    default:
+        return prefix + qsTr("站点方已取消交接")
+    }
+}
+
+
+//--------------------------------------------------------------------------
 // 本地报文判定（仅显示/门控，不落库；2026-09-02 触发语义）
 // 2026-09-27 起**全部改吃加密心跳 EXT 重建的合成遥测**（`CryptoHeartbeatExt.cc`），
 // 不再读 `/ops/overview` 的 `latest`（那是数据库里的落库快照，滞后且与链路死活无关）。
