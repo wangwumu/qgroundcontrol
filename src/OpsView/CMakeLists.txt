@@ -14,6 +14,7 @@ qt_add_qml_module(OpsViewModule
     QML_FILES
         AlertListPanel.qml
         OpsDialog.qml
+        OpsWarnIcon.qml
         OpsRouteSync.qml
         OpsShell.qml
         OpsView.qml

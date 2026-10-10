@@ -2488,26 +2488,47 @@ OpsShell {
         ColumnLayout {
             width: parent.width
             spacing: 8
-            Text {
+            // ‼️ 用户 2026-10-10 第七轮：「增加一个警告图标，就是三角形外框，里边有个叹号
+            //    那个。位置在标题一下，警告文字的左边」。范围由用户裁定为**通知类**
+            //    （「他是通知类的，警告只是更重要的通知」）—— 本框正是那一档：两条文字、
+            //    **没有任何可选项**、六个 `open()` 调用点对应**零个** `close()`
+            //    ⇒ 用户裁定的判据「这个框要不要人做决定」在这里是"不要"。
+            // ⚠️ 图标包住**两条**文字，而不是只包上面那条警告：只包一条的话，下面那行原因
+            //    会顶到框的左缘，与警告文字错开一个图标宽，看着像掉了缩进。
+            // ⚠️ `Layout.alignment: Qt.AlignTop` 不能省：`RowLayout` 缺省把图标**垂直居中**，
+            //    正文一折行，图标就飘到文字块中间，不再是"正文第一行的左边"。
+            RowLayout {
                 Layout.fillWidth: true
-                // 亮红 `#ff6b6b` —— 深绿底 `#0f2f2c` 上 **5.17:1**，过 AA 4.5:1，
-                // 与卡片里的错误红同值（本框换深色底后本行**不用改**，原本就是深底家族的色）。
-                color: "#ff6b6b"; font.pixelSize: 13
-                wrapMode: Text.Wrap
-                text: qsTr("降落操作已被阻止，请人工确认机位/状态后重试。")
-            }
-            Text {
-                Layout.fillWidth: true
-                // ‼️ 本行取值的**三度翻转**（2026-10-08），别再翻回去：
-                //    ① 原为琥珀 `#ffc107` —— 落在浅底 `Dialog` 上只剩 1.63:1，用户 2026-09-28
-                //       反馈"非常不明显"；
-                //    ② 改成深蓝 `#1565c0`（白底 5.75:1，那时是对的）；
-                //    ③ 本轮本框并入深色底（`OpsDialog`）⇒ 深蓝只剩 **2.50:1**，改回深底家族的
-                //       次要色 `#9fb3d4`（**6.75:1**）。
-                //    结论同 `slotDialog`：**字色跟着底走**，没有哪个色值"天生正确"。
-                color: "#9fb3d4"; font.pixelSize: 12
-                wrapMode: Text.Wrap
-                text: opsView._landBlockReason
+                spacing: 8
+                OpsWarnIcon {
+                    Layout.alignment: Qt.AlignTop
+                    color: landBlockDialog.warnIconColor
+                }
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 8
+                    Text {
+                        Layout.fillWidth: true
+                        // 亮红 `#ff6b6b` —— 深绿底 `#0f2f2c` 上 **5.17:1**，过 AA 4.5:1，
+                        // 与卡片里的错误红同值（本框换深色底后本行**不用改**，原本就是深底家族的色）。
+                        color: "#ff6b6b"; font.pixelSize: 13
+                        wrapMode: Text.Wrap
+                        text: qsTr("降落操作已被阻止，请人工确认机位/状态后重试。")
+                    }
+                    Text {
+                        Layout.fillWidth: true
+                        // ‼️ 本行取值的**三度翻转**（2026-10-08），别再翻回去：
+                        //    ① 原为琥珀 `#ffc107` —— 落在浅底 `Dialog` 上只剩 1.63:1，用户 2026-09-28
+                        //       反馈"非常不明显"；
+                        //    ② 改成深蓝 `#1565c0`（白底 5.75:1，那时是对的）；
+                        //    ③ 本轮本框并入深色底（`OpsDialog`）⇒ 深蓝只剩 **2.50:1**，改回深底家族的
+                        //       次要色 `#9fb3d4`（**6.75:1**）。
+                        //    结论同 `slotDialog`：**字色跟着底走**，没有哪个色值"天生正确"。
+                        color: "#9fb3d4"; font.pixelSize: 12
+                        wrapMode: Text.Wrap
+                        text: opsView._landBlockReason
+                    }
+                }
             }
         }
     }

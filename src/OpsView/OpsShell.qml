@@ -2769,14 +2769,28 @@ Item {
         ColumnLayout {
             width: parent.width
             spacing: 8
-            Text {
+            // ‼️ 用户 2026-10-10 第七轮：「这个这几个对话框中，增加一个警告图标，就是三角形
+            //    外框，里边有个叹号那个。位置在标题一下，警告文字的左边」。范围由用户裁定为
+            //    **通知类**（「他是通知类的，警告只是更重要的通知」）—— 本框正是那一档：
+            //    只告知、5 秒自关、没有任何可选项，与上面 `alert: true` **同一条判据**。
+            // ⚠️ `Layout.alignment: Qt.AlignTop` 不能省：`RowLayout` 缺省把图标**垂直居中**，
+            //    正文一折行，图标就飘到文字块中间，不再是"正文第一行的左边"。
+            RowLayout {
                 Layout.fillWidth: true
-                // 字色由告警档给出（暗黄底 `#6b4e00` 上的 `#fff8e1`，7.28:1），不写死在这里 ——
-                // 与 `handoverDialog` 同一条纪律：**字色跟着底走**。用户第六轮把底压暗，
-                // 框里每个字色就都得跟着翻一遍（实算表在 `OpsDialog.qml` 文件头）。
-                color: handoverGoneDialog.bodyColor; font.pixelSize: 13
-                wrapMode: Text.Wrap
-                text: _handoverGoneText
+                spacing: 8
+                OpsWarnIcon {
+                    Layout.alignment: Qt.AlignTop
+                    color: handoverGoneDialog.warnIconColor
+                }
+                Text {
+                    Layout.fillWidth: true
+                    // 字色由告警档给出（暗黄底 `#6b4e00` 上的 `#fff8e1`，7.28:1），不写死在这里 ——
+                    // 与 `handoverDialog` 同一条纪律：**字色跟着底走**。用户第六轮把底压暗，
+                    // 框里每个字色就都得跟着翻一遍（实算表在 `OpsDialog.qml` 文件头）。
+                    color: handoverGoneDialog.bodyColor; font.pixelSize: 13
+                    wrapMode: Text.Wrap
+                    text: _handoverGoneText
+                }
             }
             RowLayout {
                 Layout.fillWidth: true
