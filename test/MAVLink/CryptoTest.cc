@@ -1805,80 +1805,6 @@ void CryptoTest::_testNoteDeviceFrame()
     QCOMPARE(crypto->msSinceLastFrame(kInvalidDeviceID), qint64(-1));
 }
 
-void CryptoTest::_testNextRegistrationBatch()
-{
-    // §3.3 的算法，§9.2 的判据。n=18、batch=16 ⇒ 每轮 2 批，批次大小依次 16、2。
-    // ⚠️ 设计文档 §3.3 的伪码写的是 `count = qMin(n, batch)`——那在 n=18 时恒为 16，
-    //    与 §9.2 的「16、2、16、2…」不符。本实现取「切批」语义，理由见计划 R1。
-    QList<DeviceID> ids;
-    for (int i = 0; i < 18; i++) {
-        ids.append(10000030u + static_cast<uint32_t>(i));
-    }
-
-    int cursor = 0;
-    const QList<DeviceID> b1 = CryptoController::nextRegistrationBatch(ids, 16, cursor);
-    QCOMPARE(b1.size(), 16);
-    QCOMPARE(b1.first(), static_cast<DeviceID>(10000030u));
-    QCOMPARE(b1.last(), static_cast<DeviceID>(10000045u));
-    QCOMPARE(cursor, 16);
-
-    const QList<DeviceID> b2 = CryptoController::nextRegistrationBatch(ids, 16, cursor);
-    QCOMPARE(b2.size(), 2);
-    QCOMPARE(b2.at(0), static_cast<DeviceID>(10000046u));
-    QCOMPARE(b2.at(1), static_cast<DeviceID>(10000047u));
-    QCOMPARE(cursor, 0);  // 回绕到起点，下一轮从头开始
-
-    // ‼️ 覆盖性：判据是「集合里每个 id 都被登记过」，不是「第一批 16 个都对」。
-    //    只跑一轮时，第一批之后的都没轮到，而"16 个都出现了"看起来像全对（§9.2）。
-    QSet<DeviceID> seen;
-    cursor = 0;
-    const int batches = (ids.size() + 15) / 16;  // ceil(18/16) = 2（§3.4）
-    for (int round = 0; round < 2; round++) {
-        for (int b = 0; b < batches; b++) {
-            const QList<DeviceID> batch = CryptoController::nextRegistrationBatch(ids, 16, cursor);
-            for (const DeviceID id : batch) {
-                seen.insert(id);
-            }
-        }
-    }
-    QCOMPARE(seen.size(), ids.size());
-
-    // n ≤ batch ⇒ 退化为「一批全取、游标恒 0」，与改动前的行为完全一致（§3.3 关键点 3）。
-    // 这是零回归风险的依据：监控清单 ≤16 架时行为一字不变。
-    QList<DeviceID> small;
-    for (int i = 0; i < 5; i++) {
-        small.append(20000000u + static_cast<uint32_t>(i));
-    }
-    int smallCursor = 0;
-    const QList<DeviceID> s1 = CryptoController::nextRegistrationBatch(small, 16, smallCursor);
-    QCOMPARE(s1.size(), 5);
-    QCOMPARE(smallCursor, 0);
-
-    // 空集合 ⇒ 空批、游标归零（调用方据此走"发 num=0 的登记"的现状分支）
-    int emptyCursor = 7;
-    QVERIFY(CryptoController::nextRegistrationBatch(QList<DeviceID>(), 16, emptyCursor).isEmpty());
-    QCOMPARE(emptyCursor, 0);
-
-    // 游标越界防御：集合缩小后旧游标可能落在界外，必须回到 0 而不是越界读。
-    // ‼️ 取 41 而不是 40：40 是 n=5 的整数倍，`cursor %= n` 这类"看起来更通用"的
-    //    重构也能让它变成 0 ⇒ 用例全绿而注释自称的判据「必须回到 0」已不成立。
-    //    41 % 5 = 1 ⇒ 取模变体会让首元素变成 20000001，判据才真正钉死。
-    int staleCursor = 41;
-    const QList<DeviceID> s2 = CryptoController::nextRegistrationBatch(small, 16, staleCursor);
-    QCOMPARE(s2.size(), 5);
-    QCOMPARE(s2.first(), static_cast<DeviceID>(20000000u));
-
-    // 游标越界防御的**低侧**哨兵。判据：负游标必须与越界游标同样归零。
-    // ‼️ 与上面 41 那条互补——41 钉死的是高侧 `cursor >= n`，-3 钉死的是低侧 `cursor < 0`；
-    //    守卫写成 `if (cursor >= n)` （漏掉 `cursor < 0 ||`）时高侧用例仍然全绿，
-    //    而漏过低侧的后果是 `devices.at(负下标)` = **UB**（越界读，非报错）。
-    int negCursor = -3;
-    const QList<DeviceID> s3 = CryptoController::nextRegistrationBatch(small, 16, negCursor);
-    QCOMPARE(s3.size(), 5);
-    QCOMPARE(s3.first(), static_cast<DeviceID>(20000000u));
-    QCOMPARE(negCursor, 0);
-}
-
 void CryptoTest::_testRegistrationFallbackToLinked()
 {
     CryptoController* const crypto = CryptoController::instance();
@@ -1982,15 +1908,13 @@ void CryptoTest::_testRequestAcceleratedRegistration()
 {
     CryptoController* const crypto = CryptoController::instance();
 
-    // 观察点是「_sendRegistration() 被进入过几次」——单测里没有 UDP link，发送本身
-    // 观察不到。‼️ 不用 `_regCursor`：n ≤ 16 时它恒 0（集合变化观测不到），
-    // n > 16 时跑满一个周期它会回绕到 0。
+    // 观察点是**帧计数**——单测里没有 UDP link，发送本身观察不到。
+    // ‼️ 一帧一个 deviceID ⇒ 一轮 N 架 = N 帧。这条判据同时钉住"没有被合并回多 ID 帧"：
+    //    集合变 20 架时若退回旧实现（一帧装 16 个 + 一帧装 4 个），计数只会 +2。
     //
-    // strict mode 连 QtDebugMsg 都算未预期日志（UnitTest.cc:926/:936）⇒ 每次
-    // _sendRegistration 都会打一条 "registration sent ... no udp link"，
-    // 条数随 burst 批数变化。逐条 expect 会把用例钉死在 kRegistrationBurstIntervalMs /
-    // kMaxRegistrationBatches 这些**不该被测试钉住的实现常数**上，且
-    // verifyExpectedLogMessage 是 FIFO 消费一条、任一条对不上整串就崩
+    // strict mode 连 QtDebugMsg 都算未预期日志（UnitTest.cc:926/:936）⇒ 每帧都会打一条
+    // "registration sent ... no udp link"，条数随设备数变化。逐条 expect 会把用例钉死在
+    // 实现常数上，且 verifyExpectedLogMessage 是 FIFO 消费一条、任一条对不上整串就崩
     // ⇒ 对"确定性的 debug 噪音"用整类豁免（先例：MissionManagerTest.cc:37 等）。
     ignoreLogMessage("MAVLink.Crypto.CryptoController", QtDebugMsg, QRegularExpression("registration "));
 
@@ -2006,8 +1930,8 @@ void CryptoTest::_testRequestAcceleratedRegistration()
     const DeviceID a = makeDeviceID(0, 0, 0x41, 0x01);
     const DeviceID b = makeDeviceID(0, 0, 0x41, 0x02);
 
-    // 20 个 deviceID：> MAX_QGC_LINKED_PX4(16) ⇒ ceil(20/16) = 2 批。
-    // ‼️ 必须 > 16：≤ 16 时批次退化为"一批全取"，集合变化在批次上观测不到。
+    // 20 个 deviceID：一帧一个 ⇒ **20 帧**。取 20 而不是 ≤16，是为了让"退回多 ID 同帧"
+    // 的实现（20 个装不满一帧的旧上限之外还要再切一批）在计数上立刻露馅。
     QList<DeviceID> twentyIds;
     QVariantList twenty;
     for (int i = 0; i < 20; i++) {
@@ -2016,12 +1940,15 @@ void CryptoTest::_testRequestAcceleratedRegistration()
         twenty.append(static_cast<uint>(id));
     }
 
-    // ---- ① 集合变化（空 → 20）⇒ 不需要等 10s 周期，连续 2 批加速 ----
+    // ---- ① 集合变化（空 → 20）⇒ 不需要等 10s 周期，20 帧在 ~20ms 内发完 ----
     crypto->setMonitorDevices(twenty, 3000);
     QCOMPARE(crypto->monitorDeviceCount(), 20);
     QCOMPARE(crypto->monitorDevicesForTest(), twentyIds);   // 清单**内容**，条数区分不了 {a} 与 {b}
-    // 两批落在 t = 0/200ms，shortMs(1000) 留足余量。
-    QTRY_COMPARE_WITH_TIMEOUT(crypto->registrationSendCountForTest(), s0 + 2, TestTimeout::shortMs());
+    // 20 帧落在 t ≈ 0/1/…/19ms，shortMs(1000) 留足余量。
+    QTRY_COMPARE_WITH_TIMEOUT(crypto->registrationSendCountForTest(), s0 + 20, TestTimeout::shortMs());
+    // 直接观测"每帧只装一个"：最后一帧的 payload 至多一个元素。
+    QVERIFY2(crypto->lastRegistrationPayloadForTest().size() <= 1,
+             "一帧装了多个 deviceID ⇒ 又退回多 ID 同帧");
 
     const int s1 = crypto->registrationSendCountForTest();
 
@@ -2035,32 +1962,28 @@ void CryptoTest::_testRequestAcceleratedRegistration()
                               TestTimeout::shortMs()),
              "集合内容不变时 setMonitorDevices 不得触发加速发送");
 
-    // ---- ③ 集合再变（20 → 2，n ≤ 16 退化为一批全取）⇒ 只加速 1 次 ----
+    // ---- ③ 集合再变（20 → 2）⇒ 2 帧 ----
     crypto->setMonitorDevices(QVariantList{ static_cast<uint>(a), static_cast<uint>(b) }, 3000);
     QCOMPARE(crypto->monitorDeviceCount(), 2);
     QCOMPARE(crypto->monitorDevicesForTest(), (QList<DeviceID>{ a, b }));
-    QTRY_COMPARE_WITH_TIMEOUT(crypto->registrationSendCountForTest(), s1 + 1, TestTimeout::shortMs());
+    QTRY_COMPARE_WITH_TIMEOUT(crypto->registrationSendCountForTest(), s1 + 2, TestTimeout::shortMs());
 
     const int s2 = crypto->registrationSendCountForTest();
 
-    // ---- ④ 容量天花板：96 架 ⇒ ceil(96/16) = 6 批 ⇒ 截断到 kMaxRegistrationBatches(5) ----
+    // ---- ④ 96 架 ⇒ 96 帧（一帧一个；不再有批数上限/截断）----
     QVariantList over96;
     for (int i = 0; i < 96; i++) {
         over96.append(static_cast<uint>(makeDeviceID(0, 0, 0x51, static_cast<uint8_t>(i + 1))));
     }
-    // 这条 qCWarning 不是噪音——"截断确实发生了"就是被测行为本身 ⇒ 配对消费。
-    expectLogMessage("MAVLink.Crypto.CryptoController", QtWarningMsg, QRegularExpression("容量天花板"));
     crypto->setMonitorDevices(over96, 3000);
-    verifyExpectedLogMessage();
-    QCOMPARE(crypto->monitorDeviceCount(), 96);   // ‼️ 截断的是**发送批数**，不是集合
+    QCOMPARE(crypto->monitorDeviceCount(), 96);   // 集合本身不受发送方式影响
 
-    // 5 批依次落在 t = 0/200/400/600/800ms；mediumMs 留足余量。
-    QTRY_VERIFY_WITH_TIMEOUT(crypto->registrationSendCountForTest() >= s2 + 5, TestTimeout::mediumMs());
-    // 再等满一个窗口：**没截断**的话第 6 批会在 t≈1000ms 落到这里 ⇒ 计数变 s2+6 ⇒ 本格红。
-    // 这一格才是天花板真正的哨兵——只等"到 5"是等不出第 6 批的（它晚于前者）。
+    // 96 帧落在 t ≈ 0..95ms；mediumMs 留足余量。
+    QTRY_COMPARE_WITH_TIMEOUT(crypto->registrationSendCountForTest(), s2 + 96, TestTimeout::mediumMs());
+    // 再等满一个窗口：只多不少（周期定时器 1h，加速也只排这一轮）。
     // qWaitFor 是 [[nodiscard]]（qtestsupport_core.h），等窗口的返回值无意义 ⇒ 显式丢弃。
     (void) QTest::qWaitFor([] { return false; }, TestTimeout::shortMs());
-    QCOMPARE(crypto->registrationSendCountForTest(), s2 + 5);
+    QCOMPARE(crypto->registrationSendCountForTest(), s2 + 96);
 
     // ---- ⑤ 未启用登记 ⇒ 集合变化也不加速（这道门在 requestAcceleratedRegistration
     //      自己身上；`_sendRegistration()` **没有**门，别指望它自检）----
@@ -2075,13 +1998,10 @@ void CryptoTest::_testRequestAcceleratedRegistration()
     crypto->setMonitorDevices(QVariantList(), 3000);
     QCOMPARE(crypto->monitorDeviceCount(), 0);
 
-    // ---- ⑥ `n` 必须把「有效且不在清单里」的 `_activeDeviceID` 算进去 ----
-    // 构造：清单条数恰为 MAX_QGC_LINKED_PX4(16) 的**整数倍**，且 active 不在清单里。
-    //   n = 16（清单）+ 1（`_sendRegistration()` 会追加到末尾）= 17 ⇒ ceil(17/16) = **2** 批；
-    //   漏算这一个 ⇒ n = 16 ⇒ 1 批 ⇒ 追加在末尾的 active 这一轮**取不到**，
-    //   要等下一个 10s 周期——而那架正是用户刚选定、正在建链的目标。
-    // ⚠️ 必须**恰好**是 16 的整数倍：清单 15 条时漏算也是 1 批、算上也是 1 批 ⇒ 本格假绿。
-    //    这也解释了为什么单靠下面那些用例测不出：它们的清单条数都不是 16 的整数倍。
+    // ---- ⑥ 「有效且不在清单里」的 `_activeDeviceID` 必须进入本轮 ----
+    // 清单 16 架 + active 不在清单 ⇒ 本轮 **17 帧**（16 + 1）。
+    // 漏掉 active ⇒ 只发 16 帧 ⇒ 本格红（QTRY 等到超时）；那一架正是用户刚选定、
+    // 正在建链的目标，漏掉它要等下一个 10s 周期。
     crypto->returnToStandby();
     const DeviceID active = makeDeviceID(0, 0, 0x71, 0x01);
     crypto->deviceKeyManager()->cacheKey(active, testKey());
@@ -2099,24 +2019,195 @@ void CryptoTest::_testRequestAcceleratedRegistration()
     crypto->setMonitorDevices(sixteen, 3000);
     // ‼️ 追加只发生在**发送侧**：清单本身仍是 16 条，active 绝不进清单（§3.6.2 的同一约束）。
     QCOMPARE(crypto->monitorDeviceCount(), 16);
-    // 两批落在 t = 0/200ms。漏算 active ⇒ 只发 1 批 ⇒ 本格红（QTRY 等到超时）。
-    QTRY_COMPARE_WITH_TIMEOUT(crypto->registrationSendCountForTest(), s6 + 2, TestTimeout::shortMs());
-    // 再等满一个窗口（兜住反方向：别处若多排一批，本格红）。
+    // 17 帧落在 t ≈ 0..16ms。漏掉 active ⇒ 只发 16 帧 ⇒ 本格红（QTRY 等到超时）。
+    QTRY_COMPARE_WITH_TIMEOUT(crypto->registrationSendCountForTest(), s6 + 17, TestTimeout::shortMs());
+    // 再等满一个窗口（兜住反方向：别处若多排一轮，本格红）。
     (void) QTest::qWaitFor([] { return false; }, TestTimeout::shortMs());
-    QCOMPARE(crypto->registrationSendCountForTest(), s6 + 2);
+    QCOMPARE(crypto->registrationSendCountForTest(), s6 + 17);
 
     // 复位（单例跨用例共享）：active 必须清掉，否则 `_sendRegistration()` 会在**每个**
-    // 后续用例里多追加一个 id、污染它们的批次判据。顺序同下：先关登记、再清清单。
+    // 后续用例里多追加一个 id、污染它们的帧计数基线。顺序同下：先关登记、再清清单。
     crypto->setRegistrationEnabled(false);
     crypto->setMonitorDevices(QVariantList(), 3000);
     crypto->returnToStandby();
     crypto->deviceKeyManager()->removeKey(active);
     QCOMPARE(crypto->activeDeviceID(), kInvalidDeviceID);
 
-    // 排空：CryptoController 是**单例**，burst 用一次性定时器串，
-    // kRegistrationBurstIntervalMs(200) × capped(≤5) ⇒ 最晚一批在 800ms 后才投递。
-    // 不等它们落地就会跑进**下一个测试函数**、污染其 sendCount 基线。
+    // 排空：CryptoController 是**单例**，一帧一个 deviceID、singleShot 链 1ms/帧，
+    // 本轮 17 帧 ≈ 17ms 才投递完。不等它们落地就会跑进**下一个测试函数**、污染其
+    // sendCount 基线。
     // ⚠️ 用"恒假条件的 qWaitFor"= 等满一个窗口（不用 qWait(正整数)，避免固定延时禁令）。
+    (void) QTest::qWaitFor([] { return false; }, TestTimeout::shortMs());
+}
+
+// ============================================================================================
+// 逐台登记链在途（2026-10-25 补）
+//
+// 一帧一个 deviceID 之后，一轮 = `_sendRegistration()` 取快照 + 1ms/帧的 singleShot 链。
+// 链还没走完时，清单被整份替换、登记被关掉、某架被签出释出都可能发生。这三类事件都
+// 只靠 `_sendNextRegistration()` 的**逐帧复核**兜住 —— 改发送侧时这里最容易被无声破坏。
+// ============================================================================================
+void CryptoTest::_testRegistrationChainFirstFrameIsSynchronous()
+{
+    CryptoController* const crypto = CryptoController::instance();
+    ignoreLogMessage("MAVLink.Crypto.CryptoController", QtDebugMsg, QRegularExpression("registration "));
+
+    // 公共初态：上一条链若还在跑，会把本用例的计数基线搅乱 ⇒ 先关门清清单、等一个窗口排空。
+    crypto->returnToStandby();
+    crypto->setRegistrationEnabled(false);
+    crypto->setMonitorDevices(QVariantList(), 3000);
+    (void) QTest::qWaitFor([] { return false; }, TestTimeout::shortMs());
+
+    crypto->setRegistrationEnabled(true, 3600000);   // 开启自身发一帧（空清单）⇒ 用增量断言
+    const int s0 = crypto->registrationSendCountForTest();
+
+    QList<DeviceID> ids;
+    QVariantList list;
+    for (int i = 0; i < 20; ++i) {
+        const DeviceID id = makeDeviceID(0, 0, 0x65, static_cast<uint8_t>(i + 1));
+        ids.append(id);
+        list.append(static_cast<uint>(id));
+    }
+
+    crypto->setMonitorDevices(list, 3000);
+
+    // ‼️ **不转事件循环**：首帧必须是同步发出的，且只装第一台。
+    //    整轮在同一调用里发完 ⇒ 这里读到 20；首帧没发（全靠 singleShot）⇒ 这里读到 0。
+    QCOMPARE(crypto->registrationSendCountForTest(), s0 + 1);
+    QCOMPARE(crypto->lastRegistrationPayloadForTest(), QList<DeviceID>{ ids.first() });
+
+    // 其余 19 帧由链在 ~19ms 内推进完；不多不少。
+    QTRY_COMPARE_WITH_TIMEOUT(crypto->registrationSendCountForTest(), s0 + 20, TestTimeout::shortMs());
+    (void) QTest::qWaitFor([] { return false; }, TestTimeout::shortMs());
+    QCOMPARE(crypto->registrationSendCountForTest(), s0 + 20);
+
+    crypto->setRegistrationEnabled(false);
+    crypto->setMonitorDevices(QVariantList(), 3000);
+    (void) QTest::qWaitFor([] { return false; }, TestTimeout::shortMs());
+}
+
+void CryptoTest::_testRegistrationChainReplacedMidFlight()
+{
+    CryptoController* const crypto = CryptoController::instance();
+    ignoreLogMessage("MAVLink.Crypto.CryptoController", QtDebugMsg, QRegularExpression("registration "));
+
+    crypto->returnToStandby();
+    crypto->setRegistrationEnabled(false);
+    crypto->setMonitorDevices(QVariantList(), 3000);
+    (void) QTest::qWaitFor([] { return false; }, TestTimeout::shortMs());
+
+    crypto->setRegistrationEnabled(true, 3600000);
+    const int s0 = crypto->registrationSendCountForTest();
+
+    QVariantList twenty;
+    for (int i = 0; i < 20; ++i) {
+        twenty.append(static_cast<uint>(makeDeviceID(0, 0, 0x62, static_cast<uint8_t>(i + 1))));
+    }
+    crypto->setMonitorDevices(twenty, 3000);
+    QCOMPARE(crypto->registrationSendCountForTest(), s0 + 1);   // 首帧同步
+
+    // 链在途（pos=1，剩余 19 项）时整份替换成 2 台。
+    const DeviceID a = makeDeviceID(0, 0, 0x62, 0xA1);
+    const DeviceID b = makeDeviceID(0, 0, 0x62, 0xB2);
+    crypto->setMonitorDevices(QVariantList{ static_cast<uint>(a), static_cast<uint>(b) }, 3000);
+
+    // 同步调用本身不再发帧（链已激活，不另排第二条）。
+    QCOMPARE(crypto->registrationSendCountForTest(), s0 + 1);
+    // 在途的 singleShot 改为推进**新**队列：1 + 2 = 3 帧；旧队列剩余 19 台一帧都不发。
+    QTRY_COMPARE_WITH_TIMEOUT(crypto->registrationSendCountForTest(), s0 + 3, TestTimeout::shortMs());
+    (void) QTest::qWaitFor([] { return false; }, TestTimeout::shortMs());
+    QCOMPARE(crypto->registrationSendCountForTest(), s0 + 3);
+    QCOMPARE(crypto->lastRegistrationPayloadForTest(), QList<DeviceID>{ b });
+
+    crypto->setRegistrationEnabled(false);
+    crypto->setMonitorDevices(QVariantList(), 3000);
+    (void) QTest::qWaitFor([] { return false; }, TestTimeout::shortMs());
+}
+
+void CryptoTest::_testRegistrationChainStopsWhenDisabledMidFlight()
+{
+    CryptoController* const crypto = CryptoController::instance();
+    ignoreLogMessage("MAVLink.Crypto.CryptoController", QtDebugMsg, QRegularExpression("registration "));
+
+    crypto->returnToStandby();
+    crypto->setRegistrationEnabled(false);
+    crypto->setMonitorDevices(QVariantList(), 3000);
+    (void) QTest::qWaitFor([] { return false; }, TestTimeout::shortMs());
+
+    crypto->setRegistrationEnabled(true, 3600000);
+    const int s0 = crypto->registrationSendCountForTest();
+
+    QVariantList twenty;
+    for (int i = 0; i < 20; ++i) {
+        twenty.append(static_cast<uint>(makeDeviceID(0, 0, 0x63, static_cast<uint8_t>(i + 1))));
+    }
+    crypto->setMonitorDevices(twenty, 3000);
+    QCOMPARE(crypto->registrationSendCountForTest(), s0 + 1);   // 首帧同步
+    const int s1 = crypto->registrationSendCountForTest();
+
+    // 轮中关门：关门本身不发帧；链上下一次 tick 看到关门 ⇒ 清队列、剩余 19 帧一个都不发。
+    crypto->setRegistrationEnabled(false);
+    QVERIFY2(!QTest::qWaitFor([&] { return crypto->registrationSendCountForTest() != s1; },
+                              TestTimeout::shortMs()),
+             "关门之后链仍在推进 ⇒ 已停用登记的会话还在继续发 80005");
+    QCOMPARE(crypto->registrationSendCountForTest(), s1);
+
+    crypto->setMonitorDevices(QVariantList(), 3000);
+    (void) QTest::qWaitFor([] { return false; }, TestTimeout::shortMs());
+}
+
+void CryptoTest::_testRegistrationChainSkipsReleasedDeviceMidFlight()
+{
+    CryptoController* const crypto = CryptoController::instance();
+    ignoreLogMessage("MAVLink.Crypto.CryptoController", QtDebugMsg, QRegularExpression("registration "));
+
+    crypto->returnToStandby();
+    crypto->setRegistrationEnabled(false);
+    crypto->setMonitorDevices(QVariantList(), 3000);
+    (void) QTest::qWaitFor([] { return false; }, TestTimeout::shortMs());
+
+    crypto->setRegistrationEnabled(true, 3600000);
+    const int s0 = crypto->registrationSendCountForTest();
+
+    QList<DeviceID> ids;
+    QVariantList list;
+    for (int i = 0; i < 20; ++i) {
+        const DeviceID id = makeDeviceID(0, 0, 0x64, static_cast<uint8_t>(i + 1));
+        ids.append(id);
+        list.append(static_cast<uint>(id));
+    }
+    crypto->clearRegistrationSentIdsForTest(); // 只统计本轮发送的 id
+    crypto->setMonitorDevices(list, 3000);
+    QCOMPARE(crypto->registrationSendCountForTest(), s0 + 1);   // 首帧同步
+
+    // 签出释出队列里的第 6 台（pos 仍在 1）：剩余 19 项里跳过它，再发 18 帧。
+    // 若不跳过，mavp2p 那条刚被释出的配对的 `qgcSeen` 会在 1ms 后被重新刷新鲜，
+    // `releaseDevice` 的"停止登记"当场失效。
+    const DeviceID released = ids.at(5);
+    crypto->releaseDevice(released);
+
+    QTRY_COMPARE_WITH_TIMEOUT(crypto->registrationSendCountForTest(), s0 + 19, TestTimeout::shortMs());
+    (void) QTest::qWaitFor([] { return false; }, TestTimeout::shortMs());
+    QCOMPARE(crypto->registrationSendCountForTest(), s0 + 19);
+
+    // 帧数只能证明"少发了一帧"，证明不了"跳过的是 released"：误把别的 id 跳过、
+    // 仍从第 6 台发出，计数同样是 19。这里钉住整轮**实际发出去的 id 集合**。
+    QSet<DeviceID> expected;
+    for (const DeviceID id : ids) {
+        if (id != released) {
+            expected.insert(id);
+        }
+    }
+    const QSet<DeviceID> sent = crypto->registrationSentIdsForTest();
+    QVERIFY2(sent == expected,
+             qPrintable(QStringLiteral("本轮实际登记的 id 集合与「除 released 外全部」不一致："
+                                       " sent=%1 expected=%2")
+                            .arg(sent.size())
+                            .arg(expected.size())));
+    QVERIFY2(!sent.contains(released), "被释出的设备仍被重新登记 ⇒ mavp2p 的 qgcSeen 会被刷新鲜");
+
+    crypto->setRegistrationEnabled(false);
+    crypto->setMonitorDevices(QVariantList(), 3000);
     (void) QTest::qWaitFor([] { return false; }, TestTimeout::shortMs());
 }
 
@@ -2135,8 +2226,9 @@ void CryptoTest::_testReRegisterDevice()
 
     // ‼️ 本用例分**两段**：前段登记**关着**（I-1 判据），后段**开着**（原有语义）。
     //    关门段：setMonitorDevices 在集合变化时会触发 requestAcceleratedRegistration()，它自带
-    //    `registrationEnabled()` 门 ⇒ 关门时那串 200ms 的 burst 被**整条挡掉**（直接 return，
-    //    连 QTimer::singleShot 都不排）⇒ 计数干净。而 reRegisterDevice 也必须被门挡掉
+    //    `registrationEnabled()` 门 ⇒ 关门时那一轮加速登记被**整条挡掉**（直接 return，
+    //    连 `_sendRegistration()` 都不进、更不会排 1ms/帧的 singleShot 链）⇒ 计数干净。
+    //    而 reRegisterDevice 也必须被门挡掉
     //    （P5 终审 I-1：crypto 关闭时 RomView 每 2s 对每架调一次它，无门 ⇒ 80005 无限重发）。
     //    ⚠️ 前提用**构造**（下面这行）而不是断言：断言会依赖"本用例在类内声明顺序上跑在谁之后"，
     //    构造则与顺序无关（本用例若被单独跑，单例也保证登记是关的）。
@@ -2159,8 +2251,8 @@ void CryptoTest::_testReRegisterDevice()
     //    QML 调用点（RomView.qml 的 2s 节拍）物理上查不到闸的状态 ⇒ 门只能设在
     //    reRegisterDevice 自己身上，不存在"闸在调用方"这个选项。
     // ⚠️ 判据必须是 **registrationSendCountForTest()**（帧计数）：reRegisterDevice 绕过
-    //    _sendRegistration() 直调 _sendRegistrationFrame()，`_regCursor` 之类一概不动
-    //    （它恒 0，观测不到）。
+    //    _sendRegistration() 直调 _sendRegistrationFrame()，`_regQueue`/`_regQueuePos`
+    //    一概不动（直调路径完全不碰本轮队列）。
     const int sOff = crypto->registrationSendCountForTest();
     crypto->reRegisterDevice(a);
     QCOMPARE(crypto->registrationSendCountForTest(), sOff);   // ‼️ 登记关着 ⇒ 一帧都不发
@@ -2181,8 +2273,8 @@ void CryptoTest::_testReRegisterDevice()
     // ---- ② 开门 ⇒ 有效 deviceID 各发一帧，且集合一律不动 ----
     // ‼️ 周期给到 1 小时：用例内绝不可能周期触发，增量只可能来自 reRegisterDevice 直调。
     //    开门（enabled 分支）**自身立即发一帧**（_sendRegistration()）⇒ 下面一律用差值断言。
-    // ‼️ 关门段那次 setMonitorDevices 触发的 burst 是**当场被门挡掉**的、不是排队
-    //    （requestAcceleratedRegistration 直接 return，连 QTimer::singleShot 都不排）
+    // ‼️ 关门段那次 setMonitorDevices 触发的加速登记是**当场被门挡掉**的、不是排队
+    //    （requestAcceleratedRegistration 直接 return，连 `_sendRegistration()` 都不进）
     //    ⇒ 开门后**不会补发** ⇒ 本段不需要等任何定时器排空，计数因此保持精确。
     crypto->setRegistrationEnabled(true, 3600000);
     const int s0 = crypto->registrationSendCountForTest();
@@ -2242,7 +2334,7 @@ void CryptoTest::_testReRegisterDevice()
 
     // 复位（单例跨用例共享，且下一个用例假定"无清单 + 登记关着"）。
     // ‼️ 顺序不能反：**先关登记、再清清单**。反过来的话，清清单（2 → 空）会命中
-    //    setMonitorDevices 的"集合变化 ⇒ 加速"，而登记此刻还开着 ⇒ 排一串 burst 定时器，
+    //    setMonitorDevices 的"集合变化 ⇒ 加速"，而登记此刻还开着 ⇒ 排一轮 1ms/帧的登记链，
     //    既搅乱下一个用例的计数基线、又留下悬挂定时器。
     crypto->setRegistrationEnabled(false);
     crypto->setMonitorDevices(QVariantList(), 3000);
@@ -2307,8 +2399,8 @@ void CryptoTest::_testReleaseDevice()
     // 单槽 `_activeDeviceID` 是上行权（飞行安全联锁）。没有这条守卫的实现会
     // 「释出一架没在飞的飞机，顺手把正在飞的那架打回 Standby」——此后 LinkInterface 非
     // Active 直接 drop，本端拒绝一切加密上行，在飞的那架当场失联。
-    // ⚠️ 先把监控清单设成非空：①b 的摘除段（`_monitorDevices.removeAll` + `_regCursor` 归零）
-    //    只在**清单非空**时才会执行，否则 `if (removeAll(id) > 0)` 恒不成立、整段删掉也全绿。
+    // ⚠️ 先把监控清单设成非空：①b 的摘除段（`_monitorDevices.removeAll`）
+    //    只在**清单非空**时才有可观测效果，否则整段删掉也全绿。
     crypto->setMonitorDevices(QVariantList{ QVariant(static_cast<uint>(released)),
                                             QVariant(static_cast<uint>(other)) }, 3000);
     QCOMPARE(crypto->monitorDeviceCount(), 2);
@@ -2472,8 +2564,8 @@ void CryptoTest::_testReleaseDevice()
     QVERIFY(crypto->monitorListActiveForTest());
     QCOMPARE(crypto->monitorDeviceCount(), 0);
 
-    // 复位（单例跨用例共享）：顺序同前几例——**先关登记、再清清单**，反序会排一串 burst
-    // 定时器搅乱下一个用例的计数基线。另外本用例是**唯一**往 `_linkedDevices` 里放东西的
+    // 复位（单例跨用例共享）：顺序同前几例——**先关登记、再清清单**，反序会排一轮
+    // 1ms/帧的登记链搅乱下一个用例的计数基线。另外本用例是**唯一**往 `_linkedDevices` 里放东西的
     // 地方，必须清干净：留着的话，后续任何用例一旦走到"回退 `_linkedDevices`"那支就凭空多一架。
     crypto->setCryptoEnabled(false);   // ③段为验失联监测开过，复位（单例跨用例共享）
     crypto->setRegistrationEnabled(false);
@@ -2579,7 +2671,7 @@ void CryptoTest::_testMonitorListInvalidatedAtSessionBoundary()
     QVERIFY(crypto->monitorListActiveForTest());
     QCOMPARE(crypto->monitorDeviceCount(), 1);
 
-    // 复位（单例跨用例共享）：先关登记、再清清单，反序会排一串 burst 定时器搅乱下个用例。
+    // 复位（单例跨用例共享）：先关登记、再清清单，反序会排一轮 1ms/帧的登记链搅乱下个用例。
     // ⚠️ 收尾**不用** `setMonitorDevices(空)`：空清单也是**有效**清单，那会让闩停在 true 上，
     //    而 `_testRegistrationFallbackToLinked` 那类用例要的初态是 false。走会话边界收尾。
     crypto->setRegistrationEnabled(false);

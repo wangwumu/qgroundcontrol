@@ -307,6 +307,11 @@ void MAVLinkProtocol::_processEncryptedFrame(LinkInterface* link, const SharedLi
         MAVLinkCrypto::CryptoLinkLogger::instance()->logIncoming(
             msgid, deviceID, true, reinterpret_cast<const char*>(encData), encLen, nullptr, 0, false,
             QStringLiteral("畸形短帧"));
+        // 事件日志：下面五个丢弃分支以前只进控制台（默认不可见），
+        // 「帧到了但解不开」因此完全查不到。按设备记状态迁移，恢复时也会留下一行。
+        FlightEventLogger::instance()->logDeviceState(
+            static_cast<quint32>(deviceID), QStringLiteral("解密"), QStringLiteral("畸形短帧"),
+            QStringLiteral("msgid=%1 长度=%2").arg(msgid).arg(payloadBlockLen));
         return; // 畸形帧
     }
 
@@ -329,6 +334,9 @@ void MAVLinkProtocol::_processEncryptedFrame(LinkInterface* link, const SharedLi
         MAVLinkCrypto::CryptoLinkLogger::instance()->logIncoming(
             msgid, deviceID, true, reinterpret_cast<const char*>(encData), encLen, nullptr, 0, false,
             QStringLiteral("防重放拒绝"));
+        FlightEventLogger::instance()->logDeviceState(
+            static_cast<quint32>(deviceID), QStringLiteral("解密"), QStringLiteral("防重放拒绝"),
+            QStringLiteral("msgid=%1 counter=%2").arg(msgid).arg(counter));
         return;
     }
 
@@ -339,6 +347,9 @@ void MAVLinkProtocol::_processEncryptedFrame(LinkInterface* link, const SharedLi
         MAVLinkCrypto::CryptoLinkLogger::instance()->logIncoming(
             msgid, deviceID, true, reinterpret_cast<const char*>(encData), encLen, nullptr, 0, false,
             QStringLiteral("无密钥"));
+        FlightEventLogger::instance()->logDeviceState(
+            static_cast<quint32>(deviceID), QStringLiteral("解密"), QStringLiteral("无密钥"),
+            QStringLiteral("msgid=%1").arg(msgid));
         return; // 未登记设备
     }
 
@@ -349,6 +360,9 @@ void MAVLinkProtocol::_processEncryptedFrame(LinkInterface* link, const SharedLi
         MAVLinkCrypto::CryptoLinkLogger::instance()->logIncoming(
             msgid, deviceID, true, reinterpret_cast<const char*>(encData), encLen, nullptr, 0, false,
             QStringLiteral("未知msgid"));
+        FlightEventLogger::instance()->logDeviceState(
+            static_cast<quint32>(deviceID), QStringLiteral("解密"), QStringLiteral("未知msgid"),
+            QStringLiteral("msgid=%1").arg(msgid));
         return; // 未知 msgid，无法验证 CRC
     }
     const uint8_t crcExtra = entry->crc_extra;
@@ -364,12 +378,21 @@ void MAVLinkProtocol::_processEncryptedFrame(LinkInterface* link, const SharedLi
         MAVLinkCrypto::CryptoLinkLogger::instance()->logIncoming(
             msgid, deviceID, true, reinterpret_cast<const char*>(encData), encLen, nullptr, 0, false,
             QStringLiteral("解密失败"));
+        FlightEventLogger::instance()->logDeviceState(
+            static_cast<quint32>(deviceID), QStringLiteral("解密"), QStringLiteral("解密失败"),
+            QStringLiteral("msgid=%1").arg(msgid));
         return; // 解密失败 / tag 校验失败 / 密钥绑定失败
     }
 
     // 防重放「提交」（规范 §2.6 第 9 步）：认证通过后才更新 lastNonce，
     // 防止未认证的伪造帧（明文 counter 可伪造）污染重放窗口。
     crypto->commitIncoming(deviceID, counter);
+
+    // 解密认证通过 ⇒ 记「正常」。只在状态变化时落一行（上一行可能是「无密钥」「解密失败」），
+    // 所以 2 Hz 遥测不会刷屏；而「什么时候恢复的」正是排查「过几分钟又好了」时要看的。
+    FlightEventLogger::instance()->logDeviceState(
+        static_cast<quint32>(deviceID), QStringLiteral("解密"), QStringLiteral("正常"),
+        QStringLiteral("msgid=%1").arg(msgid));
 
     // 自动建链（加密心跳也触发，不依赖明文待命心跳）：
     // 若 PX4 已建链（发加密心跳）而未发明文待命心跳，QGC 的明文分支自动建链
@@ -409,6 +432,10 @@ void MAVLinkProtocol::_processEncryptedFrame(LinkInterface* link, const SharedLi
             MAVLinkCrypto::CryptoLinkLogger::instance()->logIncoming(
                 msgid, deviceID, true, reinterpret_cast<const char*>(encData), encLen, nullptr, 0, false,
                 QStringLiteral("EXT解析失败"));
+            // EXT 是加密链路下遥测的唯一来源：解析失败等于「在线但无遥测」，必须留痕。
+            FlightEventLogger::instance()->logDeviceState(
+                static_cast<quint32>(deviceID), QStringLiteral("EXT解析"), QStringLiteral("失败"),
+                QStringLiteral("payloadLen=%1").arg(static_cast<int>(plainFrame[1])));
         }
     }
 }
@@ -452,6 +479,24 @@ void MAVLinkProtocol::_injectHeartbeatExt(LinkInterface* link, const SharedLinkI
 {
     Q_UNUSED(linkPtr)
     Q_UNUSED(channel)
+
+    // 位置有效性留痕：EXT 的 lat/lon/alt 为哨兵时**不注入** GLOBAL_POSITION_INT
+    // （门控在 CryptoHeartbeatExt.cc:118）⇒ Vehicle 建出来了、坐标却是空的 ⇒
+    // `visible: _pos !== null` 判假 ⇒ 地图上一个 marker 都不画。
+    // 这是「启动后看不到飞机、一会儿又自己好了」最常见且完全不可见的成因，故按状态变化记。
+    {
+        const bool positionValid = ext.hasPosition() && ext.hasAltitude();
+        const QString detail =
+            positionValid
+                ? QStringLiteral("纬度=%1 经度=%2 高度=%3m")
+                      .arg(QString::number(ext.lat / 10000000.0, 'f', 7))
+                      .arg(QString::number(ext.lon / 10000000.0, 'f', 7))
+                      .arg(QString::number(ext.alt / 1000.0, 'f', 1))
+                : QStringLiteral("lat/lon/alt 为哨兵 ⇒ 未注入 GLOBAL_POSITION_INT ⇒ 地图不画该机");
+        FlightEventLogger::instance()->logDeviceState(
+            static_cast<quint32>(deviceID), QStringLiteral("EXT位置"),
+            positionValid ? QStringLiteral("有效") : QStringLiteral("无效"), detail);
+    }
 
     // 打包逻辑（门控/哨兵/字段映射）提取在 CryptoHeartbeatExt::buildHeartbeatExtTelemetry（可单测）。
     // 此处只遍历 emit，经 telemetryInjected 走 Vehicle 消费（绕过 seq/丢包统计，避免合成消息污染 _messagesLost）。
@@ -540,7 +585,10 @@ void MAVLinkProtocol::_logData(LinkInterface* link, const mavlink_message_t& mes
     // 被 _logSuspendError 永久停掉，而那一时刻恰恰是最需要事件日志的时候。
     // SETUP_SIGNING 携带密钥材料（MAVLink spec §Logging 要求剔除），进任何日志都不行。
     if (message.msgid != MAVLINK_MSG_ID_SETUP_SIGNING) {
-        FlightEventLogger::instance()->logFrame(FlightEventLogger::Direction::FromVehicle, message);
+        // 带上 deviceID：多机时「这帧是哪架发的」是排障的第一判据，
+        // 而 _logData 是已知 deviceID 的唯一收帧点。
+        FlightEventLogger::instance()->logFrame(FlightEventLogger::Direction::FromVehicle, message,
+                                                static_cast<quint32>(deviceID));
     }
 
     if (!_logSuspendError && !_logSuspendReplay && _tempLogFile->isOpen()) {

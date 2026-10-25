@@ -4,7 +4,9 @@
 #include <QtCore/QDateTime>
 #include <QtCore/QFile>
 #include <QtCore/QHash>
+#include <QtCore/QList>
 #include <QtCore/QMutex>
+#include <QtCore/QPair>
 #include <QtCore/QString>
 
 // 前向声明 mavlink_message_t（QGC 经 mavlink_types.h 定义，避免本头依赖 PCH 注入）
@@ -20,7 +22,8 @@ typedef struct __mavlink_message mavlink_message_t;
 ///   「发了什么命令 / 飞控怎么应答 / 报了什么警」。
 ///
 /// 文件路径：`<AppDataLocation>/FlightLogs/qgc_flight_YYYYMMDD_HHMMSS.log`
-/// 每行格式：`<本地时间 ISO 含毫秒与偏移> | <方向> | <类别> | <正文> | <备注>`
+/// 每行格式：`<本地时间 ISO 含毫秒与偏移> | <方向> | <类别> | <正文>[ | <备注>]`
+/// ——备注为空时**整个第 5 列省略**（不写空串）；解析时按 `|` 切分须容忍 4 列。
 /// 文件头部若干 `#` 开头的注释行说明格式，解析时按前缀过滤即可。
 ///
 /// 线程：写盘路径全部持 _mutex。发送侧钩子（LinkInterface::sendMessageThreadSafe）
@@ -140,6 +143,10 @@ public:
     bool isOpen() const;
     QString filePath() const;
 
+    /// **仅测试用**：置位后所有写盘直接失败（不触碰真实文件），用于验证
+    /// 「写盘失败时不得把状态记成已写」。应用代码不得调用。
+    static void setWriteFailureForTest(bool fail);
+
     // ------------------------------------------------------------------
     // 写入
     // ------------------------------------------------------------------
@@ -153,6 +160,26 @@ public:
     bool logFrame(Direction direction, const mavlink_message_t& message,
                   const QDateTime& now = QDateTime::currentDateTime());
 
+    /// 同上，并标注这一帧属于哪台飞控（deviceID 写进「备注」列，形如 `device=10001048`）。
+    ///
+    /// deviceID == 0 表示「未知 / 不适用」（未加密的直连链路、本地模拟链路），此时不写该列。
+    /// 多机场景下这一列是必需的：去重键、心跳中断判定都按设备分开，否则两架飞机的
+    /// 同名报文会互相顶掉取值。
+    bool logFrame(Direction direction, const mavlink_message_t& message, quint32 deviceID,
+                  const QDateTime& now = QDateTime::currentDateTime());
+
+    /// 记录某台设备在某个「状态通道」上的迁移。
+    ///
+    /// 同一 (deviceID, channel) 上 state 未变则**不写**；变化才写一行。
+    /// detail 只在真正写盘时附加，所以可以放逐帧变化的数值（msgid、坐标、计数）
+    /// 而不会把日志刷屏。channel 是中文短名，如「解密」「EXT位置」。
+    ///
+    /// 用途：把「帧到了但没解开」「位置是哨兵所以没画飞机」这类平时完全不可见的事，
+    /// 压成每次状态变化一行。
+    bool logDeviceState(quint32 deviceID, const QString& channel, const QString& state,
+                        const QString& detail = QString(),
+                        const QDateTime& now = QDateTime::currentDateTime());
+
     /// 记录一条 QGC 侧事件（按钮被拒、流程中止、守卫拦截）。
     void logLocalEvent(const QString& text,
                        const QDateTime& now = QDateTime::currentDateTime());
@@ -160,6 +187,17 @@ public:
     /// 记录一条链路层事件（心跳中断与恢复、版本握手、航线上传）。
     void logLinkEvent(const QString& text,
                       const QDateTime& now = QDateTime::currentDateTime());
+
+    /// 记录 80005 的**登记集合**：集合变化才写一行，未变返回 false。
+    ///
+    /// 为什么不逐帧写：登记是「一帧一台」发的（每 10s 每台一帧，每条 UDP 链路各一次），
+    /// 16 台就是 96 行/分钟，会把断链、重放丢弃、回滚这些关键事件淹没。
+    /// 集合没变说明发的是同一批 ID，逐帧细节仍在 `/tmp/FlightData*.mavlink` 全量帧日志里。
+    ///
+    /// 入参顺序不参与比较（内部按升序归一后比较并输出）；空集合首次也会记一行
+    /// （「仅保活 num=0」本身是信息）。写盘失败不记「已记录」，下一轮会重试。
+    bool logRegistrationSet(const QList<quint32>& deviceIDs,
+                            const QDateTime& now = QDateTime::currentDateTime());
 
 private:
     FlightEventLogger() = default;
@@ -169,8 +207,19 @@ private:
 
     mutable QMutex _mutex;
     QFile          _file;
-    /// 键＝方向 << 32 | msgid。**方向必须进键**：同一条报文两个方向都有（心跳最典型），
-    /// 只按 msgid 存会让两条流互相顶掉对方的取值 ⇒ 去重失效、每条都当「变了」写出去。
-    QHash<uint64_t, StreamState> _streams;
-    QDateTime      _lastHeartbeatAt;
+    /// 键＝(方向 << 32 | msgid, deviceID)。
+    ///
+    /// **方向和 deviceID 都必须进键**：同一条报文两个方向都有（心跳最典型），
+    /// 多机场景下同一个 msgid 又来自多台飞控；少任一项都会让两条流互相顶掉对方的取值
+    /// ⇒ 去重失效、每条都当「变了」写出去。
+    QHash<QPair<uint64_t, quint32>, StreamState> _streams;
+    /// 键＝(deviceID, 状态通道)，值＝上一次写下的状态；用于「变化才写」。
+    QHash<QPair<quint32, QString>, QString> _deviceStates;
+    /// 每个设备各自的心跳计时（键＝deviceID，0＝来源不明）。共用一个槽位时，
+    /// 多机交替到达的心跳会把任何单架的掉线填平。
+    QHash<quint32, QDateTime> _lastHeartbeatAt;
+    /// 上一次写进日志的 80005 登记集合（升序）；_registrationSetLogged 区分
+    /// 「还没写过」与「写过空集合」——后者再次为空时不应重复记。
+    QList<quint32> _lastRegistrationSet;
+    bool           _registrationSetLogged = false;
 };

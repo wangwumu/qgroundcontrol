@@ -8,6 +8,7 @@
 #include <QtNetwork/QNetworkReply>
 #include <QtNetwork/QNetworkRequest>
 
+#include "Comms/FlightEventLogger.h"
 #include "QGCLoggingCategory.h"
 #include "Utilities/Network/QGCNetworkHelper.h"
 
@@ -79,6 +80,10 @@ void DeviceKeyManager::fetchKey(DeviceID deviceID)
         return;
     }
 
+    // 事件日志：密钥拉取这条链以前只有控制台日志（成功是 qCDebug、失败是 qCWarning），
+    // 而「有没有拿到密钥」正是「帧到了却解不开」的唯一前置。必须进飞行事件日志。
+    FlightEventLogger::instance()->logLinkEvent(QStringLiteral("请求密钥：device %1").arg(deviceID));
+
     // GET /api/device-keys/:deviceId
     const QString url = QStringLiteral("%1/api/device-keys/%2").arg(_serverUrl).arg(deviceID);
     QNetworkRequest request = QGCNetworkHelper::createRequest(QUrl(url));
@@ -103,12 +108,16 @@ void DeviceKeyManager::_onReplyFinished(DeviceID deviceID, QNetworkReply* reply)
     if (!QGCNetworkHelper::isSuccess(reply)) {
         const QString error = QGCNetworkHelper::errorMessage(reply);
         qCWarning(DeviceKeyManagerLog) << "fetchKey failed:" << error;
+        FlightEventLogger::instance()->logLinkEvent(
+            QStringLiteral("密钥拉取失败：device %1：%2").arg(deviceID).arg(error));
         emit fetchFailed(deviceID, error);
         return;
     }
 
     const QJsonDocument doc = QGCNetworkHelper::parseJsonReply(reply);
     if (doc.isNull() || !doc.isObject()) {
+        FlightEventLogger::instance()->logLinkEvent(
+            QStringLiteral("密钥拉取失败：device %1：响应非合法 JSON").arg(deviceID));
         emit fetchFailed(deviceID, QStringLiteral("响应非合法 JSON"));
         return;
     }
@@ -119,12 +128,17 @@ void DeviceKeyManager::_onReplyFinished(DeviceID deviceID, QNetworkReply* reply)
                                     ? obj.value(QStringLiteral("key"))
                                     : obj.value(QStringLiteral("data")).toObject().value(QStringLiteral("key"));
     if (!keyValue.isString()) {
+        FlightEventLogger::instance()->logLinkEvent(
+            QStringLiteral("密钥拉取失败：device %1：响应缺少 key 字段").arg(deviceID));
         emit fetchFailed(deviceID, QStringLiteral("响应缺少 key 字段"));
         return;
     }
 
     const QByteArray keyBytes = QByteArray::fromBase64(keyValue.toString().toUtf8());
     if (keyBytes.size() != static_cast<int>(kKeySize)) {
+        FlightEventLogger::instance()->logLinkEvent(
+            QStringLiteral("密钥拉取失败：device %1：密钥长度 %2（应为 %3）")
+                .arg(deviceID).arg(keyBytes.size()).arg(kKeySize));
         emit fetchFailed(deviceID, QStringLiteral("密钥长度错误：%1（应为 %2）").arg(keyBytes.size()).arg(kKeySize));
         return;
     }
@@ -134,6 +148,7 @@ void DeviceKeyManager::_onReplyFinished(DeviceID deviceID, QNetworkReply* reply)
     cacheKey(deviceID, key);
 
     qCDebug(DeviceKeyManagerLog) << "fetchKey success for device" << deviceID;
+    FlightEventLogger::instance()->logLinkEvent(QStringLiteral("密钥就绪：device %1").arg(deviceID));
     emit keyFetched(deviceID);
 }
 
@@ -169,6 +184,9 @@ void DeviceKeyManager::fetchKeys(const QList<DeviceID>& deviceIDs)
         return;
     }
     emit keysRequested(accepted); // 观测点：载荷是实际要拉的那批
+    // 批量路径失败是**静默**的（没有逐条 fetchFailed），所以事件日志是唯一能看到它成败的地方。
+    FlightEventLogger::instance()->logLinkEvent(
+        QStringLiteral("请求密钥（批量 %1 台）：[%2]").arg(accepted.size()).arg(ids.join(QStringLiteral(", "))));
 
     // GET /api/device-keys/batch?ids=…
     const QString url = QStringLiteral("%1/api/device-keys/batch?ids=%2")
@@ -209,13 +227,17 @@ void DeviceKeyManager::_onBatchReplyFinished(QNetworkReply* reply)
     //    "范围外"一律回 **200 + 过滤后的数组**（`handlers/devicekey.go` 的 `Batch`），
     //    404 只属于单发 `Get`/`Delete`。
     if (!QGCNetworkHelper::isSuccess(reply)) {
-        qCWarning(DeviceKeyManagerLog) << "fetchKeys failed:" << QGCNetworkHelper::errorMessage(reply);
+        const QString error = QGCNetworkHelper::errorMessage(reply);
+        qCWarning(DeviceKeyManagerLog) << "fetchKeys failed:" << error;
+        FlightEventLogger::instance()->logLinkEvent(
+            QStringLiteral("密钥拉取失败（批量）：%1").arg(error));
         return;
     }
 
     const QJsonDocument doc = QGCNetworkHelper::parseJsonReply(reply);
     if (doc.isNull() || !doc.isObject()) {
         qCWarning(DeviceKeyManagerLog) << "fetchKeys: 响应非合法 JSON";
+        FlightEventLogger::instance()->logLinkEvent(QStringLiteral("密钥拉取失败（批量）：响应非合法 JSON"));
         return;
     }
 
@@ -235,6 +257,9 @@ void DeviceKeyManager::_onBatchReplyFinished(QNetworkReply* reply)
         if (keyBytes.size() != static_cast<int>(kKeySize)) {
             qCWarning(DeviceKeyManagerLog) << "fetchKeys: 密钥长度错误 device" << deviceID
                                            << keyBytes.size();
+            FlightEventLogger::instance()->logLinkEvent(
+                QStringLiteral("密钥拉取失败：device %1：密钥长度 %2（应为 %3）")
+                    .arg(deviceID).arg(keyBytes.size()).arg(kKeySize));
             continue;
         }
 
@@ -243,6 +268,7 @@ void DeviceKeyManager::_onBatchReplyFinished(QNetworkReply* reply)
         cacheKey(deviceID, key);
 
         qCDebug(DeviceKeyManagerLog) << "fetchKeys success for device" << deviceID;
+        FlightEventLogger::instance()->logLinkEvent(QStringLiteral("密钥就绪：device %1").arg(deviceID));
         emit keyFetched(deviceID); // 复用既有信号，让 confirmLinking 那条既有链路照旧工作
     }
 }

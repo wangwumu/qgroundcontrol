@@ -9,6 +9,7 @@
 #include <QtCore/QLoggingCategory>
 #include <QtCore/QRandomGenerator>
 
+#include "Comms/FlightEventLogger.h"
 #include "Comms/LinkInterface.h"
 #include "Comms/LinkManager.h"
 #include "Extensions/VTOLSafetyMessages.h"
@@ -166,7 +167,6 @@ void CryptoController::setMonitorDevices(const QVariantList& deviceIds, int fram
         changed = (parsed != _monitorDevices);
         if (changed) {
             _monitorDevices = parsed;
-            _regCursor = 0;  // 集合变了，旧游标没有意义
         }
     }
 
@@ -228,57 +228,17 @@ int CryptoController::monitorDeviceCount() const
 void CryptoController::requestAcceleratedRegistration()
 {
     if (!registrationEnabled()) {
-        // ‼️ 闸的落点分两类：
-        //    ① **C++ 内部调用**：闸一律在**调用方**——本函数自带这道门，而 `_sendRegistration()`
-        //       与 `_sendRegistrationFrame()` **两个都没有**（前者零 `return`——只有取批 +
-        //       发帧；后者只管计数 + 组帧 + 发。都假定调用方已把好关）。登记关着时不发帧靠的是
-        //       `setRegistrationEnabled(false)` 停掉周期定时器，**不是**它们的自检。
-        //    ② **QML 可达的入口（`Q_INVOKABLE`）必须自带门**：QML 查不到闸的状态
-        //       （`registrationEnabled()` 不是 Q_INVOKABLE）⇒ "闸在调用方"对它根本不成立。
-        //       `reRegisterDevice()` 即此类，见其实现与声明处的注释。
+        // ‼️ 门落在本函数：`setMonitorDevices()` 自己**不发送**，发送发生在这里；而
+        //    `_sendRegistration()` / `_sendRegistrationFrame()` **两个都没有**自检
+        //    （都假定调用方已把好关）。`reRegisterDevice()` 是另一个 QML 入口，
+        //    它自带门，见其实现与声明处的注释。
         return;
     }
 
-    int n = 0;        // 本轮要发的**总量**（含追加的 active）
-    int listSize = 0; // 清单本身的条数（不含追加）——仅供容量告警把两个量都打出来
-    {
-        const QMutexLocker locker(&_mutex);
-        // ‼️ 口径必须与 `_sendRegistration()` 取列表的那几行**一致**：那里在
-        //    `_activeDeviceID` 有效且不在清单里时会把它**追加到末尾**。
-        //    少算这一个的后果：清单条数为 16 的整数倍（16/32/48/64/80）时
-        //    `ceil(n/16)` 少排一批，而追加在末尾的 `_activeDeviceID` 恰好总落在最后一批
-        //    ⇒ 它这一轮永远取不到、要等下一个 10s 周期——而那架正是用户刚选定、
-        //    正在建链的目标。改完 n = 这一轮真正要发的总量。
-        // ‼️ 与 `_sendRegistration()` 同口径：走同一个 `_manifestLocked()`，两处不可能再漂
-        //    （口径本身"为什么是 `_monitorListActive` 而不是 `_monitorDevices.isEmpty()`"
-        //    见那个函数的声明处，这里刻意不再复述——复述就是下一个漂移点）。
-        const QList<DeviceID>& devices = _manifestLocked();
-        listSize = devices.size();
-        n = listSize;
-        if (_activeDeviceID != kInvalidDeviceID && !devices.contains(_activeDeviceID)) {
-            n++;
-        }
-    }
-
-    const int batches = (n <= 0) ? 1 : ((n + MAX_QGC_LINKED_PX4 - 1) / MAX_QGC_LINKED_PX4);
-    const int capped = qMin(batches, kMaxRegistrationBatches);
-    if (capped < batches) {
-        // 容量天花板（§3.4）：越过 n ≤ 80 时稳态本来就保证不了 TTL，
-        // 加速发送再多也只是把这一轮塞满。**截断的是批数，不是集合**——
-        // 集合永远不动（§3.6.2）。
-        // ‼️ 两个量都要打：触发判据用的是 `n`（本轮总量，含追加的 active），
-        //    而 `_monitorDevices` 的实际条数是 `listSize`。只打一个会让排障者
-        //    去找一个不存在的清单（清单恰 80 条 + active 不在清单 ⇒ n=81 触发告警）。
-        qCWarning(CryptoControllerLog) << "登记总量超过容量天花板（n ≤ 80），加速发送已截断："
-                                       << "监控清单" << listSize << "架 / 本轮" << n << "架 / 需" << batches << "批";
-    }
-
-    // ⚠️ 用 QTimer::singleShot 串，**不要**用 QThread::msleep 或忙等——那会卡 GUI 线程（§3.4）
-    for (int i = 0; i < capped; i++) {
-        QTimer::singleShot(i * kRegistrationBurstIntervalMs, this, [this]() {
-            _sendRegistration();
-        });
-    }
+    // 一帧一个 deviceID 之后，一轮就是全集，不再需要分批/游标/容量天花板：
+    // `_sendRegistration()` 把快照交给 singleShot 链（1ms/帧）逐台发出。
+    // ⚠️ 仍然**不要**把它接到 2s 轮询上——那会打乱 10s 保活周期（§3.4）。
+    _sendRegistration();
 }
 
 void CryptoController::reRegisterDevice(quint32 deviceID)
@@ -319,8 +279,8 @@ void CryptoController::reRegisterDevice(quint32 deviceID)
             return;
         }
     }
-    // 单发一批（只含这一个），复用 _sendRegistrationFrame 的组帧与发送逻辑。
-    // ‼️ 这里**不碰** _monitorDevices、不碰 _regCursor —— 重发是幂等刷新，
+    // 单发一帧（只含这一个），复用 _sendRegistrationFrame 的组帧与发送逻辑。
+    // ‼️ 这里**不碰** _monitorDevices、不碰本轮发送队列 —— 重发是幂等刷新，
     //    任何集合改动都会把"超时自愈"变成"超时自我放逐"（§3.6.2）。
     _sendRegistrationFrame(QList<DeviceID>{ static_cast<DeviceID>(deviceID) });
 }
@@ -356,26 +316,16 @@ QList<DeviceID> CryptoController::lastRegistrationPayloadForTest() const
     return _lastRegistrationPayload;
 }
 
-QList<DeviceID> CryptoController::nextRegistrationBatch(const QList<DeviceID>& devices, int batch, int& cursor)
+QSet<DeviceID> CryptoController::registrationSentIdsForTest() const
 {
-    const int n = devices.size();
-    if (n <= 0 || batch <= 0) {
-        cursor = 0;
-        return {};
-    }
-    // 防御：监控清单缩小后，上一轮留下的游标可能已越界
-    if (cursor < 0 || cursor >= n) {
-        cursor = 0;
-    }
-    const int count = qMin(batch, n - cursor);
+    const QMutexLocker locker(&_mutex);
+    return _sentRegistrationIdsForTest;
+}
 
-    QList<DeviceID> out;
-    out.reserve(count);
-    for (int i = 0; i < count; i++) {
-        out.append(devices.at((cursor + i) % n));
-    }
-    cursor = (cursor + count) % n;
-    return out;
+void CryptoController::clearRegistrationSentIdsForTest()
+{
+    const QMutexLocker locker(&_mutex);
+    _sentRegistrationIdsForTest.clear();
 }
 
 void CryptoController::addLinkedDevice(quint32 deviceID)
@@ -491,9 +441,7 @@ void CryptoController::releaseDevice(quint32 deviceID)
         //     （否则这次释出当场失效）；而未打开过 RomView 的会话从不调
         //     `setMonitorDevices`（全仓唯一调用点就在 RomView 里），此时该标志本就是
         //     false，摘空也无从翻起。
-        if (_monitorDevices.removeAll(id) > 0) {
-            _regCursor = 0; // 集合变了，旧游标没有意义（同 setMonitorDevices）
-        }
+        _monitorDevices.removeAll(id);
         // ⑤ 清三张 per-device 表，并记入 `_releasedDevices`（2026-10-06 补）。
         //    ⚠️ 这三张表原来**刻意不动**（见 .h 的旧注释）：理由是"前者没有清理时机判据"
         //    与"删掉会让 `beginLinkingForSystemID` 在这架飞机上失效"。今天两条都反过来了——
@@ -501,7 +449,7 @@ void CryptoController::releaseDevice(quint32 deviceID)
         //    **正是**签出要做的事（清表后它会打一条 `unknown systemID` 警告并 return；
         //    留着映射则本端还能凭一个 systemID 为已经交还出去的飞机重新建链）。
         _lastFrameMs.remove(id);
-        //    ⚠️ `_deviceToSystem` 今天**只写不读**（`:901` 是唯一写点，全仓无读者——
+        //    ⚠️ `_deviceToSystem` 今天**只写不读**（`learnDeviceSystemMapping` 是唯一写点，全仓无读者——
         //    `deviceIDForSystemID` 读的是反向表）。清它是防泄漏 + 与反向表保持一致，
         //    没有"不清就会被读错"这一层；下面的断言也验不到它（无观测点）。
         _deviceToSystem.remove(id);
@@ -556,26 +504,97 @@ void CryptoController::releaseDevice(quint32 deviceID)
 
 void CryptoController::_sendRegistration()
 {
-    QList<DeviceID> batch;
+    QList<DeviceID> round;
+    bool startChain = false;
     {
         const QMutexLocker locker(&_mutex);
         // §3.5.3：有**生效的**监控清单时用清单，否则回退 _linkedDevices
         //（未登录 / 站点视图从未推过清单 ⇒ 保持现状，零回归）。
         // ‼️ 取清单的判据收在 `_manifestLocked()` 一处（`_monitorListActive`，**不是**
         //    `_monitorDevices.isEmpty()`）——这里刻意只留引用，理由不再复述。
-        QList<DeviceID> devices = _manifestLocked();
-        if (_activeDeviceID != kInvalidDeviceID && !devices.contains(_activeDeviceID)) {
-            devices.append(_activeDeviceID);
+        const QList<DeviceID>& devices = _manifestLocked();
+        round = devices;
+        if (_activeDeviceID != kInvalidDeviceID && !round.contains(_activeDeviceID)) {
+            round.append(_activeDeviceID);
         }
-        // §3.3：分批轮转。n ≤ 16 时退化为"一批全取、游标恒 0"，与改动前一致。
-        // ‼️ batch 仍须是 MAX_QGC_LINKED_PX4（@pre）。但传更大值**不会越界**——下游 qMin 是真实兜底，
-        //    deviceCount 恒 ≤ 16、最大写索引 63 < 64。真实后果是**覆盖性缺口**：游标按本轮取出量推进（尾批小于 batch）
-        //    而 payload 只装前 16 个 ⇒ 每轮丢掉本轮取出的、超出 16 个的那部分（整批 = batch-16，尾批更少）。
-        batch = nextRegistrationBatch(devices, MAX_QGC_LINKED_PX4, _regCursor);
+        // 新一轮整体替换旧队列，pos **归零**。若已有 singleShot 链在推进，它下一步就按
+        // **新队列**从 0 继续（旧一轮剩下的条目直接丢弃），不另排第二条链。
+        // ‼️ 只保证「同时只有一条链」，**不**保证"同一轮内不重发"：pos 归零意味着
+        //    新一轮从头开始发，替换前已发出的那几帧不会被跳过。
+        //    （`CryptoTest::_testRegistrationChainReplacedMidFlight` 钉的就是这个形状。）
+        _regQueue = round;
+        _regQueuePos = 0;
+        if (!round.isEmpty() && !_regChainActive) {
+            _regChainActive = true;
+            startChain = true;
+        }
     }
 
-    // 空批 = 没有关联设备：保持现状，发一个 num=0 的登记告诉 mavp2p "本 GCS 在线"
-    _sendRegistrationFrame(batch);
+    // 事件日志只记**集合变化**（内部去重），不逐帧记：这一轮每台一帧、每条 UDP 链路各一次，
+    // 多机现场会把断链/重放丢弃等关键事件淹没。逐帧细节在全量帧日志 /tmp/FlightData*.mavlink。
+    FlightEventLogger::instance()->logRegistrationSet(round);
+
+    // 空清单 = 没有关联设备：发一个 num=0 的登记告诉 mavp2p "本 GCS 在线"。
+    if (round.isEmpty()) {
+        _sendRegistrationFrame(QList<DeviceID>{});
+        return;
+    }
+
+    if (startChain) {
+        _sendNextRegistration(); // 首帧立即发，其余由 singleShot 每 1ms 推进
+    }
+}
+
+void CryptoController::_sendNextRegistration()
+{
+    if (!registrationEnabled()) {
+        // 发送途中被关闭：丢弃剩余队列，不再排下一次。
+        const QMutexLocker locker(&_mutex);
+        _regQueue.clear();
+        _regQueuePos = 0;
+        _regChainActive = false;
+        return;
+    }
+
+    DeviceID id = kInvalidDeviceID;
+    bool has = false;
+    {
+        const QMutexLocker locker(&_mutex);
+        if (_regQueuePos < _regQueue.size()) {
+            id = _regQueue.at(_regQueuePos++);
+            has = true;
+        }
+        if (has) {
+            // 轮内时效性：快照取完后清单可能被整份替换，或某架被签出释出。
+            // 发送前按**当前**清单复核；不再需要的 id 直接跳过——否则会把已释出配对的
+            // `qgcSeen` 重新刷新鲜，抵消 `releaseDevice` 的效果。
+            const QList<DeviceID>& devices = _manifestLocked();
+            const bool stillListed = devices.contains(id);
+            const bool isActive = (_activeDeviceID != kInvalidDeviceID && _activeDeviceID == id);
+            if (_releasedDevices.contains(id) || (!stillListed && !isActive)) {
+                has = false;
+            }
+        }
+    }
+
+    if (has) {
+        _sendRegistrationFrame(QList<DeviceID>{ id });
+    }
+
+    bool more = false;
+    {
+        const QMutexLocker locker(&_mutex);
+        more = _regChainActive && _regQueuePos < _regQueue.size();
+        if (!more) {
+            _regChainActive = false;
+            _regQueue.clear();
+            _regQueuePos = 0;
+        }
+    }
+    if (more) {
+        // 非阻塞推进：1ms 后发下一个。不要用 QThread::msleep / 忙等（会卡 GUI 线程）。
+        QTimer::singleShot(kRegistrationPerDeviceIntervalMs, this, &CryptoController::_sendNextRegistration);
+    }
 }
 
 void CryptoController::_sendRegistrationFrame(const QList<DeviceID>& ids)
@@ -590,20 +609,27 @@ void CryptoController::_sendRegistrationFrame(const QList<DeviceID>& ids)
     }
 
     // 帧头 deviceID 用 GCS 段固定值（文档 §1.3 QGC_REGISTRATION_DEVICE_ID_DEFAULT），
-    // 由 pack 函数拆入帧头 4 字节（方案 B）。payload 填关联 PX4 deviceID 集合。
-    const int deviceCount = qMin(ids.size(), static_cast<int>(MAX_QGC_LINKED_PX4));
+    // 由 pack 函数拆入帧头 4 字节（方案 B）。
+    // ‼️ 每帧只携带 **0 或 1 个** deviceID（一包一个）：多 ID 同帧时，任何一帧的丢失/解析
+    //    异常都会牵连同帧其它 ID；拆开后故障半径缩到单个 ID。qMin 是防误传的兜底，
+    //    不是"允许装多个"——调用点都只传 0/1 个。
+    const int deviceCount = qMin(ids.size(), 1);
 
     // 单测用：记下**这一帧真正装进去的** id（截断之后），口径与下面的 `deviceBytes` 循环一致。
     // ‼️ 记的是 `deviceCount` 而非调用方传进来的整个 `ids`——否则断言会对着"打算装的"而非"装了的"。
     {
         const QMutexLocker locker(&_mutex);
         _lastRegistrationPayload = ids.mid(0, deviceCount);
+        // 累计集合（单测用）：口径与 _lastRegistrationPayload 一致 —— 记真正装进帧的 id。
+        // 有了它，用例能断言「被释出的那台从没再被登记」，而不只是「帧数少 1」。
+        for (int i = 0; i < deviceCount; i++) {
+            _sentRegistrationIdsForTest.insert(ids.at(i));
+        }
     }
 
     // ⚠️ 定长数组，不是 VLA：`uint8_t deviceBytes[count * 4]` 是 GCC 扩展、
     //    不是标准 C++，MSVC 直接编译失败，本仓是多平台构建（§3.3 关键点 1）。
-    //    count 恒 ≤ MAX_QGC_LINKED_PX4，故构造上不会越界。
-    uint8_t deviceBytes[MAX_QGC_LINKED_PX4 * 4] = {};
+    uint8_t deviceBytes[4] = {};
     for (int i = 0; i < deviceCount; i++) {
         const uint32_t dev = ids.at(i);
         deviceBytes[i * 4 + 0] = static_cast<uint8_t>(dev >> 24);
@@ -679,7 +705,11 @@ void CryptoController::setResponsibleParty(bool responsible)
         const QMutexLocker locker(&_mutex);
         _responsibleParty = responsible;
         // 会话边界：责任方身份被重新判定（登录成功 / 登录被拒 / 本地密钥源初始化）⇒
-        // 上一个会话的监控清单**当场作废**（闩回落 + 清单清空 + 轮转游标归零）。
+        // 上一个会话的监控清单**当场作废**（闩回落 + 清单清空）。此刻在途的发送链
+        // 不必单独清：`_sendNextRegistration()` 发每一帧前都按 `_manifestLocked()`
+        // 复核**当前**口径。⚠️ 闩回落后该口径是 `_linkedDevices`，不是"空清单"——
+        // 只有既不在回落清单、也不是 active 的条目才逐帧跳过；仍在 `_linkedDevices`
+        // 里的条目会继续发，那正是 §3.5.4 的回退语义。
         // 为什么落在这里：`_monitorListActive` 是**单向闩**（全仓仅 `setMonitorDevices`
         // 一处置 true），而取列表的口径是 `_monitorListActive ? _monitorDevices : _linkedDevices`
         // —— 闩不回落，**跨会话**时本端会一直按上一个站点的 `_monitorDevices` 发 80005 登记心跳：
@@ -701,7 +731,6 @@ void CryptoController::setResponsibleParty(bool responsible)
         if (_monitorListActive) {
             _monitorListActive = false;
             _monitorDevices.clear();
-            _regCursor = 0;
         }
         // 同一会话边界，**起/终维也当场作废**（2026-10-04 补）。理由与上面那段同源：它是
         // 「本端持有哪些飞机的指令权」的判定结果，归属登录会话；跨会话留着会让新账号按上一个
@@ -836,6 +865,13 @@ void CryptoController::beginLinking(DeviceID targetDeviceID)
     //    它会占住 `_activeDeviceID` 单槽把当时的持有方挤掉，违反 §3.1「同一 deviceID
     //    指令方向同一时刻只有一个发送端」。拒绝路径的静默理由与上面同一段，不变。
     if (!isInitiatorFor(targetDeviceID)) {
+        // 飞行事件日志（**不是** Qt 日志：不产出一条 qCWarning/qCDebug，因此既不进控制台，
+        // 也不参与 strict-mode 单测的"未预期日志即失败"）只在状态变化时写一行。
+        // 上面那段「拒绝路径刻意不打日志」的理由针对的是按次刷屏的控制台日志，与这里不冲突；
+        // 而「本机为什么一直不建链」恰恰是排障时最常问的一句，必须留痕。
+        FlightEventLogger::instance()->logDeviceState(
+            static_cast<quint32>(targetDeviceID), QStringLiteral("建链"),
+            QStringLiteral("未接引（本端无该机指令权，保持待命）"));
         return;
     }
 
@@ -863,6 +899,9 @@ void CryptoController::beginLinking(DeviceID targetDeviceID)
         _stopLinkLossMonitor(); // 锁外调用（同 _startLinkLossMonitor：timer 归属主线程）
     }
     emit stateChanged();
+
+    FlightEventLogger::instance()->logDeviceState(
+        static_cast<quint32>(targetDeviceID), QStringLiteral("建链"), QStringLiteral("握手中"));
 
     qCDebug(CryptoControllerLog) << "beginLinking device" << targetDeviceID;
 
@@ -898,8 +937,9 @@ void CryptoController::learnDeviceSystemMapping(DeviceID deviceID, uint8_t syste
     // 签出闸（2026-10-06 补）：`releaseDevice` 刚清掉这两张表，而 mavp2p 在配对老化前
     // （`MAP_TTL`，实测默认 60s）仍会转发该机的帧 ⇒ 不挡的话下一帧就把表重建回来。
     // ‼️ 闸收在**本函数体内**、不在 `MAVLinkProtocol.cc` 的调用点：那里的注释
-    //    （`:211-222`）写明了那四行必须**无条件**执行（失联判据依赖它们，且它们是
-    //    "全新启动学映射"的唯一入口）。用白名单（`isInManifest`）当闸会打破那个入口。
+    //    （明文待命心跳支，搜「两处收帧点必须都记」）写明了那四行必须**无条件**执行
+    //    （失联判据依赖它们，且它们是"全新启动学映射"的唯一入口）。用白名单
+    //    （`isInManifest`）当闸会打破那个入口。
     if (_releasedDevices.contains(deviceID)) {
         return;
     }
@@ -954,6 +994,8 @@ void CryptoController::confirmLinking()
         confirmedDevice = _activeDeviceID;
     }
     qCDebug(CryptoControllerLog) << "linking confirmed device" << confirmedDevice;
+    FlightEventLogger::instance()->logDeviceState(
+        static_cast<quint32>(confirmedDevice), QStringLiteral("建链"), QStringLiteral("已建链（Active）"));
     emit linkingConfirmed(confirmedDevice);
     emit stateChanged();
 }
@@ -968,19 +1010,26 @@ void CryptoController::failLinking(const QString& error)
         _state = State::Standby;
     }
     qCWarning(CryptoControllerLog) << "linking failed device" << failedDevice << error;
+    FlightEventLogger::instance()->logDeviceState(
+        static_cast<quint32>(failedDevice), QStringLiteral("建链"), QStringLiteral("失败"),
+        error);
     emit linkingFailed(failedDevice, error);
     emit stateChanged();
 }
 
 void CryptoController::returnToStandby()
 {
+    DeviceID releasedDevice;
     {
         const QMutexLocker locker(&_mutex);
+        releasedDevice = _activeDeviceID;
         _activeDeviceID = kInvalidDeviceID;
         _state = State::Standby;
     }
     // 回待命 = 连接解除，停用失联监测（不再误报，C2 修正）
     _stopLinkLossMonitor();
+    FlightEventLogger::instance()->logDeviceState(
+        static_cast<quint32>(releasedDevice), QStringLiteral("建链"), QStringLiteral("回待命"));
     qCDebug(CryptoControllerLog) << "return to standby";
     emit stateChanged();
 }

@@ -3,9 +3,19 @@
 #include "Extensions/VTOLSafetyMessages.h"
 #include "MAVLinkLib.h"
 
+#include <algorithm>
+
 #include <QtCore/QDir>
 #include <QtCore/QMutexLocker>
 #include <QtCore/QStandardPaths>
+
+/// 测试注入（见头文件）：置位后 _writeLineLocked 一律返回失败。
+static bool s_writeFailureForTest = false;
+
+void FlightEventLogger::setWriteFailureForTest(bool fail)
+{
+    s_writeFailureForTest = fail;
+}
 
 // ============================================================================
 // 枚举 → 中文
@@ -165,8 +175,11 @@ FlightEventLogger::Category FlightEventLogger::classify(const mavlink_message_t&
         // 目标点变化是「动作」，不是「状态」：它记的是「改去哪儿」，不是「现在如何」。
         return Category::Action;
     case MAVLINK_MSG_ID_QGC_REGISTRATION:
-        // 登记/保活心跳是链路层自动行为，不是操作员命令。
-        return Category::Link;
+        // 登记/保活心跳**不逐帧进事件日志**：一帧一台后，每 10s 每台（每条 UDP 链路）
+        // 都会产生一帧，16 台就是 96 行/分钟，把断链、重放丢弃、回滚等关键事件淹没。
+        // 帧级细节在 /tmp/FlightData*.mavlink 里；本日志只记「集合变化」一行
+        // （FlightEventLogger::logRegistrationSet，由 CryptoController 每轮调用）。
+        return Category::None;
     default:
         return Category::None;
     }
@@ -247,11 +260,51 @@ QString FlightEventLogger::renderFrame(const mavlink_message_t& message)
                 static_cast<double>(mavlink_msg_position_target_global_int_get_alt(&message)), 'f', 1));
     }
 
+    case MAVLINK_MSG_ID_QGC_REGISTRATION: {
+        // payload = deviceID_num(1B) + deviceIDs(4B 大端 × N)。只写「QGC登记心跳」
+        // 等于把「这次到底登了谁」丢掉 —— 多机时这是排障的第一判据。
+        // ⚠️ `mavlink_msg_qgc_registration_pack` 把 payload 零初始化后按 len 发送，
+        //    尾部零字节会被裁掉：10000384 = 0x00989800 的**尾字节**是 0 ⇒ 实际
+        //    `message.len == 4`（台数 1 字节 + 该 ID 的 3 字节）。
+        //    因此必须按声明的台数解码，超出 `message.len` 的字节按 0 补齐；
+        //    旧的 `(message.len - 1) / 4` 会算出 0 台，日志里就看不到这台。
+        constexpr int kMaxIds = (static_cast<int>(MAVLINK_MSG_ID_QGC_REGISTRATION_LEN) - 1) / 4;
+        const uint8_t* const payload = reinterpret_cast<const uint8_t*>(_MAV_PAYLOAD(&message));
+        const int declared = (message.len > 0) ? payload[0] : 0;
+        const int count = qBound(0, declared, kMaxIds);
+        // payload 偏移 0..len-1 都在帧内（payload[0] 是台数）；其余是裁掉的尾部零。
+        const int inFrame = static_cast<int>(message.len);
+        QStringList ids;
+        for (int i = 0; i < count; ++i) {
+            uint32_t id = 0;
+            for (int b = 0; b < 4; ++b) {
+                const int off = 1 + i * 4 + b;
+                id = (id << 8) | ((off < inFrame) ? payload[off] : 0x00u);
+            }
+            ids << QString::number(id);
+        }
+        QString list = QStringLiteral("%1 台 [%2]").arg(count).arg(ids.join(QStringLiteral(", ")));
+        // 补齐的字节不在帧内：尾零裁剪时它们确实是 0，但若帧是被别的原因截短的，
+        // 补出来的 0 就是猜的 —— 标出来，别让读者拿它当「对端发的就是这些字节」。
+        const int padded = (1 + count * 4) - inFrame;
+        if (padded > 0) {
+            list += QStringLiteral(" —— 帧内仅 %1 字节，其余 %2 字节按尾零补齐").arg(inFrame).arg(padded);
+        }
+        if (declared > kMaxIds) {
+            return QStringLiteral("%1(扩展 %2)：%3 —— 声明 %4 台超出帧容量 %5 台，已截断")
+                .arg(_extensionName(message.msgid))
+                .arg(message.msgid)
+                .arg(list)
+                .arg(declared)
+                .arg(kMaxIds);
+        }
+        return QStringLiteral("%1(扩展 %2)：%3").arg(_extensionName(message.msgid)).arg(message.msgid).arg(list);
+    }
+
     case MAVLINK_MSG_ID_WEATHER_FORECAST:
     case MAVLINK_MSG_ID_ALTERNATE_LANDING:
     case MAVLINK_MSG_ID_SENSOR_CTRL:
     case MAVLINK_MSG_ID_VIDEO_CTRL:
-    case MAVLINK_MSG_ID_QGC_REGISTRATION:
         return QStringLiteral("%1(扩展 %2)").arg(_extensionName(message.msgid)).arg(message.msgid);
 
     default:
@@ -395,15 +448,29 @@ bool FlightEventLogger::start(const QString& directory)
     }
 
     _streams.clear();
-    _lastHeartbeatAt = QDateTime();
+    _deviceStates.clear();
+    _lastHeartbeatAt.clear();
+    _lastRegistrationSet.clear();
+    _registrationSetLogged = false;
 
-    _file.write("# QGC 飞行事件日志\n");
-    _file.write("# 每行: <时间 ISO 含毫秒与时区> | <方向> | <类别> | <正文> | <备注>\n");
-    _file.write("# 方向: QGC→飞控 / 飞控→QGC / QGC内部\n");
-    _file.write("# 与 /tmp/FlightData*.mavlink 分工: 那个是全量原始帧, 且发送方向写的是加密后的字节;\n");
-    _file.write("#   本文件只记关键事件, 发送方向取自加密之前的明文。\n");
-    _file.write(QStringLiteral("# 启动时刻: %1\n").arg(_isoWithOffset(openedAt)).toUtf8());
-    _file.flush();
+    // 头注释一次写完并校验：写不进去（磁盘满、配额耗尽）意味着后面每条事件同样写不出，
+    // 必须让 start() 失败 —— QGCApplication 据此弹「飞行事件日志无法创建」。
+    // 若在这里无视返回值而返回 true，用户会以为在记录，实际整份日志是空的。
+    const QString header = QStringLiteral(
+                               "# QGC 飞行事件日志\n"
+                               "# 每行: <时间 ISO 含毫秒与时区> | <方向> | <类别> | <正文>[ | <备注>]\n"
+                               "#   备注为空时第 5 列整个省略（不写空串），解析时须容忍 4 列。\n"
+                               "# 方向: QGC→飞控 / 飞控→QGC / QGC内部\n"
+                               "# 与 /tmp/FlightData*.mavlink 分工: 那个是全量原始帧, 且发送方向写的是加密后的字节;\n"
+                               "#   本文件只记关键事件, 发送方向取自加密之前的明文。\n"
+                               "# 备注列: device=<deviceID> 表示该帧属于哪台飞控；距上次变化=<秒> 表示该状态已稳定多久。")
+                           + QStringLiteral("\n# 启动时刻: %1").arg(_isoWithOffset(openedAt));
+    if (!_writeLineLocked(header)) {
+        // 只剩半份头注释的文件不是可用日志；留着会被当成「本次运行没有任何事件」。
+        _file.close();
+        (void) _file.remove();
+        return false;
+    }
     return true;
 }
 
@@ -431,6 +498,12 @@ QString FlightEventLogger::filePath() const
 bool FlightEventLogger::logFrame(Direction direction, const mavlink_message_t& message,
                                  const QDateTime& now)
 {
+    return logFrame(direction, message, 0, now);
+}
+
+bool FlightEventLogger::logFrame(Direction direction, const mavlink_message_t& message,
+                                 quint32 deviceID, const QDateTime& now)
+{
     const bool isHeartbeat = (direction == Direction::FromVehicle) &&
                              (message.msgid == MAVLINK_MSG_ID_HEARTBEAT);
     const Category category = classify(message);
@@ -442,13 +515,29 @@ bool FlightEventLogger::logFrame(Direction direction, const mavlink_message_t& m
 
     // 心跳间隔先判，且与是否写盘无关：取值未变的心跳同样证明链路是通的，
     // 若把它并进去重里一起跳过，「心跳中断」将永远不会被观测到。
+    //
+    // 计时器**按设备分槽**：多机场景下四架飞机的心跳交替到达，共用一个计时器时
+    // 任何单架掉线都被其他三架填平 —— "某架失联"永远观测不到。
     if (isHeartbeat) {
+        const bool hadPrevious = _lastHeartbeatAt.contains(deviceID);
+        const QDateTime previous = _lastHeartbeatAt.value(deviceID);
         const HeartbeatGap gap =
-            observeHeartbeat(_lastHeartbeatAt, now, kHeartbeatGapThresholdSeconds);
+            observeHeartbeat(_lastHeartbeatAt[deviceID], now, kHeartbeatGapThresholdSeconds);
         if (gap.resumed) {
-            wrote = _writeLineLocked(formatLine(now, Direction::Local, Category::Link,
-                                                QStringLiteral("心跳中断 %1 秒后恢复")
-                                                    .arg(QString::number(gap.silentSeconds, 'f', 1))));
+            wrote = _writeLineLocked(formatLine(
+                now, Direction::Local, Category::Link,
+                QStringLiteral("心跳中断 %1 秒后恢复").arg(QString::number(gap.silentSeconds, 'f', 1)),
+                deviceID != 0 ? QStringLiteral("device=%1").arg(deviceID) : QString()));
+            if (!wrote) {
+                // 没落盘就回滚计时器：否则「中断→恢复」被记成已处理，
+                // 此后每次心跳都只是「距上次 1 秒」，这次链路抖动永远不再出现。
+                // 回滚到上一帧，下一次心跳会把整段静默重新报出来。
+                if (hadPrevious) {
+                    _lastHeartbeatAt.insert(deviceID, previous);
+                } else {
+                    _lastHeartbeatAt.remove(deviceID);
+                }
+            }
         }
     }
 
@@ -456,23 +545,43 @@ bool FlightEventLogger::logFrame(Direction direction, const mavlink_message_t& m
         return wrote;
     }
 
-    QString note;
+    QStringList noteParts;
+    if (deviceID != 0) {
+        noteParts << QStringLiteral("device=%1").arg(deviceID);
+    }
+
     if (stream != Stream::None) {
-        // 方向必须进键：QGC 自己每秒发一条 GCS 心跳、飞行器也每秒回一条，两者 msgid 相同、
-        // 取值不同。只按 msgid 存会让两条流互相顶掉对方的取值，于是每条心跳都判成「变了」，
-        // 去重彻底失效（真机端到端实测：1 Hz 心跳每次各写一行，且备注恒为「距上次变化 0.0 秒」）。
-        const uint64_t key = (static_cast<uint64_t>(direction) << 32) | message.msgid;
+        // 方向、设备都必须进键：QGC 自己每秒发一条 GCS 心跳、飞行器也每秒回一条，
+        // 多机时同一个 msgid 还来自多台飞控。少任一项都会让两条流互相顶掉对方的取值，
+        // 于是每条心跳都判成「变了」，去重彻底失效（真机端到端实测：1 Hz 心跳每次各写一行，
+        // 且备注恒为「距上次变化 0.0 秒」）。
+        QPair<uint64_t, quint32> key((static_cast<uint64_t>(direction) << 32) | message.msgid, deviceID);
+        const StreamState previous = _streams.value(key);
         const StreamDecision decision = decideStreamWrite(_streams[key], body.toUtf8(), now);
         if (!decision.write) {
             return wrote;
         }
         if (decision.secondsSinceLastWrite >= 0.0) {
-            note = QStringLiteral("距上次变化 %1 秒")
-                       .arg(QString::number(decision.secondsSinceLastWrite, 'f', 1));
+            noteParts << QStringLiteral("距上次变化 %1 秒")
+                             .arg(QString::number(decision.secondsSinceLastWrite, 'f', 1));
         }
+
+        const bool streamWrote = _writeLineLocked(
+            formatLine(now, direction, category, body, noteParts.join(QLatin1Char(' '))));
+        if (!streamWrote) {
+            // 没落盘就不算「已记录」：否则这个取值此后永远判「未变」，
+            // 该流在本进程余下的生命里彻底消失。
+            if (previous.hasValue) {
+                _streams.insert(key, previous);
+            } else {
+                _streams.remove(key);
+            }
+        }
+        return wrote || streamWrote;
     }
 
-    return _writeLineLocked(formatLine(now, direction, category, body, note));
+    return wrote || _writeLineLocked(
+                         formatLine(now, direction, category, body, noteParts.join(QLatin1Char(' '))));
 }
 
 void FlightEventLogger::logLocalEvent(const QString& text, const QDateTime& now)
@@ -487,17 +596,88 @@ void FlightEventLogger::logLinkEvent(const QString& text, const QDateTime& now)
     _writeLineLocked(formatLine(now, Direction::Local, Category::Link, text));
 }
 
+bool FlightEventLogger::logRegistrationSet(const QList<quint32>& deviceIDs, const QDateTime& now)
+{
+    // 顺序不参与比较：清单来自站点/监控员视图，集合相同而顺序不同不是变化。
+    QList<quint32> sorted = deviceIDs;
+    std::sort(sorted.begin(), sorted.end());
+
+    QMutexLocker locker(&_mutex);
+    if (_registrationSetLogged && sorted == _lastRegistrationSet) {
+        return false;
+    }
+
+    QString body;
+    if (sorted.isEmpty()) {
+        body = QStringLiteral("80005 登记集合：空（仅保活 num=0）");
+    } else {
+        QStringList ids;
+        ids.reserve(sorted.size());
+        for (const quint32 id : sorted) {
+            ids << QString::number(id);
+        }
+        body = QStringLiteral("80005 登记集合：%1 台 [%2]").arg(sorted.size()).arg(ids.join(QStringLiteral(", ")));
+    }
+
+    if (!_writeLineLocked(formatLine(now, Direction::Local, Category::Link, body))) {
+        // 没落盘就不算「已记录」：否则这次集合变化在进程余下生命里不再出现。
+        return false;
+    }
+    _lastRegistrationSet = sorted;
+    _registrationSetLogged = true;
+    return true;
+}
+
+bool FlightEventLogger::logDeviceState(quint32 deviceID, const QString& channel, const QString& state,
+                                       const QString& detail, const QDateTime& now)
+{
+    if (deviceID == 0 || channel.isEmpty()) {
+        return false; // 设备级状态没有「哪台设备」就失去意义
+    }
+
+    QMutexLocker locker(&_mutex);
+    const QPair<quint32, QString> key(deviceID, channel);
+    if (_deviceStates.value(key) == state) {
+        return false; // 取值未变：不写（否则解密失败/位置哨兵时每帧一行，一小时上万行）
+    }
+
+    // detail 只在真正写盘时拼进去，所以可以放逐帧变化的数值（msgid、坐标）。
+    QString body = channel + QStringLiteral("：") + state;
+    if (!detail.isEmpty()) {
+        body += QLatin1Char(' ') + detail;
+    }
+    // 只有在**落盘成功之后**才记账：写盘失败时记成「已写」会让这段迁移
+    // 在进程余下的生命里永久丢失（同一状态此后一律判「未变」）。
+    if (!_writeLineLocked(formatLine(now, Direction::Local, Category::Link, body,
+                                     QStringLiteral("device=%1").arg(deviceID)))) {
+        return false;
+    }
+    _deviceStates.insert(key, state);
+    return true;
+}
+
 bool FlightEventLogger::_writeLineLocked(const QString& line)
 {
+    if (s_writeFailureForTest) {
+        return false;
+    }
     if (!_file.isOpen()) {
         // 未 start() 时丢弃：钩子可能先于 start 接线。此处不缓冲 —— 缓冲会让
         // 「日志里没有」既可能是没发生、也可能是没落盘，把排障判据搅浑。
         return false;
     }
 
-    _file.write(line.toUtf8());
-    _file.write("\n", 1);
+    // 写盘失败（磁盘满、只读挂载）必须如实返回 false：调用方据此决定
+    // 「这一行到底算不算记下了」——去重表/状态表按这个返回值记账。
+    // 短写（返回 0 < n < size）同样是失败：QFile 缓冲写很少短写，但一旦发生，
+    // 视为成功就会让半行留在文件里，还把去重水位推进过去。
+    const QByteArray bytes = line.toUtf8();
+    if (_file.write(bytes) != static_cast<qint64>(bytes.size())) {
+        return false;
+    }
+    if (_file.write("\n", 1) != 1) {
+        return false;
+    }
     // 逐行落盘：本日志的用途正是「进程出事后回看」，攒在缓冲区里等于没写。
-    _file.flush();
-    return true;
+    return _file.flush();
 }

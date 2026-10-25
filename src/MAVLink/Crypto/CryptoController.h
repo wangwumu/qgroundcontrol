@@ -117,30 +117,20 @@ public:
     /// 供测试与诊断读——`_monitorDevices` 本身是 private。
     int monitorDeviceCount() const;
 
-    /// 立即跑一轮加速登记（§3.4）：连续 `ceil(n/16)` 次发送、批间隔
-    /// `kRegistrationBurstIntervalMs`，让新集合在**秒级**内全部接上，
-    /// 而不是等 `batches × 10s` 的游标周期。
-    /// `n` = 这一轮真正要发的 deviceID 总数，与 `_sendRegistration()` 取列表的口径一致
-    /// （含"`_activeDeviceID` 有效且不在清单里 ⇒ 追加一个"）；批数封顶见
-    /// `kMaxRegistrationBatches`。
+    /// 立即发一轮完整的 80005 登记（§3.4）：清单里**每个 deviceID 各发一个只含它的报文**，
+    /// 相邻两帧间隔 `kRegistrationPerDeviceIntervalMs`（1ms），用 `QTimer::singleShot` 串行推进
+    /// —— 让新集合在秒级内全部接上，同时不在 GUI 线程里连发或阻塞。
+    /// 本轮要发的集合与 `_sendRegistration()` 取列表的口径一致（含"`_activeDeviceID` 有效且
+    /// 不在清单里 ⇒ 追加一个"）。
     ///
     /// 触发点两处：① `setMonitorDevices` 检测到集合变化；② 登录成功后
     /// `AuthController` 通知（`_linkedDevices` 刚被填充）。
     ///
     /// ⚠️ **不要把它接到 2s 轮询上**——那会打乱 10s 保活周期。
-    /// ⚠️ 集合没变时反复调用它最多多花几帧，不改集合、不改变行为方向。
-    /// ⚠️ 闸的落点分两类：
-    ///    ① **C++ 内部调用**：闸一律在**调用方**——本函数自带 `registrationEnabled()` 门，
-    ///       而 `_sendRegistration()` 与 `_sendRegistrationFrame()` **两个都没有**
-    ///       （前者零 `return`、只有取批 + 发帧；后者只管计数 + 组帧 + 发。都假定调用方已把好关）。
-    ///       新增 C++ 调用点时必须自己带门判断。
-    ///    ② **QML 可达的入口（`Q_INVOKABLE`）不能依赖"闸在调用方"**：QML 是外部调用方，
-    ///       而 `registrationEnabled()` **不是** `Q_INVOKABLE` ⇒ QML 物理上查不到闸的状态，
-    ///       没法自己把门。故闸必须落在**这条路径上 QML 触不到的那一层**：
-    ///       - `reRegisterDevice()` **自己就发送** ⇒ 门在它自己身上（见其声明处）；
-    ///       - `setMonitorDevices()` **自己不发送**，发送发生在它触发的
-    ///         `requestAcceleratedRegistration()` 里 ⇒ 门在那个**被调方**，本函数不带门。
-    ///       ⇒ 判据不是"入口是不是 `Q_INVOKABLE`"，而是"从入口到发送这条链上至少有一层带门"。
+    /// ⚠️ 集合没变时反复调用它最多多发一轮（每帧都是幂等刷新），不改集合、不改变行为方向。
+    /// ⚠️ 闸的落点：本函数自带 `registrationEnabled()` 门，而 `_sendRegistration()` 与
+    ///    `_sendRegistrationFrame()` **两个都没有**（都假定调用方已把好关）。
+    ///    `setMonitorDevices()` 自己**不发送**，发送发生在本函数里 ⇒ 门必须在这里。
     Q_INVOKABLE void requestAcceleratedRegistration();
 
     /// 对单个 deviceID 立即发一个**只含它**的 80005 报文（§3.6.2 的"定向加速重发"）。
@@ -151,7 +141,7 @@ public:
     ///  `e.lastSeen = now; e.qgcSeen = now`），不触碰任何其它 pair、不断开已建立的链路。
     /// ⚠️ 正因为 `qgcSeen` 会被刷，本函数**绝不能**对已签出的飞机调用——见下方签出闸。
     ///
-    /// ‼️ **只重发，绝不移出登记集合**（`_monitorDevices` / `_regCursor` 一概不碰）——
+    /// ‼️ **只重发，绝不移出登记集合**（`_monitorDevices` 一概不碰）——
     ///    移出会让它更收不到帧 ⇒ 下一轮又超时 ⇒ **永久静默失效**，且日志上看不出
     ///    任何异常。代价是幂等的：单架报文的 MAVLink 帧 = 10 字节帧头 + 5 字节 payload
     ///    （`CryptoTest::_testQgcRegistration` 断言 `msg.len == 5`）+ 2 字节 CRC = **17 字节**
@@ -191,7 +181,8 @@ public:
     /// 只能数"帧组了几次"。
     /// ‼️ 不是 `_sendRegistration()` 被调用过的次数——定向重发 `reRegisterDevice()`
     ///    绕过 `_sendRegistration()` 直调 `_sendRegistrationFrame()`，同样计入。
-    /// ‼️ 不要用 `_regCursor` 代替：n ≤ 16 时它恒 0，n > 16 时跑满一个周期它会回绕到 0。
+    /// ‼️ 每帧只装一个 deviceID ⇒ 一轮登记 N 架 = **N 帧**（空清单 = 1 帧 num=0）。
+    ///    判"一轮发了几架"用帧计数差；别再拿它当"批次"数。
     int registrationSendCountForTest() const;
 
     /// 当前监控清单的**内容**副本。`monitorDeviceCount()` 只给条数，
@@ -211,8 +202,8 @@ public:
     ///    `_stopLinkLossMonitor()` 退化成纯 no-op，删掉调用点也全绿。
     bool linkLossMonitorActiveForTest() const;
 
-    /// 最近一次进入 `_sendRegistrationFrame()` 时**实际装入帧**的 deviceID 序列
-    /// （已按 `MAX_QGC_LINKED_PX4` 截断，口径与 `deviceBytes` 循环一致）。
+    /// 最近一次进入 `_sendRegistrationFrame()` 时**实际装入帧**的 deviceID 序列。
+    /// 每帧至多一个元素（空帧为空列表）——这是"一包一个 deviceID"的直接观测点。
     /// `registrationSendCountForTest()` 只数"发了几帧"，区分不了"帧里装的是 a 还是 b"
     /// —— 定向重发的判据必须落在**内容**上：一个"发了一帧、但帧里装的是别人"的实现，
     /// 能同时骗过计数与集合两格。
@@ -220,36 +211,14 @@ public:
     ///    与 `registrationSendCountForTest()` 一致（它也把失败那一次计进去）。
     QList<DeviceID> lastRegistrationPayloadForTest() const;
 
-    /// 从 `devices` 的 `cursor` 位置起取至多 `batch` 个（环形回绕），
-    /// 并把 `cursor` 就地推进到**下一批的起点**（§3.3）。
+    /// 单测用：自上次 `clearRegistrationSentIdsForTest()` 起，**累计**真正装进帧里发出去的
+    /// deviceID 集合（去重）。
     ///
-    /// 语义：把 n 架切成 ceil(n/batch) 批，每批 ≤ batch
-    /// （n=18、batch=16 ⇒ 批次大小依次 16、2、16、2…）。
-    /// ⚠️ 不是"每次取满 batch 个的滑窗"——那样每批恒为 16 个，第二批会白白多带
-    ///    14 个 deviceID（56 字节），且与 §9.2 的实测判据不符。
-    ///
-    /// n ≤ batch 时退化为「一批全取、游标恒 0」，与改动前行为完全一致。
-    ///
-    /// @pre ‼️ **`batch <= MAX_QGC_LINKED_PX4`（当前 16）——这条由调用方保证，不是本函数保证。**
-    ///    本函数**只保证「返回值 ≤ batch」，不做上限裁剪**——它是纯函数，不知道 80005
-    ///    登记报文的 payload 容量。`batch > 16` 时它会照常返回那么多元素。
-    ///    （`batch <= 0` 不是违约：按空批处理并把游标归零，见下。）
-    ///
-    ///    违约后果（**静默覆盖缺口，不是内存越界**）：游标按本轮取出量推进（尾批小于 `batch`），而 payload
-    ///    只装得下 `MAX_QGC_LINKED_PX4` 个 ⇒ 传 `batch = 60` 时，每轮丢掉本轮取出的、超出 16 个的那部分
-    ///    （整批 = `batch - 16`，尾批更少），这些 id 此后任何一轮都不会再出现（无日志、无断言、不报错）。
-    ///    它是**内容**错误：飞机登记不上，而链路看上去一切正常。
-    ///
-    ///    ⚠️ **不会**越界写：发送侧 `_sendRegistrationFrame()` 的
-    ///    `qMin(ids.size(), MAX_QGC_LINKED_PX4)` 是**真实存在的运行期兜底**，
-    ///    `deviceCount` 恒 ≤ 16、最大写索引 63 < 64。故「`deviceBytes` 定长、
-    ///    构造上不会越界」这条论证由**发送侧自身**保证。接线时（Task 4）把 `batch`
-    ///    钉在 `MAX_QGC_LINKED_PX4`，是为了**覆盖性**（每个 id 都被登记到），
-    ///    不是为了避免内存错误——别因为"反正有 qMin 兜底"就把 `batch` 调大。
-    ///
-    /// 抽成 public static 纯函数是为了单测：`_sendRegistration()` 的发送路径依赖
-    /// `LinkManager`（单测里无 UDP link），无法观察它实际发了什么。
-    static QList<DeviceID> nextRegistrationBatch(const QList<DeviceID>& devices, int batch, int& cursor);
+    /// 与 `lastRegistrationPayloadForTest()` 互补：后者只有"最后一帧"，只能证明"少发了一帧"，
+    /// 证明不了"跳过的是哪一台"。`_testRegistrationChainSkipsReleasedDeviceMidFlight` 用它
+    /// 断言「被释出的那台从没再被登记」，而不只是帧数少 1。
+    QSet<DeviceID> registrationSentIdsForTest() const;
+    void clearRegistrationSentIdsForTest();
 
     /// 声明本 QGC 关联的 PX4 deviceID（加入登记心跳 payload）。
     /// 单设备场景：建链目标 deviceID 即关联对象。
@@ -307,7 +276,7 @@ public:
     ///      ⚠️ 实现上是**内联** `_linkedDevices.removeAll(id)`，**不是**调上面那个
     ///      `removeLinkedDevice`——后者自己加 `_mutex`，而本函数在调用点已持锁
     ///      （`QMutex` 非递归）⇒ 调它会自死锁。两处做的是同一件事，只是不共函数。
-    ///   ①b **同时**从监控清单 `_monitorDevices` 摘除，并把轮转游标 `_regCursor` 归零
+    ///   ①b **同时**从监控清单 `_monitorDevices` 摘除
     ///      （同为"移出登记集合"，只是第二个容器）。站点流程下 `_sendRegistration` 实际
     ///      读的就是这一份；不摘的话，一份**刻意保留**的陈旧清单（§3.5.4：poll 失败时
     ///      保留上一份清单）会一直把已释出的飞机登记下去。
@@ -424,8 +393,8 @@ public:
     /// 只在 beginLinking 的入口检查一次，而 LinkInterface 只看 state()——只翻标志不撤链路，
     /// 闸对"先 Active 后收回"这条路径等于没生效（详见 .cc 内的实现说明）。
     ///
-    /// ⚠️ 同时**作废监控清单**（2026-10-04 补）：`_monitorListActive` 回落、`_monitorDevices`
-    /// 清空、`_regCursor` 归零。理由：该闩全仓只置不落，而取列表的口径是
+    /// ⚠️ 同时**作废监控清单**（2026-10-04 补）：`_monitorListActive` 回落、
+    /// `_monitorDevices` 清空。理由：该闩全仓只置不落，而取列表的口径是
     /// `_monitorListActive ? _monitorDevices : _linkedDevices` ⇒ 不在此处作废的话，**跨会话**
     /// 时本端会一直按上一个站点的清单发 80005 登记心跳。本函数是三个会话边界写入点
     /// （登录成功 / 登录被拒 / 本地密钥源初始化）的公共落点，故作废落在这里。
@@ -511,9 +480,10 @@ public:
     /// 学习 deviceID ↔ systemID 映射（接收端解密成功后调用）。
     /// ‼️ 已签出（`_releasedDevices`）的 deviceID **不学**：否则 `releaseDevice` 刚清掉的
     ///    两张表会被 mavp2p 继续转发的残余帧（`MAP_TTL` 内，实测默认 60s）逐帧重建回来。
-    ///    调用点（`MAVLinkProtocol.cc` 的两处收帧分支）**不设**闸——`:211-222` 的注释写明了
-    ///    那四行必须无条件执行（失联判据依赖它们，且它们是"全新启动学映射"的唯一入口）；
-    ///    闸收在本函数体内，让"什么算已签出"这个口径单点持有。
+    ///    调用点（`MAVLinkProtocol.cc` 的两处收帧分支）**不设**闸——那里明文待命心跳支的
+    ///    注释（搜「两处收帧点必须都记」）写明了那四行必须无条件执行（失联判据依赖它们，
+    ///    且它们是"全新启动学映射"的唯一入口）；闸收在本函数体内，让"什么算已签出"
+    ///    这个口径单点持有。
     void learnDeviceSystemMapping(DeviceID deviceID, uint8_t systemID);
 
     /// 记录「收到了该 deviceID 的任意一帧」的时刻（设计文档 §3.6.1）。
@@ -594,10 +564,10 @@ signals:
     void px4LinkLost(DeviceID deviceID);
 
 private:
-    /// 加速发送的批间隔（§3.4：批间隔 ~200ms，用一次性定时器串，不阻塞主线程）。
-    static constexpr int kRegistrationBurstIntervalMs = 200;
-    /// 加速发送的批数上限，与 §3.4 的容量约束同源（batches ≤ 5 ⇔ n ≤ 80）。
-    static constexpr int kMaxRegistrationBatches = 5;
+    /// 同一轮登记中相邻两帧的间隔（毫秒）。
+    /// 每帧只携带一个 deviceID，用 `QTimer::singleShot` 串行推进：既给每个 UDP 数据报
+    /// 一次独立的发送机会，又不在 GUI 线程里阻塞。16 架约 16ms，远小于 10s 保活周期。
+    static constexpr int kRegistrationPerDeviceIntervalMs = 1;
 
     void _onKeyFetched(DeviceID deviceID);
     void _onFetchFailed(DeviceID deviceID, const QString& error);
@@ -607,16 +577,22 @@ private:
     /// ‼️ 独占的取清单口径，判据是 `_monitorListActive` 而**不是** `_monitorDevices.isEmpty()`：
     ///    清单生效之后被摘空（签出释出最后一架）是"本 GCS 在线、暂不关联任何 PX4"，
     ///    绝不是"回退到 `_linkedDevices` 全体"——那会把刚释出的飞机原地登记回去。
-    ///    这套口径分散在三处（批次计数、`_sendRegistration`、以及 2026-10-04 新增的
-    ///    `isInManifest`），各写一遍时改一处漏两处不会报错，只会让"这一轮该发几架"和
-    ///    "实际发出去的集合"悄悄对不上。抽成一个函数就是为了它们不可能再漂。
+    ///    这套口径分散在 `_sendRegistration` 与 `isInManifest` 两处，各写一遍时改一处漏
+    ///    另一处不会报错，只会让"这一轮该发几架"和"实际发出去的集合"悄悄对不上。
+    ///    抽成一个函数就是为了它们不可能再漂。
     /// ⚠️ 调用方**须已持 `_mutex`**（返回的是成员引用）。
     const QList<DeviceID>& _manifestLocked() const;
 
-    void _sendRegistration(); ///< 发送 80005 登记/保活心跳（周期触发）
-    /// 把一批 deviceID 组帧并发出（§3.3 的组帧 + UDP link 过滤 + sent 日志）。
-    /// 抽出来是为了让定向重发（`reRegisterDevice`）复用同一套逻辑，
-    /// 避免 §3.3 的"定长 deviceBytes"约束出现两个维护点。
+    /// 发送一轮 80005 登记/保活心跳（周期触发）：取当前清单快照（含 active），
+    /// 记入 `_regQueue`，一帧一个 deviceID 交给 `_sendNextRegistration()` 串行发出。
+    /// 空清单直接发一个 num=0 帧（告诉 mavp2p 本 GCS 在线）。
+    void _sendRegistration();
+    /// 发出本轮队列中的下一个 deviceID；仍有剩余时用
+    /// `QTimer::singleShot(kRegistrationPerDeviceIntervalMs)` 排下一次。
+    /// 发送前按**当前**清单复核：已被移出/释出的 id 直接跳过（轮内时效性）。
+    void _sendNextRegistration();
+    /// 把**至多一个** deviceID 组帧并发出（§3.3 的组帧 + UDP link 过滤 + sent 日志）。
+    /// 抽出来是为了让定向重发（`reRegisterDevice`）复用同一套逻辑。
     void _sendRegistrationFrame(const QList<DeviceID>& ids);
     void _startLinkLossMonitor(DeviceID deviceID); ///< 启动/重置失联检测（仅 Active 状态）
     void _stopLinkLossMonitor(); ///< 停止失联检测（回待命时）
@@ -651,12 +627,14 @@ private:
     ///    不再把它写进 80005 payload ⇒ 该配对的 `qgcSeen` 冻结 ⇒ TTL 到期自然停发）。
     ///    问题出在这 60s 里：`MAVLinkProtocol.cc` 那四条收帧记账是**无条件**的
     ///    （`learnDeviceSystemMapping` / `noteDeviceFrame`，明文待命心跳支两条、加密帧支两条，
-    ///    见 `:211-222` 的注释），于是刚清掉的 `_deviceToSystem` / `_systemToDevice` /
+    ///    见 `MAVLinkProtocol.cc` 明文待命心跳支「两处收帧点必须都记」那段注释），
+    ///    于是刚清掉的 `_deviceToSystem` / `_systemToDevice` /
     ///    `_lastFrameMs` 会被**逐帧写回**——签出等于没签出。
     ///
     /// ‼️ 判据必须是**显式黑名单**，不能拿 `isInManifest()`（`_linkedDevices`）当闸：
     ///    那是个白名单，"不在白名单里"既可能是"已签出"，也可能是"全新启动、还没登录、
-    ///    清单还没拉回来"，而后者**必须**照常学映射——`:211-222` 写明了这个先有鸡先有蛋：
+    ///    清单还没拉回来"，而后者**必须**照常学映射——`MAVLinkProtocol.cc` 那段注释写明了
+    ///    这个先有鸡先有蛋：
     ///    无密钥 ⇒ 无法解密 ⇒ 学不到映射 ⇒ `beginLinkingForSystemID` 无从触发。
     ///    两者形状相同、语义相反，只有黑名单能把它们分开。
     ///    （`_onKeyFetched` 里那处"三集合都不认它"的判据同理不可搬来：那里必然处于 `Linking`
@@ -698,11 +676,18 @@ private:
     bool _monitorListActive = false;
     /// 本次生效的超时阈值（毫秒）。与 `_monitorDevices` 同一次调用更新。
     int _frameTimeoutMs = DEFAULT_FRAME_TIMEOUT_MS;
-    /// 分批发送的游标（§3.3），跨两次 `_sendRegistration()` 保持。
-    int _regCursor = 0;
+    /// 本轮登记的待发队列与游标：一帧一个 deviceID，`_sendNextRegistration()` 逐个消费。
+    /// 新一轮到来时整体替换（pos 归零），在途的链下一步就改推进新队列。
+    /// `_regChainActive` 只保证**同时只有一条** singleShot 链——它**不**表示"同一轮不重发"：
+    /// 替换后 pos 归零，新一轮会从头再发一遍。
+    QList<DeviceID> _regQueue;
+    int _regQueuePos = 0;
+    bool _regChainActive = false;
     int _registrationSendCount = 0; ///< 单测用的发送计数，见 registrationSendCountForTest()
-    /// 单测用的"上一帧装了什么"，见 lastRegistrationPayloadForTest()。
+    /// 单测用的"上一帧装了什么"（每帧至多一个元素），见 lastRegistrationPayloadForTest()。
     QList<DeviceID> _lastRegistrationPayload;
+    /// 单测用：累计真正装进帧的 id（去重），见 registrationSentIdsForTest()。
+    QSet<DeviceID> _sentRegistrationIdsForTest;
     QTimer* _linkLossTimer = nullptr; ///< PX4 失联检测定时器
     DeviceID _linkLossDevice = kInvalidDeviceID; ///< 正在监测失联的活跃 deviceID
     mutable QMutex _mutex;

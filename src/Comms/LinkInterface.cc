@@ -160,7 +160,9 @@ void LinkInterface::sendMessageThreadSafe(mavlink_message_t &message)
                 // 发送侧事件日志挂在这里而**不是函数入口**：入口处还有「加密未就绪」「加密失败」
                 // 两条 return，在入口记会把没发出去的帧记成已发出 —— 事后对着日志会以为命令到了飞控。
                 // 此处 message 仍是明文（encryptFrame 不修改它），读得出发的是什么命令。
-                FlightEventLogger::instance()->logFrame(FlightEventLogger::Direction::ToVehicle, message);
+                // deviceID 记「发给谁」：多机时同一命令可能只发给其中一架。
+                FlightEventLogger::instance()->logFrame(FlightEventLogger::Direction::ToVehicle, message,
+                                                        static_cast<quint32>(crypto->activeDeviceID()));
                 return;
             }
             // 加密失败：丢弃帧，不回退明文（回退明文会被接收端丢弃，且违反全加密不变量）

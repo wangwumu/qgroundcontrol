@@ -71,9 +71,6 @@ private slots:
     // EXT 注入层：buildHeartbeatExtTelemetry 门控/哨兵/字段映射（合成遥测）
     void _testHeartbeatExtInjection();
 
-    // 80005 分批（§3.3/§3.4）：切批 + 环形轮转 + 覆盖性
-    void _testNextRegistrationBatch();
-
     // 清单从未生效 ⇒ 回退 _linkedDevices（§3.5.4）这条零回归承诺的判据。
     // ‼️ 声明在 _testSetMonitorDevices **之前**：本用例要的初态是"闩仍为 false"。
     //    这条顺序原本是**硬约束**（`_monitorListActive` 当时一旦置 true 就永不回落，全仓
@@ -89,8 +86,16 @@ private slots:
     // 会话边界作废监控清单（2026-10-04 补）：责任方身份被重新判定 ⇒ 闩回落、清单清空
     void _testMonitorListInvalidatedAtSessionBoundary();
 
-    // 加速首轮（§3.4）：集合变化触发连续发送、集合不变不触发、容量天花板截断
+    // 加速首轮（§3.4）：集合变化触发一轮登记、集合不变不触发；一帧一个 deviceID 逐台发
     void _testRequestAcceleratedRegistration();
+
+    // 逐台链在途（2026-10-25 补）：首帧同步、轮中整份替换、轮中关门、轮中释出。
+    // 这四格钉住 1ms singleShot 链的边界——链没走完时清单/开关/释出都可能变，
+    // 改动 `_sendRegistration/_sendNextRegistration` 时最容易被无声破坏的就是这几条。
+    void _testRegistrationChainFirstFrameIsSynchronous();
+    void _testRegistrationChainReplacedMidFlight();
+    void _testRegistrationChainStopsWhenDisabledMidFlight();
+    void _testRegistrationChainSkipsReleasedDeviceMidFlight();
 
     // 定向重发（§3.6.2）：只发一帧、**绝不移出登记集合**、自带 registrationEnabled 门
     void _testReRegisterDevice();
