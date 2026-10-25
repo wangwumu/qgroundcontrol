@@ -1270,18 +1270,120 @@ function routesWithTasks(routes) {
     return out
 }
 
+// 飞机 deviceID 的合法口径（协议 §1.3 / §1.4）：
+//   · 必须落在 PX4 段：10000000 ≤ id ≤ 0x7EFFFFFF（GCS 段 < 10000000 一律非法）；
+//     ‼️ 10000000 是**协议默认值**；mavp2p 的 `--gcs-device-id-max` 可配而 QGC 侧没有
+//        对应配置入口 ⇒ 云端若改过它，两侧分界会静默漂移（改该参数必须三端同步）。
+//   · bit24 必须为 0 —— 它是 incompatFlag 的 bit0，置位后标准 MAVLink 解析器会当签名帧。
+//
+// ‼️ 只判「非 0 / 非负」是不够的：91001 = 0x00016379、91002 = 0x0001637A 全部通过。
+//    旧版 mavp2p 会为它们建出 `px4Ch` 恒 nil 的幽灵配对；本版（2026-10-24）在 80005 的
+//    payload 侧丢弃并打 `rejected=...`，残留项由 10 分钟空闲闸回收。但 QGC 这层仍是第一道：
+//    脏值一旦进了登记集合 / C++ 名单，还会污染取密钥与建链判据。
+function isValidAircraftDeviceId(id) {
+    // 先归一化再判：`Number()` 让数字字符串（后端 JSON 偶有）按数值处理；
+    // 非有限值/非整数一律非法 —— `&` 会把 10000000.5 截断成 10000000，
+    // 而调用方拿到的仍是小数，下游 `quint32` 再截一次 ⇒ JS 侧与 C++ 侧身份不一致。
+    id = Number(id)
+    if (!isFinite(id) || id !== Math.floor(id)) return false
+    // 先判号段再判 bit24：`&` 会把操作数转成 32 位有符号整数，超出 PX4 段上界的值
+    // 先被号段判据挡掉，不必依赖位运算的符号语义。
+    if (!(id >= 10000000) || id > 0x7EFFFFFF) return false
+    if (id & 0x01000000) return false
+    return true
+}
+
+// 非法 deviceID 的告警节流：调用方每 2s 轮询一次，同一条脏数据不节流会把日志刷爆。
+// ‼️ 仅用于日志，不参与任何判定（纯函数 `isValidAircraftDeviceId` 才是判据）。
+var _invalidDeviceIdWarned = {}
+
+// 单个非法 deviceID 的告警（每个值仅一次）：`filterAircraftDeviceIds` 与
+// `initiatorDeviceIds` 共用，避免两处各写一套节流。
+function warnInvalidDeviceId(id) {
+    id = Number(id)
+    if (_invalidDeviceIdWarned[id]) return
+    _invalidDeviceIdWarned[id] = true
+    console.warn("OpsCommon: ignoring invalid aircraft deviceID from gcs_server: " + id)
+}
+
+// 过滤一串原始 deviceID（保持原顺序），非法值丢弃并（每个值仅一次）告警。
+// 站点视图与监控员视图共用这一处，避免两条链路各写一套判据而漂移。
+function filterAircraftDeviceIds(ids) {
+    var out = []
+    if (!ids || !ids.length) return out
+    for (var i = 0; i < ids.length; i++) {
+        var id = Number(ids[i])
+        if (!isValidAircraftDeviceId(id)) {
+            warnInvalidDeviceId(id)
+            continue
+        }
+        out.push(id)
+    }
+    return out
+}
+
+// 站点视图（`OpsShell._fetchOverview`）的行集专用：只取 `device_id` 一列再交给统一判据。
+// ‼️ 与 `monitorDeviceIds` 分开是因为输入形状不同（行集 vs 数组），判据仍是同一份。
+// `data` 为 null / 空 ⇒ 空清单；「没有行」与「有行但全部非法」在调用方要分开处理
+// （前者是正常的空名册，后者是数据源异常、不能拿来 diff 出「全部离开」）。
+function overviewDeviceIds(data) {
+    var raw = []
+    if (data && data.length) {
+        for (var i = 0; i < data.length; i++) {
+            raw.push(data[i] ? data[i].device_id : 0)
+        }
+    }
+    return filterAircraftDeviceIds(raw)
+}
+
+// 「有行但零合法」的数据源异常判据（**三处推送共用**，口径只有这一份）：
+//   · 站点登记集合（`OpsShell._fetchOverview` 的 `_ovAnomaly`）
+//   · 监控名册（`RomView._pushMonitorDevices`）
+//   · 指令权名单（`RomView._pushInitiatorDevices`）
+// ‼️ 只在**全部**行都非法时成立。部分非法仍应正常 diff：那一行本来就给不出真实 ID，
+//    把它升级成「整轮冻结」会让一条持久脏行永久挡住合法的释出/接手（比现状更坏）。
+// ‼️ 空行集 / nil **不是**异常：空名册是合法结论，调用方必须照常推空集。
+// ‼️ 只判形状、不打日志：告警由调用方按视图调 `warnDeviceIdAnomaly`，否则一次异常打三条。
+function deviceRowsAreAnomalous(rows) {
+    if (!rows || !rows.length) return false
+    for (var i = 0; i < rows.length; i++) {
+        var d = rows[i]
+        if (d && isValidAircraftDeviceId(d.device_id)) return false
+    }
+    return true
+}
+
+// 「有行但零合法」的异常闸告警（约 60s 一次）：脏数据是持续存在的，每轮都打会把日志刷爆；
+// ‼️ 只用于日志，不参与判定——是否保留上一份清单由调用方按"行数 > 0 且合法数 == 0"判。
+var _lastDeviceIdAnomalyWarnMs = -Infinity
+function warnDeviceIdAnomaly(total) {
+    var now = Date.now()
+    if (now - _lastDeviceIdAnomalyWarnMs < 60000) return
+    _lastDeviceIdAnomalyWarnMs = now
+    console.warn("OpsCommon: all " + total + " device_id rows from gcs_server were invalid; keeping previous roster")
+}
+
 // 从 ③ 的 `devices[]` 提取要推给 C++ 的 device_id 清单（§2.3 / §3.5.3）。
-// ‼️ 这是 QML → C++ 的**唯一入口**，漏掉 `<= 0` 的过滤就会在 mavp2p 侧建出一个
-//    `deviceID=0` 的 pair——**没有任何一处会报错**。重复项同样过滤（后端已去重，此处是第二道）。
+// ‼️ 这是 `setMonitorDevices` 的**唯一入口**（站点视图走 `OpsShell` 自己的登记集合，
+//    不是这一份）。漏掉过滤，本版 mavp2p 会丢弃并打 `rejected=...`（旧版会建脏配对），
+//    但仍然没有回执给 QGC —— 本层是第一道，也是唯一能让界面侧判据保持一致的一道。
+// 两道过滤：号段（`filterAircraftDeviceIds`，GCS 段/bit24 置位/非数字全部丢弃）
+// 与去重（后端已去重，此处是第二道）。
+// ⚠️ 返回空数组有两种含义，调用方**必须分开**：**空输入**是合法空名册（照常推空集）；
+//    **有行但全非法**是数据源异常（用 `deviceRowsAreAnomalous` 判，不得整份替换）。
 function monitorDeviceIds(devices) {
+    if (!devices || !devices.length) return []
+    var raw = []
+    for (var i = 0; i < devices.length; i++) {
+        raw.push(devices[i] ? devices[i].device_id : 0)
+    }
+    var ids = filterAircraftDeviceIds(raw)
     var seen = {}
     var out = []
-    for (var i = 0; i < devices.length; i++) {
-        var id = Number(devices[i] ? devices[i].device_id : 0)
-        if (!(id > 0)) continue
-        if (seen[id]) continue
-        seen[id] = true
-        out.push(id)
+    for (var j = 0; j < ids.length; j++) {
+        if (seen[ids[j]]) continue
+        seen[ids[j]] = true
+        out.push(ids[j])
     }
     return out
 }
@@ -1289,7 +1391,7 @@ function monitorDeviceIds(devices) {
 // 从 ③ 的 `devices[]` 提取**监控员侧**的**指令权**名单（起/终维，§2.7.2 h）。
 //
 // ‼️ 与 `monitorDeviceIds` **不是同一份清单，不要合并**——两者管的是两件事：
-//   · `monitorDeviceIds` = 80005 登记集合（本端名册上的**全部**飞机；收了帧才不掉线），
+//   · `monitorDeviceIds` = 80005 登记集合（本端名册上的**全部合法**飞机；收了帧才不掉线），
 //     它的失败形状是"飞机 60s TTL 后集体掉线"（§3.5.4）；
 //   · 本函数 = 建链权（**当前**签入的那一架），它的失败形状是"两端同时说话 ⇒ nonce 重复"。
 //   合并的后果不是"多推了几个 id"，而是**用可接引范围去顶替责任方判据**——两回事。
@@ -1297,7 +1399,9 @@ function monitorDeviceIds(devices) {
 // ⚠️ 与站点侧同口径：**整份替换**、每轮重推（`checkout_state` / `landing_accepted` 都能在
 //    行集完全不变时翻转），且**无监控员身份时不推**而不是推空集（「没推过」与「推了空集」
 //    在建链答案上相反，见 `OpsShell._fetchOverview` 里同一条注释）。
-// ⚠️ 重复项过滤与 `<= 0` 过滤照抄 `monitorDeviceIds`：后端已按 `device_id` 去重，此处是第二道。
+// ⚠️ 去重与号段判据与 `monitorDeviceIds` **同源**（`isValidAircraftDeviceId`）：后端已按
+//    `device_id` 去重，此处是第二道；非法 ID 一律不推（它不是 80005 的来源，但同一份行集
+//    里的脏值同样不能流进 C++ 的建链名单）。
 function initiatorDeviceIds(devices) {
     var seen = {}
     var out = []
@@ -1305,8 +1409,12 @@ function initiatorDeviceIds(devices) {
     for (var i = 0; i < devices.length; i++) {
         var d = devices[i]
         if (!d) continue
-        var id = Number(d.device_id)
-        if (!(id > 0)) continue
+        var id = d.device_id
+        if (!isValidAircraftDeviceId(id)) {
+            warnInvalidDeviceId(id)
+            continue
+        }
+        id = Number(id)
         if (seen[id]) continue
         if (!monitorHoldsControl(d)) continue
         seen[id] = true
@@ -1590,9 +1698,13 @@ function severityLabel(severity) {
 }
 
 // 由 ③ 响应的 `devices[]` 按 `device_id` 建索引，供 `alertRows` 补 `uav_no`。
-// ‼️ 过滤 `device_id <= 0`，理由与 `monitorDeviceIds` 同源：0 是"未学到映射"的缺省值，
-//    把它建成 `out[0]` 之后，任何 `deviceID()` 也是 0 的载具都会**认领到这一行**的
-//    `uav_no`——界面看起来完全正常，只是显示的是别人的机号。
+// ‼️ 过滤 `device_id <= 0`：0 是"未学到映射"的缺省值，把它建成 `out[0]` 之后，
+//    任何 `deviceID()` 也是 0 的载具都会**认领到这一行**的 `uav_no`——界面看起来
+//    完全正常，只是显示的是别人的机号。
+// ⚠️ 这条与 `monitorDeviceIds` 走的 `filterAircraftDeviceIds` / `isValidAircraftDeviceId`
+//    **理由相同、判据不同**：本函数只排除 0，**不套号段闸**——它只用来补显示用机号，
+//    不参与登记/建链，别把两处当成同一套口径而"统一"掉（统一成号段闸会误删显示映射；
+//    反过来把登记集合退回只判 > 0 则会让 GCS 段脏 ID 重新流进 80005）。
 // ⚠️ 同一 `device_id` 出现多次时**后写覆盖**（取最后一行）。后端已按 `device_id` 去重
 //    （§3.5.2），这里是第二道；真要撞上，确定性也比"看哪个先来"好。
 function deviceIndexByDeviceID(devices) {
@@ -1713,7 +1825,8 @@ var MAV_CMD_NAV_WAYPOINT = 16
 ///    （2026-09-29 审查 A7 修正：原注释写「就地/固定翼降落」——"固定翼"是错的，
 ///      `MAV_CMD_NAV_LAND` 与机型无关；"就地"也是用户 2026-09-28 明确否掉的措辞。）
 ///    断言在 `test/UnitTestFramework/QmlTesting/tests/tst_OpsCommon.qml`（**不在 `src/OpsView/`**）：
-///    `:1180` / `:1244` 断 `items[..].command === 85`，写成 21 会当场变红。
+///    `test_routeMissionItems_vtol*` 系列（搜 `command, 85`）断 `items[..].command === 85`，
+///    写成 21 会当场变红。
 var MAV_CMD_NAV_VTOL_LAND = 85
 
 /// `MAV_FRAME_GLOBAL` —— 高度按 **AMSL**（绝对高度）解释。
@@ -2638,7 +2751,7 @@ function landKindTransitionToMc(kind) {
 /// ‼️ **航向没有「存活」判据，这是刻意的、也是本函数唯一一处"看不出来"的地方。**
 ///    `VehicleFactGroup` 的 `heading` Fact 没有 `defaultValue` ⇒ 首帧 ATTITUDE 之前
 ///    `vehicle.heading.value` 就是 `0`，而 `0°` 是**合法正北** —— 两者在数值上**不可分辨**。
-///    `OpsCommon.js:2328`（`takeoffSlotHeading` 的注释）已明文禁止拿 `heading === 0` 当"没填"。
+///    `takeoffSlotHeading()` 的函数头注释已明文禁止拿 `heading === 0` 当"没填"。
 ///    ⇒ 这里**不假装**能分辨：航向只做"是不是数"这一道，真正的"遥测在不在这架飞机上"
 ///      由 **①的飞机坐标**代理（坐标有效 ⇔ 已收到过 GPS 位置 ⇔ 链路与遥测在流）。
 ///      二者不同帧（航向来自 `ATTITUDE`、坐标来自 `GLOBAL_POSITION_INT`），这个代理

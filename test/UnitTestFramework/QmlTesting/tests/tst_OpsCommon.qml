@@ -3442,15 +3442,17 @@ TestCase {
     /// 而是**用可接引范围顶替责任方判据**——两个正交维被压成一维。
     /// ⇒ 本格的核心断言是**两份清单不相等**，而不是各查各的。
     function test_initiatorDeviceIds_isNotTheMonitorRoster() {
+        // ⚠️ 夹具必须用 **PX4 段** 的值：`monitorDeviceIds` 自 2026-10-24 起会丢弃 GCS 段
+        //    （< 10000000）的 ID，用 9103/9104/9105 会让登记集合恒空，把本格变成在测另一件事。
         var devices = [
-            _ctlDevice(9103, true,  false),   // 持有 ⇒ 两份都在
-            _ctlDevice(9104, false, false),   // 未签入 ⇒ 只在登记集合里
-            _ctlDevice(9105, true,  true),    // 已让位 ⇒ 只在登记集合里
-            _ctlDevice(9103, true,  false)    // 重复项（后端已去重，此处是第二道）
+            _ctlDevice(10001001, true,  false),   // 持有 ⇒ 两份都在
+            _ctlDevice(10001002, false, false),   // 未签入 ⇒ 只在登记集合里
+            _ctlDevice(10001003, true,  true),    // 已让位 ⇒ 只在登记集合里
+            _ctlDevice(10001001, true,  false)    // 重复项（后端已去重，此处是第二道）
         ]
-        compare(JSON.stringify(OpsCommon.initiatorDeviceIds(devices)), "[9103]",
-                "指令权名单 = 当前持有指令权的那一架；未签入的（9104）与已让位的（9105）都不得进")
-        compare(JSON.stringify(OpsCommon.monitorDeviceIds(devices)), "[9103,9104,9105]",
+        compare(JSON.stringify(OpsCommon.initiatorDeviceIds(devices)), "[10001001]",
+                "指令权名单 = 当前持有指令权的那一架；未签入的（10001002）与已让位的（10001003）都不得进")
+        compare(JSON.stringify(OpsCommon.monitorDeviceIds(devices)), "[10001001,10001002,10001003]",
                 "登记集合 = 名册上的全部飞机（两者**必须**不同，否则本函数没有存在意义）")
     }
 
@@ -3460,17 +3462,123 @@ TestCase {
     /// 是**有效**结论 ⇒ 全拒（fail-closed）；与"从未推送过"是相反的建链答案。
     function test_initiatorDeviceIds_filtersInvalidIdsAndNeverReturnsNull() {
         var withBad = [
-            _ctlDevice(0,    true, false),
-            _ctlDevice(-1,   true, false),
-            _ctlDevice(9103, true, false)
+            _ctlDevice(0,        true, false),
+            _ctlDevice(-1,       true, false),
+            _ctlDevice(91002,    true, false),  // GCS 段：与登记集合同口径丢弃
+            _ctlDevice(16777216, true, false),  // 号段内但 bit24 置位
+            _ctlDevice(10001003, true, false)
         ]
-        compare(JSON.stringify(OpsCommon.initiatorDeviceIds(withBad)), "[9103]",
-                "device_id <= 0 必须被挡（否则会建出 deviceID=0 的 pair，零报错）")
-        verify(Array.isArray(OpsCommon.initiatorDeviceIds([_ctlDevice(9104, false, false)])),
+        compare(JSON.stringify(OpsCommon.initiatorDeviceIds(withBad)), "[10001003]",
+                "非法 deviceID 必须被挡（含 <= 0、GCS 段、bit24 置位）——" +
+                "与 monitorDeviceIds 共用同一判据，否则两份名单描述的不是同一个世界")
+        verify(Array.isArray(OpsCommon.initiatorDeviceIds([_ctlDevice(10001004, false, false)])),
                "无人持有 ⇒ 必须是空**数组**，表示『本端此刻不持有任何一架』（有效结论，全拒）")
-        compare(OpsCommon.initiatorDeviceIds([_ctlDevice(9104, false, false)]).length, 0,
+        compare(OpsCommon.initiatorDeviceIds([_ctlDevice(10001004, false, false)]).length, 0,
                 "同上：长度为 0 —— 与『从未推送过』在建链答案上相反，故不得返回 null/undefined")
         verify(Array.isArray(OpsCommon.initiatorDeviceIds(null)), "null ⇒ 空数组，且不得抛错")
+    }
+
+    /// 飞机 deviceID 的合法口径（协议 §1.3 / §1.4）：PX4 段 + bit24 = 0。
+    /// 边界逐个钉：下界、上界，以及「> 1e7 但 bit24 置位」那个夹缝值 —— 只判号段的实现
+    /// 会在最后一格翻绿，而那种实现放进 80005 的正是被标准解析器当签名帧的那个值。
+    function test_isValidAircraftDeviceId_segmentBoundaries() {
+        verify(!OpsCommon.isValidAircraftDeviceId(9999999), "GCS 段末尾（9999999）必须非法")
+        verify(OpsCommon.isValidAircraftDeviceId(10000000), "PX4 段下界 10000000 必须合法")
+        verify(OpsCommon.isValidAircraftDeviceId(10001048), "正常飞机 deviceID 必须合法")
+        verify(OpsCommon.isValidAircraftDeviceId(0x7EFFFFFF), "PX4 段上界必须合法")
+        verify(!OpsCommon.isValidAircraftDeviceId(0x7F000000), "超出 PX4 段上界必须非法")
+        verify(!OpsCommon.isValidAircraftDeviceId(16777216),
+               "16777216 = 0x01000000：号段在 PX4 段内，但 bit24（签名位）置位 ⇒ 必须非法")
+        verify(!OpsCommon.isValidAircraftDeviceId(0), "0 是无效哨兵，必须非法")
+        verify(!OpsCommon.isValidAircraftDeviceId(-1), "负数必须非法")
+        verify(!OpsCommon.isValidAircraftDeviceId(NaN), "NaN（字段缺失/非数字）必须非法")
+        // 非整数：`&` 会把它截断成另一个合法值，而调用方拿到的仍是小数 ⇒
+        // `_siteDeviceIdsKey` 与 C++ 侧的 quint32 身份不一致，每轮 release→adopt 反复摘挂。
+        verify(!OpsCommon.isValidAircraftDeviceId(10000000.5), "非整数必须非法")
+        // 数字字符串按数值判定（后端 JSON 正常给 number，这里只钉住「不得因类型差异误拒」）。
+        verify(OpsCommon.isValidAircraftDeviceId("10001001"), "数字字符串应可解析为合法 deviceID")
+    }
+
+    /// `monitorDeviceIds` 是 QML → C++ 的**唯一入口**：GCS 段的 deviceID 从这里放进去，
+    /// mavp2p 侧就会建出一个 `px4Ch` 恒 nil、永不扇出的幽灵配对（只有通道关闭才清）。
+    function test_monitorDeviceIds_dropsNonPx4Ids() {
+        var devices = [
+            _ctlDevice(10001048, true,  false),  // 合法
+            _ctlDevice(91002,    true,  false),  // 实际故障里出现过的 GCS 段值
+            _ctlDevice(91001,    true,  false),  // 同上
+            _ctlDevice(0,        true,  false),
+            _ctlDevice(16777216, true,  false),  // 号段内但 bit24（签名位）置位
+            _ctlDevice(10001048, true,  false)   // 重复项（后端已去重，此处是第二道）
+        ]
+        compare(JSON.stringify(OpsCommon.monitorDeviceIds(devices)), "[10001048]",
+                "GCS 段/零值/bit24 置位的 deviceID 混进了 80005 登记集合 ⇒ 污染会传染到 mavp2p")
+    }
+
+    /// **全部不合法** ⇒ 空数组是刻意的 fail-safe，不是「漏推」。
+    /// 调用方必须把「有行但一个合法 ID 都没有」当成数据异常（OpsShell 不释出、
+    /// RomView 保留上一份清单）；本格只钉住纯函数的返回形状。
+    function test_monitorDeviceIds_allInvalidYieldsEmpty() {
+        var devices = [
+            _ctlDevice(91001,    true, false),
+            _ctlDevice(91002,    true, false),
+            _ctlDevice(0,        true, false),
+            _ctlDevice(16777216, true, false)
+        ]
+        compare(JSON.stringify(OpsCommon.monitorDeviceIds(devices)), "[]",
+                "全部非法 ⇒ 空数组（调用方据此判数据异常，不得整份替换成空清单）")
+    }
+
+    /// 三个同族提取函数对「没有输入」必须给出同一答案：空数组、不抛错。
+    function test_monitorDeviceIds_nullYieldsEmpty() {
+        compare(JSON.stringify(OpsCommon.monitorDeviceIds(null)), "[]", "null ⇒ 空数组，且不得抛错")
+        compare(JSON.stringify(OpsCommon.monitorDeviceIds(undefined)), "[]", "undefined ⇒ 空数组")
+        compare(JSON.stringify(OpsCommon.filterAircraftDeviceIds(null)), "[]", "null ⇒ 空数组")
+    }
+
+    /// 站点视图 `/api/ops/overview` 的 `data[]` → 合法 ID 列表。
+    /// 抽成纯函数是为了让 OpsShell 里那段（`_linkedDevices` 的唯一 gcs_server 来源）
+    /// 至少能被测试触达 —— QmlQuickTests 不加载 `OpsShell` 组件。
+    function test_overviewDeviceIds_filtersRowsAndKeepsOrder() {
+        var rows = [
+            { device_id: 10001048 },
+            { device_id: 91002 },        // GCS 段
+            { device_id: "10000385" },   // 数字字符串 ⇒ 按数值接受
+            null,                        // 畸形行
+            { device_id: 0 }
+        ]
+        compare(JSON.stringify(OpsCommon.overviewDeviceIds(rows)), "[10001048,10000385]",
+                "站点视图行集里的非法 deviceID 必须在这里挡掉，否则会经 addLinkedDevice 进 80005")
+        compare(JSON.stringify(OpsCommon.overviewDeviceIds([])), "[]")
+        compare(JSON.stringify(OpsCommon.overviewDeviceIds(null)), "[]", "null ⇒ 空数组，不得抛错")
+    }
+
+    /// 全部非法（空行集除外）必须是**可判定的数据源异常**：站点登记集合、监控名册、
+    /// 指令权名单三处调用方都据此**拒绝整份替换**。判据与 `overviewDeviceIds` /
+    /// `monitorDeviceIds` 同源，否则会出现「调用方以为有内容、过滤后却是空」的错判。
+    function test_deviceRowsAreAnomalous_shapes() {
+        verify(!OpsCommon.deviceRowsAreAnomalous([]), "空行集是合法空名册，不得判成异常")
+        verify(!OpsCommon.deviceRowsAreAnomalous(null), "null 不得抛错，也不得判成异常")
+        verify(!OpsCommon.deviceRowsAreAnomalous(undefined), "undefined 不得抛错")
+        verify(!OpsCommon.deviceRowsAreAnomalous([{ device_id: 10001048 }]), "有合法 ID ⇒ 不是异常")
+        verify(!OpsCommon.deviceRowsAreAnomalous([
+                   { device_id: 91002 }, { device_id: 10001048 }
+               ]),
+               "部分非法但存在合法 ID ⇒ 不是异常（本轮仍应正常 diff）")
+        verify(OpsCommon.deviceRowsAreAnomalous([
+                   { device_id: 91002 }, { device_id: 0 }, { device_id: 16777216 }
+               ]),
+               "有行但全部非法 ⇒ 必须是异常")
+        verify(OpsCommon.deviceRowsAreAnomalous([null, { device_id: "x" }]),
+               "畸形行 + 非数字 ⇒ 全部非法 ⇒ 必须是异常")
+        verify(!OpsCommon.deviceRowsAreAnomalous([{ device_id: "10001001" }]),
+               "数字字符串是合法的（与 isValidAircraftDeviceId 同口径），不得判成异常")
+    }
+
+    /// `overviewDeviceIds` 的 fail-safe 形状：全非法 ⇒ 空数组（异常由上一格的判据判定）。
+    function test_overviewDeviceIds_allInvalidYieldsEmpty() {
+        var rows = [{ device_id: 91002 }, { device_id: 0 }, { device_id: 16777216 }]
+        compare(JSON.stringify(OpsCommon.overviewDeviceIds(rows)), "[]",
+                "全非法行集 ⇒ 空数组；调用方必须用 deviceRowsAreAnomalous 把它判成异常，而不是当成空名册")
     }
 
     //=========================================================================

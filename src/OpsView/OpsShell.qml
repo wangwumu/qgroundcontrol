@@ -97,11 +97,13 @@ Item {
     property var  _tasks:          []      // /ops/overview 任务数组（已按角色过滤）
     property string _tasksJson:    ""      // 上一轮 `_tasks` 载荷的内容指纹（作用见 `_fetchOverview`）
     /// 上一轮任务列表里的 `device_id` 集合（排序后逗号连接）。**签出释出的唯一判据**。
-    /// 只统计 `device_id > 0`；`_fetchOverview` 每轮拿它在**200 且是数组**的响应上做 diff。
+    /// 只统计**合法飞机 ID**（`OpsCommon.isValidAircraftDeviceId`：PX4 段且 bit24=0）；
+    /// `_fetchOverview` 每轮拿它在**200 且是数组**的响应上做 diff。
     /// ‼️ 初值是空串，与"空集合"同形 ⇒ **首轮就是空数组时不会触发任何释出**。这不是巧合：
     ///    一次返回空数组的异常（后端故障 / 本站还没有任何任务）不该被读成"全部飞机都签出了"，
     ///    那会一次性删掉整个站点的密钥与水位。真正的"最后一架走了"必然经过一次
     ///    **非空 → 空**的转移，那时 `prev` 里确实有东西可释放。
+    /// ‼️ "有行但零合法"同理不更新 key（见 `_fetchOverview` 的 `_ovAnomaly` 闸）。
     property string _siteDeviceIdsKey: ""
     // 地图 L1 航线的**几何数据源**：只含任务身份 + 航点，**不含 `latest` 遥测**。
     /// ‼️ 为什么要跟 `_tasks` 分开：`_tasks` 带 `latest`，飞机每动一次内容就变 ⇒ 换身份
@@ -744,7 +746,14 @@ Item {
     /// 省略时行为与从前**逐字相同**（`_poll` 就不传）。
     function _fetchOverview(onDone) {
         _get("/api/ops/overview?view=" + opsShell.overviewView, function(status, data) {
-            if (status !== 200 || !Array.isArray(data)) { console.warn("OpsView overview", status); return }
+            if (status !== 200 || !Array.isArray(data)) {
+                // 2026-10-24：日志补上 view 与响应体。原先行里只有状态码，无法区分
+                // `view=site` / `view=route`，也看不到服务端 500 的原因（gin 把 error 放在 body）。
+                // ⚠️ 本行只改诊断，不改变失败路径：仍然整轮 return，保留上一份名册。
+                console.warn("OpsView overview", opsShell.overviewView, status,
+                             data === null || data === undefined ? "" : JSON.stringify(data))
+                return
+            }
             //---- 签出释出（站点视图专属）----
             // 判据：一架飞机的 device_id 在**本轮**列表里消失了。见 `_siteDeviceIdsKey` 的声明
             // （初值与空集合同形 ⇒ 空数组的异常响应不会释放整站）。
@@ -755,17 +764,26 @@ Item {
             //    （`view=site` 的可见性判据，见 ops-view-visibility-two-branches）⇒ 这是本端
             //    能观测到的**确证**签出；PENDING 挂着还没被接受时，飞机还在本站待命，
             //    那时不该动它的密钥与水位。
-            var _ovIds = []
-            for (var _oi = 0; _oi < data.length; _oi++) {
-                var _odid = Number(data[_oi] ? data[_oi].device_id : 0)
-                if (_odid > 0) _ovIds.push(_odid)
-            }
+            // 号段过滤（协议 §1.3/§1.4）：GCS 段（< 10000000）、bit24 置位、非整数/非数字
+            // 一律丢弃，每个脏值只告警一次（`OpsCommon.overviewDeviceIds`）。
+            // 这条路是 `_linkedDevices` 的唯一 gcs_server 来源；本端名册与监控员视图是
+            // **二选一**（`CryptoController._manifestLocked` 读 `_monitorDevices` 或
+            // `_linkedDevices`，不是并集）⇒ 站点视图下这一份就是**整份**登记集合。
+            // 本版 mavp2p 会在 80005 payload 侧丢弃脏 ID 并打 `rejected=...`（旧版会建幽灵配对），
+            // 但 QGC 这层仍是第一道：脏值还会污染取密钥与建链判据，且 mavp2p 不给回执。
+            var _ovIds = OpsCommon.overviewDeviceIds(data)
+            // ‼️ 异常闸：响应**有行但一个合法 ID 都没有**时，不更新 key。
+            //    否则 `_ovKey` 变成空串，下面的 diff 会把它读成"整站飞机全部离开"，
+            //    一次性释出所有密钥与水位（数据源异常 ≠ 签出）。保留上一份名册、本轮不 diff。
+            //    判据是 `OpsCommon.deviceRowsAreAnomalous`（三处推送共用，见其头注）。
+            var _ovAnomaly = OpsCommon.deviceRowsAreAnomalous(data)
+            if (_ovAnomaly) OpsCommon.warnDeviceIdAnomaly(data.length)
             // 排序只为让 key 稳定：同一集合无论按什么顺序到达，都不必每轮进 if 块重建 `now`。
             // ⚠️ 它**不是**"防止误释出"的那一层——防误释出靠下面 `_ovNow` 的集合查表
             //    （node 探针实测：去掉排序，17 格场景一格都不变红）。删掉只损失一点每轮
             //    开销，但别把它当成正确性判据去加固，也别以为有它就万事大吉。
             _ovIds.sort(function(a, b) { return a - b })
-            var _ovKey = _ovIds.join(",")
+            var _ovKey = _ovAnomaly ? _siteDeviceIdsKey : _ovIds.join(",")
             if (_ovKey !== _siteDeviceIdsKey) {
                 var _ovPrev = _siteDeviceIdsKey.length ? _siteDeviceIdsKey.split(",") : []
                 _siteDeviceIdsKey = _ovKey
@@ -784,8 +802,12 @@ Item {
                     // ‼️ 与释出共用同一个 diff 块是有意的——清单的「加」与「减」是同一件事的
                     //    两半，分成两处判据必然漂移。**不要**另起 `onPolled` 处理器或新信号。
                     // ⚠️ 闸的理由与释出侧不同、但同样必要：监控员视图走的是 `setMonitorDevices`
-                    //    那条通道（`_monitorDevices`），它**不建链**（responsibleParty=false）
+                    //    那条通道（`_monitorDevices`），与站点侧 `_linkedDevices` **互斥**
                     //    ⇒ 往 `_linkedDevices` 里塞会让两条通道互相污染。
+                    //    ‼️ 旧注释在此写「监控员视图不建链（responsibleParty=false）」——
+                    //    该结论自 2026-10-06 起已失效（见 `CryptoController.cc` 同处注释）：
+                    //    监控员是有资格的责任方，持有指令权时确实建链（走的是 initiator 名单，
+                    //    不是本处这两条推送）。
                     // ⚠️ `_ovPrev` 初值是空数组（`_siteDeviceIdsKey` 初值空串 ⇒ `"" .length` 为 0）
                     //    ⇒ **首轮所有 ID 都算"新出现"**，一次性全推。这正是首拉该做的事，与
                     //    `_siteDeviceIdsKey` 声明里"空数组的异常响应不会释放整站"不冲突：
@@ -819,14 +841,19 @@ Item {
             // ⚠️ 无站点身份（平台级账号 / `role_sites` 为空）时**不推**，而不是推空集：
             //    「没推过」在 C++ 侧退回旧形态，「推了空集」是"本端此刻不持有任何一架的指令权"
             //    ⇒ 全拒。两者的建链答案相反。口径同 `_fetchMySite` 的 `if (!(sid > 0)) return false`。
+            // ‼️ `_ovAnomaly` 时同样不推：那一轮的 `data` 有行但全部非法 ⇒ `_initIds` 必为空，
+            //    推空集等于宣称「本端此刻不持有任何一架的指令权」会全拒建链。口径与
+            //    「无站点身份时不推」相同：数据源异常 ≠ 责任方消失。
             var _mySid = Number(_mySiteId)
-            if (!routeLayersEnabled && _mySid > 0) {
+            if (!routeLayersEnabled && _mySid > 0 && !_ovAnomaly) {
                 var _initIds = []
                 for (var _ri = 0; _ri < data.length; _ri++) {
                     var _rrow = data[_ri]
                     if (!_rrow) continue
                     var _rdid = Number(_rrow.device_id)
-                    if (!(_rdid > 0)) continue
+                    // 与上面登记集合**同一判据**（`isValidAircraftDeviceId`）：非法 ID 不进建链名单。
+                    // 告警已由 `overviewDeviceIds` 按值打过一次，这里不再重复。
+                    if (!OpsCommon.isValidAircraftDeviceId(_rdid)) continue
                     // 判据 = `OpsCommon.siteHoldsControl`（纯函数、有单测，**唯一**判据点）：
                     //   起飞档 `takeoff_site_id == 本端 ∧ checkout_state !== "ACCEPTED"`
                     //   降落档 `landing_site_id == 本端 ∧ landing_accepted`

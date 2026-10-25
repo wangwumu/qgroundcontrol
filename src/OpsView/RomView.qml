@@ -74,6 +74,14 @@ OpsShell {
     ///    打两个 ③、且两个响应到达次序不定 ⇒ 推送的清单可能与界面上的列表不是同一份快照。
     function _pushMonitorDevices() {
         var ids = OpsCommon.monitorDeviceIds(romView._routeDevices)
+        // ‼️ 异常闸：有行但一个合法 ID 都没有 ⇒ **不推**。`setMonitorDevices` 是整份替换
+        //    且无条件把 `_monitorListActive` 置真 ⇒ 推空集会立刻清掉 C++ 侧名册，
+        //    这一侧刚接手的飞机从下一次合法响应之前都收不到下行（mavp2p 侧该配对在
+        //    `qgcSeen` 超过 `MAP_TTL` 后停止投递，默认 60s）。数据源异常 ≠ 名册清空。
+        if (OpsCommon.deviceRowsAreAnomalous(romView._routeDevices)) {
+            OpsCommon.warnDeviceIdAnomaly(romView._routeDevices.length)
+            return
+        }
         _monitorIds = ids
         // ⚠️ 清单与阈值**同一次**传入：两个 setter 会造出"新阈值配旧清单"的中间态（§3.6.4）
         cryptoController.setMonitorDevices(ids, _frameTimeoutMs)
@@ -104,7 +112,16 @@ OpsShell {
     ///    把"请求失败"当成"本端不持有任何一架的指令权"会让本端在监控员阶段**静默让出**上行权，
     ///    而失败原因可能只是一次网络抖动（§3.5.4）——那时本端仍该说话。
     function _pushInitiatorDevices() {
-        cryptoController.setInitiatorDevices(OpsCommon.initiatorDeviceIds(romView._routeDevices))
+        // ‼️ 与登记名册**共用同一个异常闸**（`deviceRowsAreAnomalous`）：全非法行集会算出
+        //    空名单，而 `CryptoController::setInitiatorDevices([])` 把它当作**有效结论**
+        //    （`_initiatorScopeValid=true`、全拒），且当前不在 Standby 时会当场
+        //    `returnToStandby()` —— 一次脏响应就会打断在飞链路。数据源异常 ≠ 责任方消失。
+        if (OpsCommon.deviceRowsAreAnomalous(romView._routeDevices)) {
+            OpsCommon.warnDeviceIdAnomaly(romView._routeDevices.length)
+            return
+        }
+        var _initIds = OpsCommon.initiatorDeviceIds(romView._routeDevices)
+        cryptoController.setInitiatorDevices(_initIds)
     }
 
     // ③ 每次**成功**后推清单（§3.5.3）。⚠️ 不能挂在 `onPolled` 上：`_poll()` 发出信号时
