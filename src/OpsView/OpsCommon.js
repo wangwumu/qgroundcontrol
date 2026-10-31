@@ -1916,14 +1916,18 @@ function _designCommandToMavCmd(c, isEnd, isVtol) {
 /// ‼️ 判据是 `id === endWaypointId`，**不是**"最后一项"。这个推断曾被我写进实现，
 ///    2026-09-28 真库实测将其**推翻**：
 ///
-///  · **航点端点不返回起降点**：QGC 走的快照端点
-///    `GET /api/snapshot/routes/:id/waypoints` 只读 `table_route_waypoint`
-///    （+JOIN `table_waypoint`）拿中间航点，**不读** `table_route.start_waypoint_id` /
-///    `end_waypoint_id` 这两列 ⇒ 始发站 / 终点站**不在返回列表里**。
-///    （实时端点 `ListWaypoints` 同样不读这两列；它**另**读 `table_route.plan_data`
-///      插 home 点（`command=-1`）并用 `mission.items[i].command` 覆写各点 command。
-///      ⚠️ 「实时端点只读 `table_route_waypoint` 一张表」曾是错误措辞，`handlers/ops.go`
-///      的 `MyRouteWaypoints` 一带亦然 —— **按函数名定位，别按行号**。）
+///  · **航点端点不会把起止站额外拼进列表**：QGC 走的快照端点
+///    `GET /api/snapshot/routes/:id/waypoints` 的航点查询只读 `table_route_waypoint`
+///    （+JOIN `table_waypoint`），**不读** `table_route.start_waypoint_id` /
+///    `end_waypoint_id` 这两列。
+///    ⚠️ **「不读」≠「不在列表里」**：起止航点只要本身也是 `table_route_waypoint` 的一行
+///    就会返回（云端 4/5/23 的终点就恰为末项），而 1/20/21 的终点不在列表里 ——
+///    两种形状都可达，**别按「列表位置」推断终点**。
+///    （同一只读事务里还读 `table_route.route_type` 与 `snapshot_meta.as_of`，
+///      不是"只读一张表"。实时端点 `ListWaypoints` 同样不读起止两列；它**另**读
+///      `table_route.plan_data` 插 home 点（`command=-1`）并用 `mission.items[i].command`
+///      覆写各点 command。⚠️「实时端点只读 `table_route_waypoint` 一张表」曾是错误措辞，
+///      `handlers/ops.go` 的 `MyRouteWaypoints` 一带亦然 —— **按函数名定位，别按行号**。）
 ///    对照：`handlers/ops.go` 的 `buildTaskWaypoints` 才额外把这两列读进来拼在首尾
 ///    （该口径差记在 `handlers/ops.go` 的 `MyRouteWaypoints` 函数头注释里，写着「已知且本次不修
 ///     的口径差」—— **按函数名 / 那句话定位，别按行号**；原注释引 `ops.go` 两个行号区间，
@@ -2108,8 +2112,8 @@ function routeMissionItems(wps, isVtol, endWaypointId, cruiseAGL) {
 ///    ⚠️ 设计域的 `21` 与 MAVLink 的 `NAV_LAND(21)` **数值巧合、语义无关**（见 `_designCommandToMavCmd`）。
 ///
 /// 为什么必须追加：航点端点（QGC 走快照 `GET /api/snapshot/routes/:id/waypoints`；
-/// 实时端点 `ListWaypoints` 亦然）**不返回起降点** ⇒ 固定航线的 mission 现在结束在
-/// 一个**中途点**上，而不是降落站点。
+/// 实时端点 `ListWaypoints` 亦然）不会把起止站额外拼进列表 ⇒ 对**终点不在列表里**
+/// 的固定航线（云端 1/20/21 的形状），mission 会结束在一个**中途点**上，而不是降落站点。
 ///
 /// ‼️ **覆盖声明按"形状"写，不按航线号写**（航线号会随库漂移，且读的人会把它当覆盖证明）：
 ///    · 走**行为 1（追加分支）**的样本形状 =「返回列表**非空**、且终点**不在**其中」；

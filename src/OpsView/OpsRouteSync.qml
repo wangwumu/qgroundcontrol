@@ -256,33 +256,61 @@ Item {
     ///    内分流 —— 原端点保留实时给 web-ui，**另开**快照端点给 QGC。
     ///    端点语义是 **fail-closed**：快照不可用 503、航线不在快照里 404，
     ///    **绝不回退实时** ⇒ 不会拿到「看起来成功、其实是实时」的结果。
-    ///    ⚠️ 代价（已裁定接受，不是缺陷）：QGC 拿到的是**上一次构建时**的库状态 ——
-    ///      · 此后对航线几何的修改**不会**出现在下发的航线里（连重新复核通过也一样，
-    ///        要等下一次构建）；此后被删除的航线仍会按**旧几何**下发；
+    ///    ⚠️ 代价（已裁定接受，不是缺陷）：QGC 拿到的是**上一次构建时**的状态 ——
+    ///      · 此后对**中间航点**的修改**不会**出现在下发的航线里（连重新复核通过也一样，
+    ///        要等下一次构建）；
     ///      · 在上一次构建**之后**才新建、或才首次通过复核的航线**不在快照里** ⇒ **404**
     ///        （编辑航线会把 `review_status` 复位成 DRAFT，但那是**下一次**构建才生效的
-    ///        排除条件 —— 对**当前**快照而言，它的效果是「旧几何」而不是 404）；
+    ///        排除条件 —— 对**当前**快照而言，它的效果是「旧航点」而不是 404）；
+    ///      · 已删航线到不了本端点：实时详情 `Get` 带 `deleted_at IS NULL`，第一步就 404；
+    ///      · 快照只收 `route_type='FIXED'` ⇒ **临时航线恒 404**，不是"等下一次构建"能解决的。
+    ///        QGC 访问临时航线的前提是**单机版、且只能访问自己创建的航线**（用户口径；
+    ///        后端 `List` 对 `client_type=qgc` 按 `created_by` 过滤）；
     ///      · 快照响应不含 `plan_data` 派生的 home 点与 84/85 命令覆盖（快照表没有该列）。
+    ///    ✅ **混合读不会造成几何错位**（2026-10-31 用户口径）：航线首末点是**站点**，
+    ///       站点位置由 `table_site.waypoint_id → table_waypoint` 派生，而 `table_site` /
+    ///       `table_waypoint` 都在快照内；航线中间航点的修改**不改变站点位置** ⇒
+    ///       "实时航线详情 + 快照航点"不会把新首末点接到旧中间点上。
+    ///       （`table_slot.status` 是唯一实时例外，用于紧急关停指定机位。）
     /// ‼️ 航线详情仍在 `start()` 里用**实时** `GET /api/routes/:id`：起降高度是航线级
     ///    字段，快照端点不提供 ⇒ 两次 GET 合起来是一次**混合读**（高度实时、航点快照）。
     function _fetchWaypoints(routeId) {
         get("/api/snapshot/routes/" + routeId + "/waypoints", function(status, data) {
-            // 404 / 503 是快照端点**自有**的失败语义，与「无权限 / 未知路由」不同：
-            // 分开报，别让现场按「航线坏了」去查。其余非 200（含 401/403）仍统一报
-            // 「获取失败」—— 不把 403 猜成 404。
+            // 失败一律留痕：服务端对快照故障是**节流**日志（同一错误串只打一次），
+            // 客户端再不打就两端都没痕迹。body 里带后端的具体原因。
+            if (status !== 200) {
+                console.warn("OpsRouteSync: 快照航点请求失败 route_id=" + routeId +
+                             " status=" + status + " body=" + JSON.stringify(data))
+            }
             if (status === 404) {
+                // ‼️ 两种 404 必须分开：Gin 的 NoRoute 对**未注册**的 /api/* 也回 404
+                //    （body 以「接口不存在」开头）—— 那是**服务端没部署这个路由**，
+                //    不是航线的问题。混成一句会让现场去查航线复核状态。
+                if (data && typeof data.error === "string" && data.error.indexOf("接口不存在") >= 0) {
+                    return _fail(qsTr("快照接口不存在，请确认服务端版本"))
+                }
                 return _fail(qsTr("该航线不在当前快照中，无法下发"))
             }
             if (status === 503) {
                 return _fail(qsTr("快照服务不可用，无法下发"))
             }
-            if (status !== 200 || !data) {
-                // 后端对未知路由 / 无权限一律非 200；这里不区分，统一报"获取失败"，
-                // 免得把 403 猜成 404 误导现场排查。
-                return _fail(qsTr("航线获取失败（HTTP %1）").arg(status))
+            if (status !== 200) {
+                // 其余非 200（含 401/403）不猜具体原因，统一报"获取失败"，
+                // 免得把 403 猜成 404 误导现场排查。（失败已在上方统一留痕。）
+                return _fail(qsTr("航点获取失败（HTTP %1）").arg(status))
             }
-            var wps = Array.isArray(data) ? data : (data.waypoints || data.data || [])
-            if (!Array.isArray(wps)) wps = []
+            if (!data) {
+                return _fail(qsTr("快照航点响应为空，无法下发"))
+            }
+            // ‼️ 契约是**数组**（后端 `c.JSON(200, []models.Waypoint)`）。非数组一律按
+            //    协议异常**显式失败**，不降级成空数组 —— 那会报成「航线没有可用航点」，
+            //    把操作员引向"这条航线怎么一个点都没有"这个错误方向。
+            if (!Array.isArray(data)) {
+                console.warn("OpsRouteSync: 快照航点响应非数组 route_id=" + routeId +
+                             " body=" + JSON.stringify(data))
+                return _fail(qsTr("快照航点响应格式异常，无法下发"))
+            }
+            var wps = data
             // ‼️ **快照端点不读 `plan_data`**（快照表没有该列）⇒ 它**不会**在序列头部插
             //    `command = -1` 的 home 项，也**不会**用 `mission.items[i].command` 覆写各点
             //    command。下面这行过滤因此是**廉价防御**，不是当前路径的必要步骤：
@@ -296,9 +324,10 @@ Item {
             //    **不放宽** `routeMissionItems` 对未知命令的作废语义：用户真正画的点少一个，
             //    仍然必须整条作废。
             //    ⚠️ **本过滤盖不住 plan_data 非空时的 84/85 命令覆盖**：
-            //    `_designCommandToMavCmd(84|85)` 回 `null` ⇒ 整条照样作废。今天任务按现行
-            //    前端约束只能关联 FIXED 航线、而快照不含 plan_data ⇒ **不可达**；
-            //    等"任务能引用临时航线"那天要重新处置（84/85 的裁定见 `_buildAndSend` 的 R-A1 段）。
+            //    `_designCommandToMavCmd(84|85)` 回 `null` ⇒ 整条照样作废。本组件只会拿到
+            //    **固定航线**（快照只收 FIXED；临时航线在本端点恒 404），而快照不含
+            //    `plan_data` ⇒ 84/85 覆盖**不可达**。将来若要让临时航线进快照端点，
+            //    这里必须重新处置（84/85 的裁定见 `_buildAndSend` 的 R-A1 段）。
             wps = wps.filter(function(w) { return !w || w.command !== -1 })
             _buildAndSend(wps)
         })
@@ -358,10 +387,12 @@ Item {
         //      要的落点。"若将来推翻 R-A1 会咬到谁"详见 `OpsCommon._endWaypointIndex` 的函数头注释。
         //
         // ‼️ **为什么不能按"列表位置"推断终点**（与上面那条裁定无关，本条**仍然成立**）：
-        //    航点端点**不返回起降点**：快照端点 `GET /api/snapshot/routes/:id/waypoints`
-        //    只读 `table_route_waypoint`（+JOIN `table_waypoint`）拿中间航点，
-        //    **不读** `table_route.start_waypoint_id` / `end_waypoint_id` 这两列
-        //    ⇒ 始发站 / 终点站**不在返回列表里**。
+        //    航点端点**不会把起止站额外拼进列表**：快照端点
+        //    `GET /api/snapshot/routes/:id/waypoints` 的航点查询只读
+        //    `table_route_waypoint`（+JOIN `table_waypoint`），**不读**
+        //    `table_route.start_waypoint_id` / `end_waypoint_id` 这两列。
+        //    ⚠️ **「不读」≠「不在列表里」**：起止航点只要本身也是 `table_route_waypoint`
+        //    的一行就会返回（云端 4/5/23 的终点就恰为末项），而 1/20/21 的终点不在列表里。
         //    （实时端点 `ListWaypoints` 同样不读这两列；它**另**读 `table_route.plan_data`
         //      插 home 点 / 覆写 command —— 本组件自 2026-10-31 起不再走它，
         //      理由见 `_fetchWaypoints`。⚠️ 「实时端点只读 `table_route_waypoint` 一张表」
