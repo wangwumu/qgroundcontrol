@@ -328,12 +328,16 @@ void OpsRouteSyncUITest::_testGates()
     // `else` 分支注入的是空实现、根本不回调 ⇒ 本对象恒空；那种格由断言处的 `if (stubFetch)` 跳过。
     QJSValue errSink = _engine->evaluate(QStringLiteral("[]"));
     QVERIFY2(errSink.isArray(), qPrintable(errSink.toString()));
+    // 2026-10-31：记录的请求路径。用途是钉住「航点走快照端点」这一条 —— 见末尾断言。
+    QJSValue pathSink = _engine->evaluate(QStringLiteral("[]"));
+    QVERIFY2(pathSink.isArray(), qPrintable(pathSink.toString()));
     if (stubFetch) {
         const QString factorySrc = QStringLiteral(
-            "(function(routeJson, wpsJson, errSink) {"
+            "(function(routeJson, wpsJson, errSink, pathSink) {"
             "  var route = JSON.parse(routeJson);"
             "  var wps = JSON.parse(wpsJson);"
             "  return function(path, cb) {"
+            "    pathSink.push(String(path));"
             "    try { cb(200, String(path).indexOf('/waypoints') >= 0 ? wps : route) }"
             "    catch (e) { errSink.push(String(e)); }"
             "  }"
@@ -341,7 +345,7 @@ void OpsRouteSyncUITest::_testGates()
         QJSValue factory = _engine->evaluate(factorySrc);
         QVERIFY2(!factory.isError(), qPrintable(factory.toString()));
         QJSValueList args;
-        args << routeJson << wpsJson << errSink;
+        args << routeJson << wpsJson << errSink << pathSink;
         QJSValue getFn = factory.call(args);
         QVERIFY2(!getFn.isError(), qPrintable(getFn.toString()));
         sync->setProperty("get", QVariant::fromValue(getFn));
@@ -412,6 +416,29 @@ void OpsRouteSyncUITest::_testGates()
     // ‼️ **不能只判 `>= 1`**：闸**之前**的意外异常（bounds 解析、航点追加）会顶替掉那一条，
     //    而 `state` 仍停在 `building` ⇒ 断言照样绿 —— 那正是 G3 要杀的假绿。下面的 `else`
     //    是它的另一半：**多出来的**异常同样要红。
+    // ---- 2026-10-31：航点请求必须走快照端点 ----
+    // 判据是**逐条路径全串相等**，不是 `indexOf("snapshot")`：后者对
+    // `/api/routes/1/waypoints?x=snapshot` 这类形状也放行，而本项要钉的是「端点换了」。
+    //
+    // ‼️ **所有 `stubFetch` 格都是两条**，包括在闸上就 `_fail` 的那些：三道高度闸
+    //    （起飞 / 降落 / 地面海拔）在 `_buildAndSend` 里，而 `_buildAndSend` 由
+    //    `_fetchWaypoints` 的第二条回调调用 ⇒ 它们**必然先发完两次 GET**。
+    //    只有飞行高度闸早于一切网络请求（那几格 `stubFetch == false`，不走本断言）。
+    //    第一版断言把失败格写成「只发一条」—— 实测红，正是这个次序。
+    //
+    // 路径 0 = 航线详情：**仍是实时** `/api/routes/:id`（起降高度是航线级字段，
+    //   快照端点不提供）⇒ 与路径 1 合起来是一次**混合读**，见 `_fetchWaypoints` 注释。
+    // 路径 1 = 航点：**快照** `/api/snapshot/routes/:id/waypoints`。
+    if (stubFetch) {
+        const int pathCount = pathSink.property(QStringLiteral("length")).toInt();
+        QCOMPARE(pathCount, 2);
+        if (pathCount == 2) {
+            QCOMPARE(pathSink.property(0).toString(), QStringLiteral("/api/routes/1"));
+            QCOMPARE(pathSink.property(1).toString(),
+                     QStringLiteral("/api/snapshot/routes/1/waypoints"));
+        }
+    }
+
     if (stubFetch) {
         const int errCount = errSink.property(QStringLiteral("length")).toInt();
         if (expectState == QStringLiteral("building")) {

@@ -1916,14 +1916,14 @@ function _designCommandToMavCmd(c, isEnd, isVtol) {
 /// ‼️ 判据是 `id === endWaypointId`，**不是**"最后一项"。这个推断曾被我写进实现，
 ///    2026-09-28 真库实测将其**推翻**：
 ///
-///  · `GET /routes/:id/waypoints`（后端 `route.go` 的 `ListWaypoints`）**不返回起降点**：
-///    它读 `table_route_waypoint`（+JOIN `table_waypoint`）拿中间航点，**再**读
-///    `table_route.plan_data`，用 `mission.items[i].command` 覆写各点 command、并在头部
-///    插一个 home 点（`command=-1`）；**唯独不读** `table_route.start_waypoint_id` /
+///  · **航点端点不返回起降点**：QGC 走的快照端点
+///    `GET /api/snapshot/routes/:id/waypoints` 只读 `table_route_waypoint`
+///    （+JOIN `table_waypoint`）拿中间航点，**不读** `table_route.start_waypoint_id` /
 ///    `end_waypoint_id` 这两列 ⇒ 始发站 / 终点站**不在返回列表里**。
-///    （2026-09-29 审查 A5 修正：原注释写「只读 `table_route_waypoint` 一张表」——错，
-///      它还读 `plan_data`。⚠️ 这个过简的措辞是从后端照抄的，`handlers/ops.go` 的
-///      `MyRouteWaypoints` 一带亦然 —— **按函数名定位，别按行号**。）
+///    （实时端点 `ListWaypoints` 同样不读这两列；它**另**读 `table_route.plan_data`
+///      插 home 点（`command=-1`）并用 `mission.items[i].command` 覆写各点 command。
+///      ⚠️ 「实时端点只读 `table_route_waypoint` 一张表」曾是错误措辞，`handlers/ops.go`
+///      的 `MyRouteWaypoints` 一带亦然 —— **按函数名定位，别按行号**。）
 ///    对照：`handlers/ops.go` 的 `buildTaskWaypoints` 才额外把这两列读进来拼在首尾
 ///    （该口径差记在 `handlers/ops.go` 的 `MyRouteWaypoints` 函数头注释里，写着「已知且本次不修
 ///     的口径差」—— **按函数名 / 那句话定位，别按行号**；原注释引 `ops.go` 两个行号区间，
@@ -2003,7 +2003,9 @@ function _endWaypointIndex(wps, endWaypointId) {
     return found
 }
 
-/// 把后端 `GET /routes/:id/waypoints` 的航点转成待下发的 mission 描述数组。
+/// 把航点端点的航点转成待下发的 mission 描述数组。
+/// （QGC 侧来源是快照端点 `GET /api/snapshot/routes/:id/waypoints`，2026-10-31 起；
+///   响应形状与实时端点 `GET /routes/:id/waypoints` 相同。）
 ///
 /// 产出**不含起飞项**——起飞项的坐标是"飞机当前 home 位置"（运行时才知道）。调用方
 /// 拿到 home 后用 `MissionController::insertTakeoffItem()` 插在第 0 位。
@@ -2105,8 +2107,9 @@ function routeMissionItems(wps, isVtol, endWaypointId, cruiseAGL) {
 ///    `_designCommandToMavCmd(21, false, …)` 下映射成 `16 NAV_WAYPOINT` —— 正是要的落点。
 ///    ⚠️ 设计域的 `21` 与 MAVLink 的 `NAV_LAND(21)` **数值巧合、语义无关**（见 `_designCommandToMavCmd`）。
 ///
-/// 为什么必须追加：`GET /api/routes/:id/waypoints`（后端 `route.go` 的 `ListWaypoints`）
-/// **不返回起降点** ⇒ 固定航线的 mission 现在结束在一个**中途点**上，而不是降落站点。
+/// 为什么必须追加：航点端点（QGC 走快照 `GET /api/snapshot/routes/:id/waypoints`；
+/// 实时端点 `ListWaypoints` 亦然）**不返回起降点** ⇒ 固定航线的 mission 现在结束在
+/// 一个**中途点**上，而不是降落站点。
 ///
 /// ‼️ **覆盖声明按"形状"写，不按航线号写**（航线号会随库漂移，且读的人会把它当覆盖证明）：
 ///    · 走**行为 1（追加分支）**的样本形状 =「返回列表**非空**、且终点**不在**其中」；
@@ -2127,7 +2130,8 @@ function routeMissionItems(wps, isVtol, endWaypointId, cruiseAGL) {
 ///    `endLat` / `endLon` / `endGroundMSL` **只在追加分支被读到** ⇒ 它们不参与
 ///    「末项已是终点」那一档的判定（裁定 B，2026-10-01）。签名里出现 ≠ 会被用到。
 ///
-/// @param wps 航点数组（`GET /api/routes/:id/waypoints` 的响应，调用方已摘掉 `command === -1` 的 home 项）
+/// @param wps 航点数组（QGC 走快照 `GET /api/snapshot/routes/:id/waypoints` 的响应；
+///        调用方已摘掉可能出现的 `command === -1` home 项）
 /// @param endWaypointId 航线终点航点 id（`route.end_waypoint_id`）。只认 JSON number 且 `> 0`
 ///        ——口径与 `_endWaypointIndex` **逐字相同**。
 /// @param endLat 终点航点纬度（`route.end_waypoint_lat`）—— 仅追加分支消费

@@ -214,8 +214,11 @@ Item {
         _statusText = qsTr("正在获取航线…")
         // NRRSM（2026-09-30）：先取**航线**（起降高度是航线级字段），再取**航点**。
         // 为什么不在 `/waypoints` 的响应里带：那个接口的返回值被 webui 的 RouteList.vue
-        // **直接当作要保存的 waypoint_ids**（见下方 _buildAndSend 里 **① 段**尾部以 `🔓` 开头的那块解封条件注释），
-        // 把它改成对象会连带打断保存航线。两次 GET 是最小侵入。
+        // **直接当作要保存的 waypoint_ids**，把它改成对象会连带打断保存航线。
+        // 两次 GET 是最小侵入。
+        // ⚠️ 2026-10-31 起这两步**不是同一个数据源**：本行仍是**实时** `/api/routes/:id`，
+        //    而 `_fetchWaypoints` 改走**快照**端点 ⇒ 一次混合读（高度实时、航点快照）。
+        //    理由与代价见 `_fetchWaypoints` 的函数头注释。
         // `/api/routes/:id` 无角色闸（uavm 仓 `gcs_server/router/router.go` 里注册
         // `api.GET("/routes/:id", routeH.Get)` 那一行 —— **按符号定位，别按行号**；行号会漂），SITE_ATC 能读。
         get("/api/routes/" + routeId, function(status, route) {
@@ -246,8 +249,33 @@ Item {
     }
 
     /// 取航点并下发。从 `start()` 里拆出来，因为 NRRSM 之后它是**第二步**。
+    ///
+    /// ‼️ **航点走快照端点** `GET /api/snapshot/routes/:id/waypoints`（2026-10-31 起）。
+    ///    背景：web-ui 与 QGC 原本共用 `/api/routes/:id/waypoints`，两者的读语义不同
+    ///    （web-ui 的编辑/审核是**读后写**，QGC 是**读后下发**）。用户的裁定是不在原端点
+    ///    内分流 —— 原端点保留实时给 web-ui，**另开**快照端点给 QGC。
+    ///    端点语义是 **fail-closed**：快照不可用 503、航线不在快照里 404，
+    ///    **绝不回退实时** ⇒ 不会拿到「看起来成功、其实是实时」的结果。
+    ///    ⚠️ 代价（已裁定接受，不是缺陷）：QGC 拿到的是**上一次构建时**的库状态 ——
+    ///      · 此后对航线几何的修改**不会**出现在下发的航线里（连重新复核通过也一样，
+    ///        要等下一次构建）；此后被删除的航线仍会按**旧几何**下发；
+    ///      · 在上一次构建**之后**才新建、或才首次通过复核的航线**不在快照里** ⇒ **404**
+    ///        （编辑航线会把 `review_status` 复位成 DRAFT，但那是**下一次**构建才生效的
+    ///        排除条件 —— 对**当前**快照而言，它的效果是「旧几何」而不是 404）；
+    ///      · 快照响应不含 `plan_data` 派生的 home 点与 84/85 命令覆盖（快照表没有该列）。
+    /// ‼️ 航线详情仍在 `start()` 里用**实时** `GET /api/routes/:id`：起降高度是航线级
+    ///    字段，快照端点不提供 ⇒ 两次 GET 合起来是一次**混合读**（高度实时、航点快照）。
     function _fetchWaypoints(routeId) {
-        get("/api/routes/" + routeId + "/waypoints", function(status, data) {
+        get("/api/snapshot/routes/" + routeId + "/waypoints", function(status, data) {
+            // 404 / 503 是快照端点**自有**的失败语义，与「无权限 / 未知路由」不同：
+            // 分开报，别让现场按「航线坏了」去查。其余非 200（含 401/403）仍统一报
+            // 「获取失败」—— 不把 403 猜成 404。
+            if (status === 404) {
+                return _fail(qsTr("该航线不在当前快照中，无法下发"))
+            }
+            if (status === 503) {
+                return _fail(qsTr("快照服务不可用，无法下发"))
+            }
             if (status !== 200 || !data) {
                 // 后端对未知路由 / 无权限一律非 200；这里不区分，统一报"获取失败"，
                 // 免得把 403 猜成 404 误导现场排查。
@@ -255,32 +283,22 @@ Item {
             }
             var wps = Array.isArray(data) ? data : (data.waypoints || data.data || [])
             if (!Array.isArray(wps)) wps = []
-            // ‼️ 后端 `buildWaypoints`（uavm 仓 `gcs_server/handlers/route.go` 的同名函数 ——
-            //    **按函数名定位，别按行号**）对**含 plan_data
-            //    的航线**（QGC 上传的临时航线）会在序列**头部**插一个 `command = -1` 的 home 项
+            // ‼️ **快照端点不读 `plan_data`**（快照表没有该列）⇒ 它**不会**在序列头部插
+            //    `command = -1` 的 home 项，也**不会**用 `mission.items[i].command` 覆写各点
+            //    command。下面这行过滤因此是**廉价防御**，不是当前路径的必要步骤：
+            //    将来若有人把这里改回实时端点，home 混进来会被 `routeMissionItems` 当成
+            //    "未知命令"而**作废整条航线** —— 那是 fail-closed 的静默失败，界面只显示
+            //    "没有可用航点"，排查时看不出真凶。
+            //    历史来源（实时端点 `ListWaypoints`，uavm 仓 `gcs_server/handlers/route.go`
+            //    的 `buildWaypoints` —— **按函数名定位，别按行号**）：对**含 plan_data 的
+            //    航线**（QGC 上传的临时航线）在序列头部插一个 `command = -1` 的 home 项
             //    （条件：`mission.plannedHomePosition` 恰好 3 个元素）。
-            //    home **不是航点**：混进来会被 `routeMissionItems` 当成"未知命令"而**作废整条航线**
-            //    ——那是 fail-closed 的静默失败，界面只显示"没有可用航点"，排查时看不出真凶。
-            //    这里**只**摘掉这一个已知的接口附加项，**不放宽** `routeMissionItems` 对未知命令的作废语义：
-            //    用户真正画的点少一个，仍然必须整条作废。
-            //    （2026-09-23 真库实测：7 条未删航线中 4 条 TEMPORARY 会插 home；但任务按现行前端约束
-            //     只能关联 FIXED 航线 ⇒ 本系统的任务链路**当前不触发**。按廉价防御处理，不定级为缺陷。）
-            //    ⚠️ **本过滤只覆盖一半，不要把它当成"临时航线已支持"**：同一个 `buildWaypoints`
-            //    在 plan_data 非空时还会用 `mission.items[i].command` **覆盖** `wps[i].Command`
-            //    （起飞=84、降落=85，同在 `handlers/route.go` 的 `buildWaypoints` 里 ——
-            //     **按函数名定位，别按行号**）——`_designCommandToMavCmd(84|85)`
-            //    同样回 `null` ⇒ 整条航线照样作废、且同样零诊断。
-            //    两者**同源**（都只在 plan_data 非空时发生）⇒ 等到"任务能引用临时航线"的那天，
-            //    -1 被摘掉、84/85 仍会让整条作废 ⇒ 这行过滤**不是完整修复**。
-            //    84/85 的正确处置牵着「起飞项坐标必须是飞机当前 home」与「降落稍后再议」
-            //    （用户 2026-09-23 裁定 f），**明确不在本次范围**。
-            //
-            //  ［2026-09-28 更新］用户已裁定**垂起着陆**方案（见下方 ⑤a）。⚠️ 但**本条依然成立**：
-            //    设计域的值域仍是 `{16, 21}`，`85` 在本链路里是**产出**不是**输入** ⇒
-            //    plan_data 里带着 85 过来的航线**照样整条作废**。别把新增的垂起着陆
-            //    当成"临时航线 84/85 已支持"——那两件事没有关系。
-            //    本行的实际价值仅限于一个子场景：plan_data 里有 plannedHomePosition、但 items 为空
-            //    （此时覆盖不发生，只有 home 会被插进来）。
+            //    **不放宽** `routeMissionItems` 对未知命令的作废语义：用户真正画的点少一个，
+            //    仍然必须整条作废。
+            //    ⚠️ **本过滤盖不住 plan_data 非空时的 84/85 命令覆盖**：
+            //    `_designCommandToMavCmd(84|85)` 回 `null` ⇒ 整条照样作废。今天任务按现行
+            //    前端约束只能关联 FIXED 航线、而快照不含 plan_data ⇒ **不可达**；
+            //    等"任务能引用临时航线"那天要重新处置（84/85 的裁定见 `_buildAndSend` 的 R-A1 段）。
             wps = wps.filter(function(w) { return !w || w.command !== -1 })
             _buildAndSend(wps)
         })
@@ -340,14 +358,15 @@ Item {
         //      要的落点。"若将来推翻 R-A1 会咬到谁"详见 `OpsCommon._endWaypointIndex` 的函数头注释。
         //
         // ‼️ **为什么不能按"列表位置"推断终点**（与上面那条裁定无关，本条**仍然成立**）：
-        //    `GET /routes/:id/waypoints`（后端 `route.go` 的 `ListWaypoints`）**不返回起降点**：
-        //    它读 `table_route_waypoint`（+JOIN `table_waypoint`）拿中间航点，**再**读
-        //    `table_route.plan_data`，用 `mission.items[i].command` 覆写各点 command、并在头部
-        //    插一个 home 点（`command=-1`）；**唯独不读** `table_route.start_waypoint_id` /
-        //    `end_waypoint_id` 这两列 ⇒ 始发站 / 终点站**不在返回列表里**。
-        //    （2026-09-29 审查 A5 修正：原注释写「只读 `table_route_waypoint` 一张表」——错，
-        //      它还读 `plan_data`。⚠️ 这个过简措辞是从后端照抄来的，`handlers/ops.go` 的
-        //      `MyRouteWaypoints` 一带亦然 —— **按函数名定位，别按行号**。）
+        //    航点端点**不返回起降点**：快照端点 `GET /api/snapshot/routes/:id/waypoints`
+        //    只读 `table_route_waypoint`（+JOIN `table_waypoint`）拿中间航点，
+        //    **不读** `table_route.start_waypoint_id` / `end_waypoint_id` 这两列
+        //    ⇒ 始发站 / 终点站**不在返回列表里**。
+        //    （实时端点 `ListWaypoints` 同样不读这两列；它**另**读 `table_route.plan_data`
+        //      插 home 点 / 覆写 command —— 本组件自 2026-10-31 起不再走它，
+        //      理由见 `_fetchWaypoints`。⚠️ 「实时端点只读 `table_route_waypoint` 一张表」
+        //      是曾经的错误过简措辞，`handlers/ops.go` 的 `MyRouteWaypoints` 一带亦然 ——
+        //      **按函数名定位，别按行号**。）
         //    （对照：`handlers/ops.go` 的 `buildTaskWaypoints` 才把这两列读进来拼在首尾，
         //      两处口径差记在 `handlers/ops.go` 的 `MyRouteWaypoints` 函数头注释里（写着
         //      「已知且本次不修的口径差」）—— **按函数名 / 那句话定位，别按行号**。
