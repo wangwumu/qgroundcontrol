@@ -31,7 +31,7 @@ import "OpsCommon.js" as OpsCommon
 ///   · `rightPanelContent` → 右栏中段（姿态仪之上）整块
 ///
 /// ‼️ 本文件**不认识任何角色**：`AuthController.roles` 只在各视图里判。这里只收
-///    `overviewView` 这一个**数据源参数**（喂 `GET /api/ops/overview?view=`）。
+///    `overviewView` 这一个**数据源参数**（喂 `GET /api/snapshot/ops/overview?view=`）。
 ///    角色判据若进了骨架，两个视图就会各自长出一份副本——副本漂移的后果是静默放行。
 ///
 /// ‼️ 为什么注入槽用 `Component` + `Loader` 而不是 `default property alias`：默认属性别名
@@ -51,7 +51,7 @@ Item {
     //-------------------------------------------------------------------------
     // 输入（由视图传入）
     //-------------------------------------------------------------------------
-    // 数据源参数，**不是**显示开关：吃进 `GET /api/ops/overview?view=`。
+    // 数据源参数，**不是**显示开关：吃进 `GET /api/snapshot/ops/overview?view=`。
     //   "site"  = 本站视图（后端按站点过滤）
     //   "route" = 监控员视图（后端按负责航线过滤 IN_FLIGHT）
     property string overviewView: "site"
@@ -94,7 +94,7 @@ Item {
     //-------------------------------------------------------------------------
     // 数据（轮询刷新；JS 数组整体重建以触发 Repeater 更新）
     //-------------------------------------------------------------------------
-    property var  _tasks:          []      // /ops/overview 任务数组（已按角色过滤）
+    property var  _tasks:          []      // /api/snapshot/ops/overview 任务数组（已按角色过滤）
     property string _tasksJson:    ""      // 上一轮 `_tasks` 载荷的内容指纹（作用见 `_fetchOverview`）
     /// 上一轮任务列表里的 `device_id` 集合（排序后逗号连接）。**签出释出的唯一判据**。
     /// 只统计**合法飞机 ID**（`OpsCommon.isValidAircraftDeviceId`：PX4 段且 bit24=0）；
@@ -105,6 +105,18 @@ Item {
     ///    **非空 → 空**的转移，那时 `prev` 里确实有东西可释放。
     /// ‼️ "有行但零合法"同理不更新 key（见 `_fetchOverview` 的 `_ovAnomaly` 闸）。
     property string _siteDeviceIdsKey: ""
+    /// overview 的**失败原因**（空串 = 最近一轮成功）。2026-11-01 审查补：
+    /// 原来失败只打一行 `console.warn`，界面停在上一份名册上——任务卡、飞机 marker、
+    /// 机位占用全按旧数据渲染，而"停在旧数据的界面"与"正常的界面"**长得一模一样**。
+    /// 快照不可用（后端 503）会**持续**失败，不提示等于让人拿昨天的任务派今天的活。
+    /// ‼️ 与 `_routeLoadError` 分开：那个属于监控员视图的 ①②，两者可以同时失败但挂在
+    ///    不同视图上，共用一个 ref 会让一个视图清掉另一个视图的提示。
+    /// 后端原因原样透出（`{"error":"快照不可用：…"}`），与 `_fetchMyRoutes` 同口径。
+    property string _overviewError: ""
+    /// overview 上次**成功**的时刻（陈旧提示里要给用户一个时间锚点）。
+    /// null = 本次会话从未成功过——那时的提示必须说清"还没有数据"，不能只报错误码，
+    /// 否则用户会把"从来没加载过"读成"刚才抖了一下"。
+    property var    _overviewUpdatedAt: null
     // 地图 L1 航线的**几何数据源**：只含任务身份 + 航点，**不含 `latest` 遥测**。
     /// ‼️ 为什么要跟 `_tasks` 分开：`_tasks` 带 `latest`，飞机每动一次内容就变 ⇒ 换身份
     ///    ⇒ 航线**陪着一起销毁重建**（离屏探针实测：只改一条 `latest`，4 条线全量 +4/−4）。
@@ -585,6 +597,22 @@ Item {
                 // "内容没变"误判成空转（`_routeTasks` 还停在登出时置的 `[]`，界面空白到第二发）。
                 opsShell._routeGeom = [];          opsShell._routeGeomKey = ""
                 opsShell._routeTasksJson = "";     opsShell._routeDevicesJson = ""
+                // 站点视图那一份（`_tasks` 系列）同样要清（2026-11-01 审查补）。
+                // 原来只清了监控员视图的四个字段，于是「A 站账号登出 → B 站账号登录」时，
+                // B 的第一轮 overview 到达之前，界面上一直是 **A 站的任务与飞机**：
+                //   · `_tasksJson` 不清 ⇒ `_tasks` 刚被置空、指纹却还是上一个会话的；若新会话
+                //     首发的载荷与它**逐字相同**，守卫会跳过赋值 ⇒ `_tasks` 停在 `[]`，直到
+                //     载荷再变一次——界面空着，且没有任何提示（没有错误、没有日志）；
+                //   · `_taskGeom` 不清 ⇒ **地图上的旧航线照画**（L1 的 model 就是它），
+                //     而且它是 `_requestRoutesFit()` 的取景依据 ⇒ 视野套在别人的站上；
+                //   · `_siteDeviceIdsKey` 不清 ⇒ B 的第一轮 diff 以 A 的飞机集合为 prev，
+                //     会对着从未属于 B 的 deviceID 走一遍释出分支（见该属性的声明）。
+                // `_overviewError`/`_overviewUpdatedAt` 一并清：否则上一个会话的故障提示条
+                // 会跨账号挂着，且"更新于"是**别人的**时间。
+                opsShell._tasks = [];              opsShell._tasksJson = ""
+                opsShell._taskGeom = [];           opsShell._taskGeomKey = ""
+                opsShell._siteDeviceIdsKey = ""
+                opsShell._overviewError = "";      opsShell._overviewUpdatedAt = null
                 // 视野状态一并清空。‼️ `_mapManualCenter` 必须清——它**优先级高于** `_routeFitCenter`
                 // （见 `center` 绑定），一旦在上一个会话里被平移/点选置上而这里不清，下次登录
                 // `_fitRoutesToViewport()` 把 **zoom 套对了、中心却被旧的手动位置压住** ⇒ 航线在
@@ -745,15 +773,25 @@ Item {
     ///    去判"交接为什么消失"（回航会被误报成取消，见那个函数的注释）。
     /// 省略时行为与从前**逐字相同**（`_poll` 就不传）。
     function _fetchOverview(onDone) {
-        _get("/api/ops/overview?view=" + opsShell.overviewView, function(status, data) {
+        _get("/api/snapshot/ops/overview?view=" + opsShell.overviewView, function(status, data) {
             if (status !== 200 || !Array.isArray(data)) {
                 // 2026-10-24：日志补上 view 与响应体。原先行里只有状态码，无法区分
                 // `view=site` / `view=route`，也看不到服务端 500 的原因（gin 把 error 放在 body）。
                 // ⚠️ 本行只改诊断，不改变失败路径：仍然整轮 return，保留上一份名册。
                 console.warn("OpsView overview", opsShell.overviewView, status,
                              data === null || data === undefined ? "" : JSON.stringify(data))
+                // ‼️ 2026-11-01：**不能只打日志**。这条是站点视图的唯一数据源，失败时下面
+                //    整段不执行 ⇒ 界面安静地停在上一份名册上（见 `_overviewError` 声明）。
+                //    与上面那行 warn 是**两件事**：日志给现场，这个属性给用户。
+                //    取 `data.error`（gin 的 503/500 都把它放在 body 里）；拿不到就报状态码，
+                //    宁可说"HTTP 500"也不要编一个具体原因。
+                _overviewError = (data && data.error)
+                                 ? String(data.error)
+                                 : qsTr("站点数据加载失败（HTTP %1）").arg(status)
                 return
             }
+            _overviewError = ""
+            _overviewUpdatedAt = new Date()
             //---- 签出释出（站点视图专属）----
             // 判据：一架飞机的 device_id 在**本轮**列表里消失了。见 `_siteDeviceIdsKey` 的声明
             // （初值与空集合同形 ⇒ 空数组的异常响应不会释放整站）。
@@ -1074,7 +1112,7 @@ Item {
     /// `disposition` 都已到位。这一轮延迟就是"数据对齐"的代价，2 秒，不可省。
     ///
     /// ⚠️ 任务项从**当前视图的数据源**取，不是恒取 `_tasks`（同 `_selectedTask()` 的分流）。
-    ///    监控员视图若读 `_tasks` 就是**恒判不准**，理由是实的：`/ops/overview` 的
+    ///    监控员视图若读 `_tasks` 就是**恒判不准**，理由是实的：`/api/snapshot/ops/overview` 的
     ///    `opsOverviewItem` 里**根本没有 `signed_in` 这个键**（只有 `opsRouteTaskItem`
     ///    与 `opsMonitorDevice` 有，见 `gcs_server/handlers/ops.go`）⇒ 那两档永远读不到，
     ///    四档里只剩「超时」判得准，**回航与被接管会被一起误报成「取消」**。
@@ -1094,7 +1132,7 @@ Item {
     /// ① 全部负责航线。**失败不清空已成功的缓存**（§2.2：刷新时保留旧值直到新值到手）。
     /// 自动重试 3 次、间隔 2s（§7.2）；三次都失败才置错误条。
     function _fetchMyRoutes(onDone) {
-        _get("/api/ops/my-routes", function(status, data) {
+        _get("/api/snapshot/ops/my-routes", function(status, data) {
             if (status !== 200 || !Array.isArray(data)) {
                 console.warn("OpsShell my-routes", status)
                 if (_routeRetryLeft > 0) {
@@ -1111,7 +1149,11 @@ Item {
                 // ‼️ 当初绕开它的理由——"提示指向一个找不到的入口，比不给提示更糟：用户会先
                 //    去找、再怀疑自己找错了"——随菜单项落地而消失。而不改回来则是相反的错误：
                 //    入口**存在**却没有任何地方告诉用户，等于白做。
-                _routeLoadError = qsTr("负责航线加载失败，点菜单「刷新航线与航点」重试")
+                // 服务端给了原因（`{"error": ...}`，如 503「快照不可用：…」）就原样显示：
+                // 快照缺位时"点刷新重试"是**用户做不到的事**，照旧指向那个菜单会把人带偏。
+                _routeLoadError = (data && data.error)
+                        ? qsTr("负责航线加载失败：%1").arg(data.error)
+                        : qsTr("负责航线加载失败，点菜单「刷新航线与航点」重试")
                 if (onDone) onDone(false)
                 return
             }
@@ -1147,11 +1189,13 @@ Item {
     /// ② 全部负责航线的航点，**一次拿回**（返回以**字符串** route_id 为键的对象）。
     /// 单条航线没航点时后端给 `[]` ⇒ 这里再兜一层 `Array.isArray`，让 `waypoints` 恒为数组。
     function _fetchMyRouteWaypoints(onDone) {
-        _get("/api/ops/my-routes/waypoints", function(status, data) {
+        _get("/api/snapshot/ops/my-routes/waypoints", function(status, data) {
             if (status !== 200 || !data || typeof data !== "object" || Array.isArray(data)) {
                 console.warn("OpsShell my-routes/waypoints", status)
-                // 同 `_fetchMyRoutes`：指向 §7.3 的菜单项（§7.2 的原文即要求这句文案）。
-                _routeLoadError = qsTr("航点加载失败，点菜单「刷新航线与航点」重试")
+                // 同 `_fetchMyRoutes`：有服务端原因就原样显示，否则指向 §7.3 的菜单项。
+                _routeLoadError = (data && data.error)
+                        ? qsTr("航点加载失败：%1").arg(data.error)
+                        : qsTr("航点加载失败，点菜单「刷新航线与航点」重试")
                 if (onDone) onDone(false)
                 return
             }
@@ -1765,7 +1809,7 @@ Item {
         }
     }
     // 地图中心：首个有效任务坐标，否则全局设置位置兜底。
-    // ⚠️ 这是**唯一**还在读库的一处（`t.latest.lat` 来自 `/ops/overview`），刻意留着：
+    // ⚠️ 这是**唯一**还在读库的一处（`t.latest.lat` 来自 `/api/snapshot/ops/overview`），刻意留着：
     //    它的用途是**开局那一次取景**，不是"显示飞行器当前位置"——后者（marker、轨迹、
     //    航向、状态栏、仪表）已全部改吃报文。若这里也改报文，载具尚未建链时地图就没有中心，
     //    而 `t.waypoints[0]` 兜底虽在、语义却不同（航线起点 ≠ 飞机当前位置）。
@@ -2666,7 +2710,7 @@ Item {
         }
     }
 
-    // 仪表取值（**报文源**：选中任务对应载具的实时 Fact，不再读 `/ops/overview.latest`）。
+    // 仪表取值（**报文源**：选中任务对应载具的实时 Fact，不再读 `/api/snapshot/ops/overview` 的 `.latest`）。
     // QML 文件内普通函数体里读属性**照常注册绑定依赖**（只有 `.pragma library` 的 JS 文件
     // 不注册），故这里直接读 `v.xxx.rawValue` 是对的——Fact 一变文本就刷新，无需轮询触发。
     // ⚠️ Fact 无数据时 `rawValue` 是 **NaN 而不是 0** ⇒ 必须折成 "—"。直接 `toFixed()` 会
@@ -2895,7 +2939,7 @@ Item {
     }
 
     /// 「选中的那条航班」。**数据源随视图分流**，不是恒取 `_tasks`：
-    ///   站点视图 → `_tasks`（`/ops/overview?view=site`）；
+    ///   站点视图 → `_tasks`（`/api/snapshot/ops/overview?view=site`）；
     ///   监控员视图 → ③ 的 `_routeTasks`（`/ops/route-tasks`）。
     ///
     /// ‼️ 监控员视图**必须**换源：两个端点的入选判据**不是一套**——

@@ -3271,7 +3271,7 @@ TestCase {
     //    一旦实现去读它们，读到的是 `undefined`，本组会当场红。
     //-------------------------------------------------------------------------
 
-    /// 与 `opsOverviewItem`（`GET /api/ops/overview?view=site`）同形的最小任务项。
+    /// 与 `opsOverviewItem`（`GET /api/snapshot/ops/overview?view=site`）同形的最小任务项。
     /// 站点侧判据**只吃**这四个字段 —— 多造一个都会让"实现读错字段"这件事变得不可观测。
     function _ctlSiteTask(takeoffSite, landingSite, checkoutState, landingAccepted) {
         return {
@@ -3535,7 +3535,7 @@ TestCase {
         compare(JSON.stringify(OpsCommon.filterAircraftDeviceIds(null)), "[]", "null ⇒ 空数组")
     }
 
-    /// 站点视图 `/api/ops/overview` 的 `data[]` → 合法 ID 列表。
+    /// 站点视图 `/api/snapshot/ops/overview` 的 `data[]` → 合法 ID 列表。
     /// 抽成纯函数是为了让 OpsShell 里那段（`_linkedDevices` 的唯一 gcs_server 来源）
     /// 至少能被测试触达 —— QmlQuickTests 不加载 `OpsShell` 组件。
     function test_overviewDeviceIds_filtersRowsAndKeepsOrder() {

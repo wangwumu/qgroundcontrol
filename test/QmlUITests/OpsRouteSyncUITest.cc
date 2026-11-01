@@ -36,7 +36,7 @@ static const char *kGroundMSLGateText = "该航线未取到起降站点的地面
 
 namespace {
 
-/// `GET /api/routes/<id>` 的响应体。键名与 `OpsCommon.routeAltitudeBounds` 读取的一致。
+/// `GET /api/snapshot/routes/<id>` 的响应体。键名与 `OpsCommon.routeAltitudeBounds` 读取的一致。
 ///
 /// ‼️ 后两个形参**有缺省值** ⇒ 既有各格的实参形状（只传前四个）**一个字符都没动**。
 ///    它们只是为 I2 的两格新用例（「起飞地面海拔键缺失」/「起飞地面海拔为 0」）开的口子，
@@ -93,7 +93,7 @@ QVariant waypointRow(int id, double lat, double lon, double alt, int cmd)
     return QVariant(m);
 }
 
-/// `GET /api/routes/<id>/waypoints` 的响应体。
+/// `GET /api/snapshot/routes/<id>/waypoints` 的响应体。
 /// 形状取「终点**不在**列表里」那一档（`appendLandingWaypoint` 的追加分支）——
 /// 它是云端权威库里 1 / 20 / 21 三条的形状，也是这条链上输入最多的一档。
 QString waypointsJson()
@@ -104,7 +104,7 @@ QString waypointsJson()
     return QString::fromUtf8(QJsonDocument(QJsonArray::fromVariantList(wps)).toJson(QJsonDocument::Compact));
 }
 
-/// `GET /api/routes/<id>/waypoints` 的响应体，形状取「终点**恰好是末项**」那一档。
+/// `GET /api/snapshot/routes/<id>/waypoints` 的响应体，形状取「终点**恰好是末项**」那一档。
 ///
 /// ‼️ 与 `waypointsJson()` **不是**同一档，差在 `appendLandingWaypoint` 走哪条分支：
 ///    · 本档 ⇒ **行为 2**（`OpsCommon.js` 里 `last.id === endWaypointId`）⇒ **原样返回、不追加**，
@@ -169,6 +169,10 @@ void OpsRouteSyncUITest::_testGates_data()
     // （只在行尾补 `<< 200 << QString()`，语义仍是「200 + 用夹具 wpsJson」）。
     QTest::addColumn<int>("wpsStatus");             // 航点 GET 的 HTTP 状态；既有格恒 200
     QTest::addColumn<QString>("wpsBody");           // 航点 GET 的响应体原文；**空 ⇒ 用本行的 wpsJson**
+    // 2026-10-31：航线详情那条 GET 的响应（同样放表尾，既有格只补 `<< 200 << QString()`）。
+    // 详情非 200 时 `start()` 当场 `_fail`，航点那条 GET 根本不会发 —— 路径断言据此分档。
+    QTest::addColumn<int>("routeStatus");           // 详情 GET 的 HTTP 状态；既有格恒 200
+    QTest::addColumn<QString>("routeBody");         // 详情 GET 的响应体原文；**空 ⇒ 用本行的 routeJson**
 
     // 阳性对照用的航线的起降高度：起飞 60 / 降落 50（两端的站点安全高度都是 0）。
     const QString goodRoute  = routeJsonOf(60.0, 0.0, 50.0, 0.0);
@@ -184,32 +188,39 @@ void OpsRouteSyncUITest::_testGates_data()
     // ---- 飞行高度闸（读 `task.cruise_alt_agl`，在 `start()` 顶部；走不到 `get`） ----
     QTest::newRow("flight / 50：阳性对照 —— 不得是「未设定飞行高度」")
         << cruise50 << goodRoute << wps << false << QStringLiteral("fetching") << QString() << -1
+        << 200 << QString()
         << 200 << QString();
     QTest::newRow("flight / 0：「未设定」的编码 ⇒ 拒发")
         << QStringLiteral("{\"cruise_alt_agl\":0}") << goodRoute << wps << false
         << QStringLiteral("failed") << QString::fromUtf8(kFlightGateText) << -1
+        << 200 << QString()
         << 200 << QString();
     QTest::newRow("flight / task 整个为 null ⇒ 拒发")
         << QString() << goodRoute << wps << false
         << QStringLiteral("failed") << QString::fromUtf8(kFlightGateText) << -1
+        << 200 << QString()
         << 200 << QString();
     QTest::newRow("flight / 字符串 \"50\"：闸读的是后端原始字段（非 number ⇒ 拒），不是被 real 属性同化后的值")
         << QStringLiteral("{\"cruise_alt_agl\":\"50\"}") << goodRoute << wps << false
         << QStringLiteral("failed") << QString::fromUtf8(kFlightGateText) << -1
+        << 200 << QString()
         << 200 << QString();
 
     // ---- 起飞高度闸（`_takeoffAGL = max(route.takeoff_alt_agl, route.takeoff_site_clear_alt_agl)`） ----
     QTest::newRow("takeoff / 航线值 0 且站点安全高度 0 ⇒ 拒发")
         << cruise50 << routeJsonOf(0.0, 0.0, 50.0, 0.0) << wps << true
         << QStringLiteral("failed") << QString::fromUtf8(kTakeoffGateText) << -1
+        << 200 << QString()
         << 200 << QString();
     QTest::newRow("takeoff / 60：阳性对照")
         << cruise50 << routeJsonOf(60.0, 0.0, 50.0, 0.0) << wps << true
         << QStringLiteral("building") << QString() << 3
+        << 200 << QString()
         << 200 << QString();
     QTest::newRow("takeoff / 航线值 0 但站点安全高度 60：D6 取大 ⇒ 放行")
         << cruise50 << routeJsonOf(0.0, 60.0, 50.0, 0.0) << wps << true
         << QStringLiteral("building") << QString() << 3
+        << 200 << QString()
         << 200 << QString();
 
     // ---- 降落高度闸（`_landingAGL = max(route.landing_alt_agl, route.landing_site_clear_alt_agl)`） ----
@@ -217,14 +228,17 @@ void OpsRouteSyncUITest::_testGates_data()
     QTest::newRow("landing / 航线值 0 且站点安全高度 0 ⇒ 拒发")
         << cruise50 << routeJsonOf(60.0, 0.0, 0.0, 0.0) << wps << true
         << QStringLiteral("failed") << QString::fromUtf8(kLandingGateText) << -1
+        << 200 << QString()
         << 200 << QString();
     QTest::newRow("landing / 50：阳性对照")
         << cruise50 << routeJsonOf(60.0, 0.0, 50.0, 0.0) << wps << true
         << QStringLiteral("building") << QString() << 3
+        << 200 << QString()
         << 200 << QString();
     QTest::newRow("landing / 航线值 0 但站点安全高度 50：D6 取大 ⇒ 放行")
         << cruise50 << routeJsonOf(60.0, 0.0, 0.0, 50.0) << wps << true
         << QStringLiteral("building") << QString() << 3
+        << 200 << QString()
         << 200 << QString();
 
     // ---- 地面海拔闸（I2，2026-10-01）：**两侧**地面海拔项都必须是**有限数** ----
@@ -238,6 +252,7 @@ void OpsRouteSyncUITest::_testGates_data()
     QTest::newRow("groundMSL / 起飞地面海拔键缺失 ⇒ 拒发")
         << cruise50 << routeJsonOf(60.0, 0.0, 50.0, 0.0, /*omitTakeoffGroundMSL=*/true) << wps << true
         << QStringLiteral("failed") << QString::fromUtf8(kGroundMSLGateText) << -1
+        << 200 << QString()
         << 200 << QString();
     // ‼️ 与上一格**配对**：上一格钉 `||` 的**左半边**（起飞侧缺失），下面两格钉**右半边**
     //    （降落侧缺失）。只留任何一半，「把实现改成只判一侧」都能全绿。
@@ -254,6 +269,7 @@ void OpsRouteSyncUITest::_testGates_data()
     QTest::newRow("groundMSL / 降落地面海拔键缺失 ⇒ 拒发")
         << cruise50 << routeJsonOmittingLandingGroundMSL(60.0, 0.0, 50.0, 0.0) << wpsEndLast << true
         << QStringLiteral("failed") << QString::fromUtf8(kGroundMSLGateText) << -1
+        << 200 << QString()
         << 200 << QString();
     // 阳性对照（与上一格**同形状**、只把降落侧地面海拔补回来）：证明"行为 2 这个形状本身"
     // 过得去这道闸 ⇒ 上一格的红**归因于地面海拔缺失**，而不是归因于形状。
@@ -261,6 +277,7 @@ void OpsRouteSyncUITest::_testGates_data()
     QTest::newRow("groundMSL / 行为 2 形状 + 两侧地面海拔齐全：阳性对照")
         << cruise50 << routeJsonOf(60.0, 0.0, 50.0, 0.0) << wpsEndLast << true
         << QStringLiteral("building") << QString() << 2
+        << 200 << QString()
         << 200 << QString();
     // 阴性对照：`0` 是**合法**地面海拔（海平面）⇒ 必须放行。
     // 放行后起飞端组装值 = 0 + max(60,0) = 60；降落端仍是 480 + max(50,0) = 530。
@@ -269,6 +286,7 @@ void OpsRouteSyncUITest::_testGates_data()
         << wps << true
         << QStringLiteral("building")
         << QStringLiteral("正在构造航线…（起飞 60 m / 降落 530 m）") << 3
+        << 200 << QString()
         << 200 << QString();
 
     // ---- 2026-10-31：快照航点端点的失败分支 ----
@@ -284,7 +302,8 @@ void OpsRouteSyncUITest::_testGates_data()
         << cruise50 << goodRoute << wps << true
         << QStringLiteral("failed")
         << QStringLiteral("该航线不在当前快照中，无法下发") << -1
-        << 404 << QStringLiteral("{\"error\":\"航线不在当前快照中\"}");
+        << 404 << QStringLiteral("{\"error\":\"航线不在当前快照中\"}")
+        << 200 << QString();
     // ‼️ 本格钉的是**两种 404 必须分开**：Gin 的 NoRoute 对**未注册**的 /api/* 也回 404，
     //    body 里带「接口不存在」⇒ 那是服务端版本问题，不能报成「航线不在快照」——
     //    否则现场会去查航线复核状态，而真正要做的是部署新 gcs_server。
@@ -292,30 +311,66 @@ void OpsRouteSyncUITest::_testGates_data()
         << cruise50 << goodRoute << wps << true
         << QStringLiteral("failed")
         << QStringLiteral("快照接口不存在，请确认服务端版本") << -1
-        << 404 << QStringLiteral("{\"error\":\"接口不存在：/api/snapshot/routes/1/waypoints\"}");
+        << 404 << QStringLiteral("{\"error\":\"接口不存在：/api/snapshot/routes/1/waypoints\"}")
+        << 200 << QString();
     QTest::newRow("snapshot / 503 快照不可用 ⇒ 独立文案")
         << cruise50 << goodRoute << wps << true
         << QStringLiteral("failed")
         << QStringLiteral("快照服务不可用，无法下发") << -1
-        << 503 << QStringLiteral("{\"error\":\"快照不可用\"}");
+        << 503 << QStringLiteral("{\"error\":\"快照不可用\"}")
+        << 200 << QString();
     // 其余非 200 不猜具体原因（403 报成 404 会把现场引向错误方向）。
     QTest::newRow("snapshot / 403 ⇒ 通用「航点获取失败」并带状态码")
         << cruise50 << goodRoute << wps << true
         << QStringLiteral("failed")
         << QStringLiteral("航点获取失败（HTTP 403）") << -1
-        << 403 << QStringLiteral("{\"error\":\"无权限\"}");
+        << 403 << QStringLiteral("{\"error\":\"无权限\"}")
+        << 200 << QString();
     // ‼️ 200 但 body 为 `null` / 非数组：**不得**降级成空数组 —— 那会被下游报成
     //    「航线没有可用航点」，把操作员引向"这条航线怎么一个点都没有"这个错误方向。
     QTest::newRow("snapshot / 200 + null ⇒ 响应为空")
         << cruise50 << goodRoute << wps << true
         << QStringLiteral("failed")
         << QStringLiteral("快照航点响应为空，无法下发") << -1
-        << 200 << QStringLiteral("null");
+        << 200 << QStringLiteral("null")
+        << 200 << QString();
     QTest::newRow("snapshot / 200 + 对象（非数组） ⇒ 格式异常")
         << cruise50 << goodRoute << wps << true
         << QStringLiteral("failed")
         << QStringLiteral("快照航点响应格式异常，无法下发") << -1
-        << 200 << QStringLiteral("{}");
+        << 200 << QStringLiteral("{}")
+        << 200 << QString();
+
+    // ---- 2026-10-31：快照**航线详情**端点的失败分支 ----
+    // 与上面航点那组同口径：详情改走 `/api/snapshot/routes/:id` 之后，404 的两种含义
+    // 同样必须分开，503 同样独立成句，**绝不回退实时**。
+    // ‼️ 这几格详情非 200 ⇒ `start()` 当场 `_fail`，航点那条 GET **不会发**
+    //    ⇒ 路径断言按 `routeStatus != 200 ⇒ 恰好 1 条` 分档（见 `_testGates` 尾部）。
+    QTest::newRow("snapshot detail / 404 航线不在快照 ⇒ 独立文案")
+        << cruise50 << goodRoute << wps << true
+        << QStringLiteral("failed")
+        << QStringLiteral("该航线不在当前快照中，无法下发") << -1
+        << 200 << QString()
+        << 404 << QStringLiteral("{\"error\":\"航线不在当前快照中（临时航线、当天新建、未通过复核或已删除）\"}");
+    QTest::newRow("snapshot detail / 404 接口不存在（服务端未部署） ⇒ 独立文案")
+        << cruise50 << goodRoute << wps << true
+        << QStringLiteral("failed")
+        << QStringLiteral("快照接口不存在，请确认服务端版本") << -1
+        << 200 << QString()
+        << 404 << QStringLiteral("{\"error\":\"接口不存在：/api/snapshot/routes/1\"}");
+    QTest::newRow("snapshot detail / 503 快照不可用 ⇒ 独立文案")
+        << cruise50 << goodRoute << wps << true
+        << QStringLiteral("failed")
+        << QStringLiteral("快照服务不可用，无法下发") << -1
+        << 200 << QString()
+        << 503 << QStringLiteral("{\"error\":\"快照不可用：读取失败\"}");
+    // 其余非 200 不猜原因（与航点那条同口径）。
+    QTest::newRow("snapshot detail / 403 ⇒ 通用「航线详情获取失败」并带状态码")
+        << cruise50 << goodRoute << wps << true
+        << QStringLiteral("failed")
+        << QStringLiteral("航线详情获取失败（HTTP 403）") << -1
+        << 200 << QString()
+        << 403 << QStringLiteral("{\"error\":\"无权限\"}");
 }
 
 void OpsRouteSyncUITest::_testGates()
@@ -329,6 +384,8 @@ void OpsRouteSyncUITest::_testGates()
     QFETCH(int, expectWaypointCount);
     QFETCH(int, wpsStatus);
     QFETCH(QString, wpsBody);
+    QFETCH(int, routeStatus);
+    QFETCH(QString, routeBody);
 
     startUI();
     if (QTest::currentTestFailed()) return;
@@ -375,13 +432,15 @@ void OpsRouteSyncUITest::_testGates()
     // ‼️ 只在这几格注册：判据镜像那两处 `console.warn` 的触发条件 —— ① 非 200；
     //    ② 200 但 body 不是数组。`null` 走的是「响应为空」分支（`!data`），**不打** warn ⇒ 排除。
     //    其余格子不注册 ⇒ 正常路径若开始冒这条告警，仍然会红。
+    // 2026-10-31：详情那条 GET 现在也走快照端点，非 200 时同样 `console.warn`
+    //（`OpsRouteSync: 快照航线详情请求失败 …`）⇒ 判据同步扩到 routeStatus。
     const bool expectSnapshotWarn =
-        stubFetch && (wpsStatus != 200 ||
+        stubFetch && (routeStatus != 200 || wpsStatus != 200 ||
                       (!wpsBody.isEmpty() && wpsBody != QStringLiteral("null") &&
                        !wpsBody.startsWith(QLatin1Char('['))));
     if (expectSnapshotWarn) {
         ignoreLogMessage("qml", QtWarningMsg,
-                         QRegularExpression(QStringLiteral("^OpsRouteSync: 快照航点")));
+                         QRegularExpression(QStringLiteral("^OpsRouteSync: 快照(航点|航线详情)")));
     }
 
     QQmlComponent component(_engine, QUrl(QString::fromLatin1(kOpsRouteSyncUrl)));
@@ -421,7 +480,7 @@ void OpsRouteSyncUITest::_testGates()
     QVERIFY2(pathSink.isArray(), qPrintable(pathSink.toString()));
     if (stubFetch) {
         const QString factorySrc = QStringLiteral(
-            "(function(routeJson, wpsJson, errSink, pathSink, wpsStatus, wpsBody) {"
+            "(function(routeJson, wpsJson, errSink, pathSink, wpsStatus, wpsBody, routeStatus, routeBody) {"
             "  var route = JSON.parse(routeJson);"
             "  var wps = JSON.parse(wpsJson);"
             "  return function(path, cb) {"
@@ -430,7 +489,7 @@ void OpsRouteSyncUITest::_testGates()
             "      if (String(path).indexOf('/waypoints') >= 0) {"
             "        cb(wpsStatus, wpsBody !== '' ? JSON.parse(wpsBody) : wps);"
             "      } else {"
-            "        cb(200, route);"
+            "        cb(routeStatus, routeBody !== '' ? JSON.parse(routeBody) : route);"
             "      }"
             "    } catch (e) { errSink.push(String(e)); }"
             "  }"
@@ -438,7 +497,8 @@ void OpsRouteSyncUITest::_testGates()
         QJSValue factory = _engine->evaluate(factorySrc);
         QVERIFY2(!factory.isError(), qPrintable(factory.toString()));
         QJSValueList args;
-        args << routeJson << wpsJson << errSink << pathSink << wpsStatus << wpsBody;
+        args << routeJson << wpsJson << errSink << pathSink << wpsStatus << wpsBody
+             << routeStatus << routeBody;
         QJSValue getFn = factory.call(args);
         QVERIFY2(!getFn.isError(), qPrintable(getFn.toString()));
         sync->setProperty("get", QVariant::fromValue(getFn));
@@ -535,32 +595,34 @@ void OpsRouteSyncUITest::_testGates()
     // 判据是**逐条路径全串相等**，不是 `indexOf("snapshot")`：后者对
     // `/api/routes/1/waypoints?x=snapshot` 这类形状也放行，而本项要钉的是「端点换了」。
     //
-    // ‼️ **所有 `stubFetch` 格都是两条**，包括在闸上就 `_fail` 的那些：三道高度闸
-    //    （起飞 / 降落 / 地面海拔）在 `_buildAndSend` 里，而 `_buildAndSend` 由
-    //    `_fetchWaypoints` 的第二条回调调用 ⇒ 它们**必然先发完两次 GET**。
-    //
-    // 路径 0 = 航线详情：**仍是实时** `/api/routes/:id`（起降高度是航线级字段，
-    //   快照端点不提供）⇒ 与路径 1 合起来是一次**混合读**，见 `_fetchWaypoints` 注释。
+    // 路径 0 = 航线详情：**快照** `/api/snapshot/routes/:id`（2026-10-31 起与航点同源）。
     // 路径 1 = 航点：**快照** `/api/snapshot/routes/:id/waypoints`。
+    //
+    // ‼️ 两道高度闸（起飞 / 降落 / 地面海拔）在 `_buildAndSend` 里，而 `_buildAndSend` 由
+    //    `_fetchWaypoints` 的第二条回调调用 ⇒ 过了详情那一关的格子**必然发完两次 GET**。
+    //    **例外**：详情本身非 200 的格，`start()` 当场 `_fail`，第二条 GET 不发 ⇒ 恰好 **1 条**。
     const int pathCount = pathSink.property(QStringLiteral("length")).toInt();
     if (stubFetch) {
-        QCOMPARE(pathCount, 2);
-        if (pathCount == 2) {
-            QCOMPARE(pathSink.property(0).toString(), QStringLiteral("/api/routes/1"));
+        const int wantPaths = (routeStatus == 200) ? 2 : 1;
+        QCOMPARE(pathCount, wantPaths);
+        if (pathCount == wantPaths && pathCount >= 1) {
+            QCOMPARE(pathSink.property(0).toString(), QStringLiteral("/api/snapshot/routes/1"));
+        }
+        if (wantPaths == 2 && pathCount == 2) {
             QCOMPARE(pathSink.property(1).toString(),
                      QStringLiteral("/api/snapshot/routes/1/waypoints"));
         }
     } else {
         // 飞行高度闸在 `start()` 顶部、早于第一次 `get()`：
         //   · 闸**拒发**的格 ⇒ 一个请求都不该发（`state == failed`）；
-        //   · 阳性对照 ⇒ 恰好发了一条（`/api/routes/1`，随后停在 `fetching`，因为替身不回调）。
+        //   · 阳性对照 ⇒ 恰好发了一条（`/api/snapshot/routes/1`，随后停在 `fetching`，因为替身不回调）。
         // 判**等于**而不是 `<=`：多发的请求同样是缺陷。
         if (expectState == QStringLiteral("failed")) {
             QCOMPARE(pathCount, 0);
         } else {
             QCOMPARE(pathCount, 1);
             if (pathCount == 1) {
-                QCOMPARE(pathSink.property(0).toString(), QStringLiteral("/api/routes/1"));
+                QCOMPARE(pathSink.property(0).toString(), QStringLiteral("/api/snapshot/routes/1"));
             }
         }
     }

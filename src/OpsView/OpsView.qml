@@ -26,7 +26,7 @@ OpsShell {
     //-------------------------------------------------------------------------
     // 骨架输入
     //-------------------------------------------------------------------------
-    // 数据源参数（吃进 GET /api/ops/overview?view=）。本视图**只**服务站点操作员。
+    // 数据源参数（吃进 GET /api/snapshot/ops/overview?view=）。本视图**只**服务站点操作员。
     // 用户 2026-09-21 裁定两个身份不允许重叠、不存在双身份 ⇒ 监控员不走这里，它是并列的
     // `RomView.qml`；分流判据只有一处，在 `MainWindow._onLoginSucceededForRole()`。
     overviewView: "site"
@@ -1656,6 +1656,26 @@ OpsShell {
     // 起飞闸（`_takeoffBlockReason`）读它的 `synced`。
     //=========================================================================
     property var _routeSyncs: ({})
+    /// 失败重试的节流表：`{ "<task_id>": <上次**尝试**的时刻 ms> }`（2026-11-01 审查补）。
+    /// ⚠️ 这是纯字典，**不参与任何绑定**：原地改键既不需要、也不会发出变更通知。
+    ///    `_routeSyncs` 那条「必须整体重新赋值」的规则**不适用于这里** —— 那条规则的原因是
+    ///    「有**绑定**要跟着重估」（起飞闸读 `synced`），本节流表没有任何读者。
+    property var _routeSyncRetryAt: ({})
+    /// 失败重试的最小间隔（ms）。取 10s 的理由：`on_TasksChanged` 在遥测活着时约 2s
+    /// 调一次本链，而 404/503 是毫秒级返回 ⇒ 不节流就是每 2s 打同一端点、且永远打下去
+    /// （404 要等次日 03:00 快照重建才可能自愈）。10s 也比下发给飞机本身慢得多，
+    /// 不会与 `_poll` 的 2s 叠成一个更密的节奏。
+    readonly property int _routeSyncRetryMs: 10000
+
+    /// 该任务的航线下发**现在**能不能重试。判据是「距上次**尝试**」而不是「距上次失败」：
+    /// `start()` 可能马上失败、也可能在 `fetching` 里挂很久（XHR 无超时）；
+    /// 两种都不该让下一发提前放行。调用即记账（成功/失败都算一次尝试）。
+    function _routeSyncRetryDue(taskId) {
+        var now = Date.now()
+        if (now - (_routeSyncRetryAt[taskId] || 0) < _routeSyncRetryMs) return false
+        _routeSyncRetryAt[taskId] = now
+        return true
+    }
 
     //── VTOL 起飞转换距离（运营常数，2026-10-06 设计稿 §5/§7）────────────────
     //
@@ -1765,7 +1785,7 @@ OpsShell {
         //    是**同一个集合** —— 三处要同步改。
         //
         //    为什么必须有这道闸（2026-09-23 真库实测，**不是假想**）：
-        //    `/ops/overview` 的 WHERE 是
+        //    `/api/snapshot/ops/overview` 的 WHERE 是
         //    `t.deleted_at IS NULL AND COALESCE(t.uav_id,0) <> 0`（uavm 仓 `gcs_server/handlers/ops.go`
         //    的 `OpsHandler.Overview` 里那条**共享 WHERE** —— 按符号定位：
         //    `rg -n 'COALESCE(t.uav_id,0) <> 0'`，**别按行号**）—— **没有 status 过滤**；而 `device_id`
@@ -1785,6 +1805,16 @@ OpsShell {
         if (ex) {
             // 目标飞机换了（同一任务改派了另一架）⇒ 重置后重发。
             if (ex.vehicle !== vehicle) { ex.reset(); ex.vehicle = vehicle; ex.start() }
+            // 失败**自动重试**（2026-11-01 审查补）。在此之前：`start()` 是允许从
+            // `"failed"` 重入的（`OpsRouteSync.start()` 的第一句），但**没有任何人再调它**
+            // —— `ex` 早返回把每一次后续调用都吞掉了。于是一次瞬时 503（或当天还没进快照的
+            // 航线导致的 404）就把这条任务**永久**卡在 `failed`：航线永远发不出去、
+            // 起飞闸永远不放行，界面上只有一句不会再变的失败文案。
+            // ‼️ 重试要节流：本函数在遥测活着时每 ~2s 被 `on_TasksChanged` 调一次，
+            //    而 404/503 是**毫秒级**返回的 ⇒ 不节流就是每 2s 一个请求打同一端点，
+            //    且会永远打下去（快照一天只重建一次，404 不会自愈）。
+            //    10s 与下面那个兜底 Timer 同值，两者不会叠成更密的节奏。
+            else if (ex.state === "failed" && _routeSyncRetryDue(task.task_id)) ex.start()
             return ex
         }
         // ‼️ **转换距离还在路上时不要建 sync**（设计稿 §7.3.1）。
@@ -1995,6 +2025,22 @@ OpsShell {
         // 在途期间被 `_syncRouteForTask()` 挡下的那些任务，现在补建。
         // （该函数已存在，`Component.onCompleted` 与 `on_TasksChanged` 都在调它。）
         _syncRoutesForAlreadyConnected()
+    }
+
+    /// 失败重试的**兜底心跳**（2026-11-01 审查补）。
+    ///
+    /// ‼️ 为什么不能只靠 `on_TasksChanged` 触发重试：那条链只在 `_tasks` **载荷变了**时才跑
+    ///    （`_fetchOverview` 里的 `json !== _tasksJson` 守卫）。而航线下发失败的典型原因是
+    ///    快照不可用 —— 那时 overview **也**在失败，`_tasksJson` 一个字节都不动；等快照恢复，
+    ///    若载荷与失败前逐字相同（飞机没动、任务没变），守卫照样不赋值 ⇒ 处理器不触发 ⇒
+    ///    **这条航线永远卡在 failed**。飞机静止时同样如此。失败与"有新数据"是两件事，
+    ///    不能用同一根触发线。
+    ///
+    /// 代价：每 10s 空跑一次 `_syncRoutesForAlreadyConnected()`（无失败时就是几次
+    /// `if (ex.state === "failed")` 判空），可以忽略。
+    Timer {
+        interval: 10000; repeat: true; running: true
+        onTriggered: _syncRoutesForAlreadyConnected()
     }
 
     /// 补扫：QGC 启动时飞机**已经**连好的那一批——`initialConnectComplete` 早发过了，
@@ -2257,6 +2303,41 @@ OpsShell {
         ColumnLayout {
             anchors.fill: parent
             spacing: 0
+
+            //-----------------------------------------------------------------
+            // overview 失败 / 数据陈旧 提示条（2026-11-01 审查补；样板是 `RomView.qml`
+            // 右栏顶端那一条）。
+            // ‼️ 为什么必须有：`/api/snapshot/ops/overview` 是本站任务卡、飞机 marker、
+            //    机位占用三者的**唯一**数据源。它失败时（快照不可用会持续 503）界面停在
+            //    上一份名册上，而下拉、卡片、地图全都**正常渲染**——用户没有第二条线索。
+            // ‼️ 失败**不清空**现有数据（陈旧好过空白：把任务卡清空会被读成"任务被取消了"），
+            //    但必须把"这是旧的"画出来。
+            //-----------------------------------------------------------------
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.leftMargin: 10; Layout.rightMargin: 10; Layout.topMargin: 6
+                implicitHeight: ovStaleText.implicitHeight + 8
+                radius: 3
+                color: "#5a2020"
+                border.color: "#ff3b3b"
+                border.width: 1
+                visible: opsView._isSiteATC && opsView._overviewError !== ""
+                Text {
+                    id: ovStaleText
+                    anchors { left: parent.left; right: parent.right; verticalCenter: parent.verticalCenter }
+                    anchors.leftMargin: 6; anchors.rightMargin: 6
+                    wrapMode: Text.Wrap
+                    color: "#ffd9a0"; font.pixelSize: 11
+                    // 时间锚点两种形态：
+                    //   · 成功过 ⇒ 「更新于 hh:mm:ss」——用户据此判断旧到什么程度；
+                    //   · 从未成功 ⇒ 明说"本次会话还没有数据"。缺这一支时，首拉就失败的界面
+                    //     会显示一条没有时间的"加载失败"，与"刚才抖了一下"分不开。
+                    text: opsView._overviewError + (opsView._overviewUpdatedAt
+                          ? qsTr("（数据更新于 %1，之后未再成功）")
+                                .arg(Qt.formatTime(opsView._overviewUpdatedAt, "hh:mm:ss"))
+                          : qsTr("（本次会话尚未成功加载过）"))
+                }
+            }
 
             // 站点视图（SITE_ATC）：上部任务列表 + 下部两列机位（从底向上，高≤本区一半）
             Item {

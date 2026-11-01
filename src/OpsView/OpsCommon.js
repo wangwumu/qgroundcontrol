@@ -459,7 +459,7 @@ function handoverGoneText(reason, handover) {
 //--------------------------------------------------------------------------
 // 本地报文判定（仅显示/门控，不落库；2026-09-02 触发语义）
 // 2026-09-27 起**全部改吃加密心跳 EXT 重建的合成遥测**（`CryptoHeartbeatExt.cc`），
-// 不再读 `/ops/overview` 的 `latest`（那是数据库里的落库快照，滞后且与链路死活无关）。
+// 不再读 `/api/snapshot/ops/overview` 的 `latest`（那是数据库里的落库快照，滞后且与链路死活无关）。
 // ‼️ 本组函数一律**只做纯计算**：所有需要建立绑定依赖的属性读取都在**调用点的 QML 表达式**
 //    里完成，再作为实参传进来。`.pragma library` 的函数体内读属性不注册依赖（同
 //    `resolvePosition` 第二实参的注释）——写进去界面**看不出异常**，只是按钮永远停在
@@ -604,7 +604,7 @@ function landingNotice(task, isReceiver) {
 //   · 只用状态位 ⇒ 平台级账号（无站点身份）或**别的**站点也会开闸——状态位描述的是
 //     「**这条任务**的交接走到哪了」，**不含任何站点条件**。
 
-/// 本端（站点侧，吃 `/api/ops/overview?view=site` 的行）此刻是不是这架飞机的指令权持有方。
+/// 本端（站点侧，吃 `/api/snapshot/ops/overview?view=site` 的行）此刻是不是这架飞机的指令权持有方。
 /// 无站点身份（平台级账号 / `role_sites` 为空）⇒ 恒 false。
 ///
 /// ⚠️ 起飞档读 `checkout_state` 而**不是**「有没有 ACCEPTED 的 ROUTE 交接」：`opsOverviewItem`
@@ -2345,7 +2345,7 @@ function assembledAltitude(groundMSL, agl) {
 ///    且会被读成**穷举**）：**键集以本函数 `return` 的字面量为准** ——
 ///    下面那份清单若与 `return` 不符，**以 `return` 为准**。
 ///
-/// 入参 `route` 是 `GET /api/routes/<id>` 的响应体（**不是** `/waypoints` —— 那是航点数组，
+/// 入参 `route` 是 `GET /api/snapshot/routes/<id>` 的响应体（**不是** `/waypoints` —— 那是航点数组，
 /// 不含航线级字段）。
 ///
 /// 任一项不是有限数 ⇒ 该项回 **`null`**，不是 `0`、也不是 `NaN`。这里的 `null` 只表示
@@ -2360,7 +2360,7 @@ function routeAltitudeBounds(route) {
     // ‼️ 键**分三类**（2026-10-01 A1/B7）：六个高度原始量 + 三个终点航点量 + 两个合成量。
     //    **键集以本函数末尾 `return` 的字面量为准**；下面这份清单若与 `return` 不符，
     //    **以 `return` 为准**（"共 N 键"这类计数会被下一次增删静默腐化，别按它核）。
-    //    六个高度原始量（来源就是 `GET /api/routes/<id>` 的同名响应键），**值单位各不相同、别混用**：
+    //    六个高度原始量（来源就是 `GET /api/snapshot/routes/<id>` 的同名响应键），**值单位各不相同、别混用**：
     //      · `takeoffAltAGL`     ← `route.takeoff_alt_agl`                航线起飞高度（**AGL，米**）
     //      · `takeoffClearAGL`   ← `route.takeoff_site_clear_alt_agl`     **起飞站点**最低安全高度（**AGL，米**；0=未勘测）
     //      · `takeoffGroundMSL`  ← `route.takeoff_ground_msl`             `G_t`，起飞站点**地面海拔**（**MSL，米**）

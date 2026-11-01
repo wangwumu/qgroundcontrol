@@ -46,9 +46,9 @@ Item {
     /// 注入的 GET 函数：`function(path, onDone(status, data))`。
     /// 骨架的 `_get`（`OpsShell.qml`）签名的子集，这里只用到两参形式。
     property var    get:      null
-    /// 任务对象（`GET /api/ops/overview` 响应里 `tasks[]` 的一项），只读 `current_slot_lat/lon/heading` 与 `cruise_alt_agl`。
+    /// 任务对象（`GET /api/snapshot/ops/overview` 响应里 `tasks[]` 的一项），只读 `current_slot_lat/lon/heading` 与 `cruise_alt_agl`。
     /// ⚠️ 来源端点**不是** `/tasks`：注入方是 `OpsView.qml`，它的 `_tasks` 来自
-    ///    `OpsShell._fetchOverview()` 的 `GET /api/ops/overview?view=`（`/tasks` 是另一族端点，
+    ///    `OpsShell._fetchOverview()` 的 `GET /api/snapshot/ops/overview?view=`（`/tasks` 是另一族端点，
     ///    本组件**没有**读过它）。
     ///
     /// 用途 ①：算出**起飞机位朝向**，把起飞项（MAVLink `cmd 84`）的坐标从
@@ -96,7 +96,7 @@ Item {
     ///    这里报的是"我们构造了几个点"，单点定义、零猜测。
     property int    _waypointCount: 0
 
-    // NRRSM：本航线 / 本架次的起降与飞行高度**快照**，来自 GET /api/routes/<id>（航线级）与 `task`。
+    // NRRSM：本航线 / 本架次的起降与飞行高度**快照**，来自 GET /api/snapshot/routes/<id>（航线级，2026-10-31 起读快照）与 `task`。
     // NaN = 尚未取到。名字里的 `AGL` / `MSL` 是**单位**，不是装饰 —— 六个原始量分属两种
     // 单位（AGL 三个 / MSL 三个），**同名互换不会报错**，只会静默算错，别混用。
     // ‼️ 下面这些**高度 / 飞行高度 / 终点航点快照**都必须在 reset() 里清成 NaN —— 本组件是**复用**的
@@ -216,12 +216,29 @@ Item {
         // 为什么不在 `/waypoints` 的响应里带：那个接口的返回值被 webui 的 RouteList.vue
         // **直接当作要保存的 waypoint_ids**，把它改成对象会连带打断保存航线。
         // 两次 GET 是最小侵入。
-        // ⚠️ 2026-10-31 起这两步**不是同一个数据源**：本行仍是**实时** `/api/routes/:id`，
-        //    而 `_fetchWaypoints` 改走**快照**端点 ⇒ 一次混合读（高度实时、航点快照）。
-        //    理由与代价见 `_fetchWaypoints` 的函数头注释。
-        // `/api/routes/:id` 无角色闸（uavm 仓 `gcs_server/router/router.go` 里注册
-        // `api.GET("/routes/:id", routeH.Get)` 那一行 —— **按符号定位，别按行号**；行号会漂），SITE_ATC 能读。
-        get("/api/routes/" + routeId, function(status, route) {
+        // ‼️ 2026-10-31 起**两步都走快照**（用户裁定：QGC 取航线一律读快照，不读实时）：
+        //    航线详情 `/api/snapshot/routes/:id`、航点 `/api/snapshot/routes/:id/waypoints`。
+        //    两者同为快照专用端点，同在 JWT 组、无角色闸（uavm 仓 `gcs_server/router/router.go`
+        //    里注册那两个 GET —— **按符号定位，别按行号**；行号会漂），SITE_ATC 能读。
+        //    失败语义 **fail-closed**：快照不可用 503、航线不在快照 404，**绝不回退实时**。
+        //    代价与边界见 `_fetchWaypoints` 的函数头注释（两步同源，代价相同）。
+        get("/api/snapshot/routes/" + routeId, function(status, route) {
+            if (status !== 200) {
+                // 与 `_fetchWaypoints` 同口径留痕：服务端对快照故障是节流日志，客户端不打就两端都没痕迹。
+                console.warn("OpsRouteSync: 快照航线详情请求失败 route_id=" + routeId +
+                             " status=" + status + " body=" + JSON.stringify(route))
+            }
+            if (status === 404) {
+                // 同 `_fetchWaypoints`：Gin 的 NoRoute 对**未注册**的 /api/* 也回 404，
+                // body 带「接口不存在」⇒ 那是服务端没部署这个路由，不是航线的问题。
+                if (route && typeof route.error === "string" && route.error.indexOf("接口不存在") >= 0) {
+                    return _fail(qsTr("快照接口不存在，请确认服务端版本"))
+                }
+                return _fail(qsTr("该航线不在当前快照中，无法下发"))
+            }
+            if (status === 503) {
+                return _fail(qsTr("快照服务不可用，无法下发"))
+            }
             if (status !== 200 || !route) {
                 return _fail(qsTr("航线详情获取失败（HTTP %1）").arg(status))
             }
@@ -262,18 +279,22 @@ Item {
     ///      · 在上一次构建**之后**才新建、或才首次通过复核的航线**不在快照里** ⇒ **404**
     ///        （编辑航线会把 `review_status` 复位成 DRAFT，但那是**下一次**构建才生效的
     ///        排除条件 —— 对**当前**快照而言，它的效果是「旧航点」而不是 404）；
-    ///      · 已删航线到不了本端点：实时详情 `Get` 带 `deleted_at IS NULL`，第一步就 404；
+    ///      · 已删航线到不了本端点：快照详情 `readSnapshotRoute` 的 WHERE 带 `deleted_at IS NULL`
+    ///        （构建时也已滤掉），一步就 404；
     ///      · 快照只收 `route_type='FIXED'` ⇒ **临时航线恒 404**，不是"等下一次构建"能解决的。
     ///        QGC 访问临时航线的前提是**单机版、且只能访问自己创建的航线**（用户口径；
     ///        后端 `List` 对 `client_type=qgc` 按 `created_by` 过滤）；
     ///      · 快照响应不含 `plan_data` 派生的 home 点与 84/85 命令覆盖（快照表没有该列）。
-    ///    ✅ **混合读不会造成几何错位**（2026-10-31 用户口径）：航线首末点是**站点**，
+    ///    ✅ **混合读不会造成几何错位**（2026-10-31 用户口径；⚠️ 自下面那一条落地后已是**历史依据**，
+    ///       保留是因为它解释的「首末点由站点派生」这条不变式仍然成立）：航线首末点是**站点**，
     ///       站点位置由 `table_site.waypoint_id → table_waypoint` 派生，而 `table_site` /
     ///       `table_waypoint` 都在快照内；航线中间航点的修改**不改变站点位置** ⇒
     ///       "实时航线详情 + 快照航点"不会把新首末点接到旧中间点上。
     ///       （`table_slot.status` 是唯一实时例外，用于紧急关停指定机位。）
-    /// ‼️ 航线详情仍在 `start()` 里用**实时** `GET /api/routes/:id`：起降高度是航线级
-    ///    字段，快照端点不提供 ⇒ 两次 GET 合起来是一次**混合读**（高度实时、航点快照）。
+    /// ‼️ 航线详情（`start()` 的第一步）**同样**走快照端点 `GET /api/snapshot/routes/:id`
+    ///    （2026-10-31 用户裁定：QGC 取航线一律读快照）。两个端点同属一条快照，
+    ///    起降高度与航点因此来自**同一版本**——早先"高度实时 + 航点快照"的混合读已不存在。
+    ///    代价与上面 §航点 那几条逐条相同（此时高度也随之滞后到上一次构建）。
     function _fetchWaypoints(routeId) {
         get("/api/snapshot/routes/" + routeId + "/waypoints", function(status, data) {
             // 失败一律留痕：服务端对快照故障是**节流**日志（同一错误串只打一次），
@@ -396,7 +417,7 @@ Item {
         //    （实时端点 `ListWaypoints` 同样不读这两列；它**另**读 `table_route.plan_data`
         //      插 home 点 / 覆写 command —— 本组件自 2026-10-31 起不再走它，
         //      理由见 `_fetchWaypoints`。⚠️ 「实时端点只读 `table_route_waypoint` 一张表」
-        //      是曾经的错误过简措辞，`handlers/ops.go` 的 `MyRouteWaypoints` 一带亦然 ——
+        //      是曾经的错误过简措辞，`handlers/ops_snapshot.go` 的 `snapshotRouteWaypoints` 一带亦然 ——
         //      **按函数名定位，别按行号**。）
         //    （对照：`handlers/ops.go` 的 `buildTaskWaypoints` 才把这两列读进来拼在首尾，
         //      两处口径差记在 `handlers/ops.go` 的 `MyRouteWaypoints` 函数头注释里（写着
