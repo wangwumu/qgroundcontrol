@@ -176,11 +176,12 @@ Item {
     ///    （`TaskListPanel` 那边同样要拿到同一组值，由 `OpsView` 显式传参，见那里的注释。）
     property bool  _outbound:      true    // 站点视图勾选：出站
     property bool  _inbound:       true    // 站点视图勾选：进站
-    // 本站站点**坐标**（`GET /api/sites/:id` 的 `lat`/`lon`）。站点视图套视野的**中心锚点**。
+    // 本站站点**坐标**（`GET /api/snapshot/sites/:id` 的 `lat`/`lon`）。站点视图套视野的**中心锚点**。
     /// ‼️ 为什么 id 与坐标分两个属性：id 是登录响应直接给的（内存里就有），坐标要走一次接口。
     /// ‼️ 站点表**本身不存坐标**——`table_site` 只有 `waypoint_id`，坐标在关联的 `table_waypoint`。
-    ///    后端 `siteJoinSelect` 已 `LEFT JOIN table_waypoint` 把 `w.lat`/`w.lon` 并进响应，
+    ///    后端快照端点的 SQL 已 `LEFT JOIN table_waypoint` 把 `w.lat`/`w.lon` 并进响应，
     ///    所以这里拿到的是**权威值**，前端不需要（也无法）自己拼。
+    /// ‼️ 走**快照**端点而不是实时的 `/api/sites/:id`（用户 2026-11-01）——理由见 `_fetchMySite`。
     /// ⚠️ `null` = 还没拿到 / 本站没挂航点（后端 `COALESCE(w.lat,0)` 会给出 0，被有效性检查挡掉）
     ///    ⇒ 套视野退化为"居包围盒中心"，与监控员视图逐字一致；`center` 兜底链另有落点。**不崩**。
     property var   _mySiteCoord:    null
@@ -935,18 +936,23 @@ Item {
         })
     }
 
-    /// 本站站点坐标（`GET /api/sites/:id`）。**站点视图套视野的中心锚点**，只取一次。
+    /// 本站站点坐标（`GET /api/snapshot/sites/:id`）。**站点视图套视野的中心锚点**，只取一次。
     /// ‼️ 站点表本身不存坐标（见 `_mySiteCoord` 声明处），坐标由后端 JOIN 航点后下发。
+    /// ‼️ 读**快照**而不是实时（用户 2026-11-01）：「站点坐标也要读快照，如果站点坐标实时
+    ///    位置改变，视野就没有意义了」。同一张地图上的航线几何取自快照，圆心若读实时，
+    ///    当天改了站点绑定的航点就会出现「圈住的东西与画出来的东西不是一套」。
+    ///    该端点 fail-closed（503/404），**不回退实时**，也不存在实时旁路。
     /// ⚠️ 拿不到时**保持 `null` 并照常套视野**——退化路径是"居包围盒中心"（`_applyBounds` 的
-    ///    `centerOn` 缺省行为），与监控员视图逐字一致。**不要**在这里 `return` 掉整个套视野：
+    ///    `centerOn` 缺省行为），与监控员视图逐字一致。快照不可用 / 站点当天新建（不在快照里）
+    ///    走的也是这条退化路径。**不要**在这里 `return` 掉整个套视野：
     ///    那会让"本站没挂航点"变成一个空白地图，而它本该只是一个不那么理想的视野。
     function _fetchMySite() {
         var sid = Number(_mySiteId)
-        // 无站点身份（平台级账号 / role_sites 为空）⇒ 不请求。`/api/sites/0` 会 404，
+        // 无站点身份（平台级账号 / role_sites 为空）⇒ 不请求。`/api/snapshot/sites/0` 会 400，
         // 而在控制台里打一行无意义的 warning 只会让真正的故障更难看见。
         if (!(sid > 0)) return false
-        _get("/api/sites/" + sid, function(status, data) {
-            if (status !== 200 || !data) { console.warn("OpsView 本站站点", status); return }
+        _get("/api/snapshot/sites/" + sid, function(status, data) {
+            if (status !== 200 || !data) { console.warn("OpsView 本站站点（快照）", status); return }
             var la = Number(data.lat), lo = Number(data.lon)
             // 口径与 `OpsCommon.isValidWaypoint` **逐字一致**：两轴有限，且**任一轴为 0 即无效**。
             // 后端对没挂航点的站点给的是 `COALESCE(w.lat, 0)` ⇒ 正好是 0，被这里挡住 ✓。

@@ -139,11 +139,22 @@ function taskNature(task, mySiteId) {
     return "—"
 }
 
-// 航线性质：固定/临时。暂假定固定；后端 overview 已带 route_type（协议保留状态位），空回退"固定"。
+// 航线性质：固定/临时。**不知道就说不知道**（「—」），不猜一个。
+//
+// ‼️ 空值/陌生值**不得**回退「固定」：后端自 2026-11-01 起 `route_type` 与航线几何取
+// 同一份快照（`handlers/ops.go` 的 `Overview` 与 `RouteTasks`——后者即 ③
+// `/api/ops/route-tasks`，这两个端点是唯一下发 `route_type` 的地方；
+// `handlers/realtime.go` 的 `overviewItem` **没有**该字段，别把它列进来），
+// 航线不在当日快照里（临时航线、当天新建、未复核、已删）时给**空串**，不再兜底
+// `'fixed'`。把空值显示成「固定」＝把「不知道」说成「定版航线」——临时航线被当成
+// 固定航线正是调度最怕的混淆。
+// 用例：`tst_OpsCommon.qml` 的 `test_routeNature_unknownIsNotFixed`。
 function routeNature(task) {
-    var rt = task ? task.route_type : ""
+    var rt = (task && typeof task.route_type === "string") ? task.route_type : ""
+    rt = rt.replace(/^\s+|\s+$/g, "")
     if (/temporary|temp/i.test(rt)) return qsTr("临时")
-    return qsTr("固定")
+    if (/^fixed$/i.test(rt)) return qsTr("固定")
+    return "—"
 }
 
 // 计划起飞时刻 → "HH:mm"。
@@ -2730,7 +2741,8 @@ function landKindTransitionToMc(kind) {
 ///        `_taskWithSlot`（往传给 `_execLand`/`_startLandFlow` 的临时副本上盖值），
 ///        而**那个副本的唯一读者就是本函数的第四个实参** —— 随本次改动被删掉了
 ///        ⇒ 该字段已成死数据（`OpsView.qml` 那处写入 2026-10-10 一并删除）。
-///    ⚠️ 后端仍在响应体里下发它（`gcs_server/handlers/ops.go:157`）—— 那是**下行字段**，
+///    ⚠️ 后端仍在响应体里下发它（`gcs_server/handlers/ops.go` 的 `Overview` 组装
+///      `opsOverviewItem` 处，搜 `assign_slot_heading`）—— 那是**下行字段**，
 ///      与本条无关，别把它读成"还有人在消费"。
 ///    留这段订正而不是直接删句：下一个人若在别处撞见 `assign_slot_heading`，
 ///    需要知道它**已经没有消费方**，而不是去 `takeoffSlotHeading` 里找一个不存在的调用。

@@ -3793,4 +3793,42 @@ TestCase {
         verify(t && t.indexOf("undefined") < 0, "缺任务号仍要能读：「" + t + "」")
         verify(OpsCommon.handoverGoneText("CANCELLED", null) !== "", "交接为 null 也要能读")
     }
+
+    /// 航线性质：**只在知道时**才说"固定"。
+    ///
+    /// 后端自 2026-11-01 起 `route_type` 与航线几何同一份快照；航线不在当日快照里
+    /// （临时航线、当天新建、未复核、已删）时它给**空串**，不再兜底成 `'fixed'`
+    /// （`handlers/ops.go` 的 `Overview` 一处，`realtime.go` 一处）。
+    /// 于是这里的空值有两种成因——老后端缺字段、新后端"当日快照里没有"——**都不是**
+    /// "这是一条固定航线"。伪造「固定」会让调度把一条临时航线当成定版航线。
+    function test_routeNature_onlyClaimsFixedWhenTold() {
+        compare(OpsCommon.routeNature({ route_type: "FIXED" }), qsTr("固定"),
+                "FIXED 就是固定航线")
+        compare(OpsCommon.routeNature({ route_type: "TEMPORARY" }), qsTr("临时"),
+                "TEMPORARY 就是临时航线")
+        // 大小写/空白不影响判定（库里原样透传 'FIXED'/'TEMPORARY'，前端不该只认一种写法）。
+        compare(OpsCommon.routeNature({ route_type: "temporary" }), qsTr("临时"),
+                "小写 temporary 仍要认出临时航线")
+        // 空白那一半必须单独钉：上面的小写用例走不到 `replace(/^\s+|\s+$/g, "")`，
+        // 删掉那行它照样绿。
+        compare(OpsCommon.routeNature({ route_type: "  TEMPORARY\t" }), qsTr("临时"),
+                "前后空白不影响判定（否则带空白的值会掉进「—」）")
+        compare(OpsCommon.routeNature({ route_type: " fixed " }), qsTr("固定"),
+                "前后空白的 FIXED 仍要认成固定航线")
+    }
+
+    function test_routeNature_unknownIsNotFixed() {
+        verify(OpsCommon.routeNature({ route_type: "" }) !== qsTr("固定"),
+               "空 route_type 不得显示成「固定」——那是把「不知道」说成「定版」")
+        verify(OpsCommon.routeNature({}) !== qsTr("固定"),
+               "缺字段同样不得显示成「固定」")
+        verify(OpsCommon.routeNature(null) !== qsTr("固定"),
+               "任务为 null 同样不得显示成「固定」")
+        // 未知/缺值统一显示「—」（与 taskNature / 任务号缺失同一种写法）。
+        compare(OpsCommon.routeNature({ route_type: "" }), "—", "缺值显示「—」")
+        compare(OpsCommon.routeNature(null), "—", "null 显示「—」")
+        // 认不出的枚举值同样不许猜成固定。
+        compare(OpsCommon.routeNature({ route_type: "PLANNED" }), "—",
+                "陌生枚举值也要显示「—」而不是猜一个")
+    }
 }
