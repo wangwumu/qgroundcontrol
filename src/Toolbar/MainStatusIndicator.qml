@@ -28,7 +28,11 @@ RowLayout {
     QGCLabel {
         id:                 mainStatusLabel
         Layout.fillHeight:  true
-        Layout.preferredWidth: contentWidth + (vehicleMessagesIcon.visible ? vehicleMessagesIcon.width + control.spacing : 0)
+        // ‼️ 最小可点宽：未连接时文字为空 ⇒ `contentWidth` 为 0，而本标签里的
+        //    `QGCMouseArea`（下方）是离线抽屉 `overallStatusOfflineIndicatorPage` 的
+        //    **唯一**入口 ⇒ 至少留 3 个字宽的不可见点击区，别把入口连同文字一起删掉。
+        Layout.preferredWidth: Math.max(contentWidth + (vehicleMessagesIcon.visible ? vehicleMessagesIcon.width + control.spacing : 0),
+                                        ScreenTools.defaultFontPixelWidth * 3)
         verticalAlignment:  Text.AlignVCenter
         text:               mainStatusText()
         color:              qgcPal.text
@@ -37,7 +41,6 @@ RowLayout {
         property string _commLostText:      qsTr("Comms Lost")
         property string _readyToFlyText:    qsTr("Ready")
         property string _notReadyToFlyText: qsTr("Not Ready")
-        property string _disconnectedText:  qsTr("Disconnected - Click to manually connect")
         property string _armedText:         qsTr("Armed")
         property string _flyingText:        qsTr("Flying")
         property string _landingText:       qsTr("Landing")
@@ -102,8 +105,11 @@ RowLayout {
                     }
                 }
             } else {
+                // 未连接时的提示文字已去掉（用户 2026-11-05）：本项目走自动配置的链路，
+                // 不需要「点击手动连接」这条引导。文字留空后本标签宽度归零，
+                // 点击区靠上面 `Layout.preferredWidth` 的最小宽保留。
                 _mainStatusBGColor = qgcPal.brandingPurple
-                return mainStatusLabel._disconnectedText
+                return ""
             }
         }
 
