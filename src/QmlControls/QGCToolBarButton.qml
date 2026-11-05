@@ -54,6 +54,9 @@ Button {
             visible:                text !== ""
             text:                   button.text
             color:                  button.checked ? qgcPal.buttonHighlightText : qgcPal.buttonText
+            // Label 缺省用应用字体，不随 ScreenTools 基线缩放；这里保留其原默认字号再乘
+            // 缩放因子（100% 时不变）。
+            font.pointSize:         Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
             anchors.verticalCenter: parent.verticalCenter
         }
     }

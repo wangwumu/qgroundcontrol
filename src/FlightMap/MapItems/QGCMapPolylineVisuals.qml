@@ -245,6 +245,8 @@ Item {
                 text:   _unitsConversion.metersToAppSettingsHorizontalDistanceUnits(distance).toFixed(1) + " " +
                         _unitsConversion.appSettingsHorizontalDistanceUnitsString
                 color:  "white"
+                // 裸 Text 缺省用应用字体，不随 ScreenTools 的字体基线缩放。
+                font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
             }
         }
     }

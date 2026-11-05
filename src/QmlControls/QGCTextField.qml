@@ -150,6 +150,10 @@ TextField {
     ToolTip {
         id: validationToolTip
 
+        // ToolTip 的 font 缺省为应用字体，Basic 样式的 contentItem 绑定 control.font，
+        // 因此不随 ScreenTools 基线缩放，需在此显式设字号。
+        font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
+
         property var originalValidValue: undefined
 
         QGCMouseArea {

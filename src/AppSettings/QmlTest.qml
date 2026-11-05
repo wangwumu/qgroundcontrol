@@ -276,29 +276,34 @@ Rectangle {
                     // Header row
                     Row {
                         Text {
+                            font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
                             width: editRoot.cellSize.width * 2
                             height: editRoot.cellSize.height
                             text: ""
                         }
                         Text {
+                            font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
                             width: editRoot.cellSize.width; height: editRoot.cellSize.height
                             color: "black"
                             horizontalAlignment: Text.AlignLeft
                             text: qsTr("Enabled")
                         }
                         Text {
+                            font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
                             width: editRoot.cellSize.width; height: editRoot.cellSize.height
                             color: "black"
                             horizontalAlignment: Text.AlignHCenter
                             text: qsTr("Value")
                         }
                         Text {
+                            font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
                             width: editRoot.cellSize.width; height: editRoot.cellSize.height
                             color: "black"
                             horizontalAlignment: Text.AlignHCenter
                             text: qsTr("Disabled")
                         }
                         Text {
+                            font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
                             width: editRoot.cellSize.width; height: editRoot.cellSize.height
                             color: "black"
                             horizontalAlignment: Text.AlignHCenter
@@ -325,6 +330,7 @@ Rectangle {
                         delegate: Row {
                             spacing: 5
                             Text {
+                                font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
                                 width: editRoot.cellSize.width * 2
                                 height: editRoot.cellSize.height
                                 horizontalAlignment: Text.AlignRight
@@ -378,6 +384,7 @@ Rectangle {
 
                         // Header row
                         Text {
+                            font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
                             width: ctlPrevColumn._colWidth
                             height: ctlPrevColumn._height
                             color: "black"
@@ -385,6 +392,7 @@ Rectangle {
                             text: qsTr("QGC name")
                         }
                         Text {
+                            font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
                             width: ctlPrevColumn._colWidth
                             height: ctlPrevColumn._height
                             color: "black"
@@ -392,6 +400,7 @@ Rectangle {
                             text: qsTr("Enabled")
                         }
                         Text {
+                            font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
                             width: ctlPrevColumn._colWidth
                             height: ctlPrevColumn._height
                             color: "black"
@@ -655,6 +664,7 @@ Rectangle {
                         border.width: 1
                         anchors.horizontalCenter: parent.horizontalCenter
                         Label {
+                            font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
                             text: "Alert Message"
                             color: qgcPal.alertText
                             anchors.centerIn: parent
@@ -960,6 +970,7 @@ Rectangle {
             height: ctlPrevColumn._height
             color:  "white"
             Text {
+                font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
                 color:  "black"
                 text:   parent.parent.text
                 anchors.fill: parent
@@ -992,7 +1003,7 @@ Rectangle {
                     fillMode:                   Image.PreserveAspectFit
                     source:                     "/qmlimages/Gears.svg"
                 }
-                Label { text: "colorGreen"; color: qgcPal.colorGreen; }
+                Label { font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor;  text: "colorGreen"; color: qgcPal.colorGreen; }
                 QGCColoredImage {
                     color:                      qgcPal.colorOrange
                     width:                      ScreenTools.defaultFontPixelWidth * 2
@@ -1002,7 +1013,7 @@ Rectangle {
                     fillMode:                   Image.PreserveAspectFit
                     source:                     "/qmlimages/Gears.svg"
                 }
-                Label { text: "colorOrange"; color: qgcPal.colorOrange; }
+                Label { font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor;  text: "colorOrange"; color: qgcPal.colorOrange; }
                 QGCColoredImage {
                     color:                      qgcPal.colorRed
                     width:                      ScreenTools.defaultFontPixelWidth * 2
@@ -1012,7 +1023,7 @@ Rectangle {
                     fillMode:                   Image.PreserveAspectFit
                     source:                     "/qmlimages/Gears.svg"
                 }
-                Label { text: "colorRed"; color: qgcPal.colorRed; }
+                Label { font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor;  text: "colorRed"; color: qgcPal.colorRed; }
                 QGCColoredImage {
                     color:                      qgcPal.colorGrey
                     width:                      ScreenTools.defaultFontPixelWidth * 2
@@ -1022,7 +1033,7 @@ Rectangle {
                     fillMode:                   Image.PreserveAspectFit
                     source:                     "/qmlimages/Gears.svg"
                 }
-                Label { text: "colorGrey"; color: qgcPal.colorGrey;  }
+                Label { font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor;  text: "colorGrey"; color: qgcPal.colorGrey;  }
                 QGCColoredImage {
                     color:                      qgcPal.colorBlue
                     width:                      ScreenTools.defaultFontPixelWidth * 2
@@ -1032,7 +1043,7 @@ Rectangle {
                     fillMode:                   Image.PreserveAspectFit
                     source:                     "/qmlimages/Gears.svg"
                 }
-                Label { text: "colorBlue"; color: qgcPal.colorBlue; }
+                Label { font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor;  text: "colorBlue"; color: qgcPal.colorBlue; }
             }
         }
     }

@@ -74,6 +74,8 @@ ComboBox {
             Text {
                 text:   modelData.text
                 color:  _itemQGCPal.buttonText
+                // 裸 Text 缺省用应用字体，不随 ScreenTools 的字体基线缩放。
+                font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
             }
 
         }
@@ -151,6 +153,8 @@ ComboBox {
             Text {
                 text:   _flashText
                 color:  _controlQGCPal.buttonText
+                // 同上：裸 Text 缺省用应用字体，不随基线缩放。
+                font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
             }
 
         }

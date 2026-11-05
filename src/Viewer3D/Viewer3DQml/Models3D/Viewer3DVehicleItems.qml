@@ -211,7 +211,7 @@ Node {
 
                 QGCLabel {
                     color: "black"
-                    font.pixelSize: 20
+                    font.pixelSize: Math.round(20 * ScreenTools.uiTextScaleFactor)
                     text: (model.itemName === "W") ? String(model.index) : model.itemName
                 }
             }

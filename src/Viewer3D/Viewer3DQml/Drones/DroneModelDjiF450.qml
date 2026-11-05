@@ -53,7 +53,7 @@ Node {
 
         QGCLabel {
             color: "red"
-            font.pixelSize: 25
+            font.pixelSize: Math.round(25 * ScreenTools.uiTextScaleFactor)
             text: vehicle ? Number(vehicle.id) : ""
         }
     }
