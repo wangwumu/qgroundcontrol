@@ -197,7 +197,8 @@ OpsShell {
     // 机位图**所需的右边栏宽**，由右栏内容组件内的 `Binding` 回送（见下方 rightPanelContent）。
     // ‼️ 不能在骨架里直接读 `slotLayout.desiredPanelWidth`：`slotLayout` 声明在注入的
     //    `Component` 里，骨架展开它之前那个 id 根本不存在 ⇒ 第一次求值拿到 null、
-    //    此后**没有任何 NOTIFY 会让它重估**，边栏宽就被永久钉死在 340。
+    //    此后**没有任何 NOTIFY 会让它重估**，边栏宽就被永久钉死在 `_rightPanelMinW`
+    //    （按窗口宽比例算出的下限，不再恒为 340）。
     //    回送到一个普通属性上，依赖就落在"属性变化"这件有信号的事上。
     property real _slotDesiredPanelWidth: _rightPanelMinW
 
@@ -2561,7 +2562,7 @@ OpsShell {
         //    ⚠️ `y` **不读 `_confirmAnchorY`**：本框由"降落校验未通过/指令下发失败"弹出，
         //       触发它的**不是某张卡片上的按钮** ⇒ 没有锚点来源，读了只会用到上一次动作
         //       留下的残值、贴着一张不相干的卡片。故直接垂直居中。
-        width: opsView.rightPanelWidth
+        width: Math.max(opsView.rightPanelWidth, 320)   // 320 = 弹框内容最小可用宽（按钮 132+96+间距）
         x: opsView.width - width
         y: (opsView.height - height) / 2
         modal: true
@@ -2630,7 +2631,7 @@ OpsShell {
         //    与 `actionConfirmDialog` / `handoverDialog` 逐字同款。
         // ⚠️ 宽度变成可变值后，下面机位格 `Flow` 的**列数会随栏宽变**（原注释按 360 算的
         //    固定 3 列已失效）—— 这是 `Flow` 的正常行为，不需要按宽度补分支。
-        width: opsView.rightPanelWidth
+        width: Math.max(opsView.rightPanelWidth, 320)   // 320 = 弹框内容最小可用宽（按钮 132+96+间距）
         modal: true
         // ‼️ 位置与 `actionConfirmDialog` **逐字同款**：贴右边栏、上部对齐**触发它的那张任务卡片**
         //    的下缘（留 6px，卡片靠下时向上收，别顶出屏幕底）。用户 2026-10-08 第三轮：
@@ -2808,7 +2809,7 @@ OpsShell {
         parent: opsView
         // 宽度与右边栏一致、右边缘贴窗口右缘（用户 2026-09-28）。原先没写 `x`/`y`，`Dialog` 缺省
         // 落在 (0,0) ⇒ 看起来在屏幕左上角。
-        width: opsView.rightPanelWidth
+        width: Math.max(opsView.rightPanelWidth, 320)   // 320 = 弹框内容最小可用宽（按钮 132+96+间距）
         x: opsView.width - width
         // 上部与**触发它的那张任务卡片**的下缘对齐，留 6px。卡片靠下时向上收，别顶出屏幕底。
         y: opsView._confirmAnchorY < 0

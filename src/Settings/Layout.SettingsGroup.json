@@ -29,7 +29,7 @@
         {
             "name": "rightPanelMinPercent",
             "shortDesc": "Minimum right panel width as a percentage of the window width.",
-            "longDesc": "The right panel width is calculated from the window width, this percentage and the layout scale factor, then clamped to the content minimum and the configured maximum.",
+            "longDesc": "The right panel width is calculated from the window width, this percentage and the layout scale factor, then capped at 45% of the window. There is no content-derived minimum: the panel content (instruments, task card buttons) adapts to the panel width instead.",
             "type": "double",
             "units": "%",
             "min": 1.0,

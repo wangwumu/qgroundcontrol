@@ -56,7 +56,8 @@ Item {
     //   "route" = 监控员视图（后端按负责航线过滤 IN_FLIGHT）
     property string overviewView: "site"
     // 右栏宽度。机位平面图在场时由站点视图按所需宽在下限与上限之间伸缩；其余视图恒取下限。
-    // 下限/上限均按窗口宽比例折算（Layout 设置组），下限还不低于内容最小宽 340。
+    // 下限/上限均按窗口宽比例折算（Layout 设置组），**没有内容派生的下限**；内容适配见
+    // `_instrBlockW` 与 `TaskListPanel` 的按钮夹紧/折行。
     property real   rightPanelWidth: _rightPanelMinW
     // 是否启用**航线图层**（① my-routes 缓存 + ③ route-tasks）。
     // ‼️ 与 `overviewView` 一样是**数据源参数，不是显示开关**：监控员视图（RomView）置 true，
@@ -441,20 +442,20 @@ Item {
     // 中两个卡片的间隔」，方向本就该是这个。值不变（10），两个视图因此天然同值。
     readonly property real _taskCardMargin: 10
 
-    // 姿态仪/罗盘宽度**不随边栏加宽**（恒 272 = 340×0.8）：表盘放大没有信息量，
-    // 而且会连带吃掉机位区的可用高（仪表高 = (宽−12)/2，宽了高也高）。
-    readonly property real _instrBlockW: 272
-    // 右边栏的内容下限：屏幕按比例算出来比它还窄时，以它为准（QML Item 不裁剪，栏宽低于
-    // 内容最小宽会溢出）。取两个约束的较大者：
-    //   ① 仪表簇 272 + 左右各 `_taskCardMargin` = 292；
-    //   ② 任务卡三按钮一排需要 340 —— `TaskListPanel.qml` 实测「直接降落 88 + 指派机位 88 +
-    //      停泊 100 + 2×间距 6 = 288」，可用宽 = 栏宽 − 20(右留白) − 10(左边距) − 16(卡内边距)
-    //      ⇒ 栏宽低于 340 时三颗按钮会折成两排（2026-10-08 用户原话）。
-    readonly property real _rightPanelContentMinW: Math.max(_instrBlockW + 2 * _taskCardMargin, 340)
-    // 右边栏宽度按窗口宽度的比例折算（Layout 设置组）。站点视图下按机位图**所需宽**在
-    // 下限与上限之间取值，其余视图恒取下限。
-    readonly property real _rightPanelMinW: ScreenTools.rightPanelMinWidthFor(width, _rightPanelContentMinW)
+    // 右边栏宽度**严格按参数**折算（Layout 设置组），没有 340/292 之类的硬下限；内容适配由
+    // 仪表簇缩放与任务卡按钮夹紧/折行承担（2026-11-05 用户裁定「参数优先」）。
+    // 站点视图下按机位图**所需宽**在下限与上限之间取值，其余视图恒取下限。
+    readonly property real _rightPanelMinW: ScreenTools.rightPanelMinWidthFor(width)
     readonly property real _rightPanelMaxW: ScreenTools.rightPanelMaxWidthFor(width, _rightPanelMinW)
+
+    // 姿态仪/罗盘宽度：桌面尺寸 272，但不允许超过右栏可用宽——参数优先后小屏右栏可能只有
+    // 120dp，固定 272 会占满面板、看起来"非常巨大"（2026-11-05 Android 实测）。仪表高随宽
+    // 等比缩放（height = (宽−12)/2），所以只约束宽即可。
+    // ‼️ 基准取 `_rightPanelMinW`（只由窗口宽与参数决定），**不能取 `rightPanelWidth`**：
+    //    站点视图里 `rightPanelWidth` ← `_slotDesiredPanelWidth` ← SlotLayout 的可用高 ←
+    //    `instrumentsHeight` ← 本属性 ⇒ 会闭合成环（面板宽在两值间抖动）。
+    //    取 min 也符合原设计「仪表不随边栏加宽而放大」。
+    readonly property real _instrBlockW: Math.min(272, Math.max(0, _rightPanelMinW - 2 * _taskCardMargin))
 
     // 右栏/仪表的实际尺寸，**暴露给视图**：站点视图的机位区可用高必须由它们推出
     //（见 OpsView 的 `_siteAreaH`），而 `rightPanel`/`instrumentsBlock` 是本文件的内部 id，
@@ -1943,7 +1944,7 @@ Item {
     }
 
     //-------------------------------------------------------------------------
-    // 主体：左侧地图+仪表（flex:1） / 右侧边栏（~340px）
+    // 主体：左侧地图+仪表（flex:1） / 右侧边栏（15–20% × 窗口宽 × 缩放因子）
     //-------------------------------------------------------------------------
     Item {
         id: body
@@ -2655,15 +2656,17 @@ Item {
                 // 上（内容区↔仪表）/下（仪表↔窗口底）各留仪表高度 1/20 的空隙
                 readonly property real _vGap: height / 20
                 anchors { horizontalCenter: parent.horizontalCenter; bottom: parent.bottom; bottomMargin: _vGap }
-                // ‼️ 不跟 parent.width：边栏加到 510 时表盘仍恒 272（见 _instrBlockW）
+                // ‼️ 不跟 parent.width：仪表面板宽取 `_instrBlockW` = min(272, 下限栏宽−20)。
+                //    栏宽 ≥292 时恒 272；窄栏（参数优先后可能出现）随下限缩小，但不随机位图
+                //    请求加宽而变大。
                 width: _instrBlockW
-                height: (instrumentsBlock.width - 12) / 2
+                height: Math.max(0, (instrumentsBlock.width - 12) / 2)
 
                 QGCAttitudeWidget {
                     id: attitudeWidget
                     anchors.left: parent.left
                     anchors.verticalCenter: parent.verticalCenter
-                    size: (instrumentsBlock.width - 12) / 2
+                    size: Math.max(0, (instrumentsBlock.width - 12) / 2)
                     vehicle: _selectedVehicle
                 }
                 QGCCompassWidget {
@@ -2671,7 +2674,7 @@ Item {
                     anchors.left: attitudeWidget.right
                     anchors.leftMargin: 12
                     anchors.verticalCenter: parent.verticalCenter
-                    size: (instrumentsBlock.width - 12) / 2
+                    size: Math.max(0, (instrumentsBlock.width - 12) / 2)
                     vehicle: _selectedVehicle
                 }
             }
@@ -2766,7 +2769,7 @@ Item {
         //    信号带回；这个框还能由**待办到达自动弹出**（`_notifyNewPending`），那一路没有触发
         //    卡片 ⇒ 按 `task_id` 回列表里找（`_handoverAnchorFn`，视图侧注入）。两条路都收进
         //    `_handoverAnchorY`，这里只管消费，不认识自己是被谁打开的。
-        width: opsShell.rightPanelWidth
+        width: Math.max(opsShell.rightPanelWidth, 320)   // 320 = 弹框内容最小可用宽（按钮 132+96+间距）
         x: opsShell.width - width
         // 卡片靠下时向上收，别顶出屏幕底；无锚点（交接对应的任务不在本视图列表里，或卡片滚出
         // 可视区）则垂直居中——兜底与 `actionConfirmDialog` 的 `_confirmAnchorY < 0` 那条一致。
@@ -2873,7 +2876,7 @@ Item {
     OpsDialog {
         id: handoverGoneDialog
         parent: opsShell
-        width: opsShell.rightPanelWidth
+        width: Math.max(opsShell.rightPanelWidth, 320)   // 320 = 弹框内容最小可用宽（按钮 132+96+间距）
         x: opsShell.width - width
         y: opsShell._handoverAnchorY < 0
            ? (opsShell.height - height) / 2

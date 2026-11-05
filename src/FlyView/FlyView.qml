@@ -43,7 +43,7 @@ Item {
     property var    _widgetLayer:           widgetLayer
     property real   _toolsMargin:           ScreenTools.defaultFontPixelWidth * 0.75
     property rect   _centerViewport:        Qt.rect(0, 0, width, height)
-    property real   _rightPanelWidth:       ScreenTools.rightPanelMinWidthFor(width, ScreenTools.defaultFontPixelWidth * 30)
+    property real   _rightPanelWidth:       ScreenTools.rightPanelMinWidthFor(width)
     property var    _mapControl:            mapControl
     property real   _widgetMargin:          ScreenTools.defaultFontPixelWidth * 0.75
 
@@ -75,7 +75,7 @@ Item {
         FlyViewMap {
             id:                     mapControl
             planMasterController:   _planController
-            rightPanelWidth:        ScreenTools.rightPanelMinWidthFor(width, ScreenTools.defaultFontPixelHeight * 9)
+            rightPanelWidth:        ScreenTools.rightPanelMinWidthFor(width)
             pipView:                _pipView
             pipMode:                !_mainWindowIsMap
             toolInsets:             customOverlay.totalToolInsets

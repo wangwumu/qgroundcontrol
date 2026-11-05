@@ -217,7 +217,8 @@ ColumnLayout {
             //    还原反而要动整个委托的属性归属，属于无收益的改动。
             property var task: modelData
 
-            width: taskList.width - panel.cardRightGap - panel.cardMargin
+            // 参数优先后右栏可能极窄（合法最小 1%×0.5 可低于 30dp）⇒ 夹到 0，避免负宽。
+            width: Math.max(0, taskList.width - panel.cardRightGap - panel.cardMargin)
             height: card.height
 
             Rectangle {
@@ -425,7 +426,10 @@ ColumnLayout {
                         elide: Text.ElideMiddle
                         text: modelData.route_name ? qsTr("航线：") + modelData.route_name : qsTr("航线：—")
                     }
-                    Row {
+                    // ‼️ `Flow` 而不是 `Row`：参数优先后右栏可能窄到 120dp，这一行的三段信息
+                    //    在 `Row` 里既不换行也不省略，会横向溢出、被 ListView 在面板右缘硬切掉。
+                    //    换成 `Flow` 折行，单个 `Text` 再夹到行宽并省略（否则一段长文字仍会溢出）。
+                    Flow {
                         width: parent.width
                         spacing: 8
                         // 未指派无人机的任务**整行不可见**（2026-09-17 用户裁定），过滤落在服务端：
@@ -437,6 +441,8 @@ ColumnLayout {
                         // ‼️ 判据用 uav_id（后端 `COALESCE(t.uav_id,0)`，0=未指派），**不用 uav_no 空串**
                         //——与起飞门控、机位反查同解，全视图对「有没有派机」只有一份判据。
                         Text {
+                            width: Math.min(implicitWidth, parent.width)
+                            elide: Text.ElideRight
                             color: modelData.uav_id ? "#9fb3d4" : "#ffc107"
                             font.pixelSize: 11
                             text: modelData.uav_id
@@ -444,10 +450,14 @@ ColumnLayout {
                                   : qsTr("航班：未指派无人机（%1）").arg(modelData.task_no ? modelData.task_no : "—")
                         }
                         Text {
+                            width: Math.min(implicitWidth, parent.width)
+                            elide: Text.ElideRight
                             color: "#9fb3d4"; font.pixelSize: 11
                             text: qsTr("起飞：") + OpsCommon.formatPlanTakeoff(modelData)
                         }
                         Text {
+                            width: Math.min(implicitWidth, parent.width)
+                            elide: Text.ElideRight
                             color: "#9fb3d4"; font.pixelSize: 11
                             text: qsTr("航线性质：") + OpsCommon.routeNature(modelData)
                         }
@@ -561,10 +571,15 @@ ColumnLayout {
                     //    `LANDING` 那一态（直接降落 / 指定机位 / 停泊）与出站各态同样是多颗并存。
                     //    `Flow` 放不下就折行；卡片高度是 `taskBody.height + 12`（自适应）⇒ 折行后
                     //    卡片**自动长高**，不裁不溢。
+                    //    ‼️ 2026-11-05 起右栏**严格按 Layout 参数取宽**，手机上可能远窄于 340dp
+                    //    ⇒ 每颗按钮的 `width` 都夹到本行可用宽（`actionFlow.maxButtonWidth`），
+                    //    宽栏时保持原宽度，窄栏时折行而不横向溢出。后文所有「一排 / 340」的算式
+                    //    只在面板 ≥334dp 时成立（340 是含 6px 余量的设计档位），不再是面板下限。
                     //    ‼️ 2026-10-10 第九轮之后的新状态：`LANDING` 那三颗**已经排得下一排**了
                     //    （【直接降落】【指定机位】各缩到 88，算式见那两颗按钮上的注释）。
-                    //    ⚠️ 但这个"排得下"**带一个字体前提**，别当成无条件的：三颗里【停泊】没写
-                    //    `width`，宽度由 QQC2 Basic style 定成 `max(100, 文字宽 + 4)`。
+                    //    ⚠️ 但这个"排得下"**带一个字体前提**，别当成无条件的：【停泊】的宽度现在
+                    //    也夹到行宽（`min(implicitWidth, actionFlow.maxButtonWidth)`），而它的
+                    //    `implicitWidth` 由 QQC2 Basic style 定成 `max(100, 文字宽 + 4)`。
                     //    本场景（`LANDING ∧ !_onGround`）它的文案是 **7 字**的「停泊（待落地）」
                     //    或「停泊（无遥测）」（2 字的「停泊」要求 `_onGround`，与【直接降落】的
                     //    `!_onGround` 互斥，在本场景根本不可能出现）⇒ 实测文字宽 84 < 100，
@@ -573,13 +588,18 @@ ColumnLayout {
                     //         （下限 100 压着），但口径是错的，别照抄那个样本重测。
                     //    字体边界：本机 Qt 缺省 **12px**（`fc-match` 报 DejaVu Sans 12.5；
                     //    QGC 不设全局字体，注册的 opensans 全仓零引用）⇒ 100 这个下限压得住。
-                    //    若缺省字体涨到 **≥15px**（7 字文字宽 105 > 100），【停泊】会涨到 109、
-                    //    总宽 297 > 294 ⇒ **又会折行**。届时给【停泊】也定宽，或让它自适应。
+                    //    若缺省字体涨到 **≥15px**（7 字文字宽 105 > 100），【停泊】的 implicitWidth
+                    //    会涨到 109、总宽 297 > 294 ⇒ **又会折行**（现在有行宽夹紧，不会溢出）。
                     //    但**这不能当成改回 `Row` 的理由** —— 出站各态的多颗并存、以及将来再加
                     //    按钮，都不在这次收窄的保护范围内；`Flow` 仍是"对任意组合都对"的那个写法。
                     // ⚠️ 也不要改成 `Row` + 手工算宽度：任何"按最坏情况预留宽度"的算法都会
                     //    在别的状态下留出一段空白，而 `Flow` 对任意组合都对。
                     Flow {
+                        id: actionFlow
+                        // 右栏严格按参数取宽后，小屏上面板可能远窄于 340dp。按钮宽度一律夹到
+                        // 本行可用宽：宽栏时仍取原值（88/隐式宽），窄栏时不横向溢出，由 Flow
+                        // 折行（卡片高度自适应）。
+                        readonly property real maxButtonWidth: Math.max(0, width)
                         width: parent.width
                         spacing: 6
                         // ── 站点视图：出站 ──
@@ -588,7 +608,7 @@ ColumnLayout {
                                      && OpsCommon.isOutbound(modelData, panel.mySiteId, panel.handoverById)
                                      && (modelData.status === "SCHEDULED" || modelData.status === "READY")
                             enabled: panel.canTakeoffFn ? panel.canTakeoffFn(modelData) : false
-                            height: 24; padding: 0
+                            width: Math.min(implicitWidth, actionFlow.maxButtonWidth); height: 24; padding: 0
                             text: qsTr("起飞")
                             // 置灰时说明**差哪一条**：否则用户只看到灰按钮，不知道是要去停放页
                             // 推「航前检查通过」，还是飞机压根还没连上本地面站——两种处置完全不同。
@@ -608,7 +628,7 @@ ColumnLayout {
                             visible: panel.showSiteActions && modelData.status === "TAKEOFF"
                                      && !OpsCommon.pendingPhase(modelData, "ROUTE", panel.handoverById)
                             enabled: card._vtolFwd && OpsCommon.hasLiveTelemetry(card._uav)
-                            height: 24; padding: 0
+                            width: Math.min(implicitWidth, actionFlow.maxButtonWidth); height: 24; padding: 0
                             text: qsTr("申请切出")
                             onClicked: panel.handoverProposed(modelData.task_id, "ROUTE")
                         }
@@ -622,7 +642,7 @@ ColumnLayout {
                             // 连带把状态落成 IN_FLIGHT（起飞那一刻 QGC 未必已收到 VTOL 转换完成），
                             // IN_FLIGHT 时只建交接。所以后端对两态都收，界面按飞行阶段分开显示。
                             visible: card._inFlightOutbound && !OpsCommon.checkoutPending(modelData)
-                            height: 24; padding: 0
+                            width: Math.min(implicitWidth, actionFlow.maxButtonWidth); height: 24; padding: 0
                             text: qsTr("签出")
                             onClicked: panel.checkoutRequested(modelData, panel.cardBottomYOf(card))
                         }
@@ -632,7 +652,7 @@ ColumnLayout {
                             // 判"拿得到 id 吗"才是真正的前置条件（见 `OpsCommon.handoverId` 上方注释）。
                             visible: card._inFlightOutbound && OpsCommon.checkoutPending(modelData)
                             enabled: OpsCommon.handoverId(card._handover) !== undefined
-                            height: 24; padding: 0
+                            width: Math.min(implicitWidth, actionFlow.maxButtonWidth); height: 24; padding: 0
                             text: qsTr("取消")
                             onClicked: panel.handoverCancelRequested(OpsCommon.handoverId(card._handover), modelData, panel.cardBottomYOf(card))
                         }
@@ -642,7 +662,7 @@ ColumnLayout {
                             // 把到站指派改回原机位、释放机位、并把降落指挥权交回本站；QGC 侧在落库成功后
                             // 才发 RTL（先写库、再下指令）。
                             visible: card._inFlightOutbound
-                            height: 24; padding: 0
+                            width: Math.min(implicitWidth, actionFlow.maxButtonWidth); height: 24; padding: 0
                             text: qsTr("回航")
                             onClicked: panel.returnRequested(modelData, panel.cardBottomYOf(card))
                         }
@@ -668,7 +688,7 @@ ColumnLayout {
                             //    ⇒ IN_FLIGHT 段照旧可点，死锁当时不成立。判据变迁的完整留档在下面 F2 那颗的
                             //    同名位置。
                             enabled: true
-                            height: 24; padding: 0
+                            width: Math.min(implicitWidth, actionFlow.maxButtonWidth); height: 24; padding: 0
                             text: qsTr("降落")
                             onClicked: panel.keepFwLandRequested(modelData, panel.cardBottomYOf(card))
                         }
@@ -717,7 +737,7 @@ ColumnLayout {
                             // 机位是否空闲、机场是否已核准**不在列表里预判**——那是会过期的快照，
                             // 由点击后的 `/landing-slot-check` 判定，否则会弹出错误的阻止理由。
                             enabled: true
-                            height: 24; padding: 0
+                            width: Math.min(implicitWidth, actionFlow.maxButtonWidth); height: 24; padding: 0
                             text: qsTr("切换多旋翼降落")
                             onClicked: panel.landRequested(modelData, panel.cardBottomYOf(card))
                         }
@@ -765,13 +785,13 @@ ColumnLayout {
                             //    `background.implicitWidth: 100` 是**下限**，4 字的「直接降落」与 2 字的
                             //    「停泊」都够不着它 ⇒ 改字号/文案**完全无用**，必须显式给 width。
                             //    （本仓无 `Button.qml` 覆盖、`src/` 里也没有全局 setFont，故 100 成立。）
-                            // 88 的算式（最窄档 rightPanelWidth = 340）：
-                            //    Flow 可用宽 = 340 − cardRightGap(20) − cardMargin(10) − taskBody margins 8×2
-                            //                = **294**
-                            //    88 + 88 + 100(【停泊】保持原宽) + 2×spacing(6) = **288** ≤ 294 ⇒ 余 6px。
+                            // 88 的算式（**一排所需的档位**，不再是面板下限）：
+                            //    Flow 可用宽 = 面板宽 − cardRightGap(20) − cardMargin(10) − taskBody margins 8×2
+                            //    三颗一排需要 288 + 46 = **334dp**；340 是含 6px 余量的设计档位。
+                            //    面板 < 334dp 时三颗折行，且各按钮 `width` 夹到 Flow 可用宽。
                             // ⚠️ **只缩这两颗是用户裁定**：三选一里他选了"只缩我点名的两颗"，明知三颗
                             //    等宽。所以 88/88/100 **故意不齐**，不是漏改 —— 别顺手"修正"成等宽。
-                            width: 88; height: 24; padding: 0
+                            width: Math.min(88, actionFlow.maxButtonWidth); height: 24; padding: 0
                             text: qsTr("直接降落")
                             // 红字（用户 2026-10-08 逐字「文字颜色改为红色」）。取 `#ff3b3b`
                             // ——它已经是本卡片深色底上验证过的红（`_timedOut` 的边框/「超时」字同值），
@@ -820,7 +840,7 @@ ColumnLayout {
                             // 【直接降落】那颗的注释里，此处不重复。
                             // ‼️ 但改宽度时必须**两颗一起改** —— 它们是同一个约束的两半，只动一颗
                             //    88+100+100+12 = 300 > 294，照样折行。
-                            width: 88; height: 24; padding: 0
+                            width: Math.min(88, actionFlow.maxButtonWidth); height: 24; padding: 0
                             text: qsTr("指定机位")
                             onClicked: panel.assignSlotRequested(modelData, panel.cardBottomYOf(card))
                         }
@@ -838,7 +858,7 @@ ColumnLayout {
                             //    （本站降落 ⇒ `landing_site_id === mySiteId` ⇒ 必进站），故不叠也不漏。
                             visible: panel.showSiteActions && modelData.status === "LANDING"
                             enabled: card._onGround || !OpsCommon.hasLiveTelemetry(card._uav)
-                            height: 24; padding: 0
+                            width: Math.min(implicitWidth, actionFlow.maxButtonWidth); height: 24; padding: 0
                             text: card._onGround ? qsTr("停泊")
                                   : (OpsCommon.hasLiveTelemetry(card._uav)
                                      ? qsTr("停泊（待落地）") : qsTr("停泊（无遥测）"))
@@ -861,7 +881,7 @@ ColumnLayout {
                             // 取 id 走 `_myCheckin`（待办口径，与 `visible` 同源），不是 `card._handover`
                             //——理由见 `_myCheckin` 上方注释（拿错 id ⇒ 404 被静默吞掉）。
                             enabled: OpsCommon.handoverId(card._myCheckin) !== undefined
-                            height: 24; padding: 0
+                            width: Math.min(implicitWidth, actionFlow.maxButtonWidth); height: 24; padding: 0
                             text: qsTr("签入")
                             onClicked: panel.checkinRequested(OpsCommon.handoverId(card._myCheckin), modelData)
                         }
@@ -911,7 +931,7 @@ ColumnLayout {
                                      && OpsCommon.signedIn(modelData)
                                      && !OpsCommon.pendingPhase(modelData, "LANDING", panel.handoverById)
                                      && OpsCommon.landingState(modelData) !== "ACCEPTED"
-                            height: 24; padding: 0
+                            width: Math.min(implicitWidth, actionFlow.maxButtonWidth); height: 24; padding: 0
                             text: qsTr("移交降落指挥")
                             onClicked: panel.handoverProposed(modelData.task_id, "LANDING")
                         }
@@ -928,7 +948,7 @@ ColumnLayout {
                             //    高度置 0 的按钮在 `Row` 里仍然占着宽度，会留一段莫名其妙的空档。
                             visible: (card._handover ? OpsCommon.isMine(card._handover, AuthController.userId) : false)
                                      && !card._inFlightOutbound
-                            height: 24; padding: 0
+                            width: Math.min(implicitWidth, actionFlow.maxButtonWidth); height: 24; padding: 0
                             text: qsTr("撤回交接")
                             // ‼️ 走 `handoverId()` 而不是写死 `.handover_id`：交接现在有两个来源，
                             // 字段名按各自接口的文档约定不同（任务上的用 `id`、pending 项用 `handover_id`），

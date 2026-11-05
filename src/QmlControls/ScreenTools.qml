@@ -218,12 +218,16 @@ Item {
         return Math.round(clamp(windowHeight * _statusBarHeightPercent / 100 * layoutScaleFactor, lo, hi))
     }
 
-    function rightPanelMinWidthFor(windowWidth, contentMinWidth) {
+    /// 右栏宽度**严格按参数**取比例，不再有内容派生的下限（2026-11-05 用户裁定
+    /// 「参数优先」）。仅保留「不超过 45% 窗口宽」的防吞屏上限。
+    /// 内容适配目前只做了 Ops/Rom（仪表按栏宽缩放、任务卡按钮夹到行宽并折行）；
+    /// PlanView 的右栏内容（PlanTreeView）**尚未**按窄栏适配，小屏上需实测；
+    /// FlyView 的 `_rightPanelWidth` / `FlyViewMap.rightPanelWidth` 只有声明、无读取。
+    function rightPanelMinWidthFor(windowWidth) {
         if (windowWidth <= 0) {
-            return Math.round(contentMinWidth)
+            return 0
         }
-        const hi = Math.max(contentMinWidth, 0.45 * windowWidth)
-        return Math.round(clamp(windowWidth * _rightPanelMinPercent / 100 * layoutScaleFactor, contentMinWidth, hi))
+        return Math.round(clamp(windowWidth * _rightPanelMinPercent / 100 * layoutScaleFactor, 0, 0.45 * windowWidth))
     }
 
     function rightPanelMaxWidthFor(windowWidth, panelMinWidth) {
