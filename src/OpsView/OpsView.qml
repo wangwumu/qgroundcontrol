@@ -2196,7 +2196,7 @@ OpsShell {
                         verticalAlignment: Text.AlignVCenter
                         text: parent.text
                         color: "#ffffff"
-                        font.pixelSize: 13
+                        font.pixelSize: Math.round(13 * ScreenTools.uiTextScaleFactor)
                     }
                     // 勾选框两个状态各一个图标（Q 图标风格对勾徽标）：
                     // 选中=实心对勾 /res/selected.svg；未选中=半透明对勾 /res/unselected.svg（清晰可见）。
@@ -2228,7 +2228,7 @@ OpsShell {
                         verticalAlignment: Text.AlignVCenter
                         text: parent.text
                         color: "#ffffff"
-                        font.pixelSize: 13
+                        font.pixelSize: Math.round(13 * ScreenTools.uiTextScaleFactor)
                     }
                     // 进站独立勾选框：选中=实心对勾 /res/selected.svg；未选中=半透明对勾 /res/unselected.svg
                     indicator: Rectangle {
@@ -2257,7 +2257,7 @@ OpsShell {
                 visible: opsView._showSlotLayout
                 Text {
                     anchors.verticalCenter: parent.verticalCenter
-                    color: "#8fa1bd"; font.pixelSize: 11
+                    color: "#8fa1bd"; font.pixelSize: Math.round(11 * ScreenTools.uiTextScaleFactor)
                     text: qsTr("机位")
                 }
                 Repeater {
@@ -2274,7 +2274,7 @@ OpsShell {
                             // 背景（直接透出地图）上实测只有 **1.72:1**，肉眼只剩一个空框。
                             // 状态差异改由**底色**（选中 #2f6bd8）与**框线**表达，文字不再承担状态编码。
                             color: "#ffffff"
-                            font.pixelSize: 11
+                            font.pixelSize: Math.round(11 * ScreenTools.uiTextScaleFactor)
                             text: modelData
                         }
                         MouseArea {
@@ -2329,7 +2329,7 @@ OpsShell {
                     anchors { left: parent.left; right: parent.right; verticalCenter: parent.verticalCenter }
                     anchors.leftMargin: 6; anchors.rightMargin: 6
                     wrapMode: Text.Wrap
-                    color: "#ffd9a0"; font.pixelSize: 11
+                    color: "#ffd9a0"; font.pixelSize: Math.round(11 * ScreenTools.uiTextScaleFactor)
                     // 时间锚点两种形态：
                     //   · 成功过 ⇒ 「更新于 hh:mm:ss」——用户据此判断旧到什么程度；
                     //   · 从未成功 ⇒ 明说"本次会话还没有数据"。缺这一支时，首拉就失败的界面
@@ -2594,7 +2594,7 @@ OpsShell {
                         Layout.fillWidth: true
                         // 亮红 `#ff6b6b` —— 深绿底 `#0f2f2c` 上 **5.17:1**，过 AA 4.5:1，
                         // 与卡片里的错误红同值（本框换深色底后本行**不用改**，原本就是深底家族的色）。
-                        color: "#ff6b6b"; font.pixelSize: 13
+                        color: "#ff6b6b"; font.pixelSize: Math.round(13 * ScreenTools.uiTextScaleFactor)
                         wrapMode: Text.Wrap
                         text: qsTr("降落操作已被阻止，请人工确认机位/状态后重试。")
                     }
@@ -2607,7 +2607,7 @@ OpsShell {
                         //    ③ 本轮本框并入深色底（`OpsDialog`）⇒ 深蓝只剩 **2.50:1**，改回深底家族的
                         //       次要色 `#9fb3d4`（**6.75:1**）。
                         //    结论同 `slotDialog`：**字色跟着底走**，没有哪个色值"天生正确"。
-                        color: "#9fb3d4"; font.pixelSize: 12
+                        color: "#9fb3d4"; font.pixelSize: Math.round(12 * ScreenTools.uiTextScaleFactor)
                         wrapMode: Text.Wrap
                         text: opsView._landBlockReason
                     }
@@ -2669,7 +2669,7 @@ OpsShell {
                 //    （本轮之前 `assign` 分支正是 `OpsCommon.taskNo(t)`，两行同值。）
                 // ⚠️ 条目名与 `actionConfirmDialog` 的三行摘要**用词一致**（「飞行任务：」/
                 //    「无人机：」）—— 两个框一前一后出现，读起来要是同一套。
-                color: "#e6edf7"; font.pixelSize: 12
+                color: "#e6edf7"; font.pixelSize: Math.round(12 * ScreenTools.uiTextScaleFactor)
                 wrapMode: Text.Wrap
                 text: {
                     var t = opsView._assignSlotTask
@@ -2687,14 +2687,14 @@ OpsShell {
                 Layout.fillWidth: true
                 visible: opsView._slots.length === 0
                 // 琥珀 `#ffc107` —— 深色底上的警示色（与卡片里那两条警示同值）。
-                color: "#ffc107"; font.pixelSize: 12
+                color: "#ffc107"; font.pixelSize: Math.round(12 * ScreenTools.uiTextScaleFactor)
                 wrapMode: Text.Wrap
                 text: qsTr("本站暂无可选机位（机位须已核准且空闲）。")
             }
             // 指派失败原因（保留弹框可换机位重试）
             Text {
                 Layout.fillWidth: true
-                color: "#ff6b6b"; font.pixelSize: 12
+                color: "#ff6b6b"; font.pixelSize: Math.round(12 * ScreenTools.uiTextScaleFactor)
                 wrapMode: Text.Wrap
                 visible: opsView._assignSlotError !== ""
                 text: opsView._assignSlotError
@@ -2713,7 +2713,10 @@ OpsShell {
                     //      可选（常态，悬停转青绿）。
                     delegate: Button {
                         id: slotBtn
-                        width: 104; height: 44
+                        // 44 只是**下限**：字号放大时两行内容会超过 44（实测 1.5× 时 51px），
+                        // 固定高度会让第二行压出卡片边框（`clip: false`，还会吃到 8px 行间距）。
+                        // 100% 与调小字号时仍取 44，外观不变。
+                        width: 104; height: Math.max(44, Math.ceil(contentItem.implicitHeight + 8))
                         enabled: opsView._slotAssignable(modelData)
                         // 「当前已指派」= 这条任务**库里**那个 `assign_slot_id`（旧值）。
                         // ⚠️ 本框**不预选**它、也不把它当作默认提交值（用户裁定「确认执行时才写」，
@@ -2741,7 +2744,7 @@ OpsShell {
                                 anchors.horizontalCenter: parent.horizontalCenter
                                 text: modelData.slot_code
                                 color: slotBtn.enabled ? "#e6edf7" : "#5c6b85"
-                                font.pixelSize: 13
+                                font.pixelSize: Math.round(13 * ScreenTools.uiTextScaleFactor)
                                 font.bold: slotBtn._isCurrent
                                 horizontalAlignment: Text.AlignHCenter
                             }
@@ -2758,7 +2761,7 @@ OpsShell {
                                 }
                                 visible: text !== ""
                                 color: slotBtn.enabled ? "#9fb3d4" : "#5c6b85"
-                                font.pixelSize: 10
+                                font.pixelSize: Math.round(10 * ScreenTools.uiTextScaleFactor)
                                 horizontalAlignment: Text.AlignHCenter
                             }
                         }
@@ -2833,7 +2836,7 @@ OpsShell {
                 //       两个都不及格 ⇒ 换成深底家族，现值与实算值见 `_pendingConfirmHintColor`。
                 //    结论与 `slotDialog` / `landBlockDialog` **同一条**：**字色跟着底走**，
                 //    没有哪个色值天生正确，错的是把某个底上量过的色搬到另一个底上。
-                color: opsView._pendingConfirmHintColor(); font.pixelSize: 13
+                color: opsView._pendingConfirmHintColor(); font.pixelSize: Math.round(13 * ScreenTools.uiTextScaleFactor)
                 wrapMode: Text.Wrap
                 text: opsView._pendingConfirmHint()
                 // ‼️ 降落两档（F1/F2）与救济档（F3）**都不显示这行**：它们的正文换成了下面
@@ -2864,19 +2867,19 @@ OpsShell {
                 spacing: 5
                 Text {
                     width: parent.width
-                    color: "#e6edf7"; font.pixelSize: 12
+                    color: "#e6edf7"; font.pixelSize: Math.round(12 * ScreenTools.uiTextScaleFactor)
                     elide: Text.ElideMiddle
                     text: qsTr("飞行任务：") + opsView._landConfirmTaskNo(opsView._pendingAction)
                 }
                 Text {
                     width: parent.width
-                    color: "#e6edf7"; font.pixelSize: 12
+                    color: "#e6edf7"; font.pixelSize: Math.round(12 * ScreenTools.uiTextScaleFactor)
                     elide: Text.ElideMiddle
                     text: qsTr("无人机：") + opsView._landConfirmUAVNo(opsView._pendingAction)
                 }
                 Text {
                     width: parent.width
-                    color: "#e6edf7"; font.pixelSize: 12
+                    color: "#e6edf7"; font.pixelSize: Math.round(12 * ScreenTools.uiTextScaleFactor)
                     elide: Text.ElideMiddle
                     text: qsTr("机位：") + opsView._landConfirmSlotCode(opsView._pendingAction)
                 }
@@ -2910,12 +2913,12 @@ OpsShell {
                     text: qsTr("重要提示：")
                     // 深绿底 `#0f2f2c` 上实算 5.17:1，过 AA 4.5:1（与 `_pendingConfirmHintColor`
                     // 注释里那份表同源）。加粗让"这是警示"在第一眼就成立。
-                    color: "#ff6b6b"; font.pixelSize: 13; font.bold: true
+                    color: "#ff6b6b"; font.pixelSize: Math.round(13 * ScreenTools.uiTextScaleFactor); font.bold: true
                 }
                 Text {
                     Layout.fillWidth: true
                     Layout.alignment: Qt.AlignTop
-                    color: "#ff6b6b"; font.pixelSize: 13
+                    color: "#ff6b6b"; font.pixelSize: Math.round(13 * ScreenTools.uiTextScaleFactor)
                     wrapMode: Text.Wrap
                     // ⚠️ 整段与「重要提示：」**同色**：用户说的是"一组内容"，缩进已经在版式上
                     //    分组了，颜色再拆开反而把这个组拆散。救济的醒目色就是这么来的。
@@ -2931,13 +2934,13 @@ OpsShell {
                 spacing: 5
                 Text {
                     width: parent.width
-                    color: "#e6edf7"; font.pixelSize: 12
+                    color: "#e6edf7"; font.pixelSize: Math.round(12 * ScreenTools.uiTextScaleFactor)
                     elide: Text.ElideMiddle
                     text: qsTr("任务：") + opsView._landConfirmTaskNo(opsView._pendingAction)
                 }
                 Text {
                     width: parent.width
-                    color: "#e6edf7"; font.pixelSize: 12
+                    color: "#e6edf7"; font.pixelSize: Math.round(12 * ScreenTools.uiTextScaleFactor)
                     elide: Text.ElideMiddle
                     text: qsTr("无人机：") + opsView._landConfirmUAVNo(opsView._pendingAction)
                 }
@@ -2948,17 +2951,20 @@ OpsShell {
                 Item { Layout.fillWidth: true }
                 // 红 = 确认执行（醒目危险色）
                 Button {
+                    // 标签由下面的自绘 contentItem 渲染（字号已乘缩放因子），
+                    // 不要在这里再设 Button 自身的 font —— 那只对默认 contentItem 生效。
                     text: qsTr("确认执行")
                     background: Rectangle { color: "#d63031"; radius: 3; implicitHeight: 40; implicitWidth: 132 }
-                    contentItem: Text { text: parent.text; color: "#ffffff"; font.pixelSize: 15; font.bold: true
+                    contentItem: Text { text: parent.text; color: "#ffffff"; font.pixelSize: Math.round(15 * ScreenTools.uiTextScaleFactor); font.bold: true
                                         horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                     onClicked: { actionConfirmDialog.close(); opsView._execPendingAction() }
                 }
                 // 绿 = 取消（安全退出）
                 Button {
+                    // 同上：字号由自绘 contentItem 负责。
                     text: qsTr("取消")
                     background: Rectangle { color: "#2ecc71"; radius: 3; implicitHeight: 40; implicitWidth: 96 }
-                    contentItem: Text { text: parent.text; color: "#ffffff"; font.pixelSize: 15; font.bold: true
+                    contentItem: Text { text: parent.text; color: "#ffffff"; font.pixelSize: Math.round(15 * ScreenTools.uiTextScaleFactor); font.bold: true
                                         horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                     onClicked: actionConfirmDialog.close()
                 }

@@ -110,12 +110,12 @@ ColumnLayout {
                     // 该航线有异常航班 ⇒ 警示标记（判据在后端/骨架算好，此处只画）
                     Text {
                         visible: modelData.has_abnormal
-                        color: "#ff3b3b"; font.pixelSize: 12; font.bold: true
+                        color: "#ff3b3b"; font.pixelSize: Math.round(12 * ScreenTools.uiTextScaleFactor); font.bold: true
                         text: "⚠"
                     }
                     // 航线代号（灰字，等宽感知的编号位）
                     Text {
-                        color: "#8fa1bd"; font.pixelSize: 12; font.bold: true
+                        color: "#8fa1bd"; font.pixelSize: Math.round(12 * ScreenTools.uiTextScaleFactor); font.bold: true
                         text: modelData.route_code ? modelData.route_code : ("#" + modelData.route_id)
                     }
                     // 弹簧：把活跃数量推到最右
@@ -124,7 +124,7 @@ ColumnLayout {
                     // ⚠️ 0 也要显示（灰字），**不是**留空：留空会与"这条航线正在加载"分不清。
                     Text {
                         color: modelData.active_count > 0 ? "#2ecc71" : "#6b7a90"
-                        font.pixelSize: 12; font.bold: true
+                        font.pixelSize: Math.round(12 * ScreenTools.uiTextScaleFactor); font.bold: true
                         text: qsTr("活跃 ") + modelData.active_count
                     }
                 }
@@ -132,7 +132,7 @@ ColumnLayout {
                 // ---- 下行：航线名（主信息，独占整行宽度）----
                 Text {
                     Layout.fillWidth: true
-                    color: "#e6edf7"; font.pixelSize: 13
+                    color: "#e6edf7"; font.pixelSize: Math.round(13 * ScreenTools.uiTextScaleFactor)
                     elide: Text.ElideRight
                     text: modelData.route_name ? modelData.route_name : "—"
                 }
@@ -153,7 +153,7 @@ ColumnLayout {
         Layout.leftMargin: 12; Layout.rightMargin: 12
         horizontalAlignment: Text.AlignHCenter
         wrapMode: Text.Wrap
-        color: "#8fa1bd"; font.pixelSize: 12
+        color: "#8fa1bd"; font.pixelSize: Math.round(12 * ScreenTools.uiTextScaleFactor)
         visible: panel.routes.length === 0
         text: panel.ready ? qsTr("未被指派负责航线") : qsTr("航线加载中…")
     }

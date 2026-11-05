@@ -1,6 +1,8 @@
 import QtQuick
 import QtQuick.Controls
 
+import QGroundControl.Controls
+
 /*!
     \qmltype OpsDialog
     \brief OpsView / OpsShell 家族动作弹框的**共用皮肤**（用户 2026-10-08 第四轮）。
@@ -126,7 +128,7 @@ Dialog {
             id: opsDialogTitle
             anchors { left: parent.left; right: parent.right; top: parent.top; margins: 10 }
             text: opsDialogRoot.title
-            color: opsDialogRoot.titleColor; font.pixelSize: 14; font.bold: true
+            color: opsDialogRoot.titleColor; font.pixelSize: Math.round(14 * ScreenTools.uiTextScaleFactor); font.bold: true
             elide: Text.ElideRight
         }
     }

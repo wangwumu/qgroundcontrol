@@ -1886,7 +1886,7 @@ Item {
             Text {
                 anchors.verticalCenter: parent.verticalCenter
                 color: "#e6edf7"
-                font.pixelSize: 13; font.bold: true
+                font.pixelSize: Math.round(13 * ScreenTools.uiTextScaleFactor); font.bold: true
                 text: qsTr("操作员：") + (AuthController.displayName !== "" ? AuthController.displayName : AuthController.currentUser)
             }
 
@@ -1894,7 +1894,7 @@ Item {
             Text {
                 anchors.verticalCenter: parent.verticalCenter
                 color: "#e6edf7"
-                font.pixelSize: 13; font.bold: true
+                font.pixelSize: Math.round(13 * ScreenTools.uiTextScaleFactor); font.bold: true
                 text: Qt.formatDateTime(commandBarExtras.nowTime, "yyyy年MM月dd日 hh:mm:ss")
             }
 
@@ -2319,7 +2319,7 @@ Item {
                             Text {
                                 id: siteLabel
                                 anchors.centerIn: parent
-                                color: "#e6edf7"; font.pixelSize: 10; font.bold: true
+                                color: "#e6edf7"; font.pixelSize: Math.round(10 * ScreenTools.uiTextScaleFactor); font.bold: true
                                 text: modelData.uav_no ? modelData.uav_no : ("#" + modelData.device_id)
                             }
                         }
@@ -2566,7 +2566,7 @@ Item {
                             Text {
                                 id: markerLabel
                                 anchors.centerIn: parent
-                                color: "#e6edf7"; font.pixelSize: 10; font.bold: true
+                                color: "#e6edf7"; font.pixelSize: Math.round(10 * ScreenTools.uiTextScaleFactor); font.bold: true
                                 text: modelData.uav_no ? modelData.uav_no
                                       : (modelData.task_no ? modelData.task_no : ("#" + modelData.device_id))
                             }
@@ -2702,7 +2702,7 @@ Item {
             Text {
                 anchors.left: parent.left; anchors.leftMargin: 16
                 anchors.verticalCenter: parent.verticalCenter
-                color: "#e6edf7"; font.pixelSize: 13; font.bold: true
+                color: "#e6edf7"; font.pixelSize: Math.round(13 * ScreenTools.uiTextScaleFactor); font.bold: true
                 text: qsTr("选中任务：") + OpsCommon.taskNo(_selectedTask())
             }
 
@@ -2718,7 +2718,7 @@ Item {
                             ["status", qsTr("状态")]]
                     delegate: Text {
                         textFormat: Text.RichText
-                        font.pixelSize: 13; font.bold: true
+                        font.pixelSize: Math.round(13 * ScreenTools.uiTextScaleFactor); font.bold: true
                         color: "#e6edf7"
                         text: "<span style='color:#8fa1bd;'>%1：</span>%2".arg(modelData[1]).arg(_instrumentValue(modelData[0]))
                     }
@@ -2793,7 +2793,7 @@ Item {
                 //       比第 ① 版还糟 ⇒ 改回 `#e6edf7`（深绿底上 **12.18:1**）。
                 //    结论与另三个框**同一条**：**字色跟着底走**。三次翻转里没有哪一次是"色值错了"，
                 //    每一次都是**底色变了、字色没跟着变**。
-                color: "#e6edf7"; font.pixelSize: 13
+                color: "#e6edf7"; font.pixelSize: Math.round(13 * ScreenTools.uiTextScaleFactor)
                 wrapMode: Text.Wrap
                 // 正文**条目化**（用户 2026-10-08 第四轮：「站点提示签入的对话框，也要此风格」）。
                 // 原为一句叙事：「%1 · %2 请求把任务「%3」移交 %4」。
@@ -2820,7 +2820,7 @@ Item {
                 // ⚠️ 琥珀 `#ffc107` 在深底上其实有 8.80:1（够用），本行仍不用它 —— 它是卡片里
                 //    「警示条」的专用色，而本行是"剩余时间"这类**中性信息**，用它会误导成告警。
                 color: _confirmHandover && OpsCommon.isTimeout(_confirmHandover, opsShell._now) ? "#ff6b6b" : "#9fb3d4"
-                font.pixelSize: 12
+                font.pixelSize: Math.round(12 * ScreenTools.uiTextScaleFactor)
                 text: _confirmHandover ? qsTr("剩余 ") + OpsCommon.remainingSec(_confirmHandover, opsShell._now) : ""
             }
             // 操作失败提示：瞬时网络失败时保留弹框供重试（配合 _seenHandovers 去重，关框即无再确认入口）
@@ -2828,7 +2828,7 @@ Item {
                 Layout.fillWidth: true
                 // 亮红 `#ff6b6b` —— 深绿底 `#0f2f2c` 上 **5.17:1**（过 AA 4.5:1），与卡片里的错误红同值。
                 // ⚠️ 白底时代的 `#c62828` 在深绿底上只剩 **2.55:1**（实算表见 `OpsDialog.qml`）。
-                color: "#ff6b6b"; font.pixelSize: 12
+                color: "#ff6b6b"; font.pixelSize: Math.round(12 * ScreenTools.uiTextScaleFactor)
                 wrapMode: Text.Wrap
                 visible: _handoverActionError !== ""
                 text: _handoverActionError
@@ -2838,6 +2838,7 @@ Item {
                 spacing: 8
                 Item { Layout.fillWidth: true }
                 Button {
+                    font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
                     text: qsTr("拒绝")
                     // ‼️ 成功分支**什么都不做**（2026-10-10）：关框与清账已由
                     //    `_onHandoverActionSucceeded` 在动作函数**内部**做掉。这里再关一次
@@ -2849,6 +2850,7 @@ Item {
                     })
                 }
                 Button {
+                    font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
                     text: _confirmHandover && OpsCommon.isMine(_confirmHandover, AuthController.userId) ? qsTr("撤回") : qsTr("确认接管")
                     onClicked: {
                         var mine = _confirmHandover && OpsCommon.isMine(_confirmHandover, AuthController.userId)
@@ -2924,7 +2926,7 @@ Item {
                     // 字色由告警档给出（暗黄底 `#6b4e00` 上的 `#fff8e1`，7.28:1），不写死在这里 ——
                     // 与 `handoverDialog` 同一条纪律：**字色跟着底走**。用户第六轮把底压暗，
                     // 框里每个字色就都得跟着翻一遍（实算表在 `OpsDialog.qml` 文件头）。
-                    color: handoverGoneDialog.bodyColor; font.pixelSize: 13
+                    color: handoverGoneDialog.bodyColor; font.pixelSize: Math.round(13 * ScreenTools.uiTextScaleFactor)
                     wrapMode: Text.Wrap
                     text: _handoverGoneText
                 }
@@ -2937,6 +2939,7 @@ Item {
                 // ⚠️ 这里**刻意不写死秒数** —— 2026-10-10 倒计时由 5 秒改成 10 秒时，原句里
                 //    两处写死的"5 秒"都得跟着改。**别再写回数字**，要改只改 `handoverGoneTimer`。
                 Button {
+                    font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
                     text: qsTr("知道了")
                     onClicked: handoverGoneDialog.close()
                 }

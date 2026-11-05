@@ -148,7 +148,7 @@ ColumnLayout {
 
         Text {
             Layout.alignment: Qt.AlignVCenter
-            color: "#5f7391"; font.pixelSize: 11
+            color: "#5f7391"; font.pixelSize: Math.round(11 * ScreenTools.uiTextScaleFactor)
             text: panel._rows.length > 0 ? String(panel._rows.length) : ""
         }
     }
@@ -202,7 +202,7 @@ ColumnLayout {
 
                         Text {
                             Layout.alignment: Qt.AlignVCenter
-                            color: "#5f7391"; font.pixelSize: 10
+                            color: "#5f7391"; font.pixelSize: Math.round(10 * ScreenTools.uiTextScaleFactor)
                             text: panel._timeText(alertRow.modelData)
                         }
                         // 航班号在机号**之前**：告警的主体是"哪个航班出事了"，
@@ -213,18 +213,18 @@ ColumnLayout {
                         Text {
                             Layout.alignment: Qt.AlignVCenter
                             visible: alertRow.modelData ? alertRow.modelData.taskNo !== "" : false
-                            color: "#4fc3f7"; font.pixelSize: 10
+                            color: "#4fc3f7"; font.pixelSize: Math.round(10 * ScreenTools.uiTextScaleFactor)
                             text: alertRow.modelData ? alertRow.modelData.taskNo : ""
                         }
                         Text {
                             Layout.alignment: Qt.AlignVCenter
-                            color: "#8fa1bd"; font.pixelSize: 10
+                            color: "#8fa1bd"; font.pixelSize: Math.round(10 * ScreenTools.uiTextScaleFactor)
                             text: alertRow.modelData ? alertRow.modelData.who : ""
                         }
                         Text {
                             Layout.alignment: Qt.AlignVCenter
                             color: panel._severityColor(alertRow.modelData ? alertRow.modelData.severity : -1)
-                            font.pixelSize: 10; font.bold: true
+                            font.pixelSize: Math.round(10 * ScreenTools.uiTextScaleFactor); font.bold: true
                             // ‼️ 文案走 `OpsCommon.severityLabel`（**单点定义**，八档→中文四档）：
                             //    界面不得出现裸枚举（既有约束 `ui-no-raw-enum-labels`）。
                             text: OpsCommon.severityLabel(alertRow.modelData ? alertRow.modelData.severity : -1)
@@ -235,7 +235,7 @@ ColumnLayout {
                     // 告警正文（§6.3 第二段）
                     Text {
                         width: parent.width
-                        color: "#d6e0f0"; font.pixelSize: 11
+                        color: "#d6e0f0"; font.pixelSize: Math.round(11 * ScreenTools.uiTextScaleFactor)
                         text: alertRow.modelData ? alertRow.modelData.text : ""
                         wrapMode: Text.Wrap
                         // 最多两行：固定高度的列表里，一条超长告警不该把整段撑开
@@ -254,7 +254,7 @@ ColumnLayout {
         Text {
             anchors.centerIn: parent
             visible: panel._rows.length === 0
-            color: "#5f7391"; font.pixelSize: 11
+            color: "#5f7391"; font.pixelSize: Math.round(11 * ScreenTools.uiTextScaleFactor)
             text: panel._vehicles.count === 0 ? qsTr("未接引到飞机")
                                               : qsTr("暂无告警")
         }

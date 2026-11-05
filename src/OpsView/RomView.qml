@@ -228,7 +228,7 @@ OpsShell {
                     anchors { left: parent.left; right: parent.right; verticalCenter: parent.verticalCenter }
                     anchors.leftMargin: 6; anchors.rightMargin: 6
                     wrapMode: Text.Wrap
-                    color: "#ffd9a0"; font.pixelSize: 11
+                    color: "#ffd9a0"; font.pixelSize: Math.round(11 * ScreenTools.uiTextScaleFactor)
                     text: romView._routeLoadError !== ""
                           ? romView._routeLoadError
                           : qsTr("数据更新于 %1，当前不可达").arg(romView._routeUpdatedText)

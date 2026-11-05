@@ -54,6 +54,16 @@ Item {
     /// QFontMetrics::descent for default font at default point size
     property real defaultFontDescent:       0
 
+    /// 字体缩放因子（`uiScalePercent × fontScalePercent` 的合成效果）。
+    ///
+    /// QGCLabel 等走 `pointSize` 的控件自动跟随 `defaultFontPointSize`；
+    /// 而自绘界面（如 OpsView）里写死的 `font.pixelSize` / 未设字体的 Button
+    /// 不走这条链。它们必须显式乘上本因子，才能与系统菜单等原生控件同步缩放。
+    /// 默认配置下恒为 1（外观不变）；仅当两个缩放参数偏离 100 时才离开 1。
+    readonly property real uiTextScaleFactor: platformFontPointSize > 0
+                                              ? defaultFontPointSize / platformFontPointSize
+                                              : 1
+
     /// The default amount of space in between controls in a dialog
     property real defaultDialogControlSpacing: defaultFontPixelHeight / 2
 
