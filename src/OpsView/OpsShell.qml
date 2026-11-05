@@ -2762,14 +2762,22 @@ Item {
     OpsDialog {
         id: handoverDialog
         parent: opsShell
-        // 宽度与右边栏一致、右边缘贴窗口右缘、上部与**那条交接对应的任务卡片**下缘对齐——
+        // 宽度 = max(右边栏宽, 320) × 字号因子（100% 且栏宽 ≥320 时与右栏等宽）、右边缘贴窗口右缘、
+        // 上部与**那条交接对应的任务卡片**下缘对齐——
         // 与签出确认框（`OpsView.actionConfirmDialog`）同一套规则（用户 2026-09-28 要求）。
         // 原先没写 `x`/`y`，`Dialog` 缺省落 (0,0) ⇒ 用户报的"左上角"。
         // ‼️ 与签出确认框唯一的差别在**锚点怎么来**：那个框只由"点卡片上的按钮"触发，坐标随
         //    信号带回；这个框还能由**待办到达自动弹出**（`_notifyNewPending`），那一路没有触发
         //    卡片 ⇒ 按 `task_id` 回列表里找（`_handoverAnchorFn`，视图侧注入）。两条路都收进
         //    `_handoverAnchorY`，这里只管消费，不认识自己是被谁打开的。
-        width: Math.max(opsShell.rightPanelWidth, 320)   // 320 = 弹框内容最小可用宽（按钮 132+96+间距）
+        width: Math.min(Math.round(Math.max(opsShell.rightPanelWidth, 320) * ScreenTools.uiTextScaleFactor),
+                        Math.round(opsShell.width * 0.95))
+               // 320 = 100% 时沿用的内容基线（源自确认框的旧下限；本框没有 132/96 按钮行）；
+               // 整体再乘字号因子，否则字号缩放后弹框宽度不变、内容与留白比例失衡。
+               // 封顶 95% 窗宽：字号因子最高 4×（UI 200% × 字体 200%），无上限时宽度会超出窗口、
+               // 左缘跑到屏幕外。100% 时右栏硬上限 55% 窗宽
+               // （`layoutSettings.rightPanelMaxPercent` 的 max，该项默认 20%），
+               // 封顶不生效；极窄窗下弹框才会被收到 95% 窗宽。
         x: opsShell.width - width
         // 卡片靠下时向上收，别顶出屏幕底；无锚点（交接对应的任务不在本视图列表里，或卡片滚出
         // 可视区）则垂直居中——兜底与 `actionConfirmDialog` 的 `_confirmAnchorY < 0` 那条一致。
@@ -2839,6 +2847,12 @@ Item {
                 Item { Layout.fillWidth: true }
                 Button {
                     font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
+                    // Basic 风格 Button 的 background 把 implicit 钉在 100×40，不覆盖就是「框大字小」。
+                    // ‼️ 内容项之外还要加上**未被覆盖的 padding**（Basic 为 8+8 / 6+6）：
+                    //    只比 contentItem 的话，长文案（尤其翻译）会先被 100 下限掩盖、
+                    //    随后内容区只有「宽−16」，文字被省略。
+                    implicitWidth: Math.max(Math.round(100 * ScreenTools.uiTextScaleFactor), contentItem.implicitWidth + leftPadding + rightPadding)
+                    implicitHeight: Math.max(Math.round(40 * ScreenTools.uiTextScaleFactor), contentItem.implicitHeight + topPadding + bottomPadding)
                     text: qsTr("拒绝")
                     // ‼️ 成功分支**什么都不做**（2026-10-10）：关框与清账已由
                     //    `_onHandoverActionSucceeded` 在动作函数**内部**做掉。这里再关一次
@@ -2851,6 +2865,9 @@ Item {
                 }
                 Button {
                     font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
+                    // 同上：覆盖 Basic 默认的 100×40。
+                    implicitWidth: Math.max(Math.round(100 * ScreenTools.uiTextScaleFactor), contentItem.implicitWidth + leftPadding + rightPadding)
+                    implicitHeight: Math.max(Math.round(40 * ScreenTools.uiTextScaleFactor), contentItem.implicitHeight + topPadding + bottomPadding)
                     text: _confirmHandover && OpsCommon.isMine(_confirmHandover, AuthController.userId) ? qsTr("撤回") : qsTr("确认接管")
                     onClicked: {
                         var mine = _confirmHandover && OpsCommon.isMine(_confirmHandover, AuthController.userId)
@@ -2878,7 +2895,14 @@ Item {
     OpsDialog {
         id: handoverGoneDialog
         parent: opsShell
-        width: Math.max(opsShell.rightPanelWidth, 320)   // 320 = 弹框内容最小可用宽（按钮 132+96+间距）
+        width: Math.min(Math.round(Math.max(opsShell.rightPanelWidth, 320) * ScreenTools.uiTextScaleFactor),
+                        Math.round(opsShell.width * 0.95))
+               // 320 = 100% 时沿用的内容基线（源自确认框的旧下限；本框没有 132/96 按钮行）；
+               // 整体再乘字号因子，否则字号缩放后弹框宽度不变、内容与留白比例失衡。
+               // 封顶 95% 窗宽：字号因子最高 4×（UI 200% × 字体 200%），无上限时宽度会超出窗口、
+               // 左缘跑到屏幕外。100% 时右栏硬上限 55% 窗宽
+               // （`layoutSettings.rightPanelMaxPercent` 的 max，该项默认 20%），
+               // 封顶不生效；极窄窗下弹框才会被收到 95% 窗宽。
         x: opsShell.width - width
         y: opsShell._handoverAnchorY < 0
            ? (opsShell.height - height) / 2
@@ -2940,6 +2964,9 @@ Item {
                 //    两处写死的"5 秒"都得跟着改。**别再写回数字**，要改只改 `handoverGoneTimer`。
                 Button {
                     font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
+                    // 同上：覆盖 Basic 默认的 100×40。
+                    implicitWidth: Math.max(Math.round(100 * ScreenTools.uiTextScaleFactor), contentItem.implicitWidth + leftPadding + rightPadding)
+                    implicitHeight: Math.max(Math.round(40 * ScreenTools.uiTextScaleFactor), contentItem.implicitHeight + topPadding + bottomPadding)
                     text: qsTr("知道了")
                     onClicked: handoverGoneDialog.close()
                 }

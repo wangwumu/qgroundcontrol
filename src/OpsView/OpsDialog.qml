@@ -113,6 +113,11 @@ Dialog {
     /// 与框内其它字色同源，不会引入第三个色相。
     readonly property color warnIconColor: alert ? "#ffe082" : "#ffc107"
 
+    /// ‼️ 内容留白随字号因子缩放：Basic 风格 `Dialog` 的 padding 默认是**固定 12**
+    ///    （Qt 6.11.1 `Basic/Dialog.qml` 的 `padding: 12`）。不缩放的话，字号 0.2×
+    ///    时弹框宽约 64，两侧 24 的内边距占去 38%，剩下能用 40（占内容区 60%）。
+    padding: Math.round(12 * ScreenTools.uiTextScaleFactor)
+
     background: Rectangle {
         color: opsDialogRoot.cardColor
         radius: 4
@@ -123,10 +128,11 @@ Dialog {
     // ‼️ `text: opsDialogRoot.title` 而不是裸写 `title`：`header` 的求值作用域在派生
     //    组件内部，裸写要靠 unqualified access 的兜底查找。加根 id 把它钉死。
     header: Item {
-        implicitHeight: opsDialogTitle.implicitHeight + 20
+        implicitHeight: opsDialogTitle.implicitHeight + Math.round(20 * ScreenTools.uiTextScaleFactor)
         Text {
             id: opsDialogTitle
-            anchors { left: parent.left; right: parent.right; top: parent.top; margins: 10 }
+            anchors { left: parent.left; right: parent.right; top: parent.top
+                      margins: Math.round(10 * ScreenTools.uiTextScaleFactor) }
             text: opsDialogRoot.title
             color: opsDialogRoot.titleColor; font.pixelSize: Math.round(14 * ScreenTools.uiTextScaleFactor); font.bold: true
             elide: Text.ElideRight

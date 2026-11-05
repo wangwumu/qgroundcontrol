@@ -1,6 +1,8 @@
 import QtQuick
 import QtQuick.Shapes
 
+import QGroundControl.Controls
+
 /*!
     \qmltype OpsWarnIcon
     \brief OpsView / OpsShell 家族**通知类**弹框的标记图标：三角形外框 + 叹号。
@@ -70,9 +72,11 @@ Item {
     /// ⚠️ 旧注释这里写的是「缺省 16 —— 比 13px 正文略高，压得住又不喧宾夺主」。
     ///    那是 16 的说法：48 是正文的 **3.7 倍高**，故意不再含蓄。别照那句往回改。
     /// ⚠️ 两个实例（`OpsView.qml` 的 `landBlockDialog`、`OpsShell.qml` 的
-    ///    `handoverGoneDialog`）**都没显式传 `size`** ⇒ 改缺省值两处同时变，
+    ///    `handoverGoneDialog`）**都不显式传 `size`** ⇒ 改缺省值两处同时变，
     ///    这正是单点定义想要的；要分开调再给实例传 `size`。
-    property real size: 48
+    /// ‼️ 缺省值随 `uiTextScaleFactor` 缩放（2026-11-05）：图标本身不是文字，但它与
+    ///    旁边的告警文字同一行，字号缩到 0.2× 时固定的 48 会把整行撑高。
+    property real size: Math.round(48 * ScreenTools.uiTextScaleFactor)
 
     implicitWidth: size
     implicitHeight: size
