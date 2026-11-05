@@ -30,8 +30,9 @@ OpsShell {
     // 用户 2026-09-21 裁定两个身份不允许重叠、不存在双身份 ⇒ 监控员不走这里，它是并列的
     // `RomView.qml`；分流判据只有一处，在 `MainWindow._onLoginSucceededForRole()`。
     overviewView: "site"
-    // 右栏宽度：按机位图**所需宽**取值（340 ~ 510 = 340×1.5）。510 来自用户给的上限
-    //「宽度不足时右边栏可扩至 1.5 倍」。机位图所需宽由 `_slotDesiredPanelWidth` 回送。
+    // 右栏宽度：站点视图下按机位图**所需宽**在下限~上限之间取值（两者均由 `Layout` 设置组
+    // 按窗口宽比例折算，见 `OpsShell._rightPanelMinW/_rightPanelMaxW`）。
+    // 机位图所需宽由 `_slotDesiredPanelWidth` 回送。
     rightPanelWidth: _isSiteATC
                      ? Math.min(_rightPanelMaxW, Math.max(_rightPanelMinW, _slotDesiredPanelWidth))
                      : _rightPanelMinW
@@ -2624,7 +2625,7 @@ OpsShell {
         parent: opsView
         // ‼️ 宽度与右边栏一致（用户 2026-10-08 第四轮：「宽度有与右边栏宽度等宽」）。
         //    原为**硬编码 360**。而右边栏是**可变宽**的 —— `rightPanelWidth` = 站点视图下
-        //    `min(510, max(340, 机位图所需宽))`（见本文件顶部 `rightPanelWidth` 的声明）
+        //    `clamp(机位图所需宽, 下限, 上限)`（下限/上限按窗口宽比例折算，见 OpsShell 的声明）
         //    ⇒ 机位图宽时弹框比栏窄、机位图窄时又比栏宽，两边永远对不齐。
         //    与 `actionConfirmDialog` / `handoverDialog` 逐字同款。
         // ⚠️ 宽度变成可变值后，下面机位格 `Flow` 的**列数会随栏宽变**（原注释按 360 算的

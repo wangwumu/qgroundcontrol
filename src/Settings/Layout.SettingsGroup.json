@@ -1,0 +1,77 @@
+{
+    "version": 1,
+    "fileType": "FactMetaData",
+    "QGC.MetaData.Facts": [
+        {
+            "name": "toolbarHeightPercent",
+            "shortDesc": "Toolbar height as a percentage of the window height.",
+            "longDesc": "The toolbar height is calculated from the main window content height, this percentage and the layout scale factor, then clamped to the font-derived minimum (at most 20% of the window height).",
+            "type": "double",
+            "units": "%",
+            "min": 0.5,
+            "max": 20.0,
+            "default": 3.75,
+            "label": "Toolbar height",
+            "keywords": "layout,toolbar"
+        },
+        {
+            "name": "statusBarHeightPercent",
+            "shortDesc": "Status bar height as a percentage of the window height.",
+            "longDesc": "The status bar height is calculated from the window height, this percentage and the layout scale factor, then clamped between a content-derived minimum and 15% of the window height.",
+            "type": "double",
+            "units": "%",
+            "min": 0.5,
+            "max": 15.0,
+            "default": 3.0,
+            "label": "Status bar height",
+            "keywords": "layout,status bar"
+        },
+        {
+            "name": "rightPanelMinPercent",
+            "shortDesc": "Minimum right panel width as a percentage of the window width.",
+            "longDesc": "The right panel width is calculated from the window width, this percentage and the layout scale factor, then clamped to the content minimum and the configured maximum.",
+            "type": "double",
+            "units": "%",
+            "min": 1.0,
+            "max": 45.0,
+            "default": 15.0,
+            "label": "Right panel minimum width",
+            "keywords": "layout,right panel"
+        },
+        {
+            "name": "rightPanelMaxPercent",
+            "shortDesc": "Maximum right panel width as a percentage of the window width.",
+            "longDesc": "Upper bound for the right panel width. Content-driven widening is clamped to this value, and never above 55% of the window width.",
+            "type": "double",
+            "units": "%",
+            "min": 1.0,
+            "max": 55.0,
+            "default": 20.0,
+            "label": "Right panel maximum width",
+            "keywords": "layout,right panel"
+        },
+        {
+            "name": "fontScalePercent",
+            "shortDesc": "Font scale applied on top of the UI Scaling setting.",
+            "longDesc": "Multiplies the platform font size (together with the existing UI Scaling setting). Lower it on small screens so that the font-derived minimum heights of the toolbar and status bar shrink and the percentage-based sizes can take effect. This value is set per device; it is never derived from the screen resolution automatically.",
+            "type": "double",
+            "units": "%",
+            "min": 40.0,
+            "max": 200.0,
+            "default": 100.0,
+            "label": "Font scale",
+            "keywords": "layout,font,scale"
+        },
+        {
+            "name": "scaleFactor",
+            "shortDesc": "Manual scale factor applied to the layout percentages.",
+            "longDesc": "Multiplies the calculated toolbar height, status bar height and right panel width. Each result is still clamped to its hard bound (toolbar 20%, status bar 15%, right panel 45%/55% of the window), so a factor beyond that stops growing the element. This value is set per device; it is never derived from the screen resolution automatically.",
+            "type": "double",
+            "min": 0.5,
+            "max": 10.0,
+            "default": 1.0,
+            "label": "Layout scale factor",
+            "keywords": "layout,scale"
+        }
+    ]
+}

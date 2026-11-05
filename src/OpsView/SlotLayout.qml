@@ -71,7 +71,8 @@ Item {
     property real   maxAreaHeight: 0
     /// 当前选中的机位 id（-1 = 无）。点亮用。
     property int    selectedSlotId: -1
-    /// 边栏宽的可取范围（**单点定义在 OpsView**，这里只用来算 desiredPanelWidth）
+    /// 边栏宽的可取范围。**实际值由 OpsShell 按窗口宽比例算好传入**（见 `_rightPanelMinW`），
+    /// 这两个只是没传时的旧兜底值，仅用于算 desiredPanelWidth。
     property real   panelMinWidth: 340
     property real   panelMaxWidth: 510      // = panelMinWidth × 1.5
 

@@ -25,6 +25,7 @@
 #include "VideoSettings.h"
 #include "MavlinkSettings.h"
 #include "JoystickManagerSettings.h"
+#include "LayoutSettings.h"
 #include "LogManagerSettings.h"
 #include "LogViewerSettings.h"
 #include "Viewer3DSettings.h"
@@ -78,6 +79,7 @@ void SettingsManager::init()
     _videoSettings = new VideoSettings(this);
     _mavlinkSettings = new MavlinkSettings(this);
     _joystickManagerSettings = new JoystickManagerSettings(this);
+    _layoutSettings = new LayoutSettings(this);
     _logManagerSettings = new LogManagerSettings(this);
     _logViewerSettings = new LogViewerSettings(this);
     _viewer3DSettings = new Viewer3DSettings(this);
@@ -111,6 +113,7 @@ NTRIPSettings *SettingsManager::ntripSettings() const { return _ntripSettings; }
 VideoSettings *SettingsManager::videoSettings() const { return _videoSettings; }
 MavlinkSettings *SettingsManager::mavlinkSettings() const { return _mavlinkSettings; }
 JoystickManagerSettings *SettingsManager::joystickManagerSettings() const { return _joystickManagerSettings; }
+LayoutSettings *SettingsManager::layoutSettings() const { return _layoutSettings; }
 LogManagerSettings *SettingsManager::logManagerSettings() const { return _logManagerSettings; }
 LogViewerSettings *SettingsManager::logViewerSettings() const { return _logViewerSettings; }
 Viewer3DSettings *SettingsManager::viewer3DSettings() const { return _viewer3DSettings; }

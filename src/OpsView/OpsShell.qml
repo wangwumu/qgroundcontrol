@@ -55,7 +55,8 @@ Item {
     //   "site"  = 本站视图（后端按站点过滤）
     //   "route" = 监控员视图（后端按负责航线过滤 IN_FLIGHT）
     property string overviewView: "site"
-    // 右栏宽度。机位平面图在场时由站点视图按所需宽在 340~510 之间伸缩，其余视图恒 340。
+    // 右栏宽度。机位平面图在场时由站点视图按所需宽在下限与上限之间伸缩；其余视图恒取下限。
+    // 下限/上限均按窗口宽比例折算（Layout 设置组），下限还不低于内容最小宽 340。
     property real   rightPanelWidth: _rightPanelMinW
     // 是否启用**航线图层**（① my-routes 缓存 + ③ route-tasks）。
     // ‼️ 与 `overviewView` 一样是**数据源参数，不是显示开关**：监控员视图（RomView）置 true，
@@ -440,13 +441,20 @@ Item {
     // 中两个卡片的间隔」，方向本就该是这个。值不变（10），两个视图因此天然同值。
     readonly property real _taskCardMargin: 10
 
-    // 右边栏宽度：站点视图下按机位图**所需宽**取值（340 ~ 510 = 340×1.5），其余视图恒 340。
-    // 510 来自用户给的上限「宽度不足时右边栏可扩至 1.5 倍」。
-    readonly property real _rightPanelMinW: 340
-    readonly property real _rightPanelMaxW: _rightPanelMinW * 1.5
-    // 姿态仪/罗盘宽度**不随边栏加宽**（恒 340×0.8 = 272）：表盘放大没有信息量，
+    // 姿态仪/罗盘宽度**不随边栏加宽**（恒 272 = 340×0.8）：表盘放大没有信息量，
     // 而且会连带吃掉机位区的可用高（仪表高 = (宽−12)/2，宽了高也高）。
-    readonly property real _instrBlockW:    _rightPanelMinW * 0.8
+    readonly property real _instrBlockW: 272
+    // 右边栏的内容下限：屏幕按比例算出来比它还窄时，以它为准（QML Item 不裁剪，栏宽低于
+    // 内容最小宽会溢出）。取两个约束的较大者：
+    //   ① 仪表簇 272 + 左右各 `_taskCardMargin` = 292；
+    //   ② 任务卡三按钮一排需要 340 —— `TaskListPanel.qml` 实测「直接降落 88 + 指派机位 88 +
+    //      停泊 100 + 2×间距 6 = 288」，可用宽 = 栏宽 − 20(右留白) − 10(左边距) − 16(卡内边距)
+    //      ⇒ 栏宽低于 340 时三颗按钮会折成两排（2026-10-08 用户原话）。
+    readonly property real _rightPanelContentMinW: Math.max(_instrBlockW + 2 * _taskCardMargin, 340)
+    // 右边栏宽度按窗口宽度的比例折算（Layout 设置组）。站点视图下按机位图**所需宽**在
+    // 下限与上限之间取值，其余视图恒取下限。
+    readonly property real _rightPanelMinW: ScreenTools.rightPanelMinWidthFor(width, _rightPanelContentMinW)
+    readonly property real _rightPanelMaxW: ScreenTools.rightPanelMaxWidthFor(width, _rightPanelMinW)
 
     // 右栏/仪表的实际尺寸，**暴露给视图**：站点视图的机位区可用高必须由它们推出
     //（见 OpsView 的 `_siteAreaH`），而 `rightPanel`/`instrumentsBlock` 是本文件的内部 id，
@@ -1412,7 +1420,7 @@ Item {
     ///
     /// ‼️ `opsMap` 是 `anchors.fill` **满铺**的，而三块兄弟项**盖在它上面**：
     ///      · 顶部命令条 `commandBarWrap`        → 盖住上边 `toolbarHeight`
-    ///      · 底部状态栏 `instrumentPanel`        → 盖住下边（左区宽，height 48）
+    ///      · 底部状态栏 `instrumentPanel`        → 盖住下边（左区宽，高度按屏幕比例折算）
     ///      · 右栏 `rightPanel`（从命令条下沿到底）→ 盖住右边 `rightPanelWidth`
     ///    ⇒ **可见区** = `[0, w−右栏宽] × [命令条高, h−状态栏高]`。既不是整张地图，
     ///    也不是只挖掉右边一块。历史教训（用户报「航线超过当前视口」）：只按右栏缩经度、
@@ -2626,7 +2634,7 @@ Item {
         Rectangle {
             id: rightPanel
             anchors { top: parent.top; topMargin: ScreenTools.toolbarHeight; bottom: parent.bottom; right: parent.right }
-            // 宽度不再是常量：站点视图下随机位图所需宽在 340~510 之间伸缩（视图侧算好传进来）。
+            // 宽度不再是常量：站点视图下随机位图所需宽在下限与上限之间伸缩（视图侧算好传进来）。
             // 地图是 anchors.fill 铺满的，边栏变宽只是多盖住一点地图，不改变地图自身的尺寸。
             width: opsShell.rightPanelWidth
             color: QGroundControl.globalPalette.windowTransparent
@@ -2679,11 +2687,11 @@ Item {
             }
         }
 
-        //---- 底部状态栏（占满左区宽，高度+50%，内容居中，字号按任务栏登录用户名）----
+        //---- 底部状态栏（占满左区宽，高度按窗口高比例折算，内容居中，字号按任务栏登录用户名）----
         Rectangle {
             id: instrumentPanel
             anchors { left: parent.left; right: rightPanel.left; bottom: parent.bottom }
-            height: 48
+            height: ScreenTools.statusBarHeightFor(opsShell.height)
             color: QGroundControl.globalPalette.windowTransparent
             z: 5
 

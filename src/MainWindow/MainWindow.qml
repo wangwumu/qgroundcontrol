@@ -21,6 +21,15 @@ ApplicationWindow {
     // The special casing for android prevents white bars from showing up on the edges of the screen with newer android versions
     flags:      Qt.Window | (ScreenTools.isAndroid ? Qt.ExpandedClientAreaHint | Qt.NoTitleBarBackgroundHint : 0)
 
+    // 工具栏等按比例计算的尺寸读**窗口内容区高**，不是显示器高（设计稿 §6.3）。
+    // ScreenTools 是无窗口单例，自己读不到窗口尺寸，只能由主窗口注入真实值；
+    // 其中 Screen.height 只是绑定生效前的兜底。
+    Binding {
+        target:     ScreenTools
+        property:   "windowContentHeight"
+        value:      mainWindow.contentItem.height
+    }
+
     Component.onCompleted: {
         // 登录成功后按操作岗位分流（单身份，见 _onLoginSucceededForRole）：
         //   SITE_ATC          → 站点操作员监控主界面（OpsView）

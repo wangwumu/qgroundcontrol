@@ -29,6 +29,7 @@ class Viewer3DSettings;
 class MavlinkSettings;
 class FactMetaData;
 class JoystickManagerSettings;
+class LayoutSettings;
 class LogManagerSettings;
 class LogViewerSettings;
 
@@ -63,6 +64,7 @@ class SettingsManager : public QObject
     Q_MOC_INCLUDE("VideoSettings.h")
     Q_MOC_INCLUDE("MavlinkSettings.h")
     Q_MOC_INCLUDE("JoystickManagerSettings.h")
+    Q_MOC_INCLUDE("LayoutSettings.h")
     Q_MOC_INCLUDE("LogManagerSettings.h")
     Q_MOC_INCLUDE("LogViewerSettings.h")
     Q_MOC_INCLUDE("Viewer3DSettings.h")
@@ -90,6 +92,7 @@ class SettingsManager : public QObject
     Q_PROPERTY(QObject *videoSettings                   READ videoSettings                  CONSTANT)
     Q_PROPERTY(QObject *mavlinkSettings                 READ mavlinkSettings                CONSTANT)
     Q_PROPERTY(QObject *joystickManagerSettings         READ joystickManagerSettings        CONSTANT)
+    Q_PROPERTY(QObject *layoutSettings                  READ layoutSettings                 CONSTANT)
     Q_PROPERTY(QObject *logManagerSettings              READ logManagerSettings              CONSTANT)
     Q_PROPERTY(QObject *logViewerSettings               READ logViewerSettings               CONSTANT)
     Q_PROPERTY(QObject *viewer3DSettings                READ viewer3DSettings               CONSTANT)
@@ -131,6 +134,7 @@ public:
     VideoSettings *videoSettings() const;
     MavlinkSettings *mavlinkSettings() const;
     JoystickManagerSettings *joystickManagerSettings() const;
+    LayoutSettings *layoutSettings() const;
     LogManagerSettings *logManagerSettings() const;
     LogViewerSettings *logViewerSettings() const;
     Viewer3DSettings *viewer3DSettings() const;
@@ -162,6 +166,7 @@ private:
     VideoSettings *_videoSettings = nullptr;
     MavlinkSettings *_mavlinkSettings = nullptr;
     JoystickManagerSettings *_joystickManagerSettings = nullptr;
+    LayoutSettings *_layoutSettings = nullptr;
     LogManagerSettings *_logManagerSettings = nullptr;
     LogViewerSettings *_logViewerSettings = nullptr;
     Viewer3DSettings *_viewer3DSettings = nullptr;

@@ -61,7 +61,24 @@ Item {
     property real mediumFontPointSize:      10
     property real largeFontPointSize:       10
 
-    property real toolbarHeight:            0
+    /// Screen-relative layout parameters. These are manual settings; the scale
+    /// factor is never derived from the screen resolution automatically.
+    readonly property real layoutScaleFactor:       QGroundControl.settingsManager.layoutSettings.scaleFactor.value
+    readonly property real _toolbarHeightPercent:   QGroundControl.settingsManager.layoutSettings.toolbarHeightPercent.value
+    readonly property real _statusBarHeightPercent: QGroundControl.settingsManager.layoutSettings.statusBarHeightPercent.value
+    readonly property real _rightPanelMinPercent:   QGroundControl.settingsManager.layoutSettings.rightPanelMinPercent.value
+    readonly property real _rightPanelMaxPercent:   QGroundControl.settingsManager.layoutSettings.rightPanelMaxPercent.value
+    /// Height of the main window content area. This singleton has no window of its own, so
+    /// MainWindow injects the real value; `screenHeight` is only the fallback used before that
+    /// binding is evaluated. Layout sizes must follow the window, not the monitor (design §6.3).
+    property real windowContentHeight: screenHeight
+
+    property real toolbarHeight: {
+        const lo = 3 * defaultFontPixelHeight
+        const hi = Math.max(lo, 0.20 * windowContentHeight)
+        return Math.round(clamp(windowContentHeight * _toolbarHeightPercent / 100 * layoutScaleFactor, lo, hi))
+                * QGroundControl.corePlugin.options.toolbarHeightMultiplier
+    }
 
     property real realPixelDensity: {
         //-- If a plugin defines it, just use what it tells us
@@ -126,8 +143,14 @@ Item {
     Connections {
         target: QGroundControl.settingsManager.appSettings.uiScalePercent
         function onValueChanged() {
-            var pct = QGroundControl.settingsManager.appSettings.uiScalePercent.value
-            _setBasePointSize(platformFontPointSize * pct / 100)
+            _applyBasePointSize()
+        }
+    }
+
+    Connections {
+        target: QGroundControl.settingsManager.layoutSettings.fontScalePercent
+        function onValueChanged() {
+            _applyBasePointSize()
         }
     }
 
@@ -150,6 +173,20 @@ Item {
     }
 
     /// \private
+    /// Re-derives the base point size from the platform size, the App Settings UI Scaling and the
+    /// Layout font scale. Call this whenever any of the three inputs changes.
+    function _applyBasePointSize() {
+        // Values written straight into the .ini / provision file are loaded without min/max
+        // validation (SettingsFact loads them with convertOnly), so clamp here as well: an
+        // out-of-range font scale must not be able to collapse every font-derived size.
+        const uiScaleFact   = QGroundControl.settingsManager.appSettings.uiScalePercent
+        const fontScaleFact = QGroundControl.settingsManager.layoutSettings.fontScalePercent
+        const uiPct         = clamp(uiScaleFact.value,   uiScaleFact.min,   uiScaleFact.max)
+        const fontPct       = clamp(fontScaleFact.value, fontScaleFact.min, fontScaleFact.max)
+        _setBasePointSize(platformFontPointSize * uiPct / 100 * fontPct / 100)
+    }
+
+    /// \private
     function _setBasePointSize(pointSize) {
         _textMeasure.font.pointSize = pointSize
         defaultFontPointSize    = pointSize
@@ -164,8 +201,37 @@ Item {
             // If using physical sizing takes up too much of the vertical real estate fall back to font based sizing
             minTouchPixels      = defaultFontPixelHeight * 3
         }
-        toolbarHeight           = defaultFontPixelHeight * 3
-        toolbarHeight           = toolbarHeight * QGroundControl.corePlugin.options.toolbarHeightMultiplier
+    }
+
+    function clamp(value, minValue, maxValue) {
+        return Math.min(Math.max(value, minValue), maxValue)
+    }
+
+    function statusBarHeightFor(windowHeight) {
+        // The absolute floor must stay below what a scaled-down font produces on small screens,
+        // otherwise `fontScalePercent` cannot shrink the bar at all.
+        const lo = Math.max(20, 1.8 * defaultFontPixelHeight)
+        if (windowHeight <= 0) {
+            return Math.round(lo)
+        }
+        const hi = Math.max(lo, 0.15 * windowHeight)
+        return Math.round(clamp(windowHeight * _statusBarHeightPercent / 100 * layoutScaleFactor, lo, hi))
+    }
+
+    function rightPanelMinWidthFor(windowWidth, contentMinWidth) {
+        if (windowWidth <= 0) {
+            return Math.round(contentMinWidth)
+        }
+        const hi = Math.max(contentMinWidth, 0.45 * windowWidth)
+        return Math.round(clamp(windowWidth * _rightPanelMinPercent / 100 * layoutScaleFactor, contentMinWidth, hi))
+    }
+
+    function rightPanelMaxWidthFor(windowWidth, panelMinWidth) {
+        if (windowWidth <= 0) {
+            return Math.round(panelMinWidth)
+        }
+        const hi = Math.max(panelMinWidth, 0.55 * windowWidth)
+        return Math.round(clamp(windowWidth * _rightPanelMaxPercent / 100 * layoutScaleFactor, panelMinWidth, hi))
     }
 
     Text {
@@ -208,8 +274,8 @@ Item {
                 pct = 100;
                 _uiScalePercentFact.value = pct
             }
-            //-- Set size saved in settings
-            _screenTools._setBasePointSize(platformFontPointSize * pct / 100);
+            //-- Set size saved in settings (UI Scaling × Layout font scale)
+            _screenTools._applyBasePointSize();
         }
     }
 }
