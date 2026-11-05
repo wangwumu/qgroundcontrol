@@ -135,13 +135,24 @@ void QGCCorePlugin::adjustSettingMetaData(const QString &settingsGroup, FactMeta
 
     if (settingsGroup == AppSettings::settingsGroup) {
         if (metaData.name() == AppSettings::indoorPaletteName) {
-            QVariant outdoorPalette;
-#if defined(Q_OS_ANDROID) || defined(Q_OS_IOS)
-            outdoorPalette = 0;
+            // 0 = Outdoor（浅色）/ 1 = Indoor（深色）
+            QVariant paletteDefault;
+#if defined(Q_OS_ANDROID)
+            // ABC GCS：Android 也默认 Indoor（深色）。原版 QGC 在移动端默认 Outdoor（浅色），
+            // 但本项目的 Ops 工具条 / 状态栏 / 右边栏用 `windowTransparent` 做半透明底
+            // （浅色主题下是 #ccffffff），而上面的文字与线框按深色主题写死成白色系
+            // （#e6edf7 / #ffffff）⇒ 浅色主题里白字压白底，几乎不可见。
+            // ⚠️ 这里只改**默认值**：`SettingsFact` 读时已存值优先，已把 Outdoor 写进
+            //    ini 的旧安装仍保持浅色。单机模式下可在「设置 → General → Color Scheme」
+            //    切回 Outdoor；联网运营模式（已登录）设置菜单按 N5 隐藏
+            //    （`AuthController.standaloneMode`），只能在 ini / provision 里改。
+            paletteDefault = 1;
+#elif defined(Q_OS_IOS)
+            paletteDefault = 0;
 #else
-            outdoorPalette = 1;
+            paletteDefault = 1;
 #endif
-            metaData.setRawDefaultValue(outdoorPalette);
+            metaData.setRawDefaultValue(paletteDefault);
             return;
         }
 #if defined(Q_OS_ANDROID) || defined(Q_OS_IOS)
