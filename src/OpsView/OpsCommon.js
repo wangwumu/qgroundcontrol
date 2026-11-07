@@ -674,8 +674,11 @@ function monitorHoldsControl(device) {
 // 后果不是"少显示一行"：签出被驳回/撤回/超时之后，PENDING 判据为假 ⇒ 卡片**整个从本站列表消失**
 // ⇒ 用户流程规格里的【签出】【回航】两个按钮**没有落点**，界面表现为"点了拒绝，飞机就没人管了"。
 //
-// ‼️ `!landingAccepted` 不可省：回航，以及监控员正常移交降落指挥之后，**本站已签入(LANDING)**
+// ‼️ `!landingAccepted` 不可省：监控员正常移交降落指挥、**本站签入(LANDING)** 之后
 // （`landing_accepted`），飞机已经进入本站的降落流程（`isInbound` 为真）⇒ 它不再是出站航班。
+// ⚠️ 2026-11-07 改口径：**回航本身不再自动签入 LANDING**（后端 `closeReturnLoopTx` 只作废在途
+//    交接、释放机位）⇒ 回航后 `landingAccepted` 仍为假、卡片**留在出站段**（可重新签出），
+//    要等监控员 Propose(LANDING) → 本站签入，这一条合取项才翻假。别把「回航」当成直接翻假的事件。
 // 少了这一条，同一张卡会**同时**满足出站与进站，而 `siteTasks` 是 `if / else if`（出站优先）
 // ⇒ 用户看到的是"回航之后卡片没去进站、按钮还是出站那一套"，真正该露出来的
 // 【切换多旋翼降落】永远露不出来。
@@ -2018,6 +2021,51 @@ function _endWaypointIndex(wps, endWaypointId) {
     return found
 }
 
+/// 回航航线的截取：升序输入 → 倒序输出 `[最后一个已飞点 … 选中点]`（2026-11-07）。
+///
+/// 语义来源（设计稿 §6.2）：飞机沿原路**倒着飞回**选中点。因此输出末项必须是**选中点**——
+/// `routeMissionItems` 对末项不加 `cruiseAGL`、`applyLandingAltitude` 也只覆盖末项，
+/// 整条链路的「降落点」语义都锚在末项上。写成 `[选中点 … 起点]` 会让降落高度落到起点上。
+///
+/// 为什么是「最后一个已飞点」而不是「起点」：起点在来路上、比目标更远；飞机只需退到
+/// 用户选中的那一点。多截的点不会让飞机飞回更早的位置，但会产生一条用户没画过的航线，
+/// 且让 `flown` 判据失去意义。
+///
+/// @param waypoints 后端 `return-candidates` 的 `waypoints[]`（原航线顺序）
+/// @param targetSeq 用户选中那一行的 `seq`（= 数组下标，后端保证唯一）
+/// @return 倒序切片（**原对象引用**，不复制）；任何不可用情况 ⇒ `[]`（fail-closed，调用方据此拒发）
+function returnRouteWaypoints(waypoints, targetSeq) {
+    if (!waypoints || !waypoints.length) return []
+    if (typeof targetSeq !== "number" || targetSeq < 0) return []
+    // 找选中点：必须存在且 flown=true。未飞点不可回航——飞机没飞过那儿，
+    // 「倒着飞回去」的几何无从构造。
+    //
+    // ‼️ 定位键是 `seq`（后端给的数组下标），**不是 `waypoint_id`**：同一航点可以被航线
+    //    引用两次（后端明确不去重），此时 `waypoint_id` 在候选里出现两行、距离不同。
+    //    按 id 取第一个 = 用户可能选了近的那行、实际按远的那次切航线。
+    var targetIdx = -1
+    for (var i = 0; i < waypoints.length; i++) {
+        var w = waypoints[i]
+        if (!w) return []
+        if (w.seq === targetSeq) {
+            targetIdx = i
+            break
+        }
+    }
+    if (targetIdx < 0 || !waypoints[targetIdx].flown) return []
+    // 最后一个已飞点。
+    var lastFlownIdx = -1
+    for (var j = waypoints.length - 1; j >= 0; j--) {
+        if (waypoints[j] && waypoints[j].flown) { lastFlownIdx = j; break }
+    }
+    if (lastFlownIdx < targetIdx) return []
+    var out = []
+    for (var k = lastFlownIdx; k >= targetIdx; k--) {
+        out.push(waypoints[k])
+    }
+    return out
+}
+
 /// 把航点端点的航点转成待下发的 mission 描述数组。
 /// （QGC 侧来源是快照端点 `GET /api/snapshot/routes/:id/waypoints`，2026-10-31 起；
 ///   响应形状与实时端点 `GET /routes/:id/waypoints` 相同。）
@@ -2818,4 +2866,51 @@ function landApproachPoint(kind, slotLat, slotLon, fwOrigin) {
                                       fwOrigin.headingDeg, fwOrigin.pushoutM)
     }
     return null
+}
+
+//==========================================================================
+// 动作按钮语义色（2026-11-07 用户裁定）—— **单点定义**
+//==========================================================================
+/// 三档语义色。对话框按钮（`OpsDialogButton.qml`）与任务卡按钮
+/// （`TaskListPanel.qml`）都从这里取，**别在 QML 里再写一份 hex**。
+/// 对比度实算（WCAG，深绿/深蓝卡底上）见 `OpsDialogButton.qml` 文件头：
+///   绿 `#1a7f46` 白字 5.04:1 ｜ 红 `#d63031` 白字 4.85:1 ｜ 白底深绿字 14.35:1
+var BUTTON_PRIMARY_COLOR      = "#1a7f46"   // 绿：推荐点击、无危险的正常业务动作
+var BUTTON_CANCEL_COLOR       = "#ffffff"   // 白：取消 / 拒绝 / 撤回 / 知道了
+var BUTTON_CANCEL_TEXT_COLOR  = "#0f2f2c"   // 白底上的字色
+var BUTTON_DANGER_COLOR       = "#d63031"   // 红：应急、救济、有风险
+var BUTTON_ON_COLOR           = "#ffffff"   // 绿/红底上的字色
+
+//==========================================================================
+// 动作按钮语义档（2026-11-07 用户裁定）
+//==========================================================================
+/// 确认框主按钮的语义档 —— 供 `OpsDialogButton` 取色（色值见上方 `BUTTON_*_COLOR` 常量）。
+/// ⚠️ 这里归的是**确认弹窗**的确认按钮。任务卡**入口**按钮另有裁定：卡片「回航」= 红
+///    （`TaskListPanel.qml`），与本函数把 `return` 归为绿**并存**、不是冲突。
+///
+/// 用户原话：「强烈建议用户点击且没有危险的用绿色（在正常业务流程内），取消保持白色，
+/// 应急处理，救济处理或者其他有风险的处理按钮使用红色」。
+///
+/// 入参是 `_pendingAction.kind`（`OpsView.qml` 的八个 kind）。
+/// 返回 `"primary"`（绿）或 `"danger"`（红）。
+///
+/// ‼️ 判据是**动作性质**，不是"这个框有多重要"：
+///    · 绿（正常业务流程，推荐点击）：
+///        `takeoff` 起飞 / `keepFwLand` 保持固定翼降落 / `land` 切换多旋翼降落 /
+///        `park` 停泊 / `checkout` 签出 / `cancelHandover` 取消签出 / `return` 回航
+///    · 红（应急、救济、有风险）：
+///        `mcRescueLand` 救济（MC 方式降落）
+///    · **未识别（含 undefined / ''）一律红**：fail-safe。让一个说不清的动作看起来
+///      "点下去没事"是这里最坏的结果；`_execPendingAction()` 本身也会拒绝未知 kind。
+///
+/// ⚠️ 新增 kind 时**必须**在这里显式归类：漏了会落进 `default` 变红（安全方向），
+///    但界面会多一个红按钮 —— 那是提示，不是静默错误。
+function confirmButtonKind(actionKind) {
+    switch (actionKind) {
+    case "takeoff": case "keepFwLand": case "land":
+    case "park": case "checkout": case "cancelHandover": case "return":
+        return "primary"
+    default:
+        return "danger"
+    }
 }

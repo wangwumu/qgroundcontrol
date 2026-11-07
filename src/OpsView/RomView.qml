@@ -437,13 +437,20 @@ OpsShell {
     // 正是它要自愈的场景，而那种时刻 ③ 往往也在失败。
     onPolled: _checkFrameTimeouts()
 
+    /// 回航流程（2026-11-07）：`OpsShell` 只提供骨架（HTTP / 轮询）与实例；
+    /// 取飞机必须由本视图注入 —— `_vehicleForTask` 是本文件私有的匹配逻辑。
+    /// ⚠️ 本视图不持有 `OpsRouteSync`，`routeResetFn` 保持 null（没有原航线轮询要停）。
+    Component.onCompleted: {
+        returnFlow.vehicleFn = function (task) { return romView._vehicleForTask(task) }
+    }
+
     /// 卡片上的「应急情况处理」菜单（用户 2026-11-06）。
-    /// 2026-11-07：`RESUME` 已接线；其余三项仍是 UI 壳，明确告诉用户"尚未接入"。
+    /// 2026-11-07：`RESUME` 与 `RETURN` 已接线；其余两项仍是 UI 壳，明确告诉用户"尚未接入"。
     /// 这不是多余的提示——在应急处置里，点了没反应的菜单项会被当成"指令已下发"，
     /// 那正是本项目反复防的那类"谎报成功"。
-    /// ⚠️ 其余三项接线时按 `action` 分派，三条链路各不相同：
-    ///    · `RETURN`  → `POST /tasks/:id/return`，成功后对该任务的载具发 RTL；
-    ///      顺序必须是**先写库、再下指令**（照抄 `OpsView._execReturn`）。
+    /// ⚠️ 其余两项接线时按 `action` 分派，两条链路各不相同：
+    ///    · `RETURN`  → 选点流程（`OpsReturnFlow.begin`）：查候选 → 选点 → 写库 →
+    ///      构造倒序航线并上传。写库与上传都在流程内完成；**不发 RTL**。
     ///    · `DIVERT`  → `POST /tasks/:id/divert` 需要备降场 `site_id` + 经纬度；而"生成并
     ///      上传到备降站点的续飞航线"在设计稿 §6.1-g 里仍是**未实现缺口**——只调后端
     ///      而天上不飞，同样是谎报成功。
@@ -452,6 +459,12 @@ OpsShell {
     function _onEmergencyAction(task, action) {
         if (action === "RESUME") {
             romView._beginResumeConfirm(task)
+            return
+        }
+        if (action === "RETURN") {
+            // `returnFlow` 由 `OpsShell` 以 `property alias` 暴露；RomView 是它的子视图，直接可见。
+            // 若将来 RomView 被提到独立窗口导致作用域断开，改为在实例化时注入回调。
+            returnFlow.begin(task)
             return
         }
         var labels = {
@@ -888,8 +901,10 @@ OpsShell {
     //-------------------------------------------------------------------------
     // 「继续完成航线任务」确认框（设计稿 §5.1「确认框」，用户 2026-11-07）
     //-------------------------------------------------------------------------
-    // 只对 RESUME 生效；退路/改降/迫降三项不加确认框（将来接线时另行决定）。
-    // 版式复用 `OpsDialog` 深色皮肤与红绿按钮：红 = 执行（危险动作）、绿 = 取消。
+    // 只对 RESUME 生效；退路/改降/迫降三项不加确认框（将来接线时另行决定；
+    // 将来若加，它们的确认按钮按 2026-11-07 的语义必须是**红**）。
+    // 版式复用 `OpsDialog` 深色皮肤；按钮语义见 `OpsDialogButton.qml`（2026-11-07 裁定）：
+    // 继续任务 = 正常业务动作 ⇒ 绿；取消 ⇒ 白。
     // ⚠️ 定位不贴任务卡片：菜单信号不带卡片坐标，本视图也没有 `_confirmAnchorY` 这套锚点；
     //    直接垂直居中（与 `landBlockDialog` 的"无锚点来源"同款）。
     OpsDialog {
@@ -936,20 +951,16 @@ OpsShell {
                 Layout.fillWidth: true
                 spacing: Math.round(16 * ScreenTools.uiTextScaleFactor)
                 Item { Layout.fillWidth: true }
-                // 红 = 执行（危险动作警示）
-                Button {
+                // 绿 = 继续任务（正常业务流程，非应急/救济）
+                OpsDialogButton {
                     text: qsTr("继续任务")
-                    background: Rectangle { color: "#d63031"; radius: 3; implicitHeight: Math.round(40 * ScreenTools.uiTextScaleFactor); implicitWidth: Math.round(132 * ScreenTools.uiTextScaleFactor) }
-                    contentItem: Text { text: parent.text; color: "#ffffff"; font.pixelSize: Math.round(15 * ScreenTools.uiTextScaleFactor); font.bold: true
-                                        horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                    kind: "primary"
                     onClicked: { resumeConfirmDialog.close(); romView._execResume() }
                 }
-                // 绿 = 取消（安全退出）
-                Button {
+                // 白 = 取消
+                OpsDialogButton {
                     text: qsTr("取消")
-                    background: Rectangle { color: "#2ecc71"; radius: 3; implicitHeight: Math.round(40 * ScreenTools.uiTextScaleFactor); implicitWidth: Math.round(96 * ScreenTools.uiTextScaleFactor) }
-                    contentItem: Text { text: parent.text; color: "#ffffff"; font.pixelSize: Math.round(15 * ScreenTools.uiTextScaleFactor); font.bold: true
-                                        horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                    kind: "cancel"
                     onClicked: { romView._resumePendingTask = null; resumeConfirmDialog.close() }
                 }
             }

@@ -3831,4 +3831,109 @@ TestCase {
         compare(OpsCommon.routeNature({ route_type: "PLANNED" }), "—",
                 "陌生枚举值也要显示「—」而不是猜一个")
     }
+
+    //-------------------------------------------------------------------------
+    // 回航航线的倒序截取（2026-11-07）
+    //-------------------------------------------------------------------------
+    /// 造一个与后端 `return-candidates` 的 `waypoints[]` 元素同形的航点。
+    /// `seq` 是后端给的数组下标（**唯一键**），`waypoint_id` 与 `lat` 同值只为在断言里
+    /// 一眼看出是哪一个。
+    function _rv(lat, seq) {
+        return { waypoint_id: lat, seq: seq, flown: true, lat: lat, lon: 0, altitude: 50, command: 16 }
+    }
+
+    /// 升序输入、倒序输出：从「最后一个已飞点」退到「选中点」。
+    ///
+    /// ‼️ **不是**「倒到起点」：飞机只需退到用户选中的那一点，起点 1 不在回航航线上
+    ///    （起点在来路上、比目标更远）。若这里断言 3 个点 / 末项是 1，与
+    ///    「末项必须是选中点」自相矛盾 —— 而末项的语义（降落高度只覆盖末项）不能破。
+    function test_returnRouteWaypoints_reversesFlownTailDownToTarget() {
+        var wps = [_rv(1, 0), _rv(2, 1), _rv(3, 2), _rv(4, 3)]
+        wps[3].flown = false
+        var out = OpsCommon.returnRouteWaypoints(wps, 1)
+        compare(out.length, 2, "应保留 2 个点（3 → 2）")
+        compare(out[0].seq, 2, "首项是最后一个已飞点")
+        compare(out[out.length - 1].seq, 1, "末项必须是选中点")
+    }
+
+    /// 目标恰是最后一个已飞点 ⇒ 只剩它自己。
+    function test_returnRouteWaypoints_lastFlownIsTargetYieldsSingleItem() {
+        var wps = [_rv(1, 0), _rv(2, 1), _rv(3, 2), _rv(4, 3)]
+        wps[2].flown = false; wps[3].flown = false
+        var out = OpsCommon.returnRouteWaypoints(wps, 1)
+        compare(out.length, 1, "目标就是最后一个已飞点 ⇒ 只有一项")
+        compare(out[0].seq, 1)
+    }
+
+    /// 选中未飞点 ⇒ `[]`（界面不该能选，但纯函数 fail-closed）。
+    function test_returnRouteWaypoints_targetMustBeFlown() {
+        var wps = [_rv(1, 0), _rv(2, 1), _rv(3, 2)]
+        wps[1].flown = false
+        compare(OpsCommon.returnRouteWaypoints(wps, 1).length, 0,
+                "选中未飞点必须回 []——飞机没飞过那儿，倒着飞回它的几何无从构造")
+    }
+
+    /// 空输入、目标不存在、null 输入、非法 seq ⇒ 一律 `[]`。
+    function test_returnRouteWaypoints_unknownTargetOrEmpty() {
+        compare(OpsCommon.returnRouteWaypoints([], 0).length, 0)
+        var wps = [_rv(1, 0), _rv(2, 1)]
+        compare(OpsCommon.returnRouteWaypoints(wps, 99).length, 0, "找不到目标 ⇒ []")
+        compare(OpsCommon.returnRouteWaypoints(wps, -1).length, 0, "未选（-1）⇒ []")
+        compare(OpsCommon.returnRouteWaypoints(null, 0).length, 0)
+    }
+
+    /// 一个已飞点都没有 ⇒ `[]`（起点都没到，谈不上回航）。
+    function test_returnRouteWaypoints_allNotFlown() {
+        var wps = [_rv(1, 0), _rv(2, 1)]
+        wps[0].flown = false; wps[1].flown = false
+        compare(OpsCommon.returnRouteWaypoints(wps, 0).length, 0, "没有任何已飞点 ⇒ []")
+    }
+
+    /// 同一 `waypoint_id` 被航线引用两次时，**按 `seq` 定位**。
+    /// 按 id 取第一个会「选近的那行、退到远的那次」——后端明确不去重。
+    function test_returnRouteWaypoints_duplicateWaypointIdUsesSeq() {
+        var far = _rv(7, 0)
+        var near = _rv(7, 1)
+        var wps = [far, near, _rv(8, 2)]
+        var out = OpsCommon.returnRouteWaypoints(wps, 0)
+        compare(out.length, 3, "选 seq=0（远的那次）⇒ 从末尾退到它")
+        verify(out[out.length - 1] === far, "末项必须是 seq=0 那一行")
+        var out2 = OpsCommon.returnRouteWaypoints(wps, 1)
+        compare(out2.length, 2, "选 seq=1（近的那次）⇒ 只退到它")
+        verify(out2[out2.length - 1] === near, "末项必须是 seq=1 那一行")
+    }
+
+    /// 元素必须是**原对象引用**：QGC 侧还要读同一个对象的 `command` / 坐标。
+    /// 若实现复制了对象，后续任何"按引用回查"都会静默走空。
+    function test_returnRouteWaypoints_keepsOriginalReferences() {
+        var wps = [_rv(1, 0), _rv(2, 1), _rv(3, 2)]
+        var out = OpsCommon.returnRouteWaypoints(wps, 0)
+        verify(out[0] === wps[2], "元素必须是原对象引用（QML 侧还要读 command）")
+    }
+
+    //-------------------------------------------------------------------------
+    // 动作按钮语义档（2026-11-07 用户裁定：绿=正常流程、白=取消、红=应急/救济/有风险）
+    //-------------------------------------------------------------------------
+    /// 七档正常业务动作 ⇒ 绿（`primary`）。逐档列出来，**不要**只测其中一两个：
+    /// 将来往清单里加 kind 时，漏归类的会落进 default 变红 —— 那正是这里要钉住的方向。
+    function test_confirmButtonKind_normalFlowsArePrimary() {
+        var kinds = ["takeoff", "keepFwLand", "land", "park", "checkout", "cancelHandover", "return"]
+        for (var i = 0; i < kinds.length; i++)
+            compare(OpsCommon.confirmButtonKind(kinds[i]), "primary", kinds[i] + " 是正常业务流程")
+    }
+
+    /// 救济（MC 方式降落）⇒ 红。
+    function test_confirmButtonKind_rescueIsDanger() {
+        compare(OpsCommon.confirmButtonKind("mcRescueLand"), "danger", "救济必须红")
+    }
+
+    /// 未识别 / 空 / undefined ⇒ 红（fail-safe）。
+    /// ‼️ 用 `verify(... === ...)` 比较 `undefined`：QtTest 的 `compare` 对 `undefined`
+    ///    会给出误导性的差异（它按 QVariant 处理）。
+    function test_confirmButtonKind_unknownIsDanger() {
+        compare(OpsCommon.confirmButtonKind(""), "danger")
+        compare(OpsCommon.confirmButtonKind("no-such-kind"), "danger")
+        verify(OpsCommon.confirmButtonKind(undefined) === "danger", "undefined ⇒ danger")
+        verify(OpsCommon.confirmButtonKind(null) === "danger", "null ⇒ danger")
+    }
 }

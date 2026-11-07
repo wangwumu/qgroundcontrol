@@ -162,8 +162,9 @@ ColumnLayout {
     // `task` 是可选的第二个载荷（用户 2026-09-23 要求取消/撤回也弹窗确认，弹窗里要写出是哪一单）。
     // 消费端少收后面的参数是合法的，RomView 因此不必跟着改（它只收 `handoverId`）。
     signal handoverCancelRequested(int handoverId, var task, real cardBottomY)
-    // 回航（用户 2026-09-23 流程规格）：中段飞行卡片上的【回航】。与上面两条一样**只抛信号**——
-    // 确认弹窗、写库、下发 RTL 都在视图/后端，本文件不碰网络也不碰载具。
+    // 回航（用户 2026-09-23 流程规格；2026-11-07 改为选点）：中段飞行卡片上的【回航】。
+    // 与上面两条一样**只抛信号**——选点弹窗、确认、写库、构造并上传倒序航线都在视图/后端，
+    // 本文件不碰网络也不碰载具。
     signal returnRequested(var task, real cardBottomY)
     // 中段飞行的【签出】（用户规格：「飞机起飞进入 IN_FLIGHT，site_atc 中段的飞行任务卡片变为：
     // 签出、回航」；三个动作都要弹窗确认）。**刻意不复用 `handoverProposed`**：那个信号同时供
@@ -676,6 +677,28 @@ ColumnLayout {
                             ToolTip.visible: hovered && !enabled
                             ToolTip.delay: 300
                             ToolTip.text: panel.takeoffBlockReasonFn ? panel.takeoffBlockReasonFn(modelData) : ""
+                            // 2026-11-07 用户裁定：任务卡里的**正常业务主操作** ⇒ 绿（起飞 / 申请切出 /
+                            // 签出），**改航向、责任交接类**的【回航】⇒ 红。取消保持平台白。
+                            // ‼️ 色值一律取 `OpsCommon.js` 的 `BUTTON_*_COLOR`（与 `OpsDialogButton.qml`
+                            //    同一份）：别在这里再写 `#1a7f46` / `#d63031`。
+                            // 卡片按钮的尺寸自带一套（内容高 +8、宽随文字），不复用对话框按钮组件。
+                            background: Rectangle {
+                                color: parent.hovered ? Qt.darker(OpsCommon.BUTTON_PRIMARY_COLOR, 1.12)
+                                                      : OpsCommon.BUTTON_PRIMARY_COLOR
+                                radius: 3
+                            }
+                            contentItem: Text {
+                                text: parent.text
+                                color: OpsCommon.BUTTON_ON_COLOR
+                                font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                                elide: Text.ElideRight
+                                maximumLineCount: 1
+                            }
+                            // 自绘 background 不会像平台默认按钮那样跟着 `enabled` 变灰
+                            // （起飞有 `canTakeoffFn` 的前置闸）⇒ 必须自己压暗。
+                            opacity: enabled ? 1.0 : 0.45
                             onClicked: panel.takeoffRequested(modelData, panel.cardBottomYOf(card))
                         }
                         Button {
@@ -696,6 +719,23 @@ ColumnLayout {
                             implicitHeight: contentItem.implicitHeight + Math.round(8 * ScreenTools.uiTextScaleFactor)
                             width: Math.min(implicitWidth, actionFlow.maxButtonWidth); height: implicitHeight; padding: 0
                             text: qsTr("申请切出")
+                            // 绿 = 正常业务主操作（同【起飞】/【签出】）。
+                            background: Rectangle {
+                                color: parent.hovered ? Qt.darker(OpsCommon.BUTTON_PRIMARY_COLOR, 1.12)
+                                                      : OpsCommon.BUTTON_PRIMARY_COLOR
+                                radius: 3
+                            }
+                            contentItem: Text {
+                                text: parent.text
+                                color: OpsCommon.BUTTON_ON_COLOR
+                                font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                                elide: Text.ElideRight
+                                maximumLineCount: 1
+                            }
+                            // 有前置闸（仅巡航 FW + 有实时遥测）⇒ 置灰时自己压暗。
+                            opacity: enabled ? 1.0 : 0.45
                             onClicked: panel.handoverProposed(modelData.task_id, "ROUTE")
                         }
                         // ── 站点视图：中段飞行（IN_FLIGHT 且本站仍是责任方）──
@@ -715,6 +755,21 @@ ColumnLayout {
                             implicitHeight: contentItem.implicitHeight + Math.round(8 * ScreenTools.uiTextScaleFactor)
                             width: Math.min(implicitWidth, actionFlow.maxButtonWidth); height: implicitHeight; padding: 0
                             text: qsTr("签出")
+                            // 绿 = 正常业务主操作（用户 2026-11-07：「起飞后…『签出』设为绿色」）。
+                            background: Rectangle {
+                                color: parent.hovered ? Qt.darker(OpsCommon.BUTTON_PRIMARY_COLOR, 1.12)
+                                                      : OpsCommon.BUTTON_PRIMARY_COLOR
+                                radius: 3
+                            }
+                            contentItem: Text {
+                                text: parent.text
+                                color: OpsCommon.BUTTON_ON_COLOR
+                                font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                                elide: Text.ElideRight
+                                maximumLineCount: 1
+                            }
                             onClicked: panel.checkoutRequested(modelData, panel.cardBottomYOf(card))
                         }
                         Button {
@@ -735,9 +790,10 @@ ColumnLayout {
                         Button {
                             font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
                             // 回航：任何状态下都在（用户规格：「选择签出，则……"回航"保留」）。
-                            // 落点是**原机位**——不是这里定的，是 `POST /tasks/:id/return` 在一个事务里
-                            // 把到站指派改回原机位、释放机位、并把降落指挥权交回本站；QGC 侧在落库成功后
-                            // 才发 RTL（先写库、再下指令）。
+                            // 落点由用户在「回航选点」弹窗里选择。后端只改 `landing_site_id`
+                            // 并释放机位；**不再预派原机位、不再自动签入 LANDING**。QGC 随后
+                            // 构造倒序航线并上传；到站后由监控员签出、目标场地签入、AssignSlot、
+                            // Land（先写库、再下指令）。
                             visible: card._inFlightOutbound
                             readonly property real baseWidth: Math.round(contentItem.implicitWidth + Math.round(24 * ScreenTools.uiTextScaleFactor))
                             readonly property real preferredWidth: Math.round(baseWidth * 1.5)
@@ -745,6 +801,25 @@ ColumnLayout {
                             implicitHeight: contentItem.implicitHeight + Math.round(8 * ScreenTools.uiTextScaleFactor)
                             width: Math.min(implicitWidth, actionFlow.maxButtonWidth); height: implicitHeight; padding: 0
                             text: qsTr("回航")
+                            // 红 = 有风险的处理（用户 2026-11-07：「起飞后…『回航』应该设为红色；
+                            // 选完签出后，卡片中的『回航』也设为红色」）。
+                            // ‼️ 本按钮 `visible` 只看 `card._inFlightOutbound`、**两种形态下都在场**
+                            //    （签出 / 取消是同一槽位的两形态，见上方注释）⇒ 一处改红即同时覆盖
+                            //    「起飞后」与「选完签出后」，不需要按 `checkoutPending` 分色。
+                            background: Rectangle {
+                                color: parent.hovered ? Qt.darker(OpsCommon.BUTTON_DANGER_COLOR, 1.12)
+                                                      : OpsCommon.BUTTON_DANGER_COLOR
+                                radius: 3
+                            }
+                            contentItem: Text {
+                                text: parent.text
+                                color: OpsCommon.BUTTON_ON_COLOR
+                                font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                                elide: Text.ElideRight
+                                maximumLineCount: 1
+                            }
                             onClicked: panel.returnRequested(modelData, panel.cardBottomYOf(card))
                         }
                         // ── 站点视图：进站（accept 交接走 handoverDialog，此处无行内确认按钮）──
@@ -1053,9 +1128,27 @@ ColumnLayout {
                             implicitHeight: contentItem.implicitHeight + Math.round(8 * ScreenTools.uiTextScaleFactor)
                             width: Math.min(implicitWidth, actionFlow.maxButtonWidth); height: implicitHeight; padding: 0
                             text: qsTr("移交降落指挥")
+                            // 2026-11-07 用户裁定：这是**正常业务主操作** ⇒ 绿。
+                            // 色值取 `OpsCommon.BUTTON_PRIMARY_COLOR`（与 `OpsDialogButton.qml` 同一份），白字 5.04:1。
+                            // 卡片按钮的尺寸自成一套（内容高 +8、宽随文字），不复用对话框按钮组件。
+                            background: Rectangle {
+                                color: handoverControlBtn.hovered
+                                       ? Qt.darker(OpsCommon.BUTTON_PRIMARY_COLOR, 1.12)
+                                       : OpsCommon.BUTTON_PRIMARY_COLOR
+                                radius: 3
+                            }
+                            contentItem: Text {
+                                text: handoverControlBtn.text
+                                color: OpsCommon.BUTTON_ON_COLOR
+                                font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                                elide: Text.ElideRight
+                                maximumLineCount: 1
+                            }
                             onClicked: panel.handoverProposed(modelData.task_id, "LANDING")
                         }
-                        // 「应急情况处理」靠右：夹在两颗按钮之间的**零高度占位**（用户 2026-11-06：
+                        // 「应急情况处理」靠右：夹在两颗按钮之间的**极薄占位**（用户 2026-11-06：
                         //   「与『移交降落指挥』一行，但靠右放置」）。
                         // ‼️ 不用 `Row`/`RowLayout` 把两颗按钮包起来：它们必须继续留在同一个
                         //    `actionFlow`（`Flow`）里，才能保住"窄栏折行、不横向溢出"这条底线
@@ -1065,14 +1158,31 @@ ColumnLayout {
                         // 退回"紧挨着排"，放不下时照旧由 Flow 折行。
                         Item {
                             id: emergencyRightSpacer
+                            // ‼️ 必须参与 `actionFlow.useExtraWidth` 的行宽试算（同一个
+                            //    `preferredWidth` 契约，见 `actionFlow.preferredRowWidth`）。
+                            //    不算它时，行宽恰好等于「两颗带余量按钮 + 一条 spacing」也会
+                            //    判成"放得下"⇒ 本占位 `desiredWidth = -spacing` ⇒ 隐藏 ⇒
+                            //    两颗按钮贴在一起（2026-11-07 用户报"误触"，要求应急按钮右对齐）。
+                            //    把它算进去，窄栏时会整行退回内容宽，占位重新变正、距离拉开。
+                            readonly property real preferredWidth: Math.round(24 * ScreenTools.uiTextScaleFactor)
                             readonly property real desiredWidth:
                                 Math.floor(actionFlow.width
                                            - handoverControlBtn.width
                                            - emergencyBtn.width
                                            - 2 * actionFlow.spacing)
-                            visible: emergencyBtn.visible && desiredWidth > 0
-                            width: visible ? desiredWidth : 0
-                            height: 0
+                            // ⚠️ `visible` **不能**依赖 `desiredWidth`：那会成绑定环
+                            //    （useExtraWidth → 按钮宽 → desiredWidth → visible →
+                            //    preferredRowWidth → useExtraWidth）。只跟两颗按钮的可见性走。
+                            //    宽 ≤ 0 时靠 Flow 的两条 `spacing` 仍留出 ≥ 12px 间隔；
+                            //    连两条都放不下时 Flow 会把应急按钮折到下一行（同样不会误触）。
+                            visible: handoverControlBtn.visible && emergencyBtn.visible
+                            width: Math.max(0, desiredWidth)
+                            // ‼️ **不能是 0**：`Flow` 会整项跳过高度为 0 的子项（2026-11-07 离屏实测：
+                            //    三子项 100/100(高0)/100，第三颗 x=106 而不是 212；改成高 1 后 x=212）。
+                            //    这正是用户 2026-11-07 报「两颗按钮紧挨着」的根因——原实现写的是
+                            //    `height: 0`，占位从未参与布局。1px 不改变行高（行高取子项最大值，
+                            //    两颗按钮都比它高），但能让 Flow 把它算进本行。
+                            height: 1
                         }
                         Button {
                             id: emergencyBtn
@@ -1090,6 +1200,25 @@ ColumnLayout {
                             implicitHeight: contentItem.implicitHeight + Math.round(8 * ScreenTools.uiTextScaleFactor)
                             width: Math.min(implicitWidth, actionFlow.maxButtonWidth); height: implicitHeight; padding: 0
                             text: qsTr("应急情况处理")
+                            // 2026-11-07 用户裁定：应急处理入口 ⇒ **红**。
+                            // 色值取 `OpsCommon.BUTTON_DANGER_COLOR`（与 `OpsDialogButton.qml` 同一份），白字 4.85:1。
+                            // ⚠️ 红的是**入口按钮**；菜单里的四项仍各自按处置性质着色
+                            //    （继续=中性蓝 / 回航黄 / 备降橙 / 迫降红），两者不冲突。
+                            background: Rectangle {
+                                color: emergencyBtn.hovered
+                                       ? Qt.darker(OpsCommon.BUTTON_DANGER_COLOR, 1.12)
+                                       : OpsCommon.BUTTON_DANGER_COLOR
+                                radius: 3
+                            }
+                            contentItem: Text {
+                                text: emergencyBtn.text
+                                color: OpsCommon.BUTTON_ON_COLOR
+                                font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                                elide: Text.ElideRight
+                                maximumLineCount: 1
+                            }
                             onClicked: emergencyMenu.popup(emergencyBtn, 0, emergencyBtn.height)
 
                             // 深色底 + 浅蓝描边（与任务卡同一套配色）。默认 Basic 样式是白底，

@@ -2848,15 +2848,12 @@ Item {
                 Layout.fillWidth: true
                 spacing: 8
                 Item { Layout.fillWidth: true }
-                Button {
-                    font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
-                    // Basic 风格 Button 的 background 把 implicit 钉在 100×40，不覆盖就是「框大字小」。
-                    // ‼️ 内容项之外还要加上**未被覆盖的 padding**（Basic 为 8+8 / 6+6）：
-                    //    只比 contentItem 的话，长文案（尤其翻译）会先被 100 下限掩盖、
-                    //    随后内容区只有「宽−16」，文字被省略。
-                    implicitWidth: Math.max(Math.round(100 * ScreenTools.uiTextScaleFactor), contentItem.implicitWidth + leftPadding + rightPadding)
-                    implicitHeight: Math.max(Math.round(40 * ScreenTools.uiTextScaleFactor), contentItem.implicitHeight + topPadding + bottomPadding)
+                OpsDialogButton {
                     text: qsTr("拒绝")
+                    // 2026-11-07 用户裁定：白 = 取消/拒绝/撤回（不改变状态的一侧）。
+                    // ⚠️ 这**不是**回到"白按钮"那个老问题：那次是主操作也没有颜色；
+                    //    现在【确认接管】是绿的，白只表示"这一侧是退出"。
+                    kind: "cancel"
                     // ‼️ 成功分支**什么都不做**（2026-10-10）：关框与清账已由
                     //    `_onHandoverActionSucceeded` 在动作函数**内部**做掉。这里再关一次
                     //    虽无害，但会让"谁负责关这个框"多出一个落点——本轮要消掉的正是这类
@@ -2866,15 +2863,18 @@ Item {
                         _handoverActionError = err + qsTr("；仍失败请通知提出方撤回重提")
                     })
                 }
-                Button {
-                    font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
-                    // 同上：覆盖 Basic 默认的 100×40。
-                    implicitWidth: Math.max(Math.round(100 * ScreenTools.uiTextScaleFactor), contentItem.implicitWidth + leftPadding + rightPadding)
-                    implicitHeight: Math.max(Math.round(40 * ScreenTools.uiTextScaleFactor), contentItem.implicitHeight + topPadding + bottomPadding)
-                    text: _confirmHandover && OpsCommon.isMine(_confirmHandover, AuthController.userId) ? qsTr("撤回") : qsTr("确认接管")
+                OpsDialogButton {
+                    id: handoverPrimaryBtn
+                    /// 这张单据是不是自己提的 ⇒ 主按钮是【撤回】（作废自己的申请）而不是【确认接管】。
+                    readonly property bool _mine: _confirmHandover && OpsCommon.isMine(_confirmHandover, AuthController.userId)
+                    text: _mine ? qsTr("撤回") : qsTr("确认接管")
+                    // 2026-11-07 用户裁定：
+                    //   绿 = 推荐点击且无危险 ⇒ 【确认接管】（正常业务流程）
+                    //   白 = 不改变状态/作废 ⇒ 【撤回】
+                    //   （旧的蓝 `#1f6fd0` 已取消：主操作统一用绿，不再引入第三种色相。）
+                    kind: _mine ? "cancel" : "primary"
                     onClicked: {
-                        var mine = _confirmHandover && OpsCommon.isMine(_confirmHandover, AuthController.userId)
-                        var act = mine ? _cancelHandover : _acceptHandover
+                        var act = _mine ? _cancelHandover : _acceptHandover
                         act(OpsCommon.handoverId(_confirmHandover), function(ok, err) {
                             if (ok) return   // 同上：关框由 `_onHandoverActionSucceeded` 单点负责
                             _handoverActionError = err + qsTr("；仍失败请通知对方人工处理")
@@ -2965,12 +2965,12 @@ Item {
                 // 手动出口：对正在看别处的人，倒计时是必要的；对已经读完的人，它是白等。
                 // ⚠️ 这里**刻意不写死秒数** —— 2026-10-10 倒计时由 5 秒改成 10 秒时，原句里
                 //    两处写死的"5 秒"都得跟着改。**别再写回数字**，要改只改 `handoverGoneTimer`。
-                Button {
-                    font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
-                    // 同上：覆盖 Basic 默认的 100×40。
-                    implicitWidth: Math.max(Math.round(100 * ScreenTools.uiTextScaleFactor), contentItem.implicitWidth + leftPadding + rightPadding)
-                    implicitHeight: Math.max(Math.round(40 * ScreenTools.uiTextScaleFactor), contentItem.implicitHeight + topPadding + bottomPadding)
+                OpsDialogButton {
                     text: qsTr("知道了")
+                    // 2026-11-07 用户裁定：它只是"看完就走"的关闭，**不改变任何状态**
+                    // ⇒ 归入取消档（白），不算"推荐执行"的绿。判据与 `alert: true` 同一条：
+                    // 这个框要不要人做决定 —— 不要。
+                    kind: "cancel"
                     onClicked: handoverGoneDialog.close()
                 }
             }
@@ -3052,5 +3052,25 @@ Item {
         // ③ 一架都没建链：退回第一条（保持原行为，界面显示 "—"）。
         return src[0]
     }
+
+    //-------------------------------------------------------------------------
+    // 回航选点流程（2026-11-07，站点视图与监控员视图共用）
+    //-------------------------------------------------------------------------
+    OpsReturnFlow {
+        id: _returnFlow
+        // ‼️ `OpsShell.qml` 的根 id 是 `opsShell`，**没有** `root`。写成 `root` 会在运行时报
+        //    `ReferenceError: root is not defined`，且只在打开回航流程时才暴露。
+        shell: opsShell
+        // 取飞机与清理原航线的钩子由视图写 `returnFlow.vehicleFn` 注入 ——
+        // `OpsView` / `RomView` 各有一份 `_vehicleForTask`，`OpsShell` 自己没有。
+        // （曾经在 shell 上放过 `returnVehicleFn` 中转属性，但从来没人给它们赋值，
+        //   是死接线；删掉以免后来人以为还能从 shell 层注入。）
+        // `message` 是 Flow 对外的提示通道。不接这个处理器，写库失败 / 模式切换失败
+        // 会全部静默消失——用户只看到弹窗关掉，以为回航生效了。
+        onMessage: function (title, text) {
+            QGroundControl.showMessageDialog(opsShell, title, text)
+        }
+    }
+    property alias returnFlow: _returnFlow
 
 }

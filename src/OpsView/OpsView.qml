@@ -137,6 +137,21 @@ OpsShell {
         _slotOrient = _loadSlotOrient()
         // 补扫入口①：视图加载时，飞机可能**早已**连好（握手信号早发过、等不到）。
         _syncRoutesForAlreadyConnected()
+        // 回航流程（2026-11-07）：`OpsShell` 只提供骨架（HTTP / 轮询）与实例，
+        // 取飞机与清理原航线的钩子必须由本视图注入 —— 两者都依赖本文件私有的
+        // `_vehicleForTask` 与 `_routeSyncs`。
+        returnFlow.vehicleFn = function (task) { return _vehicleForTask(task) }
+        returnFlow.routeResetFn = function (task) {
+            var sync = _routeSyncs[task.task_id]
+            if (!sync) return
+            sync.reset()
+            // ‼️ `_routeSyncs` 是 `property var` 持有 JS 对象：原地改内容不发 changed，
+            //    必须整体重新赋值（见本文件 `_routeSyncs` 处的注释）。
+            var copy = {}
+            for (var k in _routeSyncs) copy[k] = _routeSyncs[k]
+            delete copy[task.task_id]
+            _routeSyncs = copy
+        }
     }
     // 补扫入口②：任务列表到位后。`_tasks` 是骨架的属性（`OpsShell._tasks`），
     // 本文件是 `OpsShell` 的派生类，可以直接给它写信号处理器。
@@ -388,6 +403,12 @@ OpsShell {
     function _isRescueKind(a) {
         return !!a && a.kind === "mcRescueLand"
     }
+    /// 确认按钮的语义档（`"primary"` 绿 / `"danger"` 红）。
+    /// ‼️ 归类逻辑的单点在 `OpsCommon.confirmButtonKind`（有单测钉住八个 kind + 未识别），
+    ///    这里只把"没有动作"折成空串再委托，别在本文件重写一份 switch。
+    function _pendingConfirmButtonKind() {
+        return OpsCommon.confirmButtonKind(_pendingAction ? _pendingAction.kind : "")
+    }
     /// 「任务：」那一行的取值。
     /// ‼️ **刻意不用 `OpsCommon.taskNo()`**：那个函数**优先取 `uav_no`**
     ///    （`task.uav_no ? task.uav_no : task.task_no`，"航班号"语义），而本行要的是**任务号**。
@@ -526,7 +547,10 @@ OpsShell {
         // 译文表里永远缺这一条，界面上就它一个不跟着语言走。
         case "checkout":       h = qsTr("将把本任务的飞行责任签出给航线监控员，等待其签入接管；无人机继续按原航线飞行，签出后本站仍可取消或回航"); break
         case "cancelHandover": h = qsTr("将撤回本次签出，飞行责任仍留在本站；无人机继续按原航线飞行"); break
-        case "return":         h = qsTr("将发出回航指令：无人机返回起飞机场，并降落回原机位（不可撤销）"); break
+        // 2026-11-07：回航改为**选点**流程。旧文案「返回起飞机场 / 降落回原机位 /
+        // 不可撤销」三句全不成立：目标由来路站点中选、机位到站后才指派、RETURNING
+        // 期间允许改选。这段字是用户在**点下去之前**唯一能看到的话。
+        case "return":         h = qsTr("将发出回航指令：随后选择来路上已飞过的站点作为落点，无人机沿原航线倒序飞回并悬停；落点与机位在到站后由签入/指派确定"); break
         default:               return qsTr("无法识别的操作类型，请点「取消」并联系维护人员。")
         }
         // 「任务「%1」 · 无人机 %2」这一行是弹窗里**唯一**指明"对哪一单下手"的信息。
@@ -567,7 +591,7 @@ OpsShell {
     //                          mcRescueLand→救济：零校验、零读写库，直接走降落链；
     //                          park→DB 停泊收尾 + 离线下电；
     //                          checkout→建 ROUTE 交接；cancelHandover→撤回自己提的交接；
-    //                          return→回航落库 + RTL）
+    //                          return→选点 + 回航落库 + 构造倒序航线上传（不再发 RTL））
     function _execPendingAction() {
         var a = _pendingAction
         if (!a) return
@@ -1468,40 +1492,23 @@ OpsShell {
         })
     }
 
-    // 回航（用户 2026-09-23）：「任何时候，执行"回航"都导致飞机原机位降落」。
+    // 回航（2026-11-07）：**选点**回航，不再是「一律回起飞机场原机位」。
     //
-    // ‼️ 顺序是硬的——**先写库、再下指令**（同日用户工程指令：「任何操作先写数据库状态，再执行
-    // 相应指令」）。后端在一个事务里做完全部落库：`landing_site_id` 改回起飞机场、原机位写回
-    // 到站指派、释放 `uav.current_slot_id`、作废在途交接、补一条已签入(LANDING)——**没有这一步，
-    // 飞机飞回来也落不下来**（`Land` 的机位占用与"本站尚未签入(LANDING)"两道闸）。
-    // 反过来先发 RTL 的话：指令下去了而库里没记，界面显示飞机还在航线上，它却已经在往回飞
-    // ——正是本项目反复防的那类"谎报成功"。
+    // 用户点「回航」后走 `OpsReturnFlow`：
+    //   ① GET /tasks/:id/return-candidates（来路上已飞、关联站点的航点，由近及远）；
+    //   ② 用户在弹窗里选点、确认；
+    //   ③ POST /tasks/:id/return（**先写库**：只改 `landing_site_id`、释放机位、
+    //      作废在途交接；不预派机位、不自动签入 LANDING）；
+    //   ④ 写库成功后才构造倒序航线并上传（`OpsReturnRoute`），这之后才切 `AUTO_MISSION`。
     //
-    // 指令用 `guidedModeRTL(false)`＝PX4 AUTO.RTL（"Return"）。取**本任务指定的那架**载具而不是
-    // `activeVehicle`，理由与 `_guidedTakeoff` 同一份：本站有两架在连时会把指令发给另一架飞机。
+    // ‼️ 顺序是硬的——**先写库、再下指令**（用户 2026-09-23 工程指令）。反过来先发指令的话：
+    //    指令下去了而库里没记，界面显示飞机还在原航线上，它却已经在往回飞——正是本项目
+    //    反复防的那类"谎报成功"。
+    //
+    // ‼️ **不再发 `guidedModeRTL`**：选点回航要求飞机沿原路倒着飞到选中点，RTL 只会回 home。
     function _execReturn(task) {
         if (!task) return
-        _post("/api/tasks/" + task.task_id + "/return", null, function(status, data) {
-            if (status !== 200) {
-                // 透传服务端业务原因（403 的「签出已由航线监控员接管，回航决策权归航线监控员」
-                // 是操作员最需要看到的一句），避免只显示 "HTTP 403" 无从处置。
-                QGroundControl.showMessageDialog(opsView, qsTr("回航未生效"),
-                    ((data && (data.error || data.reason)) || ("HTTP " + status)) +
-                    qsTr("\n数据库未做任何改动，飞机仍在原航线上。"))
-                console.warn("OpsView 回航失败:", status, JSON.stringify(data))
-                return
-            }
-            var v = _vehicleForTask(task)
-            if (!v) {
-                QGroundControl.showMessageDialog(opsView, qsTr("回航指令未发出"),
-                    qsTr("未找到该任务无人机（deviceID %1）的连接，RTL 指令未下发，请检查现场链路。")
-                        .arg(task && task.device_id ? task.device_id : "—"))
-                _poll()   // 库已改：卡片要立刻从出站移到进站，别让界面停在旧状态上
-                return
-            }
-            v.guidedModeRTL(false)
-            _poll()
-        })
+        returnFlow.begin(task)
     }
 
     //-------------------------------------------------------------------------
@@ -2820,10 +2827,13 @@ OpsShell {
     }
 
     //-------------------------------------------------------------------------
-    // 飞行控制动作红绿确认弹框，共**八种**：起飞、保持固定翼降落、切换多旋翼降落、MC方式降落（救济）、
+    // 飞行控制动作确认弹框，共**八种**：起飞、保持固定翼降落、切换多旋翼降落、MC方式降落（救济）、
     // 停泊（前五种在站点视图的卡片上），以及中段飞行的签出/取消/回航（用户 2026-09-23 要求后三者
     // 也要确认）。交接的**受理**（签入/驳回）仍走 handoverDialog——那是另一回事。
-    // 红=确认执行（危险动作警示）、绿=取消（安全退出）。未来专用控制台做大红/大绿实体按钮。
+    // ‼️ 按钮语义（2026-11-07 用户裁定，推翻旧的「红=确认执行、绿=取消」）：
+    //    绿 = 推荐点击且无危险的正常业务动作；白 = 取消；红 = 应急/救济/有风险。
+    //    本框只有救济档（`mcRescueLand`）与未识别动作是红，其余七档都是绿。
+    //    色值单点在 `OpsDialogButton.qml`。
     //-------------------------------------------------------------------------
     OpsDialog {
         id: actionConfirmDialog
@@ -2977,23 +2987,17 @@ OpsShell {
                 // 行间距也随字号因子走，否则极低档（因子 0.2×）时按钮行会溢出内容宽。
                 spacing: Math.round(16 * ScreenTools.uiTextScaleFactor)
                 Item { Layout.fillWidth: true }
-                // 红 = 确认执行（醒目危险色）
-                Button {
-                    // 标签由下面的自绘 contentItem 渲染（字号已乘缩放因子），
-                    // 不要在这里再设 Button 自身的 font —— 那只对默认 contentItem 生效。
+                // 绿 = 推荐执行（正常业务、无危险）；红只留给救济与未识别动作。
+                // 色值与尺寸单点在 `OpsDialogButton.qml`，这里只给语义。
+                OpsDialogButton {
                     text: qsTr("确认执行")
-                    background: Rectangle { color: "#d63031"; radius: 3; implicitHeight: Math.round(40 * ScreenTools.uiTextScaleFactor); implicitWidth: Math.round(132 * ScreenTools.uiTextScaleFactor) }
-                    contentItem: Text { text: parent.text; color: "#ffffff"; font.pixelSize: Math.round(15 * ScreenTools.uiTextScaleFactor); font.bold: true
-                                        horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                    kind: opsView._pendingConfirmButtonKind()
                     onClicked: { actionConfirmDialog.close(); opsView._execPendingAction() }
                 }
-                // 绿 = 取消（安全退出）
-                Button {
-                    // 同上：字号由自绘 contentItem 负责。
+                // 白 = 取消（安全退出，不改变任何状态）
+                OpsDialogButton {
                     text: qsTr("取消")
-                    background: Rectangle { color: "#2ecc71"; radius: 3; implicitHeight: Math.round(40 * ScreenTools.uiTextScaleFactor); implicitWidth: Math.round(96 * ScreenTools.uiTextScaleFactor) }
-                    contentItem: Text { text: parent.text; color: "#ffffff"; font.pixelSize: Math.round(15 * ScreenTools.uiTextScaleFactor); font.bold: true
-                                        horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                    kind: "cancel"
                     onClicked: actionConfirmDialog.close()
                 }
             }
