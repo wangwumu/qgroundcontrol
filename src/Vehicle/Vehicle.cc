@@ -1559,6 +1559,29 @@ void Vehicle::setFlightMode(const QString& flightMode)
     }
 }
 
+bool Vehicle::setFlightModeChecked(const QString& flightMode)
+{
+    uint8_t  baseMode   = 0;
+    uint32_t customMode = 0;
+
+    // 预检与 `hoverAndTransitionToMultirotor()` 同款：`setFlightModeCustom()` 只查本固件的
+    // 模式表、无副作用。空串（非 PX4 固件的 `missionFlightMode()`）在这里落网。
+    if (flightMode.isEmpty() || !setFlightModeCustom(flightMode, &baseMode, &customMode)) {
+        qCWarning(VehicleLog) << "setFlightModeChecked: no such flight mode for this firmware, flightMode:" << flightMode;
+        return false;
+    }
+    // `communicationLost` 有 3.5s 去抖 ⇒ 真正发帧前再查一次链路。拿不到就不发，也不许报成功。
+    if (vehicleLinkManager()->primaryLink().lock() == nullptr) {
+        qCWarning(VehicleLog) << "setFlightModeChecked: primary link gone, flightMode:" << flightMode;
+        return false;
+    }
+
+    // 走到这里 `setFlightMode()` 的查表与链路检查必然通过；它内部的 MAV_CMD_DO_SET_MODE
+    // 带 `showError=true`，机载 NACK 由 Vehicle 自己弹错误。
+    setFlightMode(flightMode);
+    return true;
+}
+
 #if 0
 QVariantList Vehicle::links() const {
     QVariantList ret;

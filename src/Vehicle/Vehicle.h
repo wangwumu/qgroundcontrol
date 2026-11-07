@@ -96,6 +96,7 @@ class Vehicle : public VehicleFactGroup, public VehicleTypes
     Q_MOC_INCLUDE("GimbalController.h")
     Q_MOC_INCLUDE("LinkInterface.h")
     Q_MOC_INCLUDE("MAVLinkLogManager.h")
+    Q_MOC_INCLUDE("MissionManager.h")
     Q_MOC_INCLUDE("ParameterManager.h")
     Q_MOC_INCLUDE("QGCMapCircle.h")
     Q_MOC_INCLUDE("QmlObjectListModel.h")
@@ -239,6 +240,11 @@ public:
     Q_PROPERTY(bool     haveFWSpeedLimits       READ haveFWSpeedLimits                              NOTIFY haveFWSpeedLimChanged)
 
     Q_PROPERTY(ParameterManager*        parameterManager    READ parameterManager   CONSTANT)
+    /// 机上任务进度（2026-11-07）。QML 侧「继续完成航线任务」要读 `currentIndex` 记
+    /// `mission_seq`（设计稿《应急情况处理》§5.1）。此前 `missionManager()` 只是普通 C++
+    /// getter、QML 够不到——**不要**改成本属性之外的第二条通路（如 Vehicle 上另开一个
+    /// `int missionCurrentIndex`），那会造出两个会漂移的判据点。
+    Q_PROPERTY(MissionManager*          missionManager      READ missionManager     CONSTANT)
     Q_PROPERTY(VehicleLinkManager*      vehicleLinkManager  READ vehicleLinkManager CONSTANT)
     Q_PROPERTY(VehicleObjectAvoidance*  objectAvoidance     READ objectAvoidance    CONSTANT)
     Q_PROPERTY(Autotune*                autotune            READ autotune           CONSTANT)
@@ -478,6 +484,17 @@ public:
     QStringList flightModes                 ();
     QString flightMode                      () const;
     void setFlightMode                      (const QString& flightMode);
+
+    /// 与 `Q_PROPERTY(flightMode WRITE setFlightMode)` 同一条发送路径，但**返回是否真的
+    /// 发出了报文**。
+    ///
+    /// 为什么需要：`setFlightMode()` 返回 void，且有两处**静默失败**——模式名不在当前固件的
+    /// 模式表（非 PX4 固件的 `missionFlightMode()` 是空串，必走这条），以及真正发帧前
+    /// primary link 已消失。调用方若用属性写入，两处都无从发现，会把"一个字节都没发"当成
+    /// "指令已下发"（RESUME 的抑制期/失败提示就会建立在这个谎报上）。
+    ///
+    /// @return false 表示**一个字节都没发**；调用方必须把它变成用户可见的失败。
+    Q_INVOKABLE bool setFlightModeChecked   (const QString& flightMode);
 
     bool airship() const;
 

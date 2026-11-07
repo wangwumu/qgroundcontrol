@@ -59,6 +59,302 @@ OpsShell {
     readonly property bool _isRouteMon: AuthController.roles.indexOf("ROUTE_MONITOR") >= 0
 
     //=========================================================================
+    // 「继续完成航线任务」（RESUME）：异常派生状态 + n 秒抑制窗口
+    //=========================================================================
+    // 设计稿《应急情况处理》§5.1（2026-11-07 定稿）。无人机不是只发**一次**异常，而是连续
+    // 重复下发一串 RTL/悬停状态 ⇒ 本端按设备维护**派生状态**，不按单条报文置位/清除。
+    //
+    // 状态机（逐条对应设计稿）：
+    //   收到 RTL/悬停        ⇒ 置位并刷新 `lastAnomalyAt`
+    //   遥测正常且 n 秒无异常 ⇒ 自动清除
+    //   按下 RESUME 后        ⇒ t0（`AUTO_MISSION` 发送成功）起进入 n 秒抑制期：
+    //                          期内报文不置位、但刷新 `lastAnomalyAt`；菜单保持置灰
+    //                          t0+n 时最近 n 秒仍有异常 ⇒ 重新置位，并提示"恢复未生效"
+    //   链路中断             ⇒ 不自动清除；恢复后重新开始 n 秒计时
+    //
+    // ‼️ 状态只在本端内存里，不落库：记录由**发命令前**的那次写库补上（§5.1「落库与状态修正」）。
+
+    /// 异常判定 / 抑制窗口 n（毫秒）。设计稿要求"实现时落为可配置项"——这是唯一落点，
+    /// 将来接设置项时只改这一处。5 秒是容忍上限：再长就"来得及处置"了（用户 2026-11-07）。
+    property int resumeAnomalyWindowMs: 5000
+
+    /// 抑制 / 异常状态的版本号。`_resumeStates` 是普通 JS 对象（QML 不观察其内容），
+    /// 1s 刷新时自增它 ⇒ `TaskListPanel` 里 `enabled` 的绑定经函数调用读到它，会自动重估。
+    property int _resumeRevision: 0
+
+    /// deviceID -> {
+    ///   active:         处理中派生出的"异常状态存在"
+    ///   lastAnomalyAt:  最后一次观测到 RTL/悬停的时刻（抑制期内也刷新）
+    ///   anomalySince:   本轮异常首次观测时刻（写进操作记录，供事后关联）
+    ///   suppressedUntil: 抑制期结束时刻；0 = 不在抑制期
+    ///   linkWasLost:    上次是否因链路中断而暂停自动清除
+    ///   failNotified:   本轮抑制期是否已提示过"恢复未生效"
+    ///   linkNotified:   本轮抑制期是否已提示过"链路中断，无法确认恢复"
+    ///   sawNormalSinceCommand: 抑制期内是否**回读过**非 RTL/悬停模式（见抑制期结束的判据）
+    /// }
+    property var _resumeStates: ({})
+
+    /// 待确认的任务（确认框打开期间非 null）。
+    property var _resumePendingTask: null
+
+    /// 写库请求是否在途。在途期间菜单置灰（防重复提交），并且超时后**丢弃迟到的响应**——
+    /// 已经告诉用户"指令未发出"之后再补发 AUTO_MISSION，是更严重的谎报。
+    property bool _resumeRequestPending: false
+
+    /// 写库请求的代次。只判 `_resumeRequestPending` 不够：第 1 次超时后用户立刻重试，
+    /// 第 1 次的迟到 200 会在第 2 次在途时到达，被当成第 2 次的成功 ⇒ 发两次 AUTO_MISSION。
+    /// 回调只认自己那一代，超时/重试都自增把旧回调作废。
+    property int _resumeRequestSeq: 0
+
+    Timer {
+        // 与骨架的 `_now` 时钟同频（1s），但**不复用**它：`_now` 只是界面时钟，
+        // 本状态机还要在抑制期结束时弹提示，需要自己的触发点。
+        interval: 1000; repeat: true
+        running: romView.visible && AuthController.loggedIn
+        onTriggered: romView._refreshResumeStates()
+    }
+
+    // 写库请求的超时兜底。**不能用 `xhr.timeout`**：Qt 6.11 的 QML XMLHttpRequest 没实现它
+    // （赋值能读回、永不触发，见 `OpsView.qml` 里同款注释）。没有这一条，请求卡在网络上时
+    // 弹框已关、菜单已灰，界面上就是"点了没反应"——应急处置里最不能出现的那种。
+    Timer {
+        id: resumeRequestTimer
+        interval: 10000; repeat: false
+        onTriggered: {
+            if (!romView._resumeRequestPending) return
+            romView._resumeRequestPending = false
+            romView._resumeRequestSeq++   // 作废这一代的迟到响应（见 `_resumeRequestSeq` 注释）
+            QGroundControl.showMessageDialog(romView, qsTr("继续任务未确认"),
+                qsTr("请求超时：未收到服务器回应，AUTO_MISSION 未下发。\n"
+                     + "数据库是否写入未能确认，请核对后决定是否重试（重试会再写一条记录）。"))
+        }
+    }
+
+    /// 按 `task.device_id` 定位载具。与 `OpsView._vehicleForTask` 同解——`RomView` 是
+    /// `OpsShell` 的子类而不是 `OpsView` 的子类，够不到那一份，故在此重写（逻辑只有一行）。
+    function _vehicleForTask(task) {
+        if (!task || !task.device_id) return null
+        var vs = QGroundControl.multiVehicleManager.vehicles
+        if (!vs || vs.count === 0) return null
+        return OpsCommon.matchDeviceToVehicle(task, vs)
+    }
+
+    /// ‼️ 模式比较一律用 `Vehicle` 给出的模式名**属性**，不得写 `"Return"` / `"Hold"` 字面量：
+    /// PX4 插件里的 `rtlFlightModeName = tr("Return")` 在中文界面会被翻译成「返航Return」。
+    function _isAnomalyMode(v) {
+        if (!v) return false
+        return v.flightMode === v.rtlFlightMode || v.flightMode === v.pauseFlightMode
+    }
+
+    /// 读不到链路状态 ⇒ 按"不能确认恢复"处理（fail-closed）。
+    function _vehicleLinkLost(v) {
+        if (!v || !v.vehicleLinkManager) return true
+        return v.vehicleLinkManager.communicationLost === true
+    }
+
+    /// 1s 推进一次派生状态。只碰当前仍连在本端的载具；已消失的载具条目会被清掉，
+    /// 免得同一 deviceID 重连时带着上一轮的抑制窗口。
+    function _refreshResumeStates() {
+        var now = Date.now()
+        var n = romView.resumeAnomalyWindowMs
+        var vs = QGroundControl.multiVehicleManager.vehicles
+        var states = romView._resumeStates
+        var alive = {}
+        var count = vs ? vs.count : 0
+        for (var i = 0; i < count; i++) {
+            var v = vs.get(i)
+            if (!v) continue
+            var deviceID = Number(v.deviceID())
+            if (!(deviceID > 0)) continue
+            alive[deviceID] = true
+            var st = states[deviceID]
+            if (!st) {
+                st = { active: false, lastAnomalyAt: 0, anomalySince: 0,
+                       suppressedUntil: 0, linkWasLost: false, failNotified: false,
+                       linkNotified: false, sawNormalSinceCommand: false }
+                states[deviceID] = st
+            }
+            // ‼️ 重新见到一辆**消失过**的载具（单链路断连会把 Vehicle 移出列表）：抑制期与
+            //    异常状态都不许丢（§5.1「链路中断不自动清除、菜单不重新激活」）。
+            //    · 抑制期内的断链 ⇒ 从"重新见到它"起重新计时 n 秒（恢复后的第一个 tick
+            //      起才是完整的新窗口）；
+            //    · 无抑制期但异常成立 ⇒ 把 n 秒自动清除的计时起点重置到现在（断链期间
+            //      不能算"没有异常"）。
+            if (st.linkWasLost) {
+                st.linkWasLost = false
+                if (st.suppressedUntil > 0) {
+                    st.suppressedUntil = now + n
+                    romView._notifyResumeLinkLost(st)
+                    continue
+                }
+                st.lastAnomalyAt = now
+            }
+            var anomalous  = romView._isAnomalyMode(v)
+            var linkLost   = romView._vehicleLinkLost(v)
+            var suppressing        = st.suppressedUntil > now
+            var suppressionExpired = st.suppressedUntil > 0 && now >= st.suppressedUntil
+
+            // ‼️ 链路中断优先于一切**模式**判定：`flightMode` 是**最后一次收到的心跳里的模式**，
+            //    断链后它只会停在旧值（多半还是 Return/Hold），而 `communicationLost` 有 3.5s
+            //    去抖 ⇒ 断链恰好落在到期那几秒时，照常读缓存模式会把"读不到遥测"判成
+            //    "仍有返航报文"并误报"切换未生效"。链路断 ⇒ 抑制期顺延、异常状态不置位、
+            //    提示一次"无法确认恢复"（§5.1 明确要求这句提示）。
+            if (linkLost && (suppressing || suppressionExpired)) {
+                st.active = false
+                st.suppressedUntil = now + n
+                st.linkWasLost = true
+                romView._notifyResumeLinkLost(st)
+            } else if (anomalous) {
+                // 抑制期内的报文是命令前那串重复报文的尾巴 / 模式切换的过渡残留：
+                // 不置位，但**仍刷新** `lastAnomalyAt`，供抑制期结束时判断。
+                st.lastAnomalyAt = now
+                if (!st.anomalySince) st.anomalySince = now
+                st.linkWasLost = linkLost
+                if (suppressionExpired) {
+                    st.suppressedUntil = 0
+                    // **模式回读优先**（§5.1）：抑制期内只要回读到过一次非 RTL/悬停模式，
+                    // 说明切换已生效 ⇒ 判成功、状态保持清除。到期这一刻仍为异常不算失败
+                    // ——那是切换的过渡残留被 1 秒采样捞到。真正的"恢复后再次触发"会在
+                    // 下一个 tick 作为**新的**异常重新置位（并重新给出判定），不在这里误报。
+                    if (st.sawNormalSinceCommand) {
+                        st.active = false
+                        st.anomalySince = 0
+                    } else {
+                        st.active = true
+                        romView._notifyResumeFailed(st)
+                    }
+                } else if (!suppressing) {
+                    st.active = true
+                }
+            } else if (suppressing) {
+                st.active = false
+                st.linkWasLost = linkLost
+                // 模式回读已经离开 RTL/悬停 ⇒ 指令确实生效过。记下它，抑制期结束时用来
+                // 把"模式切换那一下的过渡残留"与"真正没生效"分开（见上一条判据）。
+                st.sawNormalSinceCommand = true
+            } else if (suppressionExpired) {
+                // t0+n：最近 n 秒内仍有异常下发 ⇒ 重新成立；否则保持清除。
+                // ‼️ 但若窗口内**已经回读到非 RTL/悬停模式**，说明切换生效过，此时仍在
+                //    `lastAnomalyAt` 窗口里多半是切换那 1-2 秒的过渡残留（1s tick 采样，
+                //    残留必然落在窗口前段）⇒ 判成功。只有"整段抑制期都没回读到正常模式"
+                //    才用时间窗兜底。设计稿的口径是"模式回读 + 最近 n 秒是否仍有异常"，
+                //    两者是合取，不是只看后一半。
+                st.active = !st.sawNormalSinceCommand
+                            && st.lastAnomalyAt > 0 && (now - st.lastAnomalyAt < n)
+                st.suppressedUntil = 0
+                if (st.active) {
+                    romView._notifyResumeFailed(st)
+                } else {
+                    st.anomalySince = 0
+                }
+            } else if (linkLost) {
+                // 遥测不正常不满足"正常情况" ⇒ 不自动清除。恢复后重新开始 n 秒计时（见上）。
+                st.linkWasLost = true
+            } else {
+                if (st.active && now - st.lastAnomalyAt >= n) {
+                    st.active = false
+                    st.anomalySince = 0
+                }
+            }
+        }
+        for (var key in states) {
+            if (!alive[Number(key)]) {
+                var gone = states[key]
+                // 载具暂时消失（断连会把 Vehicle 从列表移除）⇒ 抑制期/异常状态保留。
+                // 直接删条目会让同一 deviceID 重连后读到 RTL 时**立刻**可点：既没有剩余
+                // 抑制期，也没有"未生效"提示。只有"无异常也不在抑制期"的条目才清掉，
+                // 避免状态表随历史设备无限增长。
+                if (gone.suppressedUntil > 0 || gone.active === true) {
+                    gone.linkWasLost = true
+                } else {
+                    delete states[key]
+                }
+            }
+        }
+        romView._resumeRevision++
+    }
+
+    /// 抑制期结束仍判为异常 ⇒ 提示"恢复未生效"。每个抑制期只提示一次。
+    /// 设计稿要求"结合无人机轨迹判断是切换未生效还是恢复后再次触发"——轨迹判读是人的事，
+    /// 这里只把两种可能都摆出来，不替操作员下结论。
+    function _notifyResumeFailed(st) {
+        if (st.failNotified) return
+        st.failNotified = true
+        QGroundControl.showMessageDialog(romView, qsTr("继续任务未生效"),
+            qsTr("指令已下发，但未能确认飞机已恢复航线任务（最近 %1 秒内仍有返航/悬停状态）。\n"
+                 + "可能是模式切换未生效，也可能是异常原因仍未解除；"
+                 + "请结合飞机航迹判断后重新处置。")
+                .arg(Math.round(romView.resumeAnomalyWindowMs / 1000)))
+    }
+
+    /// 抑制期内链路中断 ⇒ 提示"无法确认恢复"（§5.1 明确要求）。每个抑制期只提示一次。
+    /// ‼️ 措辞不得写成"仍有返航/悬停"或"切换未生效"：断链时模式是缓存值，我们**不知道**
+    ///    飞机当前在做什么；把它说成任一结论都是无依据的断言。
+    function _notifyResumeLinkLost(st) {
+        if (st.linkNotified) return
+        st.linkNotified = true
+        QGroundControl.showMessageDialog(romView, qsTr("链路中断，无法确认恢复"),
+            qsTr("恢复指令已下发，但之后与飞机的链路中断，无法确认是否已切回航线任务。\n"
+                 + "链路恢复后将重新观察 %1 秒；请确认链路恢复后再处置。")
+                .arg(Math.round(romView.resumeAnomalyWindowMs / 1000)))
+    }
+
+    /// 取**当前**任务行（按 task_id 从最新一轮轮询结果里找）。
+    /// ‼️ `TaskListPanel` 传进来的 `modelData` 是**渲染快照**，停在模型刷新那一刻。确认框
+    ///    是模态的、可以开着很久：期间降落站接受交接、任务状态/处置方式都可能变化 ⇒
+    ///    发指令前必须按 task_id 重新取当前行，不能拿快照当"现在的状态"。
+    function _freshTask(task) {
+        if (!task) return null
+        var rows = romView._routeTasks
+        if (!rows) return null
+        for (var i = 0; i < rows.length; i++) {
+            if (rows[i] && Number(rows[i].task_id) === Number(task.task_id)) return rows[i]
+        }
+        return null
+    }
+
+    /// 「继续完成航线任务」是否可点（§5.1「菜单项置灰」唯一的判据实现点）。
+    /// 前置的 `IN_FLIGHT` / 指令权 / 降落交接条件由 `TaskListPanel._monitorHandoverVisible`
+    /// 保证（菜单借此才可见），这里补的是 RESUME 特有的四条。
+    function _resumeAvailable(task) {
+        // ‼️ 读 `_resumeRevision` 是本函数对 1s 刷新的**唯一**绑定依赖：`_resumeStates`
+        //    是普通 JS 对象，改内容不会通知 QML；不读它，抑制期结束/自动清除后按钮不会变灰/变亮。
+        //    条件永不成立，只为在绑定求值时登记这次属性读取（写成裸表达式会被编译器当无副作用丢弃）。
+        if (romView._resumeRevision < 0) return false
+        if (!task) return false
+        // 上一次写库请求还没回来 ⇒ 不可重复提交（两次请求会产生两条记录、两条指令）。
+        if (romView._resumeRequestPending) return false
+        // 抛异常（如载具对象在求值途中被销毁）一律按"不可用"——否则绑定求值失败会得到
+        // undefined，而 `enabled:` 把 undefined 当"无绑定值"退回 true，菜单反而可点。
+        try {
+            // ‼️ 用**当前**任务行，不用调用方给的渲染快照（见 `_freshTask`）。
+            var fresh = romView._freshTask(task)
+            if (!fresh) return false   // 已不在列表里 ⇒ 不处置
+            if (fresh.status !== "IN_FLIGHT") return false
+            // 已人工回航/备降/迫降：原任务不再是要执行的对象（§5.1「边界」）。缺字段 ⇒ fail-closed。
+            if (fresh.disposition !== "NONE") return false
+            // 指令权（与卡片出现条件**同一份**判据，见 `TaskListPanel._monitorHandoverVisible`）：
+            // 确认框是模态的、可以开着很久，期间降落站可能已接受 LANDING 交接 ⇒ 卡片上的
+            // 按钮会消失，但快照里的字段不会变。不在这里重判，就会对已移交的飞机发指令。
+            if (!OpsCommon.signedIn(fresh)) return false
+            if (OpsCommon.pendingPhase(fresh, "LANDING", romView._handoverById)) return false
+            if (OpsCommon.landingState(fresh) === "ACCEPTED") return false
+            var v = romView._vehicleForTask(fresh)
+            if (!v) return false
+            if (romView._vehicleLinkLost(v)) return false
+            // 只有 RTL/悬停两种模式视为"可恢复"；Mission/Land/Offboard 一律置灰。
+            if (!romView._isAnomalyMode(v)) return false
+            var st = romView._resumeStates[Number(fresh.device_id)]
+            // ‼️ `=== true`：状态缺失时 `st && st.active` 会求值成 undefined，
+            //    而 QML 的 `enabled:` 把 undefined 当"绑定无值"退回默认值 true（fail-open）。
+            return !!(st && st.active === true)
+        } catch (e) {
+            console.warn("RomView._resumeAvailable 判据异常:", e)
+            return false
+        }
+    }
+
+    //=========================================================================
     // 接引清单与超时（设计文档 §3.5.3 / §3.6）
     //=========================================================================
     // 上次**成功**推送的清单。超时检查用它遍历；请求失败时**保留不动**（§3.5.4）。
@@ -140,6 +436,195 @@ OpsShell {
     // 超时检查与轮询同相、每 2s 一次（§3.6.2）：**即使 ③ 失败也要跑**——超过阈值收不到帧
     // 正是它要自愈的场景，而那种时刻 ③ 往往也在失败。
     onPolled: _checkFrameTimeouts()
+
+    /// 卡片上的「应急情况处理」菜单（用户 2026-11-06）。
+    /// 2026-11-07：`RESUME` 已接线；其余三项仍是 UI 壳，明确告诉用户"尚未接入"。
+    /// 这不是多余的提示——在应急处置里，点了没反应的菜单项会被当成"指令已下发"，
+    /// 那正是本项目反复防的那类"谎报成功"。
+    /// ⚠️ 其余三项接线时按 `action` 分派，三条链路各不相同：
+    ///    · `RETURN`  → `POST /tasks/:id/return`，成功后对该任务的载具发 RTL；
+    ///      顺序必须是**先写库、再下指令**（照抄 `OpsView._execReturn`）。
+    ///    · `DIVERT`  → `POST /tasks/:id/divert` 需要备降场 `site_id` + 经纬度；而"生成并
+    ///      上传到备降站点的续飞航线"在设计稿 §6.1-g 里仍是**未实现缺口**——只调后端
+    ///      而天上不飞，同样是谎报成功。
+    ///    · `EMERGENCY_LANDING` → `POST /tasks/:id/disposition`（带实时位置）；发给飞机的
+    ///      载体是本系统扩展 80000–80003，格式尚待补充。
+    function _onEmergencyAction(task, action) {
+        if (action === "RESUME") {
+            romView._beginResumeConfirm(task)
+            return
+        }
+        var labels = {
+            "RESUME":            qsTr("继续完成航线任务"),
+            "RETURN":            qsTr("回航"),
+            "DIVERT":            qsTr("备降"),
+            "EMERGENCY_LANDING": qsTr("迫降")
+        }
+        var label = labels[action] !== undefined ? labels[action] : action
+        QGroundControl.showMessageDialog(romView,
+            qsTr("「%1」尚未接入").arg(label),
+            qsTr("数据库与飞机均未做任何改动。")
+            + qsTr("\n任务 %1 仍在原航线上。")
+                .arg(task && task.task_no ? task.task_no : "—"))
+    }
+
+    /// 打开 RESUME 确认框（§5.1「确认框」：先弹框、不直接发指令）。
+    /// 菜单项置灰时本就点不到这里，但仍重查一次 `_resumeAvailable`：菜单可能已开着而
+    /// 状态在打开瞬间变化（1s 刷新周期内）。
+    function _beginResumeConfirm(task) {
+        if (!romView._resumeAvailable(task)) {
+            QGroundControl.showMessageDialog(romView, qsTr("无法继续任务"),
+                qsTr("当前条件不满足（异常状态已消失、模式已变化或链路中断）。\n"
+                     + "数据库与飞机均未做任何改动。"))
+            return
+        }
+        romView._resumePendingTask = task
+        resumeConfirmDialog.open()
+    }
+
+    /// 确认框里「继续任务」：**先写库、写成功后才发 `AUTO_MISSION`**（2026-11-07 定）。
+    ///
+    /// 失败语义（§5.1「回执与失败」，逐字实现）：
+    ///   · 写库失败 ⇒ 不发指令、不进入抑制期，提示"本次未生效、指令未发出"；
+    ///   · 指令未发出（库已写）⇒ 记录保留为一次尝试，提示"记录已写、指令未发出"；
+    ///   · 发送成功后 ⇒ 进入 n 秒抑制期，菜单置灰；是否生效由模式回读 + 异常状态判定。
+    function _execResume() {
+        var task = romView._resumePendingTask
+        romView._resumePendingTask = null
+        if (!task) return
+        // 确认框打开期间条件可能已经变化（飞机恢复、链路断开、模式被改）⇒ 重查。
+        // 此刻若照原样发出去，就可能把一架已经恢复的飞机再切一次模式。
+        if (!romView._resumeAvailable(task)) {
+            QGroundControl.showMessageDialog(romView, qsTr("继续任务已取消"),
+                qsTr("等待确认期间条件已变化（异常状态消失、模式改变或链路中断），本次指令未发出。\n"
+                     + "数据库未做任何改动。"))
+            return
+        }
+        // `_resumeAvailable` 刚刚用**当前行**判过（指令权/状态/处置方式），这里取同一份当前行
+        // 传给后续步骤；不要退回上面那个渲染快照。
+        var fresh = romView._freshTask(task)
+        if (!fresh) return
+        var v = romView._vehicleForTask(fresh)
+        if (!v) return   // _resumeAvailable 已保证非空，这里只做防御
+        // `mode_before`：QGC 把载具的模式名映射成后端白名单值（不用字面量比较，理由见 _isAnomalyMode）。
+        var modeBefore = (v.flightMode === v.rtlFlightMode) ? "auto_rtl" : "auto_loiter"
+        var st = romView._resumeStates[Number(fresh.device_id)]
+        var body = {
+            mode_before: modeBefore,
+            // `missionManager` / `currentIndex` 由 2026-11-07 的 Q_PROPERTY 暴露（此前 QML 够不到）。
+            // 读不到时送 -1：后端允许"QGC 尚不知道当前序号"，恢复本身不依赖它。
+            mission_seq: (v.missionManager && typeof v.missionManager.currentIndex === "number")
+                         ? v.missionManager.currentIndex : -1,
+            note: qsTr("监控员确认异常原因已解除，继续原航线任务"),
+            telemetry_at: new Date().toISOString()
+        }
+        if (st && st.anomalySince > 0) body.anomaly_since = new Date(st.anomalySince).toISOString()
+        if (v.coordinate && isFinite(v.coordinate.latitude) && isFinite(v.coordinate.longitude)
+                && v.coordinate.latitude !== 0) {
+            body.lat = v.coordinate.latitude
+            body.lon = v.coordinate.longitude
+        }
+        var seq = ++romView._resumeRequestSeq
+        romView._resumeRequestPending = true
+        resumeRequestTimer.restart()
+        romView._post("/api/tasks/" + fresh.task_id + "/resume", body, function(status, data) {
+            // 超时兜底已经向用户报过"未确认、指令未下发" ⇒ 迟到的响应一律丢弃。
+            // （若此时再补发 AUTO_MISSION，用户刚被告知"没发"，天上却发了。）
+            // ‼️ 判代次而不只判 pending：超时后用户立刻重试时，第 1 次的迟到 200 会在
+            //    第 2 次在途期间到达，只判 pending 会把它当第 2 次的成功 ⇒ 发两次指令。
+            if (seq !== romView._resumeRequestSeq) return
+            romView._resumeRequestPending = false
+            resumeRequestTimer.stop()
+            if (status === 0) {
+                // 请求根本没发出去，或响应在网络上丢了：两种情况下我们都**不知道**库写了没有，
+                // 不能替服务端担保"未做改动"。
+                QGroundControl.showMessageDialog(romView, qsTr("继续任务未确认"),
+                    qsTr("与服务器的通信中断，无法确认写库结果，AUTO_MISSION 未下发。\n"
+                         + "请先确认飞机仍处于返航/悬停，再决定是否重试（重试会再写一条记录）。"))
+                console.warn("RomView 继续任务无响应（status 0）")
+                return
+            }
+            // ‼️ 成功 = 2xx **且回执明确说记录已落**。中间层 200 HTML 错误页、被截断的
+            //    JSON、`operation_logged:false` 都必须按"写库结果未确认"处理——否则就是
+            //    在库没写的情况下发指令，事后审计断链且界面不报错。
+            if (status !== 200 || !data || data.operation_logged !== true) {
+                if (status >= 400 && status < 500) {
+                    // 4xx = 服务端**明确拒绝**，此时"库未写、指令未发"才是确定的。
+                    QGroundControl.showMessageDialog(romView, qsTr("继续任务未生效"),
+                        ((data && (data.error || data.reason)) || ("HTTP " + status))
+                        + qsTr("\n本次未生效，指令未发出。"))
+                } else {
+                    // 5xx / 2xx 但不合契约：提交结果**未知**（COMMIT 报文丢失时服务端也可能
+                    // 已提交），不许替服务端担保"未做改动"，也不许发指令。
+                    QGroundControl.showMessageDialog(romView, qsTr("继续任务未确认"),
+                        qsTr("服务器未确认操作记录已写入（HTTP %1），AUTO_MISSION 未下发。\n"
+                             + "数据库是否写入未能确认，请核对后决定是否重试（重试会再写一条记录）。")
+                            .arg(status))
+                }
+                console.warn("RomView 继续任务失败:", status, JSON.stringify(data))
+                return
+            }
+            // 写库成功后才发 AUTO_MISSION。载具可能在写库往返期间掉线 ⇒ 重新定位。
+            var live = romView._vehicleForTask(fresh)
+            if (!live) {
+                QGroundControl.showMessageDialog(romView, qsTr("记录已写、指令未发出"),
+                    qsTr("未找到该任务无人机（deviceID %1）的连接。\n"
+                         + "操作记录已写入；是否重试由你决定（重试会再写一条记录）。")
+                        .arg(fresh && fresh.device_id ? fresh.device_id : "—"))
+                return
+            }
+            if (romView._vehicleLinkLost(live)) {
+                QGroundControl.showMessageDialog(romView, qsTr("记录已写、指令未发出"),
+                    qsTr("链路中断，AUTO_MISSION 未下发。\n"
+                         + "操作记录已写入；是否重试由你决定（重试会再写一条记录）。"))
+                return
+            }
+            // ‼️ 写库往返期间模式可能已经变化（异常自解、操作员/别人切了 Land/Offboard 等）。
+            //    此刻仍照原样发 AUTO_MISSION 会**覆盖当前模式**——尤其是降落/迫降途中被切回
+            //    航线任务，后果比"少发一条指令"严重得多。条件已变 ⇒ 记录保留、指令不发。
+            if (!romView._isAnomalyMode(live)) {
+                QGroundControl.showMessageDialog(romView, qsTr("记录已写、指令未发出"),
+                    qsTr("写库期间飞机的模式已变化（不再是返航/悬停），AUTO_MISSION 未下发，以免覆盖当前模式。\n"
+                         + "操作记录已写入；是否重新处置由你决定（重试会再写一条记录）。"))
+                return
+            }
+            // ‼️ 用 `setFlightModeChecked()` 而不是给 `flightMode` 属性赋值：后者 (void) 有两处
+            //    静默失败——模式名不在本固件模式表（非 PX4 的 `missionFlightMode` 是空串）、
+            //    或真正发帧前 primary link 消失——都会"看着成功"，让抑制期和之后的失败提示
+            //    建立在一个根本没发出去的指令上。返回 false ⇒ 一个字节都没发，按"记录已写、
+            //    指令未发出"处理，**不进入抑制期**。
+            if (!live.setFlightModeChecked(live.missionFlightMode)) {
+                QGroundControl.showMessageDialog(romView, qsTr("记录已写、指令未发出"),
+                    qsTr("无法发送模式指令（当前固件不支持该模式，或链路已在发送前断开），AUTO_MISSION 未下发。\n"
+                         + "操作记录已写入；是否重新处置由你决定（重试会再写一条记录）。"))
+                return
+            }
+            // 指令已发出；是否生效由模式回读 + 异常状态判定。
+            // ⚠️ 抑制期**只在指令发出后**开始：写库失败或上面几条提前返回时不得抑制。
+            romView._beginResumeSuppression(Number(live.deviceID()))
+            romView._poll()   // 库已写：卡片/任务数据立即刷新
+        })
+    }
+
+    /// 进入 n 秒抑制期：期内收到的 RTL/悬停报文不置位，菜单保持置灰。
+    /// `_resumeRevision++` 让 `enabled` 绑定**立刻**重估（不等下一次 1s tick）。
+    function _beginResumeSuppression(deviceID) {
+        var states = romView._resumeStates
+        var st = states[deviceID]
+        if (!st) {
+            st = { active: false, lastAnomalyAt: 0, anomalySince: 0,
+                   suppressedUntil: 0, linkWasLost: false, failNotified: false,
+                   linkNotified: false, sawNormalSinceCommand: false }
+            states[deviceID] = st
+        }
+        st.suppressedUntil = Date.now() + romView.resumeAnomalyWindowMs
+        st.active = false
+        st.linkWasLost = false
+        st.failNotified = false
+        st.linkNotified = false
+        st.sawNormalSinceCommand = false
+        romView._resumeRevision++
+    }
 
     //=========================================================================
     // 右栏内容（设计文档 §4.1）
@@ -357,6 +842,15 @@ OpsShell {
                     //    的对象。上面那条 `handoverCancelRequested` 少收一个参数是合法的（QML 允许
                     //    处理器少声明实参），但那是因为它不需要；不要照抄成习惯。
                     onCheckinRequested: function(handoverId, task) { romView._checkinFromCard(handoverId, task) }
+                    // 「继续完成航线任务」的置灰判据（异常派生状态 / 模式 / 链路 / disposition）。
+                    // 注入函数而不是值：面板只消费，判据唯一实现在本视图（`_resumeAvailable`）。
+                    resumeAvailable: romView._resumeAvailable
+                    // 「应急情况处理」菜单的四项（用户 2026-11-06）。`RESUME` 已接线
+                    // （`_onEmergencyAction` → 确认框 → 先写库 → 切 AUTO_MISSION）；其余三项
+                    // 仍只给出"尚未接入"的明确提示，不写库、不下发指令。
+                    onEmergencyActionRequested: function(task, action) {
+                        romView._onEmergencyAction(task, action)
+                    }
                 }
             }
 
@@ -386,6 +880,77 @@ OpsShell {
                     anchors.fill: parent
                     anchors.margins: 2
                     devices: romView._routeDevices
+                }
+            }
+        }
+    }
+
+    //-------------------------------------------------------------------------
+    // 「继续完成航线任务」确认框（设计稿 §5.1「确认框」，用户 2026-11-07）
+    //-------------------------------------------------------------------------
+    // 只对 RESUME 生效；退路/改降/迫降三项不加确认框（将来接线时另行决定）。
+    // 版式复用 `OpsDialog` 深色皮肤与红绿按钮：红 = 执行（危险动作）、绿 = 取消。
+    // ⚠️ 定位不贴任务卡片：菜单信号不带卡片坐标，本视图也没有 `_confirmAnchorY` 这套锚点；
+    //    直接垂直居中（与 `landBlockDialog` 的"无锚点来源"同款）。
+    OpsDialog {
+        id: resumeConfirmDialog
+        parent: romView
+        width: Math.min(Math.round(Math.max(romView.rightPanelWidth, 320) * ScreenTools.uiTextScaleFactor),
+                        Math.round(romView.width * 0.95))
+        x: romView.width - width
+        y: (romView.height - height) / 2
+        modal: true
+        title: qsTr("继续完成航线任务")
+
+        ColumnLayout {
+            width: parent.width
+            spacing: 8
+            Text {
+                Layout.fillWidth: true
+                color: "#e6edf7"; font.pixelSize: Math.round(13 * ScreenTools.uiTextScaleFactor)
+                wrapMode: Text.Wrap
+                // 三行条目，与 `actionConfirmDialog` / `slotDialog` 的条目名逐字一致。
+                // ⚠️ 模式名从**载具当前属性**取，不写字面量（中文界面会翻译）。
+                text: {
+                    var t = romView._resumePendingTask
+                    if (!t) return ""
+                    var v = romView._vehicleForTask(t)
+                    var modeLabel = "—"
+                    if (v && v.flightMode === v.rtlFlightMode) modeLabel = qsTr("返航（RTL）")
+                    else if (v && v.flightMode === v.pauseFlightMode) modeLabel = qsTr("悬停")
+                    return qsTr("飞行任务：%1\n无人机：%2\n当前异常：%3")
+                        .arg(t.task_no ? t.task_no : "—")
+                        .arg(t.uav_no ? t.uav_no : "—")
+                        .arg(modeLabel)
+                }
+            }
+            Text {
+                Layout.fillWidth: true
+                // 亮琥珀 `#ffc107` —— 深绿底 `#0f2f2c` 上 8.80:1（`OpsDialog.qml` 文件头的实算表）。
+                color: "#ffc107"; font.pixelSize: Math.round(12 * ScreenTools.uiTextScaleFactor)
+                wrapMode: Text.Wrap
+                // 必须写明后果（§5.1）：恢复是按机上 `current_seq` 继续，可能掉头飞回已过航点。
+                text: qsTr("将切回原航线任务：飞机飞回离开时的下一个航点，可能掉头飞回已经过的航点。")
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: Math.round(16 * ScreenTools.uiTextScaleFactor)
+                Item { Layout.fillWidth: true }
+                // 红 = 执行（危险动作警示）
+                Button {
+                    text: qsTr("继续任务")
+                    background: Rectangle { color: "#d63031"; radius: 3; implicitHeight: Math.round(40 * ScreenTools.uiTextScaleFactor); implicitWidth: Math.round(132 * ScreenTools.uiTextScaleFactor) }
+                    contentItem: Text { text: parent.text; color: "#ffffff"; font.pixelSize: Math.round(15 * ScreenTools.uiTextScaleFactor); font.bold: true
+                                        horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                    onClicked: { resumeConfirmDialog.close(); romView._execResume() }
+                }
+                // 绿 = 取消（安全退出）
+                Button {
+                    text: qsTr("取消")
+                    background: Rectangle { color: "#2ecc71"; radius: 3; implicitHeight: Math.round(40 * ScreenTools.uiTextScaleFactor); implicitWidth: Math.round(96 * ScreenTools.uiTextScaleFactor) }
+                    contentItem: Text { text: parent.text; color: "#ffffff"; font.pixelSize: Math.round(15 * ScreenTools.uiTextScaleFactor); font.bold: true
+                                        horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                    onClicked: { romView._resumePendingTask = null; resumeConfirmDialog.close() }
                 }
             }
         }

@@ -16,6 +16,9 @@ public:
     ~MissionManager();
 
     /// Current mission item as reported by MISSION_CURRENT
+    /// Q_PROPERTY 供 QML 读取（2026-11-07）：「继续完成航线任务」要把 `current_seq` 写进操作记录
+    /// （设计稿《应急情况处理》§5.1）。信号 `currentIndexChanged` 继承自 `PlanManager`。
+    Q_PROPERTY(int currentIndex READ currentIndex NOTIFY currentIndexChanged)
     int currentIndex(void) const { return _currentMissionIndex; }
 
     /// Last current mission item reported while in Mission flight mode
