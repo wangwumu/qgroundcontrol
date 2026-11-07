@@ -81,6 +81,13 @@ ColumnLayout {
     property int    selectedTaskId: -1
     property bool   showSiteActions: false      // 站点视图 ∧ SITE_ATC（出站/进站按钮组）
     property bool   isRouteMonitor: false       // 监控员视图（移交降落指挥）
+    // 「继续完成航线任务」当前是否可点（设计稿《应急情况处理》§5.1，2026-11-07）。
+    // 由视图注入 `function(task) -> bool`：判据全在视图侧（异常派生状态、抑制窗口、载具模式、
+    // 链路、disposition），本文件不碰载具也不碰时间。**未注入 ⇒ 恒置灰**（fail-closed）：
+    // 站点视图没有这项动作，将来若忘了接线，表现是"灰着点不动"，不会误发指令。
+    // ⚠️ 绑定依赖穿过函数调用：该函数内部读视图的 `_resumeRevision`（1s 自增）⇒
+    //    抑制期结束/异常状态变化会触发这里重估，不需要另开 Timer。
+    property var    resumeAvailable: null
     // 站点视图的两个勾选框（「出站」/「进站」）。卡片**配色**要用它们：
     // 调用方传进来的 `tasks` 已经是 `OpsCommon.siteTasks(...)` 过滤+排序过的结果，
     // 而"这张卡属于哪一段"这件事在**面板里**必须重算一遍（拿不到段号）⇒ 得把同一个
@@ -174,10 +181,25 @@ ColumnLayout {
     //    那行数据上了。
     // `task` 是可选的第二个载荷，理由同 `handoverCancelRequested`（视图侧要写"是哪一单"）。
     signal checkinRequested(int handoverId, var task)
+    // 监控员卡片上的「应急情况处理」菜单（用户 2026-11-06）。与同族信号一样**只抛动作名**，
+    // 本文件不碰网络、不碰载具。
+    // ⚠️ 动作名是**占位约定**，不是后端字段：`RESUME`（继续完成航线任务）/ `RETURN`（回航）/
+    //    `DIVERT`（备降）/ `EMERGENCY_LANDING`（迫降）。接线时由视图侧决定每个动作走哪条链路。
+    // 2026-11-07：`RESUME` 已接线（`POST /tasks/:id/resume` → 切 `AUTO_MISSION`，见
+    // `RomView._onEmergencyAction`）；其余三项仍是 UI 壳，视图收到后明确告诉用户"尚未接入"。
+    // 置灰判据由视图经 `resumeAvailable` 注入——本文件不知道"异常状态"是什么。
+    signal emergencyActionRequested(var task, string action)
 
     // 标题行（`headerText`）已删：用户 2026-09-29「可以把各部分的标题去掉，使用的都是
     // 专业培训的熟练人员」。
-    ListView {
+    // ‼️ 用 `QGCListView` 而不是裸 `ListView`（2026-11-06，用户报「Android 上任务列表空间
+    //    不足时没有滚动条」）：裸 ListView 不会自己画滚动条，Basic 风格也不会自动附加，
+    //    而本模块从未声明过 ScrollBar（见 `OpsShell.qml` 的 `_taskCardRightGap` 注释）。
+    //    `QGCListView` 在内容溢出时挂一条竖向指示条（`QGCFlickableScrollIndicator`），
+    //    宽 ≈ `defaultFontPixelWidth/2`，正好落在卡片右侧 `cardRightGap = 20` 的留白里；
+    //    拖动时重新出现、停止 2s 后淡出（不是常驻条 —— 仓内其他列表同款）。
+    //    PC 与 Android 同一份代码 ⇒ 两端都因此有了可见的滚动提示。
+    QGCListView {
         id: taskList
         Layout.fillWidth: true
         Layout.fillHeight: true
@@ -320,6 +342,19 @@ ColumnLayout {
                 //    真接上双身份时才不会把"我是谁"和"这张卡给我哪套按钮"混成一个判据。
                 readonly property string _checkinNotice:
                     OpsCommon.checkinNotice(modelData, panel.isRouteMonitor, panel.handoverById)
+
+                // 「移交降落指挥」与「应急情况处理」的**共用出现条件**（用户 2026-11-06 裁定：
+                //   「应急情况处理」与「移交降落指挥」完全相同）。
+                // ‼️ 单点定义：两颗按钮都只引用本属性。各写一份合取式的后果不是报错，而是两张
+                //    判据慢慢漂移——卡片上会出现"移交按钮没了、应急按钮还在"（或反之）的错位。
+                // 判据的**语义与由来**原样保留在下面「移交降落指挥」按钮旁的注释里，逐字未改，
+                // 只是判据本身搬到了这里。
+                readonly property bool _monitorHandoverVisible:
+                    !panel.showSiteActions && panel.isRouteMonitor
+                    && modelData.status === "IN_FLIGHT"
+                    && OpsCommon.signedIn(modelData)
+                    && !OpsCommon.pendingPhase(modelData, "LANDING", panel.handoverById)
+                    && OpsCommon.landingState(modelData) !== "ACCEPTED"
 
                 // 宽度由外层 `cardSlot` 单点决定（`taskList.width - cardRightGap - cardMargin`），
                 // 这里跟着走——两处各算一遍的话，分段与非分段视图会得到两种右空位。
@@ -967,6 +1002,7 @@ ColumnLayout {
                         }
                         // ── 监控员视图 ──
                         Button {
+                            id: handoverControlBtn
                             font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
                             // 仅**本相位没有生效中的交接**时可发起（防重复 409；已有交接可走"撤回交接"）。
                             // 生效中 = PENDING ∪ ACCEPTED，两半各一条判据，缺一即漏：
@@ -1007,11 +1043,10 @@ ColumnLayout {
                             //    为 **true** ⇒ 这一项单独看是 **fail-open** 的，**不能**当门用。
                             //    ⚠️ 引注一律用**函数名**不用行号：`OpsCommon.js` 行号会被增删行顶偏
                             //    （本条原引 `OpsCommon:503-504` 就已经指到了相反的内容）。
-                            visible: !panel.showSiteActions && panel.isRouteMonitor
-                                     && modelData.status === "IN_FLIGHT"
-                                     && OpsCommon.signedIn(modelData)
-                                     && !OpsCommon.pendingPhase(modelData, "LANDING", panel.handoverById)
-                                     && OpsCommon.landingState(modelData) !== "ACCEPTED"
+                            // 判据已上提为 `card._monitorHandoverVisible`（见上方同名属性，语义逐字
+                            // 搬移）：这里是唯一引用点之一，另一处是「应急情况处理」按钮——两颗
+                            // 按钮共用同一条绑定，因此不可能出现一颗在、另一颗不在的错位。
+                            visible: card._monitorHandoverVisible
                             readonly property real baseWidth: Math.round(contentItem.implicitWidth + Math.round(24 * ScreenTools.uiTextScaleFactor))
                             readonly property real preferredWidth: Math.round(baseWidth * 1.5)
                             implicitWidth: actionFlow.useExtraWidth ? preferredWidth : baseWidth
@@ -1019,6 +1054,195 @@ ColumnLayout {
                             width: Math.min(implicitWidth, actionFlow.maxButtonWidth); height: implicitHeight; padding: 0
                             text: qsTr("移交降落指挥")
                             onClicked: panel.handoverProposed(modelData.task_id, "LANDING")
+                        }
+                        // 「应急情况处理」靠右：夹在两颗按钮之间的**零高度占位**（用户 2026-11-06：
+                        //   「与『移交降落指挥』一行，但靠右放置」）。
+                        // ‼️ 不用 `Row`/`RowLayout` 把两颗按钮包起来：它们必须继续留在同一个
+                        //    `actionFlow`（`Flow`）里，才能保住"窄栏折行、不横向溢出"这条底线
+                        //    （见 `actionFlow` 头注的 2026-10-08 事故）。
+                        // 宽度 = 本行剩余空间（两端各一条 `spacing`）。算出来 ≤ 0（窄栏放不下两颗）
+                        // ⇒ **整个隐藏**：隐藏项不参与 Flow 布局、也不产生 spacing，于是两颗按钮
+                        // 退回"紧挨着排"，放不下时照旧由 Flow 折行。
+                        Item {
+                            id: emergencyRightSpacer
+                            readonly property real desiredWidth:
+                                Math.floor(actionFlow.width
+                                           - handoverControlBtn.width
+                                           - emergencyBtn.width
+                                           - 2 * actionFlow.spacing)
+                            visible: emergencyBtn.visible && desiredWidth > 0
+                            width: visible ? desiredWidth : 0
+                            height: 0
+                        }
+                        Button {
+                            id: emergencyBtn
+                            font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
+                            // 应急情况处理（用户 2026-11-06）：出现条件与「移交降落指挥」**完全相同**
+                            // （同一条 `card._monitorHandoverVisible`），位置由上面的 spacer 推到本行右缘。
+                            // ‼️ 本文件只发 `emergencyActionRequested`，不发任何数据库请求、不下发任何
+                            //    MAVLink 指令。`RESUME` 的"写库 → 切 AUTO_MISSION"在 `RomView` 里；
+                            //    其余三项仍未接入，视图侧会明确告诉用户"尚未接入"——这一点是必需的：
+                            //    点了没反应的按钮在应急处置里会被误读成"指令已下发"。
+                            visible: card._monitorHandoverVisible
+                            readonly property real baseWidth: Math.round(contentItem.implicitWidth + Math.round(24 * ScreenTools.uiTextScaleFactor))
+                            readonly property real preferredWidth: Math.round(baseWidth * 1.5)
+                            implicitWidth: actionFlow.useExtraWidth ? preferredWidth : baseWidth
+                            implicitHeight: contentItem.implicitHeight + Math.round(8 * ScreenTools.uiTextScaleFactor)
+                            width: Math.min(implicitWidth, actionFlow.maxButtonWidth); height: implicitHeight; padding: 0
+                            text: qsTr("应急情况处理")
+                            onClicked: emergencyMenu.popup(emergencyBtn, 0, emergencyBtn.height)
+
+                            // 深色底 + 浅蓝描边（与任务卡同一套配色）。默认 Basic 样式是白底，
+                            // 落在深色右栏里像一块补丁（2026-11-06 用户报「菜单太单调」）。
+                            // ⚠️ 四个菜单项各自带一条**分类色条**，色值与 `OpsCommon.abnormalColor`
+                            //    是同一套语义（回航黄 / 备降橙 / 迫降红）⇒ 菜单里的颜色和置顶徽标、
+                            //    地图 marker 说的是同一件事。「继续完成航线任务」是**非异常**档，
+                            //    用中性蓝，不占用那三色（否则会把"继续"看成第四种异常）。
+                            // ⚠️ 行高/字号一律随 `ScreenTools.uiTextScaleFactor`，与右侧按钮同口径。
+                            QGCMenu {
+                                id: emergencyMenu
+                                padding: Math.round(4 * ScreenTools.uiTextScaleFactor)
+                                // ‼️ `implicitWidth` 不能省：Basic 样式的 `Menu` 用
+                                //    `max(背景 implicitWidth, 内容 implicitWidth)` 定宽，而它的
+                                //    contentItem 是个 **ListView**（`implicitWidth` 恒 0、委托宽度
+                                //    跟随列表宽）⇒ 背景不给宽就没完没了：菜单宽 = 0+padding，
+                                //    列表宽 0、每个菜单项宽 0，只剩一条细边框（2026-11-06 离屏实测）。
+                                //    默认样式的背景自带 200 宽，正是用来打破这个环的。
+                                background: Rectangle {
+                                    implicitWidth: Math.round(160 * ScreenTools.uiTextScaleFactor)
+                                    color: "#16233c"
+                                    border.color: "#6f9fd8"
+                                    border.width: 1
+                                    radius: 4
+                                }
+                                QGCMenuItem {
+                                    id: resumeItem
+                                    text: qsTr("继续完成航线任务")
+                                    implicitHeight: Math.round(30 * ScreenTools.uiTextScaleFactor)
+                                    padding: 0
+                                    // 置灰判据（§5.1）：异常状态不存在（含 n 秒无异常后的自动清除）、
+                                    // 抑制期内、当前模式不是 RTL/悬停、链路中断、disposition ≠ NONE
+                                    // ⇒ 不可点、不弹确认框。判据实现全部在视图侧，这里只消费。
+                                    // ⚠️ `=== true` 不是啰嗦：注入函数返回 undefined（判据字段缺失）时，
+                                    //    `enabled:` 会拿到 undefined —— QML 把它当"绑定无值"、`enabled`
+                                    //    退回 Item 默认值 **true**，菜单反而更可点。这是本仓踩过的坑
+                                    //    （`_monitorHandoverVisible` 的 `&&` 短路注释同款）。
+                                    enabled: panel.resumeAvailable ? (panel.resumeAvailable(modelData) === true) : false
+                                    background: Rectangle {
+                                        color: resumeItem.highlighted && resumeItem.enabled ? "#283d5c" : "transparent"
+                                        radius: 3
+                                        Rectangle {
+                                            width: Math.round(3 * ScreenTools.uiTextScaleFactor)
+                                            height: parent.height - Math.round(10 * ScreenTools.uiTextScaleFactor)
+                                            radius: width / 2
+                                            anchors { left: parent.left; leftMargin: 5; verticalCenter: parent.verticalCenter }
+                                            // 禁用时色条压暗，与文字同档——只灰字不灰条会让人以为还能点。
+                                            color: resumeItem.enabled ? "#6f9fd8" : "#3d5175"
+                                        }
+                                    }
+                                    contentItem: Text {
+                                        text: resumeItem.text
+                                        leftPadding: Math.round(16 * ScreenTools.uiTextScaleFactor)
+                                        rightPadding: Math.round(12 * ScreenTools.uiTextScaleFactor)
+                                        // 禁用态：`#5a6b83`（深底上 3.1:1，非文字级但**可辨识**；
+                                        // 菜单禁用项本就不承载可读信息，重点是它明显不同于可用态）。
+                                        color: !resumeItem.enabled ? "#5a6b83"
+                                                                   : (resumeItem.highlighted ? "#ffffff" : "#e6edf7")
+                                        font.pixelSize: Math.round(12 * ScreenTools.uiTextScaleFactor)
+                                        verticalAlignment: Text.AlignVCenter
+                                        elide: Text.ElideRight
+                                    }
+                                    onTriggered: panel.emergencyActionRequested(modelData, "RESUME")
+                                }
+                                QGCMenuSeparator {
+                                    contentItem: Rectangle {
+                                        implicitHeight: Math.max(1, Math.round(1 * ScreenTools.uiTextScaleFactor))
+                                        color: "#2f4463"
+                                    }
+                                }
+                                QGCMenuItem {
+                                    id: returnItem
+                                    text: qsTr("回航")
+                                    implicitHeight: Math.round(30 * ScreenTools.uiTextScaleFactor)
+                                    padding: 0
+                                    background: Rectangle {
+                                        color: returnItem.highlighted ? "#283d5c" : "transparent"
+                                        radius: 3
+                                        Rectangle {
+                                            width: Math.round(3 * ScreenTools.uiTextScaleFactor)
+                                            height: parent.height - Math.round(10 * ScreenTools.uiTextScaleFactor)
+                                            radius: width / 2
+                                            anchors { left: parent.left; leftMargin: 5; verticalCenter: parent.verticalCenter }
+                                            color: "#ffd54f"
+                                        }
+                                    }
+                                    contentItem: Text {
+                                        text: returnItem.text
+                                        leftPadding: Math.round(16 * ScreenTools.uiTextScaleFactor)
+                                        rightPadding: Math.round(12 * ScreenTools.uiTextScaleFactor)
+                                        color: returnItem.highlighted ? "#ffffff" : "#ffd54f"
+                                        font.pixelSize: Math.round(12 * ScreenTools.uiTextScaleFactor)
+                                        verticalAlignment: Text.AlignVCenter
+                                        elide: Text.ElideRight
+                                    }
+                                    onTriggered: panel.emergencyActionRequested(modelData, "RETURN")
+                                }
+                                QGCMenuItem {
+                                    id: divertItem
+                                    text: qsTr("备降")
+                                    implicitHeight: Math.round(30 * ScreenTools.uiTextScaleFactor)
+                                    padding: 0
+                                    background: Rectangle {
+                                        color: divertItem.highlighted ? "#283d5c" : "transparent"
+                                        radius: 3
+                                        Rectangle {
+                                            width: Math.round(3 * ScreenTools.uiTextScaleFactor)
+                                            height: parent.height - Math.round(10 * ScreenTools.uiTextScaleFactor)
+                                            radius: width / 2
+                                            anchors { left: parent.left; leftMargin: 5; verticalCenter: parent.verticalCenter }
+                                            color: "#ff9800"
+                                        }
+                                    }
+                                    contentItem: Text {
+                                        text: divertItem.text
+                                        leftPadding: Math.round(16 * ScreenTools.uiTextScaleFactor)
+                                        rightPadding: Math.round(12 * ScreenTools.uiTextScaleFactor)
+                                        color: divertItem.highlighted ? "#ffffff" : "#ff9800"
+                                        font.pixelSize: Math.round(12 * ScreenTools.uiTextScaleFactor)
+                                        verticalAlignment: Text.AlignVCenter
+                                        elide: Text.ElideRight
+                                    }
+                                    onTriggered: panel.emergencyActionRequested(modelData, "DIVERT")
+                                }
+                                QGCMenuItem {
+                                    id: forcedLandingItem
+                                    text: qsTr("迫降")
+                                    implicitHeight: Math.round(30 * ScreenTools.uiTextScaleFactor)
+                                    padding: 0
+                                    background: Rectangle {
+                                        color: forcedLandingItem.highlighted ? "#4a2028" : "transparent"
+                                        radius: 3
+                                        Rectangle {
+                                            width: Math.round(3 * ScreenTools.uiTextScaleFactor)
+                                            height: parent.height - Math.round(10 * ScreenTools.uiTextScaleFactor)
+                                            radius: width / 2
+                                            anchors { left: parent.left; leftMargin: 5; verticalCenter: parent.verticalCenter }
+                                            color: "#ff3b3b"
+                                        }
+                                    }
+                                    contentItem: Text {
+                                        text: forcedLandingItem.text
+                                        leftPadding: Math.round(16 * ScreenTools.uiTextScaleFactor)
+                                        rightPadding: Math.round(12 * ScreenTools.uiTextScaleFactor)
+                                        color: forcedLandingItem.highlighted ? "#ffffff" : "#ff3b3b"
+                                        font.pixelSize: Math.round(12 * ScreenTools.uiTextScaleFactor)
+                                        font.bold: true
+                                        verticalAlignment: Text.AlignVCenter
+                                        elide: Text.ElideRight
+                                    }
+                                    onTriggered: panel.emergencyActionRequested(modelData, "EMERGENCY_LANDING")
+                                }
+                            }
                         }
                         // 撤回/拒绝（提出方或接收方在交接弹框内处理；此处提供撤回）
                         Button {

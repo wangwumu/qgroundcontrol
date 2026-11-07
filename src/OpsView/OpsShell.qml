@@ -434,6 +434,9 @@ Item {
     //    （搜它必然搜到本行）。QGC 用 Qt `Basic` 风格，该风格也不会给 ListView 自动附加滚动条，
     // 所以这 20 到底是给谁留的无法从代码确认 —— 按"来历不明的右侧留白"对待，
     // 只保持原值、不替它编一个用途。
+    // ‼️ 2026-11-06 起 `TaskListPanel` 改用 `QGCListView` ⇒ 这块留白的右缘现在**确实**会画
+    //    一条竖向滚动指示条（宽 ≈ `defaultFontPixelWidth/2`，只占 20 的左边一点点）；
+    //    其余宽度仍无出处，20 保持不变。
     property real  _taskCardRightGap: 20
     // 任务卡片**左**空位。原在 `OpsView.qml` 上定义成 `_taskCardMargin: _slotMargin`（机位边距
     // 派生出来的），因为当时监控员视图只是同一实例里的一个分支，借用得到；拆成两个视图后那根
