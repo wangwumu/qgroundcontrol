@@ -135,6 +135,32 @@ ColumnLayout {
     property var    takeoffBlockReasonFn: null
 
     //-------------------------------------------------------------------------
+    // 内部状态（不是输入）
+    //-------------------------------------------------------------------------
+    // 「本进程内见过它在空中」的 deviceID 集合 —— 迫降落地判据的**前提**（见卡片
+    // `_emergencyLanded`）。
+    //
+    // ‼️ 为什么必须有它：单看 `!flying && !armed` 在**遥测首帧到达之前**是"首拍即真"——两个
+    //    属性的初值都是 `false`。那一拍上的任务若已是 `IN_FLIGHT + disposition=EMERGENCY_LANDING`
+    //    （典型：QGC 重启后重新拉到列表、飞机其实还在空中），会立刻把【重新迫降】判成"已落地"
+    //    藏掉，而那是**最需要它**的时刻。⇒ 必须先见过 `flying === true` 至少一拍。
+    //    与 `OpsView._landFlowTick` 的 `_landSawAirborne` 同一条判据、同一理由。
+    //
+    // 键用 **deviceID 而不是 task_id**：地面事实跟着飞机走；而且卡片委托会随滚动重建，
+    // 状态必须挂在面板上（挂在委托里的字段一滚就丢）。
+    // ⚠️ 必须**整体换新对象**（不是就地改字段）——QML 的 `property var` 只在赋值时发 changed，
+    //    就地写 `_everAirborne[id] = true` 不会让读它的绑定重估。
+    property var _everAirborne: ({})
+    function noteAirborne(deviceId) {
+        var id = Number(deviceId)
+        if (!(id > 0) || _everAirborne[id] === true) return
+        var next = {}
+        for (var k in _everAirborne) next[k] = _everAirborne[k]
+        next[id] = true
+        _everAirborne = next
+    }
+
+    //-------------------------------------------------------------------------
     // 输出
     //-------------------------------------------------------------------------
     signal taskSelected(var task)
@@ -187,9 +213,25 @@ ColumnLayout {
     // ⚠️ 动作名是**占位约定**，不是后端字段：`RESUME`（继续完成航线任务）/ `RETURN`（回航）/
     //    `DIVERT`（备降）/ `EMERGENCY_LANDING`（迫降）。接线时由视图侧决定每个动作走哪条链路。
     // 2026-11-07：`RESUME` 已接线（`POST /tasks/:id/resume` → 切 `AUTO_MISSION`，见
-    // `RomView._onEmergencyAction`）；其余三项仍是 UI 壳，视图收到后明确告诉用户"尚未接入"。
+    // `RomView._onEmergencyAction`）；2026-11-08：`EMERGENCY_LANDING` 已接线（确认框 →
+    // `POST /tasks/:id/disposition` → 写库成功后下发就地降落）。剩 `DIVERT` 仍是 UI 壳，
+    // 视图收到后明确告诉用户"尚未接入"。
     // 置灰判据由视图经 `resumeAvailable` 注入——本文件不知道"异常状态"是什么。
     signal emergencyActionRequested(var task, string action)
+
+    // 迫降的后续按钮（用户 2026-11-08）。与同族一样只抛信号，不碰网络/载具。
+    //
+    // 【重新迫降】= 救济入口，定位与 F3「直接降落」相同：库里已经宣告过迫降
+    //   （`disposition === "EMERGENCY_LANDING"`），本动作**只补发飞控指令、零读写库**。
+    //   用户原话：「先写库，再发指令，如果指令没收到，需要有救济途径（类似降落阶段中的
+    //   "直接降落"）」。为什么需要它：写库成功而指令没发出（链路断 / 载具掉线 / 坐标丢失）
+    //   时，重走菜单要"打开菜单 → 迫降 → 确认框 → 再写一次库"，应急时太慢，而且那句
+    //   "不可撤销"的确认文案会让人以为不能重发。
+    //
+    // 落地后的处置（含关机）已移交机载计算机：下发时就地降落指令后会紧跟一条 80009
+    // `EMERGENCY_LANDING_CMD`，上位机据此接管降落监控与落地后的收尾。本端**不再**提供
+    // 任何关机按钮 —— 空中误按就是坠机，风险不可控（用户 2026-11-08 明确要求去掉）。
+    signal emergencyRelandRequested(var task, real cardBottomY)
 
     // 标题行（`headerText`）已删：用户 2026-09-29「可以把各部分的标题去掉，使用的都是
     // 专业培训的熟练人员」。
@@ -268,6 +310,61 @@ ColumnLayout {
                 }
                 readonly property bool _vtolFwd:  OpsCommon.isCruising(_uav ? _uav.vtolInFwdFlight : undefined)
                 readonly property bool _onGround: OpsCommon.isLandedOnGround(_uav ? _uav.flying : undefined)
+                // 本卡是否处在**已宣告迫降**的状态（结构性判断，**不含**"飞机此刻在哪"）：
+                //   ① 【移交降落指挥】/【应急情况处理】**隐藏**的判据（`_monitorHandoverVisible`
+                //      里取反）—— 迫降是不可撤销的终态，移交与其它应急处置都已是回头路
+                //      （后端本就 409/403，界面不该继续给入口；2026-11-08 用户裁定）；
+                //   ② 【重新迫降】**出现**的前提（再叠 `_emergencyLanded` 才决定显不显示）。
+                // ‼️ ① 与 ② **必须分成两个属性**：若把"已落地"直接并进本属性，落地瞬间它翻假
+                //    ⇒ ① 的 `!_emergencyDeclared` 跟着翻真 ⇒【移交】/【应急】重新冒出来，
+                //    而用户 2026-11-08 明确要求迫降后这两颗不许再出现。
+                // ‼️ 只给监控员视图：站点视图没有「应急情况处理」菜单，也就没有宣告迫降的入口；
+                //    在那儿显示「重新迫降」等于给一个没有前因的按钮。
+                // ⚠️ `modelData.disposition` 由后端 `RouteTasks` 以 `COALESCE(...,'NONE')` 下发，
+                //    缺字段时是 `undefined` ⇒ 与 `"EMERGENCY_LANDING"` 不等 ⇒ 按钮不出现（fail-closed）。
+                readonly property bool _emergencyDeclared:
+                    !panel.showSiteActions && panel.isRouteMonitor
+                    && modelData.status === "IN_FLIGHT"
+                    && modelData.disposition === "EMERGENCY_LANDING"
+                // 迫降已落地 = 宣告过 ∧ 本进程见过它空中 ∧ 现在 `!flying` ∧ 已上锁。
+                //
+                // ‼️ **两个合取项都不能删**（与 `OpsView._landFlowTick` 那条判据同源）：
+                //    只看 `armed` —— 飞行中 armed 短暂为假会被误判成落地；
+                //    只看 `flying` —— PX4 按 `COM_DISARM_LAND`（默认 2 秒）才自动上锁，
+                //                    那两秒里 `flying` 已是 false ⇒ 提前判成功。
+                //    `flying === false` 在 PX4 路径上等价于 `landed_state == ON_GROUND`：
+                //    加密心跳 EXT 的 `landed` bit0 被合成为 `EXTENDED_SYS_STATE`
+                //    （`CryptoHeartbeatExt::buildHeartbeatExtTelemetry`）⇒ `Vehicle::_setFlying(false)`。
+                // ‼️ 前置 `panel._everAirborne` 的理由见该属性注释（遥测首帧之前两值都是初值 false）。
+                // ⚠️ 用户 2026-11-08 裁定：落地后被现场拉起**不存在** ⇒ 不做"重新出现"的反向判据。
+                readonly property bool _emergencyLanded:
+                    _emergencyDeclared
+                    && _uav !== null
+                    && panel._everAirborne[modelData.device_id] === true
+                    && !_uav.flying && !_uav.armed
+                // 【重新迫降】的显示判据：宣告过、且**还没落地**（用户 2026-11-08：迫降成功后
+                // 再补发一条 LAND 是回头路）。
+                // ⚠️ 卡片本身仍**留在列表里**：后端 `routeScopeFromWhere` 的 (b) 支按「该任务还有
+                //    未闭环事件」保留它，直到善后人工关单把事件置 `RESOLVED`。本文件不参与那个判据。
+                readonly property bool _emergencyRelandVisible:
+                    _emergencyDeclared && !_emergencyLanded
+                // 把"见过它空中"记进面板（委托重建不丢）。三个钩子缺一不可：
+                //   `flyingChanged` —— 飞行过程中变真；
+                //   `_uavChanged`   —— 载具上线时可能**已经**在空中（首帧就是 true）；
+                //   `Component.onCompleted` —— 列表重建后新建的卡片。
+                // 按 deviceID 记、重复调用无害。
+                Connections {
+                    target: card._uav
+                    function onFlyingChanged() {
+                        if (card._uav && card._uav.flying) panel.noteAirborne(card._uav.deviceID())
+                    }
+                }
+                on_UavChanged: {
+                    if (_uav && _uav.flying) panel.noteAirborne(_uav.deviceID())
+                }
+                Component.onCompleted: {
+                    if (_uav && _uav.flying) panel.noteAirborne(_uav.deviceID())
+                }
                 // 中段飞行卡片：本站责任尚未交出去的**在飞**航班。判据复用 `isOutbound`（出站/进站的
                 // 同一份），再叠 `IN_FLIGHT`——起飞前那些状态用的是另一组按钮（起飞 / 申请切出）。
                 // ‼️ 写成独立属性而不是在三处按钮里各写一遍：按钮组与提示条必须**同源**，
@@ -350,12 +447,17 @@ ColumnLayout {
                 //    判据慢慢漂移——卡片上会出现"移交按钮没了、应急按钮还在"（或反之）的错位。
                 // 判据的**语义与由来**原样保留在下面「移交降落指挥」按钮旁的注释里，逐字未改，
                 // 只是判据本身搬到了这里。
+                // ‼️ 已宣告迫降（`_emergencyDeclared`）时两颗都隐藏：迫降不可撤销，之后既没有
+                //    「移交降落指挥」可言，其余应急处置（继续任务/回航/备降）也都已是回头路
+                //    —— 后端对它们本就 409/403，界面继续给按钮只会让操作员点出一个错误弹框
+                //    （2026-11-08 用户裁定：「执行迫降就没有回头路了」）。
                 readonly property bool _monitorHandoverVisible:
                     !panel.showSiteActions && panel.isRouteMonitor
                     && modelData.status === "IN_FLIGHT"
                     && OpsCommon.signedIn(modelData)
                     && !OpsCommon.pendingPhase(modelData, "LANDING", panel.handoverById)
                     && OpsCommon.landingState(modelData) !== "ACCEPTED"
+                    && !_emergencyDeclared
 
                 // 宽度由外层 `cardSlot` 单点决定（`taskList.width - cardRightGap - cardMargin`），
                 // 这里跟着走——两处各算一遍的话，分段与非分段视图会得到两种右空位。
@@ -824,6 +926,7 @@ ColumnLayout {
                         }
                         // ── 站点视图：进站（accept 交接走 handoverDialog，此处无行内确认按钮）──
                         Button {
+                            id: keepFwLandBtn
                             font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
                             // F1「降落」= 保持固定翼进近 + 正常降落。
                             // ‼️ `visible` / `enabled` 与下面 F2 那颗**逐字相同**（设计稿 §9.8.2 的裁定）
@@ -851,9 +954,34 @@ ColumnLayout {
                             implicitHeight: contentItem.implicitHeight + Math.round(8 * ScreenTools.uiTextScaleFactor)
                             width: Math.min(implicitWidth, actionFlow.maxButtonWidth); height: implicitHeight; padding: 0
                             text: qsTr("降落")
+                            // 2026-11-08 用户裁定：降落站点**接受监控员签出、完成签入后**，任务卡上
+                            // 【降落】= 绿、【切换多旋翼降落】= 黄（首选 / 次选两档）。
+                            // ‼️ 这里**不加**"已签入"判据：本按钮 `visible` 已是
+                            //    `_inboundActionable && status === "IN_FLIGHT"`，而 `OpsCommon.inboundActionable`
+                            //    对 IN_FLIGHT 要求 `landing_accepted` ⇒ 按钮出现的那一刻必然已签入，
+                            //    "未签入却涂了色"在结构上不可达。另写一条只会是一份会漂移的重复判据。
+                            // 色值取 `BUTTON_PRIMARY_COLOR`（与【起飞】/【签出】同一份）。
+                            background: Rectangle {
+                                color: parent.hovered ? Qt.darker(OpsCommon.BUTTON_PRIMARY_COLOR, 1.12)
+                                                      : OpsCommon.BUTTON_PRIMARY_COLOR
+                                radius: 3
+                            }
+                            // ‼️ 用 `id` 取字，**不是** `parent.text`：`contentItem` 的 `parent`
+                            //    在 qmllint 眼里是 `QQuickItem`（无 `text`/`font`），照抄别处那句会
+                            //    新增两条 `missing-property` 告警（同「直接降落」那颗的留档）。
+                            contentItem: Text {
+                                text: keepFwLandBtn.text
+                                font: keepFwLandBtn.font
+                                color: OpsCommon.BUTTON_ON_COLOR
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                                elide: Text.ElideRight
+                                maximumLineCount: 1
+                            }
                             onClicked: panel.keepFwLandRequested(modelData, panel.cardBottomYOf(card))
                         }
                         Button {
+                            id: vtolLandBtn
                             font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
                             // ⚠️ **机型闸没有**（2026-09-29 审查 C1）：`visible` 与 `enabled` 都不看该载具是不是
                             //    VTOL。非 VTOL 机体上点它，`_vtolState` 恒为 0 ⇒ `vtolTransitionDone(0)`
@@ -905,6 +1033,27 @@ ColumnLayout {
                             implicitHeight: contentItem.implicitHeight + Math.round(8 * ScreenTools.uiTextScaleFactor)
                             width: Math.min(implicitWidth, actionFlow.maxButtonWidth); height: implicitHeight; padding: 0
                             text: qsTr("切换多旋翼降落")
+                            // 黄 = 正常流程内的**次选**路径（2026-11-08 用户裁定，与【降落】的绿成对）。
+                            // ‼️ 黄底**不能配白字**（`#ffca28` 上白字仅 1.53:1）⇒ 字色取
+                            //    `BUTTON_WARNING_TEXT_COLOR`（深绿 `#0f2f2c`，9.38:1），色值与实算
+                            //    单点在 `OpsCommon.js` 的 `BUTTON_WARNING_*`。
+                            // ‼️ "签入后才出现"由上面的 `visible` 蕴含（`_inboundActionable` 对
+                            //    IN_FLIGHT 要求 `landing_accepted`），不在这里重复判。
+                            background: Rectangle {
+                                color: parent.hovered ? Qt.darker(OpsCommon.BUTTON_WARNING_COLOR, 1.12)
+                                                      : OpsCommon.BUTTON_WARNING_COLOR
+                                radius: 3
+                            }
+                            // 同 F1：用 `id` 取字，避免 `parent.text` 的 missing-property 告警。
+                            contentItem: Text {
+                                text: vtolLandBtn.text
+                                font: vtolLandBtn.font
+                                color: OpsCommon.BUTTON_WARNING_TEXT_COLOR
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                                elide: Text.ElideRight
+                                maximumLineCount: 1
+                            }
                             onClicked: panel.landRequested(modelData, panel.cardBottomYOf(card))
                         }
                         Button {
@@ -967,17 +1116,22 @@ ColumnLayout {
                             implicitHeight: contentItem.implicitHeight + Math.round(8 * ScreenTools.uiTextScaleFactor)
                             width: Math.min(baseWidth, actionFlow.maxButtonWidth); height: implicitHeight; padding: 0
                             text: qsTr("直接降落")
-                            // 红字（用户 2026-10-08 逐字「文字颜色改为红色」）。取 `#ff3b3b`
-                            // ——它已经是本卡片深色底上验证过的红（`_timedOut` 的边框/「超时」字同值），
-                            // 不新引入一个没在深色底上量过的色号。
+                            // 红（用户 2026-11-08 裁定：「把降落过程那个按钮『直接降落』改成红色」）。
+                            // 改前是**灰底红字**（2026-10-08 用户原话「文字颜色改为红色」，字色 `#ff3b3b`）；
+                            // 本轮改为**红底白字**，与【回航】同一档（`BUTTON_DANGER_COLOR`，白字 4.85:1）。
                             // ‼️ 用 `id` 取字，**不是** `parent.text` ——`contentItem` 的 `parent` 在
                             //    qmllint 眼里是 `QQuickItem`（无 `text`/`font`），照抄别处那句会新增
                             //    两条 `missing-property` 告警；而 `id` 指向的 Button 是确定的
                             //    （`Text.font` 绑定到按钮 font 也是 QQC2 里 `contentItem` 的官方写法）。
+                            background: Rectangle {
+                                color: parent.hovered ? Qt.darker(OpsCommon.BUTTON_DANGER_COLOR, 1.12)
+                                                      : OpsCommon.BUTTON_DANGER_COLOR
+                                radius: 3
+                            }
                             contentItem: Text {
                                 text: rescueLandBtn.text
                                 font: rescueLandBtn.font
-                                color: "#ff3b3b"
+                                color: OpsCommon.BUTTON_ON_COLOR
                                 horizontalAlignment: Text.AlignHCenter
                                 verticalAlignment: Text.AlignVCenter
                             }
@@ -1008,7 +1162,26 @@ ColumnLayout {
                             //    的 `LANDING || (IN_FLIGHT && landingAccepted)`），故两者恰好互补、不重不漏。
                             //    ⚠️ 机位选择框的锚点（`cardBottomY`）必须在这里传：用户第三轮明确
                             //    「位置，我们的惯例是显示在对应任务卡片的下方」。
-                            visible: card._inboundActionable && modelData.status !== "IN_FLIGHT"
+                            // ‼️ 2026-11-08 用户裁定（覆盖 2026-10-08 那条留档里"LANDING 段仍需保留
+                            //    独立入口"的后半段）：「飞机都落地了，选机位还有什么意义？难道它会
+                            //    飞起来飞到另一个机位。没意义，已经降落，下边就是停泊了（只是状态
+                            //    的修改）」⇒ 落地后（`_onGround`，来自 PX4 落地检测位）**隐藏**本按钮。
+                            //    理由：本按钮只改「停泊落点 / 登记」，**不会让飞机移动**；落地后唯一
+                            //    剩下的动作就是【停泊】（纯 DB 状态收尾）。
+                            //    ⚠️ 代价（刻意接受）：若此刻停泊机位不可用，【停泊】会被后端硬拒
+                            //    （409「停泊机位不可用：…」），恢复路径改到 WebUI 停放页
+                            //    （移出占位飞机 / 改机位状态），QGC 上不再有改派入口。
+                            //    ⚠️ fail-open 的判据**不是**「无遥测时 `flying` 为 undefined」——
+                            //    `flying` 是 C++ bool 属性，永远有值（初值 false）；只有 `_uav`
+                            //    为 null 时我们才给 `_onGround` 喂 undefined。⇒ 直接用 `flying`
+                            //    判会在「载具已建链、还没收到合成 EXTENDED_SYS_STATE」的那段窗口里
+                            //    误判落地、把入口藏掉（`OpsCommon.isLandedOnGround` 的注释写明
+                            //    `flying` 初值就是 false）。改与同卡的【停泊】按钮（下方 `enabled`）
+                            //    同一形状：**载具本身不可达时**才 fail-open，宁可多给一个入口，
+                            //    不因失联把机位卡死。
+                            visible: card._inboundActionable
+                                     && modelData.status !== "IN_FLIGHT"
+                                     && (!card._onGround || !OpsCommon.hasLiveTelemetry(card._uav))
                             // ── 宽度 88（用户 2026-10-10 第九轮）──────────────────────────
                             // 用户点名的两颗之一（另一颗是【直接降落】；用户原话写的是"指派机位"，
                             // 就是本颗）。88 的算式、以及"三颗实测等宽 100px"这个根因，都写在上面
@@ -1025,6 +1198,7 @@ ColumnLayout {
                             onClicked: panel.assignSlotRequested(modelData, panel.cardBottomYOf(card))
                         }
                         Button {
+                            id: parkBtn
                             font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
                             // 6.0-B 停泊门控：已落地可停泊；载具在线但未落地→置灰"停泊（待落地）"；
                             // 失联/无载具→放行"停泊（无遥测）"；均不隐藏，供人工收尾。
@@ -1047,7 +1221,72 @@ ColumnLayout {
                             text: card._onGround ? qsTr("停泊")
                                   : (OpsCommon.hasLiveTelemetry(card._uav)
                                      ? qsTr("停泊（待落地）") : qsTr("停泊（无遥测）"))
+                            // 绿 = 正常业务主操作（2026-11-08 用户裁定：把【停泊】设为绿色）。
+                            // 色值取 `OpsCommon.BUTTON_PRIMARY_COLOR`（与【起飞】/【签出】同一份）。
+                            background: Rectangle {
+                                color: parent.hovered ? Qt.darker(OpsCommon.BUTTON_PRIMARY_COLOR, 1.12)
+                                                      : OpsCommon.BUTTON_PRIMARY_COLOR
+                                radius: 3
+                            }
+                            // ‼️ 用 `id` 取字，**不是** `parent.text`（`contentItem` 的 `parent` 在
+                            //    qmllint 眼里是 `QQuickItem`，会新增 `missing-property` 告警）。
+                            contentItem: Text {
+                                text: parkBtn.text
+                                font: parkBtn.font
+                                color: OpsCommon.BUTTON_ON_COLOR
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                                elide: Text.ElideRight
+                                maximumLineCount: 1
+                            }
+                            // 自绘 background 不会跟着 `enabled` 变灰（「停泊（待落地）」那档正是
+                            // 靠 disabled 表达）⇒ 必须自己压暗，与【起飞】同款。
+                            opacity: enabled ? 1.0 : 0.45
                             onClicked: panel.parkRequested(modelData, panel.cardBottomYOf(card))
+                        }
+                        // ── 迫降的后续按钮（监控员视图，用户 2026-11-08）──
+                        // 【重新迫降】= 救济：库已宣告、但飞机没收到/没执行 ⇒ 补发一条就地降落。
+                        // 落地后的处置（含关机）由机载计算机按 80009 通告接管，本端不再给入口。
+                        // ‼️ 门控用的是 `card._emergencyLanded`（`!flying && !armed` 外加"本进程见过它
+                        //    在空中"的前置），**不是**裸 `_onGround`：后者在"还没收到过合成
+                        //    EXTENDED_SYS_STATE"时恒为 false，会把救济按钮在**最需要它**的时候藏掉
+                        //    —— 2026-11-07 那个判断依然成立，解它的是 `panel._everAirborne` 这个前置
+                        //    latch（必须先看到 `flying === true` 至少一拍，才认"已经落地"）。
+                        //    ⚠️ 已知边界（刻意保守）：QGC 重启后若飞机**已经落地**，本进程没见过它在
+                        //    空中 ⇒ 本颗继续显示（点下去 PX4 拒收、界面报错）。宁可多显示一颗，
+                        //    不可在飞着时藏掉。
+                        Button {
+                            font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
+                            id: emergencyRelandBtn
+                            // 宣告过 ∧ **还没落地**（落地后这颗消失，卡片留下等善后关单）
+                            visible: card._emergencyRelandVisible
+                            readonly property real baseWidth: Math.round(88 * ScreenTools.uiTextScaleFactor)
+                            // ‼️ 必须暴露 `preferredWidth` 才参与 `actionFlow.preferredRowWidth`
+                            //    的行宽试算（同一个契约，见该属性）。固定 88 档不加余量，
+                            //    与其它 88 宽按钮一致。漏掉它 ⇒ 本行试算少算这颗 ⇒ 误判
+                            //    "放得下"⇒ 整行保持带余量宽而实际溢出/折行。
+                            //    （迫降后它与【移交降落指挥】/【应急情况处理】互斥，见
+                            //     `_monitorHandoverVisible` 的 `!_emergencyDeclared`。）
+                            readonly property real preferredWidth: baseWidth
+                            implicitWidth: baseWidth
+                            implicitHeight: contentItem.implicitHeight + Math.round(8 * ScreenTools.uiTextScaleFactor)
+                            width: Math.min(baseWidth, actionFlow.maxButtonWidth); height: implicitHeight; padding: 0
+                            text: qsTr("重新迫降")
+                            // 红 = 应急动作（`OpsDialogButton` 三档语义；2026-11-07 用户裁定）。
+                            background: Rectangle {
+                                color: parent.hovered ? Qt.darker(OpsCommon.BUTTON_DANGER_COLOR, 1.12)
+                                                      : OpsCommon.BUTTON_DANGER_COLOR
+                                radius: 3
+                            }
+                            contentItem: Text {
+                                text: emergencyRelandBtn.text
+                                font: emergencyRelandBtn.font
+                                color: OpsCommon.BUTTON_ON_COLOR
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                                elide: Text.ElideRight
+                            }
+                            onClicked: panel.emergencyRelandRequested(modelData, panel.cardBottomYOf(card))
                         }
                         // ── 接收方：签入（两个视图共用一格）──
                         Button {
@@ -1165,6 +1404,10 @@ ColumnLayout {
                             //    两颗按钮贴在一起（2026-11-07 用户报"误触"，要求应急按钮右对齐）。
                             //    把它算进去，窄栏时会整行退回内容宽，占位重新变正、距离拉开。
                             readonly property real preferredWidth: Math.round(24 * ScreenTools.uiTextScaleFactor)
+                            // ⚠️【重新迫降】与本占位**互斥**：`_monitorHandoverVisible` 已含
+                            //    `!_emergencyDeclared`，而本占位要求两颗按钮可见 ⇒ 迫降后它必隐藏。
+                            //    故 `desiredWidth` 不必再扣【重新迫降】；它自己的宽度由
+                            //    `emergencyRelandBtn.preferredWidth` 参与 `preferredRowWidth` 试算。
                             readonly property real desiredWidth:
                                 Math.floor(actionFlow.width
                                            - handoverControlBtn.width
@@ -1190,9 +1433,11 @@ ColumnLayout {
                             // 应急情况处理（用户 2026-11-06）：出现条件与「移交降落指挥」**完全相同**
                             // （同一条 `card._monitorHandoverVisible`），位置由上面的 spacer 推到本行右缘。
                             // ‼️ 本文件只发 `emergencyActionRequested`，不发任何数据库请求、不下发任何
-                            //    MAVLink 指令。`RESUME` 的"写库 → 切 AUTO_MISSION"在 `RomView` 里；
-                            //    其余三项仍未接入，视图侧会明确告诉用户"尚未接入"——这一点是必需的：
-                            //    点了没反应的按钮在应急处置里会被误读成"指令已下发"。
+                            //    MAVLink 指令。`RESUME` 的"写库 → 切 AUTO_MISSION"、`RETURN` 的
+                            //    选点流程、`EMERGENCY_LANDING` 的"写库 → 就地降落"都在 `RomView` /
+                            //    `OpsReturnFlow` 里。唯一仍未接入的是 `DIVERT`，视图侧明确告诉用户
+                            //    "尚未接入"——这一点是必需的：点了没反应的按钮在应急处置里会被
+                            //    误读成"指令已下发"。
                             visible: card._monitorHandoverVisible
                             readonly property real baseWidth: Math.round(contentItem.implicitWidth + Math.round(24 * ScreenTools.uiTextScaleFactor))
                             readonly property real preferredWidth: Math.round(baseWidth * 1.5)

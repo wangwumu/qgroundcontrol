@@ -92,4 +92,15 @@ namespace VTOLExtensionsEnums {
         VideoCmdQuery         = 7,
     };
     Q_ENUM_NS(VTOLVideoCmd)
+
+    // -- VTOL Emergency Reason (protocol Section 3.8) --
+    // 80009 EMERGENCY_LANDING_CMD 的 `reason` 字段。QML 侧只应引用本枚举，
+    // 不要另写 JSON/JS 字面量（C 侧同名宏见 VTOLSafetyMessages.h:VTOL_EMERGENCY_REASON_*）。
+    enum VTOL_EMERGENCY_REASON : quint8 {
+        EmergencyReasonUnknown    = 0,
+        EmergencyReasonOperator   = 1,   ///< 监控员在地面站确认迫降（当前唯一来源）
+        EmergencyReasonAutopilot  = 2,   ///< 飞控自主触发（保留）
+        EmergencyReasonLinkLoss   = 3,   ///< 链路丢失触发（保留）
+    };
+    Q_ENUM_NS(VTOL_EMERGENCY_REASON)
 }

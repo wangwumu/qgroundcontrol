@@ -1222,6 +1222,52 @@ void CryptoTest::_testVtolMessages()
     QCOMPARE(vc.framerate, static_cast<uint8_t>(30));
     QCOMPARE(vc.bitrate_kbps, static_cast<uint16_t>(4000));
     QCOMPARE(QByteArray(vc.codec, 4), QByteArray("h264"));
+
+    // 4) 80009 EMERGENCY_LANDING_CMD：同样手写（无生成器兜底），CRC/偏移/往返都要钉死。
+    //    CRC_EXTRA=245、LEN=36 由 pymavlink message_checksum 独立复算（现有 4 条已标定）。
+    QVERIFY(mavlink_msg_vtol_crc_extra(MAVLINK_MSG_ID_EMERGENCY_LANDING_CMD, &crc));
+    QCOMPARE(crc, static_cast<uint8_t>(245));
+    QCOMPARE(sizeof(mavlink_emergency_landing_cmd_t), size_t(36));
+    QCOMPARE(offsetof(mavlink_emergency_landing_cmd_t, latitude), size_t(0));
+    QCOMPARE(offsetof(mavlink_emergency_landing_cmd_t, longitude), size_t(4));
+    QCOMPARE(offsetof(mavlink_emergency_landing_cmd_t, altitude), size_t(8));
+    QCOMPARE(offsetof(mavlink_emergency_landing_cmd_t, timestamp), size_t(12));
+    QCOMPARE(offsetof(mavlink_emergency_landing_cmd_t, task_no), size_t(16));
+    QCOMPARE(offsetof(mavlink_emergency_landing_cmd_t, reason), size_t(32));
+    QCOMPARE(offsetof(mavlink_emergency_landing_cmd_t, reserved), size_t(33));
+
+    // ‼️ task_no 必须传**定长 16 字节**缓冲：pack 内是 memcpy(...,16)，传字面量会越界读。
+    char taskNo[MAVLINK_MSG_EMERGENCY_LANDING_CMD_FIELD_TASK_NO_LEN] = "T-20261108";
+    mavlink_msg_emergency_landing_cmd_pack(0x01, 0x01, &msg, 391234567, 1169876543, 12345, 1700000000u,
+                                           taskNo, 1);
+    mavlink_emergency_landing_cmd_t el{};
+    mavlink_msg_emergency_landing_cmd_decode(&msg, &el);
+    QCOMPARE(el.latitude, static_cast<int32_t>(391234567));
+    QCOMPARE(el.longitude, static_cast<int32_t>(1169876543));
+    QCOMPARE(el.altitude, static_cast<int32_t>(12345));
+    QCOMPARE(el.timestamp, static_cast<uint32_t>(1700000000));
+    QCOMPARE(el.reason, static_cast<uint8_t>(1));
+    QCOMPARE(QByteArray(el.task_no, 16), QByteArray("T-20261108").leftJustified(16, '\0'));
+
+    // 尾部 reserved 全 0 ⇒ MAVLink v2 裁到 33 字节（标准行为；接收端按 LEN=36 补零）。
+    QCOMPARE(msg.len, static_cast<uint8_t>(33));
+
+    // wire 布局钉死：这份十六进制是 pymavlink 按同一字段定义独立打包的结果（seq 不影响 payload）。
+    // 与它逐字节相等 ⇒ 上位机按 vtol_safety.xml 解析时不会错位。
+    QCOMPARE(QByteArray(reinterpret_cast<const char*>(_MAV_PAYLOAD(&msg)), msg.len).toHex(),
+             QByteArray("07c451173fe6ba453930000000f15365542d323032363131303800000000000001"));
+
+    // 帧 CRC 自洽：序列化后的帧尾 CRC == 按 (帧头余部 + payload + crc_extra=245) 重算的值。
+    // ⚠️ 不能硬编码 checksum —— `mavlink_finalize_message` 的 seq 在全进程内递增，
+    //    同函数前面已 pack 过 4 条消息，到这里 seq 不为 0。
+    uint8_t sentBuf[MAVLINK_MAX_PACKET_LEN];
+    const int sentLen = mavlink_msg_to_send_buffer(sentBuf, &msg);
+    QVERIFY(sentLen > 0);
+    const QByteArray sent(reinterpret_cast<const char*>(sentBuf), sentLen);
+    const uint16_t frameTail =
+        static_cast<uint16_t>(static_cast<uint8_t>(sent.at(sentLen - 2)))
+        | static_cast<uint16_t>(static_cast<uint8_t>(sent.at(sentLen - 1)) << 8);
+    QCOMPARE(frameTail, frameCrc(sent, MAVLINK_MSG_ID_EMERGENCY_LANDING_CMD_CRC));
 }
 
 void CryptoTest::_testQgcRegistration()

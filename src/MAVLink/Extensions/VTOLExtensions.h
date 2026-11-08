@@ -94,6 +94,32 @@ public:
         quint8 sensorId, quint8 command);
 
     // ------------------------------------------------------------------------
+    // Emergency Landing Notify (msg_id 80009)
+    // ------------------------------------------------------------------------
+    /// 迫降通告：告知机载计算机「本次迫降已开始、落点在此」，由它接管降落监控与
+    /// 落地后的处置。**不是控制指令** —— 飞行控制由紧随其前的
+    /// `MAV_CMD_NAV_LAND(21)` 完成；本消息只在上位机侧建立上下文。
+    /// @param vehicle    Target vehicle
+    /// @param taskNo     Flight task number (UTF-8, max 16 **bytes**). Truncation is
+    ///                   by raw bytes, so a multi-byte char may be split at the
+    ///                   boundary. The wire field is fixed-length and **not**
+    ///                   NUL-terminated.
+    /// @param latitude   Coordinates as sent to the autopilot alongside this notice,
+    ///                   decimal degrees. ⚠️ They are **not** what PX4 lands on —
+    ///                   `MAV_CMD_NAV_LAND` makes PX4 land at its own position at
+    ///                   command time; these are for the companion computer's record.
+    /// @param longitude  Ditto
+    /// @param altitude   MSL altitude of the aircraft at send time, meters (0 = unknown).
+    ///                   Context only — not a landing target height.
+    /// @param reason     VTOL_EMERGENCY_REASON_* (1 = operator confirmed)
+    /// @return true=已交给链路发送；false=载具/链路不可用，或坐标非法（未发送）。
+    ///         ⚠️ 协议里本消息**没有应答**，true 只代表「已发出」，不代表上位机已收到。
+    Q_INVOKABLE static bool sendEmergencyLandingCmd(
+        Vehicle* vehicle, const QString& taskNo,
+        double latitude, double longitude, float altitude,
+        quint8 reason);
+
+    // ------------------------------------------------------------------------
     // Video Control (msg_id 80003)
     // ------------------------------------------------------------------------
     /// Send a video control command.

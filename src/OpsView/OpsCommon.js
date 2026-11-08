@@ -1829,15 +1829,39 @@ function alertRows(vehicles, deviceByDeviceID, perVehicleLimit, totalLimit) {
 /// `MAV_CMD_NAV_WAYPOINT`。
 var MAV_CMD_NAV_WAYPOINT = 16
 
+/// `MAV_CMD_NAV_LAND` —— 降落。MAVLink 规范语义是「飞到 `param5/param6` 指定的坐标降落」，
+/// 但 **PX4 的实现忽略坐标**：`commander/Commander.cpp:1148-1165` 收到该命令只做一件事 ——
+/// 切到 `NAVIGATION_STATE_AUTO_LAND`（日志 "Landing at current position"），
+/// `param4`/`param5`/`param6`/`param7` 一个不读；落点由
+/// `navigator/mission_block.cpp:set_land_item()` 取**收到命令那一刻**的当前位置。
+/// ‼️ 因此「发到哪就在哪落」**不成立** —— 落点由飞控按收到命令时刻自行决定（2026-11-08 读源码核实）。
+///
+/// ‼️ 本值 **21**，与紧邻的 `MAV_CMD_NAV_VTOL_LAND(85)` **不是同一条指令**：
+///    21 = 「就地降落」（PX4 不读坐标），85 = 「飞到这个坐标、**转多旋翼**再落」。
+///    两者都出现在本文件，别按名字顺手续写。
+///
+/// 用途（2026-11-08）：**迫降**（`RomView` 的应急菜单）下发 `param5/param6 = 飞机当前坐标`
+/// —— 坐标对 PX4 不生效，填它只为兼容其它实现、并与紧随其后的 80009 通告共用同一组坐标。
+/// ⚠️ 飞控侧的**临时载体**，不是设计定稿：05 §3.14-3 规划的是本系统扩展，
+/// 而该命令格式至今未定义（60824.0 协议 §5.2 的 `MAV_CMD_USER_DEFINED_EMERGENCY`
+/// 写着「命令号待注册」）。
+/// ⇒ 2026-11-08 定的分工：**飞行控制仍走本命令**；紧随其后补发
+///   `MAVLink/Extensions` 的 80009 `EMERGENCY_LANDING_CMD` 通告给**上位机**，
+///   由机载计算机接管降落监控与落地后的处置（见 `VTOLSafetyMessages.h` 80009 小节）。
+var MAV_CMD_NAV_LAND = 21
+
 /// `MAV_CMD_NAV_VTOL_LAND` —— **垂起着陆**：飞向指定坐标（高度不变），
 /// 过渡到多旋翼并着陆。即单机版航线编辑器「选择航线任务指令」里的那一项。
 ///
 /// ‼️ **不要和设计域的 `21` 混**：本值是 **85**。`21` 在 MAVLink 里是
-///    `MAV_CMD_NAV_LAND`（在指定坐标降落，**不换机型**），与本函数要表达的"转多旋翼着陆"
-///    是两条不同的指令 —— 数值上差得远，但设计域的站点标记恰好也叫 21，
-///    极易顺手写错。
+///    `MAV_CMD_NAV_LAND`（规范语义是飞向指定坐标降落，PX4 实现忽略坐标、就地降落），
+///    与本函数要表达的"转多旋翼着陆"是两条不同的指令 —— 数值上差得远，
+///    但设计域的站点标记恰好也叫 21，极易顺手写错。
 ///    （2026-09-29 审查 A7 修正：原注释写「就地/固定翼降落」——"固定翼"是错的，
-///      `MAV_CMD_NAV_LAND` 与机型无关；"就地"也是用户 2026-09-28 明确否掉的措辞。）
+///      `MAV_CMD_NAV_LAND` 与机型无关；"就地"也是用户 2026-09-28 明确否掉的措辞。
+///      ‼️ 2026-11-08 再修正：当时写的「不换机型」也是错的 —— PX4 的 `set_land_item()`
+///      在 `force_vtol()` 为真（VTOL）时同样先发 `NAV_CMD_DO_VTOL_TRANSITION` 转 MC；
+///      21 与 85 的区别是**是否要求先飞到指定点**，不是是否转旋翼。）
 ///    断言在 `test/UnitTestFramework/QmlTesting/tests/tst_OpsCommon.qml`（**不在 `src/OpsView/`**）：
 ///    `test_routeMissionItems_vtol*` 系列（搜 `command, 85`）断 `items[..].command === 85`，
 ///    写成 21 会当场变红。
@@ -2871,15 +2895,21 @@ function landApproachPoint(kind, slotLat, slotLon, fwOrigin) {
 //==========================================================================
 // 动作按钮语义色（2026-11-07 用户裁定）—— **单点定义**
 //==========================================================================
-/// 三档语义色。对话框按钮（`OpsDialogButton.qml`）与任务卡按钮
+/// 四档语义色。对话框按钮（`OpsDialogButton.qml`）与任务卡按钮
 /// （`TaskListPanel.qml`）都从这里取，**别在 QML 里再写一份 hex**。
 /// 对比度实算（WCAG，深绿/深蓝卡底上）见 `OpsDialogButton.qml` 文件头：
 ///   绿 `#1a7f46` 白字 5.04:1 ｜ 红 `#d63031` 白字 4.85:1 ｜ 白底深绿字 14.35:1
+///   黄 `#ffca28` 深绿字 `#0f2f2c` 9.38:1（同色白字只有 1.53:1 ⇒ 黄底**必须**配深色字）
 var BUTTON_PRIMARY_COLOR      = "#1a7f46"   // 绿：推荐点击、无危险的正常业务动作
 var BUTTON_CANCEL_COLOR       = "#ffffff"   // 白：取消 / 拒绝 / 撤回 / 知道了
 var BUTTON_CANCEL_TEXT_COLOR  = "#0f2f2c"   // 白底上的字色
 var BUTTON_DANGER_COLOR       = "#d63031"   // 红：应急、救济、有风险
 var BUTTON_ON_COLOR           = "#ffffff"   // 绿/红底上的字色
+// 黄：正常流程内的**非首选**路径（2026-11-08 用户裁定：降落站点签入后，
+// 任务卡【切换多旋翼降落】= 黄；首选路径【降落】= 绿）。目前只有任务卡用它，
+// 确认弹框的主按钮仍走 `confirmButtonKind`（`land` 归绿），**未**随之改成黄。
+var BUTTON_WARNING_COLOR      = "#ffca28"
+var BUTTON_WARNING_TEXT_COLOR = "#0f2f2c"   // 黄底上的字色（9.38:1）
 
 //==========================================================================
 // 动作按钮语义档（2026-11-07 用户裁定）

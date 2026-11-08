@@ -51,6 +51,7 @@ static bool isCommandMsgid(uint32_t msgid)
     case MAVLINK_MSG_ID_ALTERNATE_LANDING:  // 80001
     case MAVLINK_MSG_ID_SENSOR_CTRL:        // 80002
     case MAVLINK_MSG_ID_VIDEO_CTRL:         // 80003
+    case MAVLINK_MSG_ID_EMERGENCY_LANDING_CMD: // 80009
         return true;
     default:
         return false;
@@ -246,6 +247,7 @@ QString CryptoLinkLogger::_describeMsgid(uint32_t msgid)
     case MAVLINK_MSG_ID_ALTERNATE_LANDING: return QStringLiteral("备降点命令");
     case MAVLINK_MSG_ID_SENSOR_CTRL:       return QStringLiteral("传感器控制");
     case MAVLINK_MSG_ID_VIDEO_CTRL:        return QStringLiteral("视频控制");
+    case MAVLINK_MSG_ID_EMERGENCY_LANDING_CMD: return QStringLiteral("迫降通告命令");
     default:                                return QStringLiteral("MAVLink报文");
     }
 }

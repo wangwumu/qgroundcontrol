@@ -12,6 +12,7 @@ private slots:
     void _classifyCommandAck_test();
     void _classifyStatusText_test();
     void _classifyUnrelatedFrameIsNone_test();
+    void _emergencyLandingCmdIsLogged_test();
 
     // 渲染：命令 / 应答
     void _commandLongRendersCommandName_test();

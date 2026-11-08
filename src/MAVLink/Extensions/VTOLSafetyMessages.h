@@ -812,10 +812,110 @@ static inline uint16_t mavlink_msg_qgc_registration_pack(uint32_t gcsDeviceID,
 }
 
 // ============================================================================
+// 80009: EMERGENCY_LANDING_CMD（迫降通告，QGC → 机载计算机）
+// ============================================================================
+//
+// 用户 2026-11-08：「在发出降落指令 MAV_CMD_NAV_LAND 后，紧跟着再发一个额外 8000x
+// 指令（不如：80009），这个指令是给上位机的，具体降落监控以及降落后的处理事宜
+// 交给上位机」。
+//
+// 定位：**通告**，不是控制指令。飞行控制仍由紧随其前的 `MAV_CMD_NAV_LAND(21)` 完成；
+// 80009 只告诉机载计算机「这架飞机正在执行迫降、落点在这里，请接管降落监控与落地
+// 处置」。⇒ **上位机侧的处理不在本仓**：需在 `vtol_safety.xml` 增加同名消息定义并
+//    重新生成 pymavlink，否则解密后无人认领（消息体 36 字节，wire 顺序见结构体）。
+//
+// 加密：与 80000-80003 同类（任务帧），随加密链路上行。
+// CRC_EXTRA=245、LEN=36 由 pymavlink `message_checksum` 计算（同文件其余消息已标定）。
+
+#define MAVLINK_MSG_ID_EMERGENCY_LANDING_CMD 80009
+#define MAVLINK_MSG_ID_80009_CRC                 245
+#define MAVLINK_MSG_ID_EMERGENCY_LANDING_CMD_CRC 245
+#define MAVLINK_MSG_ID_EMERGENCY_LANDING_CMD_LEN     36U
+#define MAVLINK_MSG_ID_EMERGENCY_LANDING_CMD_MIN_LEN 36U
+
+#define MAVLINK_MSG_EMERGENCY_LANDING_CMD_FIELD_TASK_NO_LEN 16
+
+/// reason 字段取值。⚠️ 三处同值：本宏（C 侧）、`VTOLExtensionsEnums::VTOL_EMERGENCY_REASON`
+/// （QML 侧唯一来源）、`vtol_safety.xml` 的同名枚举（上位机侧）。改一处必须改三处。
+#define VTOL_EMERGENCY_REASON_OPERATOR 1   ///< 监控员在地面站确认迫降
+
+MAVPACKED(
+typedef struct __mavlink_emergency_landing_cmd_t {
+    int32_t  latitude;         ///< WGS84 latitude of the emergency landing point (degE7)
+    int32_t  longitude;        ///< WGS84 longitude of the emergency landing point (degE7)
+    int32_t  altitude;         ///< MSL altitude at the moment of landing command (mm)
+    uint32_t timestamp;        ///< Command issued time (UTC seconds)
+    char     task_no[16];      ///< Flight task number (not null-terminated)
+    uint8_t  reason;           ///< Trigger reason (VTOL_EMERGENCY_REASON enum)
+    uint8_t  reserved[3];      ///< Reserved, must be 0
+}) mavlink_emergency_landing_cmd_t;
+
+/// @note `task_no` 必须指向**至少 16 个可读字节**（与 `_mav_put_char_array` 的 memcpy
+///       一致，不要求 NUL 结尾）。不足 16 字节的缓冲或 nullptr 会越界读 —— 调用方必须先
+///       补齐到定长（`VTOLExtensions::sendEmergencyLandingCmd` 用 `QByteArray::resize`）。
+static inline uint16_t mavlink_msg_emergency_landing_cmd_pack(
+    uint8_t system_id, uint8_t component_id, mavlink_message_t* msg,
+    int32_t latitude, int32_t longitude, int32_t altitude,
+    uint32_t timestamp, const char *task_no, uint8_t reason)
+{
+    char buf[MAVLINK_MSG_ID_EMERGENCY_LANDING_CMD_LEN];
+    _mav_put_int32_t(buf, 0, latitude);
+    _mav_put_int32_t(buf, 4, longitude);
+    _mav_put_int32_t(buf, 8, altitude);
+    _mav_put_uint32_t(buf, 12, timestamp);
+    _mav_put_char_array(buf, 16, task_no, 16);
+    _mav_put_uint8_t(buf, 32, reason);
+    _mav_put_uint8_t(buf, 33, 0);
+    _mav_put_uint8_t(buf, 34, 0);
+    _mav_put_uint8_t(buf, 35, 0);
+    memcpy(_MAV_PAYLOAD_NON_CONST(msg), buf, MAVLINK_MSG_ID_EMERGENCY_LANDING_CMD_LEN);
+
+    msg->msgid = MAVLINK_MSG_ID_EMERGENCY_LANDING_CMD;
+    return mavlink_finalize_message(msg, system_id, component_id,
+                                    MAVLINK_MSG_ID_EMERGENCY_LANDING_CMD_MIN_LEN,
+                                    MAVLINK_MSG_ID_EMERGENCY_LANDING_CMD_LEN,
+                                    MAVLINK_MSG_ID_EMERGENCY_LANDING_CMD_CRC);
+}
+
+static inline uint16_t mavlink_msg_emergency_landing_cmd_encode(
+    uint8_t system_id, uint8_t component_id, mavlink_message_t* msg,
+    const mavlink_emergency_landing_cmd_t* emergency_landing_cmd)
+{
+    return mavlink_msg_emergency_landing_cmd_pack(system_id, component_id, msg,
+        emergency_landing_cmd->latitude, emergency_landing_cmd->longitude,
+        emergency_landing_cmd->altitude, emergency_landing_cmd->timestamp,
+        emergency_landing_cmd->task_no, emergency_landing_cmd->reason);
+}
+
+static inline void mavlink_msg_emergency_landing_cmd_decode(
+    const mavlink_message_t* msg, mavlink_emergency_landing_cmd_t* emergency_landing_cmd)
+{
+    memcpy(emergency_landing_cmd, _MAV_PAYLOAD(msg), MAVLINK_MSG_ID_EMERGENCY_LANDING_CMD_LEN);
+}
+
+static inline int32_t mavlink_msg_emergency_landing_cmd_get_latitude(const mavlink_message_t* msg)
+    { return _MAV_RETURN_int32_t(msg, 0); }
+
+static inline int32_t mavlink_msg_emergency_landing_cmd_get_longitude(const mavlink_message_t* msg)
+    { return _MAV_RETURN_int32_t(msg, 4); }
+
+static inline int32_t mavlink_msg_emergency_landing_cmd_get_altitude(const mavlink_message_t* msg)
+    { return _MAV_RETURN_int32_t(msg, 8); }
+
+static inline uint32_t mavlink_msg_emergency_landing_cmd_get_timestamp(const mavlink_message_t* msg)
+    { return _MAV_RETURN_uint32_t(msg, 12); }
+
+static inline uint16_t mavlink_msg_emergency_landing_cmd_get_task_no(const mavlink_message_t* msg, char *task_no)
+    { return _MAV_RETURN_char_array(msg, task_no, 16, 16); }
+
+static inline uint8_t mavlink_msg_emergency_landing_cmd_get_reason(const mavlink_message_t* msg)
+    { return _MAV_RETURN_uint8_t(msg, 32); }
+
+// ============================================================================
 // CRC_EXTRA 查询助手
 // ============================================================================
 
-/// @brief 返回 80000-80003 及 80005 自定义消息的 CRC_EXTRA。
+/// @brief 返回 80000-80003、80005、80009 自定义消息的 CRC_EXTRA。
 ///
 /// 这些消息独立于 mavlink 生成层，未注册进 `MAVLINK_MESSAGE_CRCS` 表，
 /// 因此 `mavlink_get_crc_extra()` 对它们返回 0。加密链路（`encryptFrame`）
@@ -833,6 +933,7 @@ static inline bool mavlink_msg_vtol_crc_extra(uint32_t msgid, uint8_t* out_crc)
         case MAVLINK_MSG_ID_SENSOR_CTRL:       *out_crc = MAVLINK_MSG_ID_SENSOR_CTRL_CRC;       return true;
         case MAVLINK_MSG_ID_VIDEO_CTRL:        *out_crc = MAVLINK_MSG_ID_VIDEO_CTRL_CRC;        return true;
         case MAVLINK_MSG_ID_QGC_REGISTRATION:  *out_crc = MAVLINK_MSG_ID_QGC_REGISTRATION_CRC;  return true;
+        case MAVLINK_MSG_ID_EMERGENCY_LANDING_CMD: *out_crc = MAVLINK_MSG_ID_EMERGENCY_LANDING_CMD_CRC; return true;
         default: return false;
     }
 }

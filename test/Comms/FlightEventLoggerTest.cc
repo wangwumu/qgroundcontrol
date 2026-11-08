@@ -67,6 +67,25 @@ void FlightEventLoggerTest::_classifyUnrelatedFrameIsNone_test()
     QVERIFY(!FlightEventLogger::renderFrame(known).isEmpty());
 }
 
+void FlightEventLoggerTest::_emergencyLandingCmdIsLogged_test()
+{
+    // 80009 是应急事件，必须进事件日志 —— 且不能只写「发了一条扩展消息」。
+    // ‼️ 这条用例钉的是 `classify()`：它落到 default 的 None 时 `logFrame` 直接返回，
+    //    renderFrame 写得再好也不会落盘（本次评审就是在这里抓到一次）。
+    char taskNo[MAVLINK_MSG_EMERGENCY_LANDING_CMD_FIELD_TASK_NO_LEN] = "T-20261108";
+    mavlink_message_t msg{};
+    (void) mavlink_msg_emergency_landing_cmd_pack(1, 1, &msg, 391234567, 1169876543, 12345,
+                                                  1700000000u, taskNo, 1);
+
+    QVERIFY(FlightEventLogger::classify(msg) == Category::Command);
+
+    const QString rendered = FlightEventLogger::renderFrame(msg);
+    QVERIFY2(!rendered.isEmpty(), qPrintable(rendered));
+    QVERIFY2(rendered.contains(QStringLiteral("T-20261108")), qPrintable(rendered));
+    QVERIFY2(rendered.contains(QStringLiteral("39.1234567")), qPrintable(rendered));
+    QVERIFY2(rendered.contains(QStringLiteral("116.9876543")), qPrintable(rendered));
+}
+
 // ---------------------------------------------------------------------------
 // 渲染：命令 / 应答
 // ---------------------------------------------------------------------------

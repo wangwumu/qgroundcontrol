@@ -1,5 +1,7 @@
 #include "VTOLExtensions.h"
 
+#include <QtCore/QDateTime>
+
 #include "MAVLinkLib.h"
 #include "QGCLoggingCategory.h"
 
@@ -163,6 +165,59 @@ void VTOLExtensions::sendSensorCtrl(
         sensorId, command);
 
     vehicle->sendMessageOnLinkThreadSafe(sharedLink.get(), msg);
+}
+
+// ----------------------------------------------------------------------------
+// Emergency Landing Notify (msg_id 80009)
+// ----------------------------------------------------------------------------
+bool VTOLExtensions::sendEmergencyLandingCmd(
+    Vehicle* vehicle, const QString& taskNo,
+    double latitude, double longitude, float altitude,
+    quint8 reason)
+{
+    if (!vehicle) {
+        qCWarning(VTOLExtensionsLog) << "sendEmergencyLandingCmd: null vehicle";
+        return false;
+    }
+
+    const SharedLinkInterfacePtr sharedLink = vehicle->vehicleLinkManager()->primaryLink().lock();
+    if (!sharedLink) {
+        qCWarning(VTOLExtensionsLog) << "sendEmergencyLandingCmd: no primary link";
+        return false;
+    }
+
+    // ‼️ `static_cast<int32_t>(NaN/Inf/超范围)` 是 UB：落点会静默变成一个**错误但合法**的
+    //    坐标（x86 常见 INT_MIN）。QML 调用方已挡了大部分，但这是公开的 Q_INVOKABLE，
+    //    必须在 C++ 侧自己 fail-closed。`altitude` 非法时退化为 0（=未知），不影响落点。
+    if (!qIsFinite(latitude) || !qIsFinite(longitude)
+        || qAbs(latitude) > 90.0 || qAbs(longitude) > 180.0) {
+        qCWarning(VTOLExtensionsLog) << "sendEmergencyLandingCmd: invalid coordinates"
+                                     << latitude << longitude;
+        return false;
+    }
+    const double safeAltitude = qIsFinite(altitude) ? static_cast<double>(altitude) : 0.0;
+
+    const auto latInt = static_cast<int32_t>(latitude * 1e7);
+    const auto lonInt = static_cast<int32_t>(longitude * 1e7);
+    const auto altInt = static_cast<int32_t>(safeAltitude * 1e3);   // m → mm
+    // 秒级时间戳：上位机只拿它判重/算超时，不要求毫秒精度（与 80000 valid_from 同口径）。
+    const auto timestamp = static_cast<uint32_t>(QDateTime::currentSecsSinceEpoch());
+
+    // pack 里是 `_mav_put_char_array(..., 16)`（memcpy 16 字节）⇒ 必须补齐到定长，
+    // 否则会读到 `constData()` 之外。截断按**原始字节**：若任务号含多字节 UTF-8 且正好
+    // 被截在第 16 字节中间，接收端会拿到一个不完整的字符（协议字段没有长度前缀，无法规避）。
+    QByteArray taskBytes = taskNo.toUtf8().left(MAVLINK_MSG_EMERGENCY_LANDING_CMD_FIELD_TASK_NO_LEN);
+    taskBytes.resize(MAVLINK_MSG_EMERGENCY_LANDING_CMD_FIELD_TASK_NO_LEN, '\0');
+
+    mavlink_message_t msg;
+    mavlink_msg_emergency_landing_cmd_pack(
+        static_cast<uint8_t>(MAVLinkProtocol::instance()->getSystemId()),
+        MAVLinkProtocol::getComponentId(),
+        &msg,
+        latInt, lonInt, altInt,
+        timestamp, taskBytes.constData(), reason);
+
+    return vehicle->sendMessageOnLinkThreadSafe(sharedLink.get(), msg);
 }
 
 // ----------------------------------------------------------------------------

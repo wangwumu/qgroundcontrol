@@ -113,7 +113,7 @@ static QString _commandWithNumber(uint16_t command)
                           : QStringLiteral("%1(%2)").arg(name).arg(command);
 }
 
-/// 扩展消息（80000-80005）→ 中文名。未收录的返回空串。
+/// 扩展消息（80000-80005、80009）→ 中文名。未收录的返回空串。
 static QString _extensionName(uint32_t msgid)
 {
     switch (msgid) {
@@ -122,6 +122,7 @@ static QString _extensionName(uint32_t msgid)
     case MAVLINK_MSG_ID_SENSOR_CTRL:       return QStringLiteral("传感器控制");
     case MAVLINK_MSG_ID_VIDEO_CTRL:        return QStringLiteral("视频控制");
     case MAVLINK_MSG_ID_QGC_REGISTRATION:  return QStringLiteral("QGC登记心跳");
+    case MAVLINK_MSG_ID_EMERGENCY_LANDING_CMD: return QStringLiteral("迫降通告");
     default:                               return QString();
     }
 }
@@ -163,6 +164,9 @@ FlightEventLogger::Category FlightEventLogger::classify(const mavlink_message_t&
     case MAVLINK_MSG_ID_ALTERNATE_LANDING:
     case MAVLINK_MSG_ID_SENSOR_CTRL:
     case MAVLINK_MSG_ID_VIDEO_CTRL:
+    case MAVLINK_MSG_ID_EMERGENCY_LANDING_CMD:
+        // 80009 必须归 Command：落到 default 的 None 会让 `logFrame` 直接返回，
+        // 迫降通告在事件日志里**一条都看不到** —— 而它正是事后复盘最需要的一条。
         return Category::Command;
     case MAVLINK_MSG_ID_COMMAND_ACK:
         return Category::Ack;
@@ -299,6 +303,23 @@ QString FlightEventLogger::renderFrame(const mavlink_message_t& message)
                 .arg(kMaxIds);
         }
         return QStringLiteral("%1(扩展 %2)：%3").arg(_extensionName(message.msgid)).arg(message.msgid).arg(list);
+    }
+
+    case MAVLINK_MSG_ID_EMERGENCY_LANDING_CMD: {
+        // 迫降通告是**应急事件**：只写「发了一条扩展消息」信息量不够，事后复盘要看
+        // 「哪一单、落在哪」。`task_no` 不保证 NUL 结尾 ⇒ 缓冲 +1 并零初始化。
+        char taskNo[MAVLINK_MSG_EMERGENCY_LANDING_CMD_FIELD_TASK_NO_LEN + 1] = {};
+        mavlink_msg_emergency_landing_cmd_get_task_no(&message, taskNo);
+        const int32_t latE7 = mavlink_msg_emergency_landing_cmd_get_latitude(&message);
+        const int32_t lonE7 = mavlink_msg_emergency_landing_cmd_get_longitude(&message);
+        const int32_t altMm = mavlink_msg_emergency_landing_cmd_get_altitude(&message);
+        return QStringLiteral("%1(扩展 %2)：任务 %3 落点 %4,%5 高度 %6 m")
+            .arg(_extensionName(message.msgid))
+            .arg(message.msgid)
+            .arg(taskNo[0] ? QString::fromUtf8(taskNo) : QStringLiteral("—"))
+            .arg(latE7 / 1e7, 0, 'f', 7)
+            .arg(lonE7 / 1e7, 0, 'f', 7)
+            .arg(altMm / 1000.0, 0, 'f', 0);
     }
 
     case MAVLINK_MSG_ID_WEATHER_FORECAST:

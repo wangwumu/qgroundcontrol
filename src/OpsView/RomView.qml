@@ -130,6 +130,41 @@ OpsShell {
         }
     }
 
+    //=========================================================================
+    // 迫降（EMERGENCY_LANDING）：确认框 → 先写库 → 再下发「就地降落」
+    //=========================================================================
+    // 用户 2026-11-08：「点击迫降后，需要弹出对话框来确认（"确认"按钮要用红色），确认后…
+    // 先写库，再发指令」。顺序与全项目同一条口径（RESUME / 回航 / 降落 / 停泊）：
+    // **写库失败 ⇒ 一条飞控指令都不发**；写库成功而指令没发出 ⇒ 明确报「记录已写、指令未发出」。
+    //
+    // ⚠️ 与 RESUME 的状态机不同，这里**不做抑制期/派生状态**：迫降是一次性宣告，
+    //    「是否真的落地」由落地检测（`_onGround`）与善后界面负责，不靠本端推演。
+
+    /// 待确认的任务（迫降确认框打开期间非 null）。
+    property var _emergencyPendingTask: null
+
+    /// 写库请求是否在途（防重复提交；超时后丢弃迟到的响应）。
+    property bool _emergencyRequestPending: false
+
+    /// 写库请求代次。理由与 `_resumeRequestSeq` 逐字相同：只判 pending 会让
+    /// 「第 1 次超时后重试」把迟到的 200 当成第 2 次的成功 ⇒ 发两次降落指令。
+    property int _emergencyRequestSeq: 0
+
+    /// 写库超时兜底（QML 的 XHR 没有 timeout，见 `resumeRequestTimer` 的注释）。
+    /// 超时**不自动重发**：写库可能已在服务端生效，重发会再写一条流水。
+    Timer {
+        id: emergencyRequestTimer
+        interval: 10000; repeat: false
+        onTriggered: {
+            if (!romView._emergencyRequestPending) return
+            romView._emergencyRequestPending = false
+            romView._emergencyRequestSeq++   // 作废这一代的迟到响应
+            QGroundControl.showMessageDialog(romView, qsTr("迫降未确认"),
+                qsTr("请求超时：未收到服务器回应，降落指令未下发。\n"
+                     + "数据库是否写入未能确认，请核对后再决定是否重试（重试会再写一条记录）。"))
+        }
+    }
+
     /// 按 `task.device_id` 定位载具。与 `OpsView._vehicleForTask` 同解——`RomView` 是
     /// `OpsShell` 的子类而不是 `OpsView` 的子类，够不到那一份，故在此重写（逻辑只有一行）。
     function _vehicleForTask(task) {
@@ -445,17 +480,18 @@ OpsShell {
     }
 
     /// 卡片上的「应急情况处理」菜单（用户 2026-11-06）。
-    /// 2026-11-07：`RESUME` 与 `RETURN` 已接线；其余两项仍是 UI 壳，明确告诉用户"尚未接入"。
-    /// 这不是多余的提示——在应急处置里，点了没反应的菜单项会被当成"指令已下发"，
-    /// 那正是本项目反复防的那类"谎报成功"。
-    /// ⚠️ 其余两项接线时按 `action` 分派，两条链路各不相同：
+    /// 2026-11-07：`RESUME` 与 `RETURN` 已接线；2026-11-08：`EMERGENCY_LANDING` 已接线。
+    /// `DIVERT` 仍是 UI 壳，明确告诉用户"尚未接入"。这不是多余的提示——在应急处置里，
+    /// 点了没反应的菜单项会被当成"指令已下发"，那正是本项目反复防的那类"谎报成功"。
+    /// ⚠️ 各链路的差别：
+    ///    · `RESUME`  → 确认框 → `POST /tasks/:id/resume` → 切 `AUTO_MISSION`。
     ///    · `RETURN`  → 选点流程（`OpsReturnFlow.begin`）：查候选 → 选点 → 写库 →
     ///      构造倒序航线并上传。写库与上传都在流程内完成；**不发 RTL**。
+    ///    · `EMERGENCY_LANDING` → 确认框（红确认）→ `POST /tasks/:id/disposition` →
+    ///      写库成功后下发 `MAV_CMD_NAV_LAND`（就地降落）。见 `_execEmergencyLanding`。
     ///    · `DIVERT`  → `POST /tasks/:id/divert` 需要备降场 `site_id` + 经纬度；而"生成并
     ///      上传到备降站点的续飞航线"在设计稿 §6.1-g 里仍是**未实现缺口**——只调后端
     ///      而天上不飞，同样是谎报成功。
-    ///    · `EMERGENCY_LANDING` → `POST /tasks/:id/disposition`（带实时位置）；发给飞机的
-    ///      载体是本系统扩展 80000–80003，格式尚待补充。
     function _onEmergencyAction(task, action) {
         if (action === "RESUME") {
             romView._beginResumeConfirm(task)
@@ -465,6 +501,10 @@ OpsShell {
             // `returnFlow` 由 `OpsShell` 以 `property alias` 暴露；RomView 是它的子视图，直接可见。
             // 若将来 RomView 被提到独立窗口导致作用域断开，改为在实例化时注入回调。
             returnFlow.begin(task)
+            return
+        }
+        if (action === "EMERGENCY_LANDING") {
+            romView._beginEmergencyLandingConfirm(task)
             return
         }
         var labels = {
@@ -479,6 +519,240 @@ OpsShell {
             qsTr("数据库与飞机均未做任何改动。")
             + qsTr("\n任务 %1 仍在原航线上。")
                 .arg(task && task.task_no ? task.task_no : "—"))
+    }
+
+    /// 打开「迫降」确认框（用户 2026-11-08：先弹框，确认按钮为红）。
+    /// ‼️ 本函数**不写库、不发指令**：只是把后果摆给用户看，等 `_execEmergencyLanding`。
+    /// 打开之前把能挡的都挡掉 —— 让用户拿到一句人话，而不是确认完之后收到一个 HTTP 409。
+    function _beginEmergencyLandingConfirm(task) {
+        var fresh = romView._freshTask(task)
+        if (!fresh) {
+            QGroundControl.showMessageDialog(romView, qsTr("无法迫降"),
+                qsTr("该任务已不在当前任务列表中（可能已结束或被撤销），本次未生效。"))
+            return
+        }
+        // ⚠️ 与后端同一判据：`ReportDisposition` 对非 `IN_FLIGHT` 回 409
+        //    （`recordDispositionTx` 的 `ErrTaskNotInFlight`）。
+        if (fresh.status !== "IN_FLIGHT") {
+            QGroundControl.showMessageDialog(romView, qsTr("无法迫降"),
+                qsTr("任务当前状态为 %1，只有飞行中（IN_FLIGHT）的任务可以迫降。\n"
+                     + "数据库与飞机均未做任何改动。").arg(fresh.status ? fresh.status : "—"))
+            return
+        }
+        var v = romView._vehicleForTask(fresh)
+        if (!v) {
+            QGroundControl.showMessageDialog(romView, qsTr("无法迫降"),
+                qsTr("未找到该任务（%1）对应无人机的连接，请检查现场链路。\n"
+                     + "数据库与飞机均未做任何改动。")
+                    .arg(fresh.uav_no ? fresh.uav_no : "—"))
+            return
+        }
+        if (romView._vehicleLinkLost(v)) {
+            QGroundControl.showMessageDialog(romView, qsTr("无法迫降"),
+                qsTr("该无人机链路中断，无法确认其当前位置。\n"
+                     + "数据库与飞机均未做任何改动。"))
+            return
+        }
+        // 迫降的位置要写进库（后端对 `EMERGENCY_LANDING` 强制要求非零 lat/lon），
+        // 也要作为就地降落的落点 ⇒ 拿不到位置就不进确认框。
+        if (!(v.coordinate && OpsCommon.isValidWaypoint(v.coordinate.latitude, v.coordinate.longitude))) {
+            QGroundControl.showMessageDialog(romView, qsTr("无法迫降"),
+                qsTr("未收到该无人机的有效位置，无法确定迫降位置。\n"
+                     + "数据库与飞机均未做任何改动。"))
+            return
+        }
+        romView._emergencyPendingTask = fresh
+        emergencyLandingConfirmDialog.open()
+    }
+
+    /// 确认框里「确认迫降」：**先写库、写成功后才发降落指令**（用户 2026-11-08 定）。
+    ///
+    /// 失败语义沿用 `_execResume`（全项目同一条）：
+    ///   · 写库失败（4xx 明确拒绝）⇒ 一条飞控指令都不发，提示"本次未生效、指令未发出"；
+    ///   · 写库结果未知（超时 / 5xx / 2xx 但不合契约）⇒ 同样不发，且**不替服务端担保**
+    ///     "库未写"；
+    ///   · 写库成功而指令没发出 ⇒ 提示"记录已写、指令未发出"，由用户决定下一步。
+    function _execEmergencyLanding() {
+        var task = romView._emergencyPendingTask
+        romView._emergencyPendingTask = null
+        if (!task) return
+        // 上一轮还在写库 ⇒ 忽略（两次请求 = 两条流水 + 两条指令）。
+        if (romView._emergencyRequestPending) return
+
+        // 确认框开着的时候条件可能已经变化（任务结束、飞机掉线、模式被改）⇒ 全部重查。
+        var fresh = romView._freshTask(task)
+        if (!fresh || fresh.status !== "IN_FLIGHT") {
+            QGroundControl.showMessageDialog(romView, qsTr("迫降已取消"),
+                qsTr("等待确认期间任务状态已变化，本次未生效。\n"
+                     + "数据库与飞机均未做任何改动。"))
+            return
+        }
+        var v = romView._vehicleForTask(fresh)
+        if (!v || romView._vehicleLinkLost(v)) {
+            QGroundControl.showMessageDialog(romView, qsTr("迫降已取消"),
+                qsTr("等待确认期间无人机链路中断，无法确认其位置，本次未生效。\n"
+                     + "数据库与飞机均未做任何改动。"))
+            return
+        }
+        var lat = v.coordinate ? v.coordinate.latitude : NaN
+        var lon = v.coordinate ? v.coordinate.longitude : NaN
+        if (!OpsCommon.isValidWaypoint(lat, lon)) {
+            QGroundControl.showMessageDialog(romView, qsTr("迫降已取消"),
+                qsTr("等待确认期间丢失了无人机位置，本次未生效。\n"
+                     + "数据库与飞机均未做任何改动。"))
+            return
+        }
+
+        // 写的是**确认这一刻**的位置（后端口径：「宣布那一刻」的初值，允许后续更新）。
+        // 真正下发给飞机的落点另取一次（见 `_sendEmergencyLandingCommand`）：往返期间飞机会动。
+        var body = {
+            event:  "EMERGENCY_LANDING",
+            // ⚠️ 服务端解析但**当前不使用** `source`（`ReportDisposition` 注释「留作扩展」）。
+            source: "qgc",
+            reason: qsTr("监控员在飞行监控界面确认迫降（就地降落）"),
+            lat: lat,
+            lon: lon
+        }
+        var seq = ++romView._emergencyRequestSeq
+        romView._emergencyRequestPending = true
+        emergencyRequestTimer.restart()
+        romView._post("/api/tasks/" + fresh.task_id + "/disposition", body, function(status, data) {
+            // 超时兜底已经向用户报过"未确认、指令未下发" ⇒ 迟到的响应一律丢弃。
+            // ‼️ 判代次而不只判 pending（理由同 `_execResume`）。
+            if (seq !== romView._emergencyRequestSeq) return
+            romView._emergencyRequestPending = false
+            emergencyRequestTimer.stop()
+            if (status === 0) {
+                // 请求没发出去 / 响应丢了：两种情况下我们都**不知道**库写了没有。
+                QGroundControl.showMessageDialog(romView, qsTr("迫降未确认"),
+                    qsTr("与服务器的通信中断，无法确认写库结果，降落指令未下发。\n"
+                         + "请先确认飞机状态，再决定是否重试（重试会再写一条记录）。"))
+                console.warn("RomView 迫降无响应（status 0）")
+                return
+            }
+            // ‼️ 成功 = 200 **且回执明确说这是 EMERGENCY_LANDING**。中间层 200 HTML 错误页、
+            //    被截断的 JSON 都必须按"写库结果未确认"处理。`idempotent:true`（重复上报）
+            //    同样是成功 —— 后端已明确把它当"已在处置中"。
+            if (status !== 200 || !data || data.status !== "EMERGENCY_LANDING") {
+                if (status >= 400 && status < 500) {
+                    // 4xx = 服务端**明确拒绝** ⇒ "库未写、指令未发"是确定的。
+                    QGroundControl.showMessageDialog(romView, qsTr("迫降未生效"),
+                        ((data && (data.error || data.reason)) || ("HTTP " + status))
+                        + qsTr("\n本次未生效，降落指令未发出。"))
+                } else {
+                    QGroundControl.showMessageDialog(romView, qsTr("迫降未确认"),
+                        qsTr("服务器未确认迫降记录已写入（HTTP %1），降落指令未下发。\n"
+                             + "数据库是否写入未能确认，请核对后决定是否重试（重试会再写一条记录）。")
+                            .arg(status))
+                }
+                console.warn("RomView 迫降写库失败:", status, JSON.stringify(data))
+                return
+            }
+            // ---- 库已写：从这里开始，失败一律报「记录已写、指令未发出」----
+            romView._sendEmergencyLandingCommand(fresh)
+        })
+    }
+
+    /// 写库成功之后才走到这里：给飞机下发**就地降落**。
+    ///
+    /// ‼️ 载体是 `MAV_CMD_NAV_LAND(21)`，本函数把 `param5/param6` 填成**下发这一刻的坐标**。
+    ///    ⚠️ **PX4 并不读这两个参数**（2026-11-08 读源码核实）：
+    ///    `commander/Commander.cpp:1148-1165` 收到该命令只做一件事 —— 切到
+    ///    `NAVIGATION_STATE_AUTO_LAND`（日志 "Landing at current position"），四个 param 一个不读；
+    ///    随后 `navigator/land.cpp:50-66` → `mission_block.cpp:set_land_item()` 把落点取成
+    ///    **收到命令时**飞控自己的 `get_global_position()`，`force_vtol()` 为真（VTOL）时它还
+    ///    先发 `NAV_CMD_DO_VTOL_TRANSITION` 转 MC —— **会换机型**。
+    ///    我们仍填坐标的用途只有两个：① 兼容会读这两个参数的实现；② 与紧随其后的
+    ///    80009 通告共享同一组坐标，上位机可据此比对「同一次迫降」。
+    ///    ⚠️ **这不是设计定稿**：05 §3.14-3 规划走本系统扩展 80000–80003，而该命令
+    ///    格式至今未定义（60824.0 协议 §5.2：`MAV_CMD_USER_DEFINED_EMERGENCY`「命令号
+    ///    待注册」；80000–80003 是天气/备降场/传感器/视频，没有迫降）。扩展命令注册后
+    ///    应改走扩展，本处只是**当前唯一可执行**的载体。
+    function _sendEmergencyLandingCommand(fresh) {
+        // 写库往返期间载具可能掉线 ⇒ 重新定位（`Vehicle` 只在建链时重建）。
+        var live = romView._vehicleForTask(fresh)
+        if (!live) {
+            QGroundControl.showMessageDialog(romView, qsTr("记录已写、指令未发出"),
+                qsTr("未找到该任务无人机（deviceID %1）的连接。\n"
+                     + "迫降记录已写入数据库；链路恢复后点卡片上的【重新迫降】补发（不必再写库）。")
+                    .arg(fresh && fresh.device_id ? fresh.device_id : "—"))
+            return
+        }
+        if (romView._vehicleLinkLost(live)) {
+            QGroundControl.showMessageDialog(romView, qsTr("记录已写、指令未发出"),
+                qsTr("链路中断，降落指令未下发。\n"
+                     + "迫降记录已写入数据库；链路恢复后点卡片上的【重新迫降】补发（不必再写库）。"))
+            return
+        }
+        // ‼️ **不拿 `flying === false` 当"已落地、不用再发"的闸**：`Vehicle::flying` 只由
+        //    合成后的 `EXTENDED_SYS_STATE` 驱动，而旧载具在**还没收到过**该消息时该值是
+        //    `false`（`TaskListPanel.qml` 里那条 fail-open 注释同一件事）。把它当"已在地面"
+        //    会在"其实还在飞、只是没收到落地检测帧"时**吞掉迫降指令**——这比多发一条
+        //    `NAV_LAND`（PX4 拒收，QGC 弹一条错误）严重得多。宁多勿漏。
+        // ‼️ 坐标取自**下发这一刻**，不是写库那一刻：往返期间飞机已经移动。
+        //    对 PX4 的落点判定没有影响（它用自己收到命令时的位置，见函数头），
+        //    但 80009 通告里带的就是这组坐标，上位机以此认「同一次迫降」。
+        //    拿不到有效坐标就不发 —— 把坐标发成 (0,0) 是比"少发一条"严重得多的错。
+        var la = live.coordinate ? live.coordinate.latitude : NaN
+        var lo = live.coordinate ? live.coordinate.longitude : NaN
+        if (!OpsCommon.isValidWaypoint(la, lo)) {
+            QGroundControl.showMessageDialog(romView, qsTr("记录已写、指令未发出"),
+                qsTr("拿不到无人机的有效位置，降落指令未下发（不能把落地坐标发成 0,0）。\n"
+                     + "迫降记录已写入数据库；收到位置后点卡片上的【重新迫降】补发（不必再写库）。"))
+            return
+        }
+        // param4 传 NaN、param7 传 0 沿用既有约定（PX4 忽略这三者，见函数头）。
+        live.sendCommand(1, OpsCommon.MAV_CMD_NAV_LAND, true,
+                         0, 0, 0, NaN, la, lo, 0)
+        // ‼️ 紧接着把「迫降」通告给上位机（80009，见 `VTOLSafetyMessages.h`）：由机载计算机
+        //    接管**降落监控与落地后的处置**。顺序固定 —— 先 NAV_LAND、后 80009；反过来会让
+        //    机上先看到「要迫降」而飞控层还没收到降落指令。
+        //    `altitude` 是**发送时刻飞机的 MSL 高度**，只作上下文（上位机据此比对），取不到就发 0。
+        var alt = live.coordinate ? live.coordinate.altitude : NaN
+        var notified = VTOLExtensions.sendEmergencyLandingCmd(
+                    live, fresh.task_no ? fresh.task_no : "",
+                    la, lo, isNaN(alt) ? 0 : alt,
+                    VTOLExtensionsEnums.EmergencyReasonOperator)
+        romView._poll()
+        if (!notified) {
+            // ⚠️ 80009 没有应答：`true` 只代表「已交给链路发出」，但 `false` 是明确的
+            //    「没发出去」——这时必须让操作员知道，且不能报「已移交机载计算机」。
+            QGroundControl.showMessageDialog(romView, qsTr("记录已写、降落通告未发出"),
+                qsTr("迫降记录已写入数据库，就地降落指令已发出；但迫降通告（80009）没能发出去，"
+                     + "机载计算机不会接管降落监控。\n"
+                     + "请检查链路后点卡片上的【重新迫降】补发（不必再写库）。"))
+            return
+        }
+        // 成功路径**不弹框**（用户 2026-11-08 裁定）：确认框已经点过一次，成功后再弹一次
+        // 是第二次打断。操作员看到的反馈是：卡片上出现【重新迫降】，以及飞机高度开始下降。
+        // ‼️ 静默 ≠ 上位机已收到 —— 80009 在协议里没有应答。失败分支仍有明确弹框；
+        //    若始终不下降，操作员按既定流程点【重新迫降】。
+    }
+
+    /// 救济：【重新迫降】（用户 2026-11-08）。
+    ///
+    /// ‼️ **零读写库**：库里已经是 `disposition = EMERGENCY_LANDING`，本动作只补发一条
+    ///    就地降落指令。定位与 F3「直接降落」完全相同 —— 它不是业务动作，是"指令没收到"
+    ///    之后的补发通道，因此**不弹确认框**（再问一次"确不确定迫降"只会拖慢应急）。
+    /// ⚠️ 前置只做**前提类**检查（任务仍在飞、载具可达、链路在、坐标可用），
+    ///    业务状态机与 QGC 指令执行进度一概不看（同 F3 的「不判」辖区）。
+    function _execEmergencyReland(task) {
+        var fresh = romView._freshTask(task)
+        if (!fresh || fresh.status !== "IN_FLIGHT") {
+            QGroundControl.showMessageDialog(romView, qsTr("无法重新迫降"),
+                qsTr("该任务已不在飞行中，本次未生效。\n数据库与飞机均未做任何改动。"))
+            return
+        }
+        // 按钮的 `visible` 已经保证这一点；防御一次 —— 判据若漂移，这里能拦住
+        // "库没有迫降记录却发出一条就地降落指令"。
+        if (fresh.disposition !== "EMERGENCY_LANDING") {
+            QGroundControl.showMessageDialog(romView, qsTr("无法重新迫降"),
+                qsTr("数据库中没有本任务的迫降记录，请改用「应急情况处理 → 迫降」。\n"
+                     + "数据库与飞机均未做任何改动。"))
+            return
+        }
+        // 复用写库成功之后的那一段：同样的前提检查、同样的落点取法、同样的失败提示。
+        romView._sendEmergencyLandingCommand(fresh)
     }
 
     /// 打开 RESUME 确认框（§5.1「确认框」：先弹框、不直接发指令）。
@@ -864,6 +1138,12 @@ OpsShell {
                     onEmergencyActionRequested: function(task, action) {
                         romView._onEmergencyAction(task, action)
                     }
+                    // 迫降的后续按钮（用户 2026-11-08）：【重新迫降】= 救济，只补发飞控指令、
+                    // 零读写库（同 F3 定位）。落地后的处置已移交机载计算机（80009），
+                    // 本端不再提供任何"关机"入口。
+                    onEmergencyRelandRequested: function(task, cardBottomY) {
+                        romView._execEmergencyReland(task)
+                    }
                 }
             }
 
@@ -901,8 +1181,8 @@ OpsShell {
     //-------------------------------------------------------------------------
     // 「继续完成航线任务」确认框（设计稿 §5.1「确认框」，用户 2026-11-07）
     //-------------------------------------------------------------------------
-    // 只对 RESUME 生效；退路/改降/迫降三项不加确认框（将来接线时另行决定；
-    // 将来若加，它们的确认按钮按 2026-11-07 的语义必须是**红**）。
+    // 只对 RESUME 生效（迫降另有确认框，见文件末 `emergencyLandingConfirmDialog`；
+    // 回航的确认框在 `OpsReturnFlow` 里）。
     // 版式复用 `OpsDialog` 深色皮肤；按钮语义见 `OpsDialogButton.qml`（2026-11-07 裁定）：
     // 继续任务 = 正常业务动作 ⇒ 绿；取消 ⇒ 白。
     // ⚠️ 定位不贴任务卡片：菜单信号不带卡片坐标，本视图也没有 `_confirmAnchorY` 这套锚点；
@@ -966,4 +1246,84 @@ OpsShell {
             }
         }
     }
+
+    //-------------------------------------------------------------------------
+    // 「迫降」确认框（用户 2026-11-08）
+    //-------------------------------------------------------------------------
+    // 用户原话：「点击迫降后，需要弹出对话框来确认（"确认"按钮要用红色），确认后…
+    // 先写库，再发指令」。
+    // 版式与 `resumeConfirmDialog` 同款（`OpsDialog` 深色皮肤 + 自绘按钮），
+    // 差别只有两处：确认按钮是**红**（`OpsDialogButton` 的 `danger` 档 —— 应急处理按
+    // 2026-11-07 的语义裁定就是红），以及正文必须**写明后果**：落地在当前位置、
+    // 不再飞向接机机位、不可撤销。
+    // ⚠️ 定位同样不贴卡片（菜单信号不带坐标）：垂直居中。
+    OpsDialog {
+        id: emergencyLandingConfirmDialog
+        parent: romView
+        width: Math.min(Math.round(Math.max(romView.rightPanelWidth, 320) * ScreenTools.uiTextScaleFactor),
+                        Math.round(romView.width * 0.95))
+        x: romView.width - width
+        y: (romView.height - height) / 2
+        modal: true
+        title: qsTr("确认迫降")
+
+        ColumnLayout {
+            width: parent.width
+            spacing: 8
+            Text {
+                Layout.fillWidth: true
+                color: "#e6edf7"; font.pixelSize: Math.round(13 * ScreenTools.uiTextScaleFactor)
+                wrapMode: Text.Wrap
+                // 条目名与 `resumeConfirmDialog` / `actionConfirmDialog` 逐字一致；
+                // 位置取**确认框打开这一刻**的实时值（与将要写库的坐标同源）。
+                text: {
+                    var t = romView._emergencyPendingTask
+                    if (!t) return ""
+                    var v = romView._vehicleForTask(t)
+                    var pos = "—"
+                    if (v && v.coordinate && OpsCommon.isValidWaypoint(v.coordinate.latitude,
+                                                                      v.coordinate.longitude)) {
+                        pos = v.coordinate.latitude.toFixed(6) + ", "
+                              + v.coordinate.longitude.toFixed(6)
+                    }
+                    return qsTr("飞行任务：%1\n无人机：%2\n当前位置：%3")
+                        .arg(t.task_no ? t.task_no : "—")
+                        .arg(t.uav_no ? t.uav_no : "—")
+                        .arg(pos)
+                }
+            }
+            Text {
+                Layout.fillWidth: true
+                // 亮琥珀 `#ffc107` —— 深绿底 `#0f2f2c` 上 8.80:1（`OpsDialog.qml` 文件头的实算表）。
+                color: "#ffc107"; font.pixelSize: Math.round(12 * ScreenTools.uiTextScaleFactor)
+                wrapMode: Text.Wrap
+                // 必须写明：① 先写库再发指令（顺序对用户可见）；② 落点是当前位置、不再飞向接机机位；
+                // ③ 不可撤销。三条都是操作员做这个决定时必须知道的后果。
+                text: qsTr("确认后先把本次迫降写入数据库，写库成功后才向飞机下发就地降落指令。\n"
+                           + "飞机将在当前位置下降着陆，不再飞向接机机位，落点由飞机自行决定；"
+                           + "本操作不可撤销。")
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: Math.round(16 * ScreenTools.uiTextScaleFactor)
+                Item { Layout.fillWidth: true }
+                // 红 = 迫降（应急处理；`OpsDialogButton` 三档语义里唯一的红档）
+                OpsDialogButton {
+                    text: qsTr("确认迫降")
+                    kind: "danger"
+                    onClicked: {
+                        emergencyLandingConfirmDialog.close()
+                        romView._execEmergencyLanding()
+                    }
+                }
+                // 白 = 取消（不改变任何状态）
+                OpsDialogButton {
+                    text: qsTr("取消")
+                    kind: "cancel"
+                    onClicked: { romView._emergencyPendingTask = null; emergencyLandingConfirmDialog.close() }
+                }
+            }
+        }
+    }
+
 }
