@@ -1,10 +1,12 @@
 #include "CryptoController.h"
 
 #include <algorithm>
+#include <limits>
 
 #include <openssl/crypto.h>
 
 #include <QtCore/QApplicationStatic>
+#include <QtCore/QDateTime>
 #include <QtCore/QFile>
 #include <QtCore/QLoggingCategory>
 #include <QtCore/QRandomGenerator>
@@ -385,6 +387,40 @@ bool CryptoController::isInManifest(DeviceID deviceID) const
     return _manifestLocked().contains(deviceID);
 }
 
+bool CryptoController::isDeviceAuthorized(DeviceID deviceID) const
+{
+    if (deviceID == kInvalidDeviceID || !hasValidSignatureBit(deviceID)) {
+        return false;
+    }
+
+    bool released = false;
+    bool inScope = false;
+    {
+        const QMutexLocker locker(&_mutex);
+        released = _releasedDevices.contains(deviceID);
+        // ‼️ 权限范围是**两个集合的并集**，不是 `_manifestLocked()`：
+        //    后者回答"本视图此刻用哪一份清单"（登记/被动接引口径），受 `_monitorListActive`
+        //    这个**单向闩**左右——监控员视图推过清单后本会话内不再回落，而站点操作员
+        //    `addLinkedDevice` 接手的飞机在 `_monitorDevices`（航线名册）里可能根本没有。
+        //    同机双角色下按 `_manifestLocked()` 判会把那架飞机的帧全部拒掉（直到按需取回密钥）。
+        //    `_linkedDevices` 的写入方只有"站点接手 / 单机本地密钥源 / releaseDevice 摘除"，
+        //    本身就是"本端权限内"的证据。签出语义不受影响：`releaseDevice` 两个集合都摘净
+        //    并记入 `_releasedDevices`，下面 ① 仍优先。
+        inScope = _linkedDevices.contains(deviceID) || _monitorDevices.contains(deviceID);
+    }
+
+    // ① 已释放优先于一切：releaseDevice 清完密钥/水位后，残余帧不能把它重新拉回授权态。
+    if (released) {
+        return false;
+    }
+    if (inScope) {
+        return true;
+    }
+    // ③ 本地密钥本身是授权证据（服务端按需拉取 / 本地注入）。
+    //    ⚠️ `hasKey` 自管一把锁：在 `_mutex` 之外问，避免嵌套锁序（同 releaseDevice）。
+    return _keyManager.hasKey(deviceID);
+}
+
 void CryptoController::releaseDevice(quint32 deviceID)
 {
     const DeviceID id = static_cast<DeviceID>(deviceID);
@@ -473,6 +509,9 @@ void CryptoController::releaseDevice(quint32 deviceID)
         //    `reRegisterDevice`；撤销点是"本端以任何身份重新认领它"
         //    （`addLinkedDevice` / `setMonitorDevices`）。
         _releasedDevices.insert(id);
+        // 上行心跳节拍状态随释出一起清：否则这架飞机若日后重新认领，残存的
+        // `downlinkHbSeen` / 计数会跳过 bootstrap，直接按旧计数放行/拦截。
+        _gcsHeartbeat.remove(id);
         // ④ 让出上行权——**只在它确实占着槽时**。`_activeDeviceID` 是单槽，
         //    可能正属于另一架飞机，无条件回 Standby 会把在飞那架一起打掉。
         if (_activeDeviceID == id) {
@@ -742,6 +781,14 @@ void CryptoController::setResponsibleParty(bool responsible)
         // ⚠️ 同样刻意不打日志（本函数在单测里每格都被调，留日志会让 strict mode 红）。
         _initiatorScopeValid = false;
         _initiatorDevices.clear();
+        // 引入权是同一条会话边界上的另一维，必须**同样无条件**作废（理由同上一行）。
+        _introducerScopeValid = false;
+        _introducerDevices.clear();
+        // 会话边界：心跳节拍状态一并作废（含 bootstrap 已装填但尚未放行的条目）。
+        // 与上面两张表同一归属，跨会话留着会按上一个站点的名单继续档/放上行心跳。
+        if (!responsible) {
+            _gcsHeartbeat.clear();
+        }
         // 收回发言权时，已建立的链路必须**当场**降回待命。闸只在 beginLinking 的入口
         // 检查一次，而 LinkInterface 只看 state()——标志翻转本身不会撤销 Active 链路，
         // 于是本机会以「当前 Active」继续加密外发（操纵杆 MANUAL_CONTROL 天然走这条路）。
@@ -786,6 +833,16 @@ void CryptoController::setInitiatorDevices(const QVariantList& deviceIds)
         // ‼️ 空名单同样生效：它表示「本端此刻不持有任何一架的指令权」⇒ 全拒（fail-closed）。
         _initiatorScopeValid = true;
         _initiatorDevices = parsed;
+        // 名单缩小时，丢掉不再持有指令权的那几架的心跳节拍状态（含 bootstrap 装填）。
+        // 不丢的话，这些飞机日后若又被交回本端，会带着上一轮的 `downlinkHbSeen` 直接
+        // 进稳态，跳过「收到明文待命心跳才主动建链」的引导语义。
+        for (auto it = _gcsHeartbeat.begin(); it != _gcsHeartbeat.end();) {
+            if (parsed.contains(it.key())) {
+                ++it;
+            } else {
+                it = _gcsHeartbeat.erase(it);
+            }
+        }
         // 闸只在 `beginLinking` 入口检查**一次**（同 `setResponsibleParty` 收权那一段的
         // 理由）：正在 Active 的那一架若本端不再持有其指令权（责任链推进、交棒给了下一方），
         // 必须当场让出上行权。否则本机会继续以当前 Active 加密外发，与新持有方的 QGC 争同一
@@ -833,6 +890,104 @@ bool CryptoController::isInitiatorFor(DeviceID deviceID) const
     return _initiatorDevices.contains(deviceID);
 }
 
+void CryptoController::setIntroducerDevices(const QVariantList& deviceIds)
+{
+    QList<DeviceID> parsed;
+    parsed.reserve(deviceIds.size());
+    for (const QVariant& v : deviceIds) {
+        bool ok = false;
+        const uint id = v.toUInt(&ok);
+        // 与 setInitiatorDevices / addLinkedDevice / setMonitorDevices 同一组校验（规范 §1.4）。
+        if (!ok || id == kInvalidDeviceID || !hasValidSignatureBit(static_cast<DeviceID>(id))) {
+            qCWarning(CryptoControllerLog) << "setIntroducerDevices: 非法 deviceID，已跳过" << v;
+            continue;
+        }
+        parsed.append(static_cast<DeviceID>(id));
+    }
+
+    bool changed = false;
+    {
+        const QMutexLocker locker(&_mutex);
+        changed = !_introducerScopeValid || (_introducerDevices != parsed);
+        _introducerScopeValid = true;
+        _introducerDevices = parsed;
+        // 已经装填的 bootstrap 必须在**同一时刻**失效：否则一架刚被移出引入名单的飞机
+        // 还能靠 `bootstrapArmMs` 的 10s 宽限继续发上行心跳（`shouldSendGcsHeartbeat` 只看
+        // 条目里的 `bootstrapArmed`）。稳态计数/`downlinkHbSeen` 不动——那是"链路已通"的证据，
+        // 与引入权无关。
+        for (auto it = _gcsHeartbeat.begin(); it != _gcsHeartbeat.end(); ++it) {
+            if (!parsed.contains(it.key())) {
+                it.value().bootstrapArmed = false;
+            }
+        }
+    }
+    // 只在**结论变化**时留一行：QML 每轮整份重推，内容不变时不能刷屏。
+    // 这一行是"本端到底有没有被允许引入"的唯一持久证据（单机模式 = 从未推过 = 无此行）。
+    // 落在锁外：FlightEventLogger 要写盘，没必要占着 `_mutex`。
+    if (changed) {
+        FlightEventLogger::instance()->logLinkEvent(
+            parsed.isEmpty() ? QStringLiteral("引入名单：空（本端不引入）")
+                             : QStringLiteral("引入名单：%1 台").arg(parsed.size()));
+    }
+    // ⚠️ 刻意**不**在这里 returnToStandby：引入权变窄 ≠ 失去指令权。降落站在整段飞行里
+    //    都要指挥（发降落指令），不能因为名单里没有它就断链；PX4 待命时的让位由
+    //    `noteStandbyHeartbeat` 按"收到明文待命心跳"这个**事件**触发。
+}
+
+void CryptoController::resetIntroducerScopeForTest()
+{
+    const QMutexLocker locker(&_mutex);
+    _introducerScopeValid = false;
+    _introducerDevices.clear();
+}
+
+bool CryptoController::isIntroducerFor(DeviceID deviceID) const
+{
+    if (!isResponsibleParty()) {
+        return false;
+    }
+    // 信息不可得 ⇒ fail-open（与 isInitiatorFor 的 ②③ 同源：单机模式不跑站点视图）。
+    if (deviceID == kInvalidDeviceID) {
+        return true;
+    }
+    const QMutexLocker locker(&_mutex);
+    if (!_introducerScopeValid) {
+        return true;
+    }
+    return _introducerDevices.contains(deviceID);
+}
+
+bool CryptoController::allowsUplink(DeviceID deviceID) const
+{
+    if (!cryptoEnabled()) {
+        return true;
+    }
+    if (deviceID == kInvalidDeviceID) {
+        return false;
+    }
+    // 两个判据各自取 `_mutex`（非递归），顺序求值即可，不得嵌套。
+    if (isIntroducerFor(deviceID)) {
+        return true;
+    }
+    return _recentEncryptedDownlink(deviceID);
+}
+
+bool CryptoController::_recentEncryptedDownlink(DeviceID deviceID) const
+{
+    const qint64 now = _nowMs();
+    const QMutexLocker locker(&_mutex);
+    const auto it = _gcsHeartbeat.constFind(deviceID);
+    if (it == _gcsHeartbeat.constEnd() || !it.value().downlinkHbSeen) {
+        return false;
+    }
+    return (now - it.value().lastDownlinkHbMs) <= kDownlinkFreshnessMs;
+}
+
+qint64 CryptoController::_nowMs() const
+{
+    return _testNowMs >= 0 ? _testNowMs : QDateTime::currentMSecsSinceEpoch();
+}
+
 void CryptoController::beginLinking(DeviceID targetDeviceID)
 {
     // 建链闸（2026-09-27 用户裁定；2026-10-06 扩到责任链三档）：**同一时刻只有持有该机
@@ -875,6 +1030,25 @@ void CryptoController::beginLinking(DeviceID targetDeviceID)
         return;
     }
 
+    // 引入权闸（2026-11-10 用户裁定）：PX4 待命时，只有**场内引入方**允许把链路建起来。
+    // 非引入方（典型：签入后的降落站 qgc1）必须等到「**近期**收到该机的加密下行」——那证明
+    // 链路此刻仍由别人建着，本端只是加入；此时上行 counter 由下行水位派生
+    // （`nextOutgoingCounter`），不会与引入方的序列冲突。
+    // ‼️ 只挡上行心跳**挡不住**这条：PX4 对**任何**首条合法加密上行都会确立下行基准，
+    //    本端进 Active 后首条命令（`REQUEST_MESSAGE` 等）就足以完成引入。
+    // ‼️ 「收到过」不够，必须「近期」：PX4 停发几十秒后，陈旧记录仍会放行（2026-11-10 实测）。
+    const bool introducer = isIntroducerFor(targetDeviceID);
+    if (!introducer && !_recentEncryptedDownlink(targetDeviceID)) {
+        FlightEventLogger::instance()->logDeviceState(
+            static_cast<quint32>(targetDeviceID), QStringLiteral("建链"),
+            QStringLiteral("未接引（本端非场内引入方，且近期无加密下行）"));
+        return;
+    }
+    // 留痕：本端是凭什么被允许建链的。排障时这两句决定「谁把它引入的」。
+    FlightEventLogger::instance()->logDeviceState(
+        static_cast<quint32>(targetDeviceID), QStringLiteral("建链"),
+        introducer ? QStringLiteral("本端引入") : QStringLiteral("搭车（近期加密下行已确认）"));
+
     // 拒绝非法目标：sentinel 0 与签名位非法值（规范 §1.4）
     if (targetDeviceID == kInvalidDeviceID || !hasValidSignatureBit(targetDeviceID)) {
         qCWarning(CryptoControllerLog) << "beginLinking: invalid target deviceID" << targetDeviceID;
@@ -892,6 +1066,12 @@ void CryptoController::beginLinking(DeviceID targetDeviceID)
         // `px4LinkLost`（假失联告警）。故"停"必须挂在这里，不能只挂在 `releaseDevice` 的
         // 让位分支上——被切走的目标未必紧接着被释出。
         hadLinkLossMonitor = (_linkLossDevice != kInvalidDeviceID);
+        // 只为「还没有条目」的目标建一条空记录，**绝不重置已有状态**：
+        // `noteStandbyHeartbeat` / `noteDownlinkHeartbeat` 就在本函数之前、同一帧里执行，
+        // 在这里清 `bootstrapArmed` / `downlinkHbSeen` 会把刚装填的引导状态抹掉。
+        if (!_gcsHeartbeat.contains(targetDeviceID)) {
+            _gcsHeartbeat.insert(targetDeviceID, GcsHeartbeatState{});
+        }
         _activeDeviceID = targetDeviceID;
         _state = State::Linking;
     }
@@ -936,10 +1116,11 @@ void CryptoController::learnDeviceSystemMapping(DeviceID deviceID, uint8_t syste
     const QMutexLocker locker(&_mutex);
     // 签出闸（2026-10-06 补）：`releaseDevice` 刚清掉这两张表，而 mavp2p 在配对老化前
     // （`MAP_TTL`，实测默认 60s）仍会转发该机的帧 ⇒ 不挡的话下一帧就把表重建回来。
-    // ‼️ 闸收在**本函数体内**、不在 `MAVLinkProtocol.cc` 的调用点：那里的注释
-    //    （明文待命心跳支，搜「两处收帧点必须都记」）写明了那四行必须**无条件**执行
-    //    （失联判据依赖它们，且它们是"全新启动学映射"的唯一入口）。用白名单
-    //    （`isInManifest`）当闸会打破那个入口。
+    // ‼️ 2026-11-10 起接收入口已先过 `isDeviceAuthorized`（`MAVLinkProtocol.cc` 两个分支），
+    //    已签出的设备在入口就被丢弃，正常收帧路径到不了本行。本闸继续作为**纵深防御**，
+    //    覆盖单测等直接调用方——那些路径不经过报文接收入口。
+    // ⚠️ 本闸的判据只能是**显式签出**，不能换成白名单（`isInManifest`）：后者会把
+    //    "全新启动、名册未到"与"已签出"混成一格，而前者在授权之后仍需照常学映射。
     if (_releasedDevices.contains(deviceID)) {
         return;
     }
@@ -1008,6 +1189,7 @@ void CryptoController::failLinking(const QString& error)
         failedDevice = _activeDeviceID;
         _activeDeviceID = kInvalidDeviceID;
         _state = State::Standby;
+        _gcsHeartbeat.remove(failedDevice);
     }
     qCWarning(CryptoControllerLog) << "linking failed device" << failedDevice << error;
     FlightEventLogger::instance()->logDeviceState(
@@ -1025,6 +1207,8 @@ void CryptoController::returnToStandby()
         releasedDevice = _activeDeviceID;
         _activeDeviceID = kInvalidDeviceID;
         _state = State::Standby;
+        // 让出上行权即结束这一轮节拍；bootstrap 状态不得跨会话残留。
+        _gcsHeartbeat.remove(releasedDevice);
     }
     // 回待命 = 连接解除，停用失联监测（不再误报，C2 修正）
     _stopLinkLossMonitor();
@@ -1129,6 +1313,9 @@ bool CryptoController::nextOutgoingCounter(uint64_t& outCounter)
         // 能走到这里有**三**条路：① 明文待命心跳触发 beginLinking——此时 QGC 是建链发起方，
         // §2.5 的随机起点正是正确规则；② 同一次 receiveBytes 内先提交下行、后建链
         // （微秒级窗口）；③ **释出后重建链**（`releaseDevice` 把水位清了之后）。
+        // ⚠️ PX4 重启的会话边界（2026-11-10，判定在 `MAVLinkProtocol::_processEncryptedFrame`）
+        //    不会走到这里：它不清水位，而是把新会话的加密心跳 commit 进来——`commit` 是
+        //    无条件覆盖，下行水位当场被压到新会话的小 counter（上行水位原样保留）。
         // ⚠️ 三条路里只有 ③ 的安全性由本端自己保证——它依赖同一批删掉的密钥（见
         //    releaseDevice 的因果链）：密钥若还在，那两个自动建链入口会把飞机接回来，
         //    而那时 PX4 的残留水位与我们的随机起点只是"可能"相容。
@@ -1174,6 +1361,133 @@ void CryptoController::commitIncoming(DeviceID deviceID, uint64_t counter)
     // 仅对当前活跃目标监测（单设备场景；多 PX4 会话时 `_linkLossDevice` 单值
     // 会被最后收到的设备覆盖，需改为按 deviceID 分列的计时器——待多设备会话实现）。
     _startLinkLossMonitor(deviceID);
+}
+
+bool CryptoController::shouldSendGcsHeartbeat(DeviceID deviceID, int ratio, bool immediate) const
+{
+    // 非加密部署：上行心跳行为完全不变（这条必须在任何状态判据之前）。
+    if (!cryptoEnabled()) {
+        return true;
+    }
+    if (deviceID == kInvalidDeviceID) {
+        return false;
+    }
+    // 三个加锁 getter 都在取 _mutex 之前调用，避免 QMutex 非递归导致自死锁。
+    if (state() != State::Active || activeDeviceID() != deviceID) {
+        return false;
+    }
+    // ‼️ 非引入方**一律不发**上行心跳（2026-11-10 用户实测后裁定）：
+    //    PX4 把任何一条合法加密上行都当作引入。非引入方只要发，PX4 重启的那一刻就可能
+    //    被它引入——滴答（ratio）只能把频率压低，不能把窗口关死。故与 ratio 无关，直接拒。
+    //    `isIntroducerFor` 自己取 `_mutex` ⇒ 必须在锁外求值。
+    //    单机模式 / 名单尚未推送时 `isIntroducerFor` fail-open 为 true，行为不变。
+    if (!isIntroducerFor(deviceID)) {
+        return false;
+    }
+
+    const qint64 now = _nowMs();
+    const QMutexLocker locker(&_mutex);
+    const auto it = _gcsHeartbeat.constFind(deviceID);
+    if (it == _gcsHeartbeat.constEnd()) {
+        return false;
+    }
+    const GcsHeartbeatState& hb = it.value();
+
+    // bootstrap：引入方收到明文待命心跳后，按 1 Hz 放行直到首条加密下行心跳。
+    // 超时兜底覆盖「mavp2p 已 handshaked、但扇出为空导致 QGC 收不到心跳」。
+    if (hb.bootstrapArmed && !hb.downlinkHbSeen) {
+        return (now - hb.bootstrapArmMs) < kBootstrapArmTimeoutMs;
+    }
+
+    // 即时调用（建车时的 ASAP 心跳）只允许 bootstrap，不得消费稳态 slot。
+    if (immediate) {
+        return false;
+    }
+    if (ratio <= 0 || !hb.downlinkHbSeen) {
+        return false;
+    }
+    return hb.downlinkHbCount >= ratio;
+}
+
+void CryptoController::consumeGcsHeartbeatSlot(DeviceID deviceID)
+{
+    const QMutexLocker locker(&_mutex);
+    const auto it = _gcsHeartbeat.find(deviceID);
+    if (it == _gcsHeartbeat.end()) {
+        return;
+    }
+    GcsHeartbeatState& hb = it.value();
+    // bootstrap 不消费稳态计数（它由「收到加密下行心跳」自然结束）。
+    if (hb.bootstrapArmed && !hb.downlinkHbSeen) {
+        return;
+    }
+    hb.downlinkHbCount = 0;
+}
+
+void CryptoController::noteStandbyHeartbeat(DeviceID deviceID)
+{
+    if (deviceID == kInvalidDeviceID) {
+        return;
+    }
+    // isIntroducerFor 自己取 _mutex ⇒ 必须在锁外求值。
+    const bool introducer = isIntroducerFor(deviceID);
+
+    // 明文待命心跳 = PX4 已丢失加密状态（重启 / 回到待命）。本端若**不是**引入方，
+    // 就没有资格把链路重新建起来——此时必须当场让出上行权。否则本端会继续以 Active
+    // 发命令帧，而 PX4 把**任何**首条合法加密上行都当作引入（命令帧照样能建链）。
+    bool mustYield = false;
+    {
+        const QMutexLocker locker(&_mutex);
+        mustYield = !introducer && (_state != State::Standby) && (_activeDeviceID == deviceID);
+    }
+    if (mustYield) {
+        // 锁外调用（QMutex 非递归）。它会一并清掉本 device 的节拍条目，故装填放到其后。
+        returnToStandby();
+    }
+
+    // ‼️ 这里**不**动防重放水位：明文待命心跳无认证（不加密、无 counter/tag），
+    //    伪造它就能诱使本端降水位、再重放旧加密帧。会话边界的判定放在解密侧——
+    //    收到被水位拦下的**加密心跳**时，解密并校验其 EXT 的 GPS UTC 与本地时间
+    //    是否在 5 s 内（`MAVLinkProtocol::_processEncryptedFrame`）。GCM 通过 +
+    //    时间新鲜 ⇒ 这才是一条「当前活着的 PX4 发的新会话帧」的认证证据。
+
+    const qint64 now = _nowMs();
+    const QMutexLocker locker(&_mutex);
+    GcsHeartbeatState& hb = _gcsHeartbeat[deviceID];
+    hb.bootstrapArmed = introducer;
+    hb.bootstrapArmMs = now;
+    hb.downlinkHbSeen = false;
+    hb.downlinkHbCount = 0;
+    hb.lastDownlinkHbMs = 0;
+}
+
+void CryptoController::noteDownlinkHeartbeat(DeviceID deviceID)
+{
+    if (deviceID == kInvalidDeviceID) {
+        return;
+    }
+    const QMutexLocker locker(&_mutex);
+    auto it = _gcsHeartbeat.find(deviceID);
+    if (it == _gcsHeartbeat.end()) {
+        // ‼️ **不**按 "是否为当前 Active" 过滤。这条记录还是非引入方的建链通行证
+        // （见 `beginLinking` 第二道闸）：晚到的降落站从没收到过明文待命心跳，
+        // 只能靠"收到该机的认证加密下行"来证明链路已被别人建好——此时它还不是 Active，
+        // 按 Active 过滤会让它永远拿不到通行证。旁观的计数不影响上行（`shouldSendGcsHeartbeat`
+        // 先验 Active），条目随会话边界/释出清理。
+        it = _gcsHeartbeat.insert(deviceID, GcsHeartbeatState{});
+    }
+    GcsHeartbeatState& hb = it.value();
+    hb.downlinkHbSeen = true;
+    hb.lastDownlinkHbMs = _nowMs();
+    if (hb.downlinkHbCount < std::numeric_limits<int>::max()) {
+        ++hb.downlinkHbCount;
+    }
+}
+
+int CryptoController::gcsHeartbeatEntryCountForTest() const
+{
+    const QMutexLocker locker(&_mutex);
+    return static_cast<int>(_gcsHeartbeat.size());
 }
 
 void CryptoController::setLinkLossTimeout(int timeoutMs)

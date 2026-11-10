@@ -206,6 +206,15 @@ void MAVLinkProtocol::_receiveEncryptedBytes(LinkInterface* link, const SharedLi
             // 明文特例：待命心跳（msgID=0）不加密、无 counter/tag（规范 §2.2）。
             // 学习 deviceID↔sysid 映射后走标准解析器，识别在线/待命。
             const MAVLinkCrypto::DeviceID deviceID = MAVLinkCrypto::deviceIDFromFrame(frameData);
+            // 权限前置闸（2026-11-10 用户裁定）：报文被处理的前提是 deviceID 在本端权限范围内。
+            // ‼️ 必须**先于任何状态写入**——未授权设备的帧不 learn/note/取密钥/建链/喂解析器，
+            //    否则任务完成时清掉的状态会被残余帧逐帧重建。
+            // ⚠️ 这里是 while 逐帧循环：用 `continue` 而不是 `return`（`return` 会丢掉同一缓冲区里
+            //    本帧之后的所有帧，本帧已从 buffer 移除、不会被重新处理）。
+            if (!MAVLinkCrypto::CryptoController::instance()->isDeviceAuthorized(deviceID)) {
+                qCDebug(MAVLinkProtocolLog) << "unauthorized device heartbeat dropped" << deviceID;
+                continue;
+            }
             MAVLinkCrypto::CryptoLinkLogger::instance()->logIncoming(
                 0, deviceID, false, reinterpret_cast<const char*>(frameData), frame.size(), nullptr, 0, true);
             MAVLinkCrypto::CryptoController::instance()->learnDeviceSystemMapping(
@@ -213,6 +222,10 @@ void MAVLinkProtocol::_receiveEncryptedBytes(LinkInterface* link, const SharedLi
             // 收帧时间戳（§3.6.1）：本分支覆盖「未建链」阶段。
             // ⚠️ 两处收帧点必须都记——只记心跳会让判据在接引成功那一刻起永久失效。
             MAVLinkCrypto::CryptoController::instance()->noteDeviceFrame(deviceID);
+            // 上行心跳节拍：明文待命心跳是「PX4 已回到待命、链路要重建」的唯一信号。
+            // 装载 bootstrap 的条件（本端是否为该机的引入方）由 CryptoController 内部判定。
+            // ⚠️ 必须在下面那处自动建链之前——建链不会重置这里装填的状态（只补建空条目）。
+            MAVLinkCrypto::CryptoController::instance()->noteStandbyHeartbeat(deviceID);
 
             // 被动取密钥时机（规范 §2.7.2 e）：收到明文待命心跳但本地无该密钥、且它在清单内 ⇒ 拉 1 个。
             //
@@ -266,7 +279,21 @@ void MAVLinkProtocol::_receiveEncryptedBytes(LinkInterface* link, const SharedLi
             // 不截断的后果（2026-09-26 实测）：凭空建出 Vehicle → InitialConnectStateMachine 启动 →
             //    其命令在 Standby 下全被 LinkInterface 丢弃 → RequestMission 重试耗尽 →
             //    弹「任务传输失败。错误：任务请求列表失败,超过了最大重试次数。」
-            if (AuthController::standaloneModeEnabled() || AuthController::backendLoggedIn()) {
+            // 引入权闸（2026-11-10 用户复现后补）：**非引入方不拿明文待命心跳建 Vehicle**。
+            // 与上面那条"未登录不认飞机"同源——都是"凭空建出 Vehicle"的截断，只是判据不同：
+            //   · 未登录：本机根本没有任何授权证据；
+            //   · 非引入方（已登录但该机不在本端引入名单）：PX4 此刻处于待命、链路由别人建着，
+            //     本端建出 Vehicle 只会启动 InitialConnectStateMachine，自动发起
+            //     任务/围栏/集结点下载 → 全部被 Standby 丢弃 → 重试耗尽 → 三连报错
+            //     （2026-09-26 已实测过一次，当时只挡了"未登录"这一档）。
+            // ‼️ 只截断这一支：飞行中 PX4 停发明文心跳、改发加密遥测，走 `_processEncryptedFrame`，
+            //    监控员/降落站照常靠加密帧建 Vehicle、照常看遥测。待命中的 PX4 本来就不是它们
+            //    该接引的对象（引入权只有起飞档）。
+            // ⚠️ 上面的 learnDeviceSystemMapping / noteDeviceFrame / noteStandbyHeartbeat /
+            //    取密钥**照常执行**——失联判据与让位逻辑都依赖它们，截断只针对"喂标准解析器"。
+            // ⚠️ 单机模式 / 名单未推送时 `isIntroducerFor` fail-open 为 true，行为不变。
+            if ((AuthController::standaloneModeEnabled() || AuthController::backendLoggedIn()) &&
+                crypto->isIntroducerFor(deviceID)) {
                 // 还原帧头 compid 归一化的**第二处落点**（第一处在 CryptoCodec::decryptFrame）。
                 // 本分支不经 decryptFrame —— 明文待命心跳无 counter/tag（规范 §2.2），
                 // 原始帧直接交给标准解析器，帧头 compid 就是 deviceID 的低字节。
@@ -296,6 +323,14 @@ void MAVLinkProtocol::_processEncryptedFrame(LinkInterface* link, const SharedLi
     const MAVLinkCrypto::DeviceID deviceID = MAVLinkCrypto::deviceIDFromFrame(encData);
     const uint32_t msgid = MAVLinkCrypto::msgidFromFrame(encData);
 
+    // 权限前置闸（2026-11-10 用户裁定）：报文被处理的前提是 deviceID 在本端权限范围内。
+    // ‼️ 必须先于任何状态写入——下面的 learnDeviceSystemMapping / noteDeviceFrame /
+    //    防重放判定 / 取密钥 / 解密全部让位于本闸。未授权帧直接丢弃，不留设备状态。
+    if (!crypto->isDeviceAuthorized(deviceID)) {
+        qCDebug(MAVLinkProtocolLog) << "unauthorized device frame dropped" << deviceID << "msgid" << msgid;
+        return;
+    }
+
     // 长度检查（规范 §2.6 第 0 步）：payload block >= counter(8) + deviceID(4) + tag(16) = 28
     const int payloadBlockLen = MAVLinkCrypto::frameLength(encData);
     if (payloadBlockLen < static_cast<int>(MAVLinkCrypto::kCounterSize + MAVLinkCrypto::kDeviceIDSize +
@@ -319,8 +354,10 @@ void MAVLinkProtocol::_processEncryptedFrame(LinkInterface* link, const SharedLi
     const uint64_t counter = MAVLinkCrypto::counterFromFrame(encData);
 
     // 学习 deviceID ↔ systemID 映射（供上层按 vehicle->id() 触发建链）。
-    // 明文帧头即可重组，无需密钥；放在取密钥前可打破全新启动的死锁
-    //（否则无密钥→无法解密→无法学习映射→beginLinkingForSystemID 无从触发）。
+    // 明文帧头即可重组，无需密钥——但这**不是**一条自我授权的通道：本行只在上面
+    // `isDeviceAuthorized` 放行之后执行，授权证据来自名册或已缓存的密钥（两者都由
+    // HTTP 侧下发/注入），不来自报文本身。因此"未登录/名册未到⇒不处理帧"是权限边界，
+    // 不存在"无密钥→无法解密→学不到映射→死锁"这个环。
     crypto->learnDeviceSystemMapping(deviceID, MAVLinkCrypto::systemID(deviceID));
     // 收帧时间戳（§3.6.1）：本分支覆盖「已建链」阶段——建链后 PX4 停发明文心跳、
     // 改发加密遥测，只记心跳分支的实现在这里会漏掉全部在飞飞机。
@@ -329,7 +366,11 @@ void MAVLinkProtocol::_processEncryptedFrame(LinkInterface* link, const SharedLi
 
     // 防重放「判定」（规范 §2.6 第 3 步：仅判定，不更新 lastNonce，
     // 更新须待解密 + tag 认证通过后，见下方 commitIncoming）。
-    if (!crypto->isIncomingAcceptable(deviceID, counter)) {
+    // ‼️ 判定与处置分离：非心跳的被拒帧直接丢（无需解密）；**加密心跳**被拒时可能是
+    //    PX4 重启后的新会话（counter 不保证单调），必须解密后按 EXT GPS UTC 判会话边界，
+    //    不能在这里就丢掉（2026-11-10 用户裁定，见解密后的分支）。
+    const bool replayAcceptable = crypto->isIncomingAcceptable(deviceID, counter);
+    if (!replayAcceptable && (msgid != MAVLINK_MSG_ID_HEARTBEAT)) {
         qCDebug(MAVLinkProtocolLog) << "encrypted frame replay dropped" << deviceID << counter;
         MAVLinkCrypto::CryptoLinkLogger::instance()->logIncoming(
             msgid, deviceID, true, reinterpret_cast<const char*>(encData), encLen, nullptr, 0, false,
@@ -384,6 +425,48 @@ void MAVLinkProtocol::_processEncryptedFrame(LinkInterface* link, const SharedLi
         return; // 解密失败 / tag 校验失败 / 密钥绑定失败
     }
 
+    if (!replayAcceptable) {
+        // 加密心跳被水位拦下 ⇒ 可能是 PX4 重启后的新会话（counter 从新的随机起点出发，
+        // 不保证高于旧会话水位）。会话边界判据（2026-11-10 用户裁定）：
+        //   ① 帧已通过 GCM 认证（能走到这里即满足——明文 counter 伪造不出 tag）；
+        //   ② 解出的 EXT 带 GPS UTC（60825.0 段，len ≥ 63）且非 0；
+        //   ③ 该 UTC 与本地时间相差 ≤ 5 s。
+        // 三条同时成立 ⇒ 这是一条「此刻活着的 PX4 发出的新会话帧」：接受本帧，水位随之压到
+        // 本帧 counter（见下方为何不调 `resetReplay`）。
+        // 缺任何一条 ⇒ 仍按重放丢弃，且**不** commit（否则旧帧会把水位推得更高）。
+        // 为什么旧会话的帧骗不过它：旧心跳带的是旧时间戳，超过 5 s 即被拒；
+        // 为什么伪造者骗不过它：没有密钥就过不了 GCM，而有密钥本来就等同 PX4。
+        MAVLinkCrypto::HeartbeatExt ext;
+        constexpr qint64 kSessionBoundaryUtcToleranceMs = 5000;
+        bool gpsUtcFresh = MAVLinkCrypto::parseHeartbeatExtFromFrame(msgid, plainFrame, plainLen, &ext);
+        gpsUtcFresh = gpsUtcFresh && ext.hasGpsUtc && (ext.gpsUtcUs != 0);
+        if (gpsUtcFresh) {
+            const qint64 gpsUtcMs = static_cast<qint64>(ext.gpsUtcUs / 1000ull);
+            gpsUtcFresh = qAbs(gpsUtcMs - QDateTime::currentMSecsSinceEpoch()) <= kSessionBoundaryUtcToleranceMs;
+        }
+        if (!gpsUtcFresh) {
+            qCDebug(MAVLinkProtocolLog) << "encrypted heartbeat rejected by replay watermark (GPS UTC not fresh)"
+                                        << deviceID << counter;
+            MAVLinkCrypto::CryptoLinkLogger::instance()->logIncoming(
+                msgid, deviceID, true, reinterpret_cast<const char*>(encData), encLen, nullptr, 0, false,
+                QStringLiteral("防重放拒绝"));
+            FlightEventLogger::instance()->logDeviceState(
+                static_cast<quint32>(deviceID), QStringLiteral("解密"), QStringLiteral("防重放拒绝"),
+                QStringLiteral("msgid=%1 counter=%2（心跳，无可用的新鲜 GPS UTC）").arg(msgid).arg(counter));
+            return;
+        }
+        // ‼️ 这里**不**调 `resetReplay`：下面的 `commitIncoming` 已经把下行水位压到本帧
+        //    counter（`ReplayGuard::commit` 是无条件 insert，不要求 counter 更大），
+        //    这就是「清除本机水位」的效果；后续新会话帧（counter 更大）自然放行。
+        //    而 `resetReplay` 会连**上行**水位一起清，此刻密钥并没有更换（重启前后同一 key），
+        //    上行 counter 若从新会话的小值重新起算，就会与旧会话用过的 counter 重合
+        //    ⇒ GCM nonce 复用。会话边界只该动下行。
+        qCWarning(MAVLinkProtocolLog) << "replay watermark lowered: new-session encrypted heartbeat with fresh GPS UTC,"
+                                      << "device" << deviceID << "counter" << counter << "utcUs" << ext.gpsUtcUs;
+        FlightEventLogger::instance()->logLinkEvent(
+            tr("会话边界：新会话加密心跳（UTC 新鲜），本机下行防重放水位已对齐本帧"));
+    }
+
     // 防重放「提交」（规范 §2.6 第 9 步）：认证通过后才更新 lastNonce，
     // 防止未认证的伪造帧（明文 counter 可伪造）污染重放窗口。
     crypto->commitIncoming(deviceID, counter);
@@ -393,6 +476,14 @@ void MAVLinkProtocol::_processEncryptedFrame(LinkInterface* link, const SharedLi
     FlightEventLogger::instance()->logDeviceState(
         static_cast<quint32>(deviceID), QStringLiteral("解密"), QStringLiteral("正常"),
         QStringLiteral("msgid=%1").arg(msgid));
+
+    // 上行心跳节拍：首条「认证通过的加密下行心跳」= 加密链路真的双向通了。
+    // ‼️ 必须放在下面自动建链**之前**：非引入方（降落站/监控员）靠这条记录证明「链路是
+    //    别人建好的」才获准 beginLinking（引入权闸的通行证，见 `CryptoController::beginLinking`）。
+    // 空 payload 退化帧不承载心跳信息，不计（判据与下面的退化帧分支同形，先在此处跳过）。
+    if (msgid == MAVLINK_MSG_ID_HEARTBEAT && plainFrame[1] != 0) {
+        crypto->noteDownlinkHeartbeat(deviceID);
+    }
 
     // 自动建链（加密心跳也触发，不依赖明文待命心跳）：
     // 若 PX4 已建链（发加密心跳）而未发明文待命心跳，QGC 的明文分支自动建链

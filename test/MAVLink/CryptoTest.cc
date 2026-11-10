@@ -11,9 +11,12 @@
 #include "MAVLinkLib.h"
 #include "Extensions/VTOLSafetyMessages.h"
 #include "development/mavlink_msg_gnss_integrity.h"
+#include "SettingsManager.h"
+#include "MavlinkSettings.h"
 
 #include <checksum.h>   // crc_init/crc_accumulate*：测试侧自算帧尾 CRC（见 frameCrc）
 
+#include <QDateTime>
 #include <QtTest/QtTest>
 
 #include <QDir>
@@ -337,7 +340,13 @@ void CryptoTest::init()
     //    （实测过程中出现过「数得 9、真值 8」）——判据命令的作用范围含同名文本时，先标定再采信。
     //    本文件再增删 beginLinking 调用时请重新数，别信这个数字。
     // 放这里而不是逐个用例加：新增用例时漏写会红在"state 不是 Active"上，红得晚且理由不直观。
-    MAVLinkCrypto::CryptoController::instance()->setResponsibleParty(true);
+    auto* const crypto = MAVLinkCrypto::CryptoController::instance();
+    crypto->setResponsibleParty(true);
+    // 两维名单与测试时钟的复位：`_testIntroducerGate` 会把引入名单推成**有效空集**
+    // （fail-closed）。不在这里打回「从未推送」，它之后的每个用例都会变成「非引入方」
+    // ⇒ `beginLinking` 与上行心跳全被拒，红在莫名其妙的地方。
+    crypto->resetIntroducerScopeForTest();
+    crypto->setNowMsForTest(-1);
 }
 
 void CryptoTest::_testDeviceIDEncodeDecode()
@@ -2729,7 +2738,14 @@ void CryptoTest::_testReleaseDevice()
     //    区分"水位被清了"与"本来就没有水位"。
     QVERIFY(!crypto->isIncomingAcceptable(released, 1999));
 
+    // ⑤c 上行心跳节拍状态也归释出清（2026-11-10 补）：留着的话，这架飞机日后重新认领时
+    //    会带着旧的 `downlinkHbSeen`/计数，跳过「收到明文待命心跳才建链」的引导语义。
+    //    `other` 的条目（beginLinking 补建的空条目）必须不受影响 ⇒ 判据用相对计数。
+    const int hbEntriesBefore = crypto->gcsHeartbeatEntryCountForTest();
+    crypto->noteStandbyHeartbeat(released);
+    QCOMPARE(crypto->gcsHeartbeatEntryCountForTest(), hbEntriesBefore + 1);  // 阳性对照
     crypto->releaseDevice(released);                  // 释放的不是当前活跃目标
+    QCOMPARE(crypto->gcsHeartbeatEntryCountForTest(), hbEntriesBefore);
     QCOMPARE(crypto->activeDeviceID(), other);        // ‼️ 槽位纹丝不动
     QCOMPARE(crypto->state(), CryptoController::State::Active);
     QVERIFY2(crypto->deviceKeyManager()->hasKey(other), "释放 A 误删了 B 的密钥");
@@ -3087,11 +3103,11 @@ void CryptoTest::_testReleaseDeviceClearsPerDeviceTables()
 // 老化（`MAP_TTL`；实测云端部署未传 `--map-ttl` ⇒ 走默认 **60s**，且 `fanoutTargets` 的判据
 // 是 `qgcSeen` 而非 `lastSeen`：签出后本端不再把它写进 80005 payload ⇒ `qgcSeen` 冻结
 // ⇒ TTL 到期自然停发——用户说的"等超时"机制成立）。
-// 问题出在这 60s 里：`MAVLinkProtocol.cc` 的四条收帧记账是**无条件**的（明文待命心跳支两条、
-// 加密帧支两条），于是刚清掉的三张表会被**下一帧**原地写回——签出等于没签出。
-// ⇒ 闸落在 `learnDeviceSystemMapping` / `noteDeviceFrame` **函数体内**，调用点不设闸：
-//    那里的注释写明那四行必须无条件执行（失联判据依赖它们，且它们是"全新启动学映射"的
-//    唯一入口——用白名单 `isInManifest()` 当闸会打破那个先有鸡先有蛋）。
+// 问题出在这 60s 里：收帧记账（`learnDeviceSystemMapping` / `noteDeviceFrame`）会把刚清掉的
+// 三张表**下一帧**原地写回——签出等于没签出。
+// ⇒ 两道闸：① 接收入口 `isDeviceAuthorized`（2026-11-10；`_releasedDevices` 优先于任何授权
+//    证据）；② 上面两个写入函数**体内**各有同一黑名单闸（纵深防御，覆盖直接调用方）。
+//    本用例**直接调用**这两个函数、不经过接收入口 ⇒ 钉的是 ②：删掉体内的闸，下面 ① 会红。
 // ============================================================================================
 void CryptoTest::_testReleaseDeviceBlocksFrameReactivation()
 {
@@ -3367,6 +3383,357 @@ void CryptoTest::_testIsInManifestUsesMonitorListActiveNotEmptiness()
     // `CryptoController::setResponsibleParty` 内那块清闩），故下格开头闩恒为 false。
     crypto->setMonitorDevices(QVariantList(), 0);
     crypto->removeLinkedDevice(id);
+}
+
+// 接收权限前置闸（2026-11-10 用户裁定）：报文被处理的前提是 deviceID 在本端权限范围内。
+// 判据：已释放 ⇒ 拒绝；`_linkedDevices` ∪ `_monitorDevices` 内 或 本地有密钥 ⇒ 放行；其余 ⇒ 拒绝。
+//
+// ⚠️ 每一支都必须在**无密钥**下问，否则只能证明 ③（本地密钥），证明不了集合这一支。
+void CryptoTest::_testIsDeviceAuthorized()
+{
+    CryptoController* const crypto = CryptoController::instance();
+    DeviceKeyManager* const keyMgr = crypto->deviceKeyManager();
+    const DeviceID id = makeDeviceID(0, 0, 0x77, 0x01);
+    QVERIFY(hasValidSignatureBit(id));
+
+    // 不配 gcs_server：`addLinkedDevice` / `setMonitorDevices` 对无密钥设备会触发批量拉取，
+    // 空地址时静默早退（`.cc` 里那条 `qCDebug`），不产生 strict-mode 打红的警告。
+    keyMgr->setServerUrl(QString());
+
+    // 初态：两个集合都没有它、无密钥 ⇒ 拒绝。
+    crypto->removeLinkedDevice(id);
+    keyMgr->removeKey(id);
+    // 空清单也是生效清单 ⇒ 明确"两个集合里没有它"。
+    crypto->setMonitorDevices(QVariantList(), 3000);
+    QVERIFY2(!crypto->isDeviceAuthorized(id), "两个集合外且无密钥必须拒绝");
+
+    // 集合之一：`_linkedDevices`（站点接手 / 单机本地密钥源）⇒ 放行。
+    crypto->addLinkedDevice(id);
+    QVERIFY2(crypto->isDeviceAuthorized(id), "_linkedDevices 内必须放行（无密钥也算）");
+    crypto->removeLinkedDevice(id);
+    QVERIFY2(!crypto->isDeviceAuthorized(id), "移出 _linkedDevices 且无密钥 ⇒ 必须拒绝");
+
+    // 集合之二：`_monitorDevices`（航线监控员视图）⇒ 放行；清空后 ⇒ 拒绝。
+    QVariantList monitorIds;
+    monitorIds.append(QVariant(static_cast<uint>(id)));
+    crypto->setMonitorDevices(monitorIds, 3000);
+    QVERIFY2(crypto->isDeviceAuthorized(id), "_monitorDevices 内必须放行（无密钥也算）");
+    crypto->setMonitorDevices(QVariantList(), 3000);
+    QVERIFY2(!crypto->isDeviceAuthorized(id), "清单清空且无密钥 ⇒ 必须拒绝");
+
+    // ‼️ 并集判据的判别点（2026-11-10 review）：监控清单生效（`_monitorListActive` 为 true）时，
+    //    `isInManifest()` 只看 `_monitorDevices`；此时站点操作员接手、但不在航线名册里的飞机
+    //    **必须仍被授权**。改用 `_manifestLocked()` 判权限 ⇒ 本断言变红。
+    //    （同机双角色：先开过 RomView，再在站点视图接手。）故这里必须无密钥。
+    crypto->addLinkedDevice(id);
+    QVERIFY2(!crypto->isInManifest(id), "前置：监控清单生效时 isInManifest 只看 _monitorDevices");
+    QVERIFY2(crypto->isDeviceAuthorized(id), "监控清单生效时，站点接手的飞机仍须授权");
+    crypto->removeLinkedDevice(id);
+
+    // ③ 本地密钥本身是授权证据（无集合、无签出记号）⇒ 放行。
+    keyMgr->cacheKey(id, testKey());
+    QVERIFY2(crypto->isDeviceAuthorized(id), "本地有密钥必须放行");
+
+    // 已释放 ⇒ 拒绝，且优先于「本地有密钥」这一证据；释放必须把密钥删掉。
+    // （`releaseDevice` 的成员资格闸接受"仅本地有密钥"这一种本地状态。）
+    crypto->releaseDevice(id);
+    QVERIFY2(!crypto->isDeviceAuthorized(id), "已释放设备必须拒绝");
+    QVERIFY2(!keyMgr->hasKey(id), "释放必须删密钥（否则本用例只测到了黑名单）");
+    keyMgr->cacheKey(id, testKey());
+    QVERIFY2(!crypto->isDeviceAuthorized(id), "已释放设备的旧密钥不得恢复授权");
+
+    // 重新认领（站点接手 / 名册重新包含）⇒ 撤销黑名单、恢复放行。
+    crypto->addLinkedDevice(id);
+    QVERIFY2(crypto->isDeviceAuthorized(id), "重新认领后必须恢复");
+
+    // 非法 deviceID 与坏签名位（incompat_flags.bit0 必须为 0）恒拒绝——即便在集合内。
+    QVERIFY(!crypto->isDeviceAuthorized(kInvalidDeviceID));
+    QVERIFY(!crypto->isDeviceAuthorized(static_cast<DeviceID>(id | 0x01000000u)));
+
+    crypto->removeLinkedDevice(id);
+    keyMgr->removeKey(id);
+}
+
+// 上行加密心跳节拍（2026-11-10 用户裁定）。语义三条：
+//   ① 非加密部署：行为与改动前完全一致（恒放行，不看 deviceID、不看 n）；
+//   ② bootstrap：本端**是该机引入方**（`isInitiatorFor`）且收到它的明文待命心跳 ⇒
+//      不受 n 限制，1 Hz 放行，直到收到首条认证通过的加密下行心跳（或 10s 超时）；
+//   ③ 稳态：此后累计收到 n 条加密下行心跳才上行一条加密心跳。n=0 关闭稳态上行。
+// 目的：mavp2p 部署下，无指令权的 QGC（qgc1）不扰动链路；PX4 重启后可被引入方（qgc2）干净重建。
+void CryptoTest::_testGcsHeartbeatTicking()
+{
+    CryptoController* const crypto = CryptoController::instance();
+
+    // beginLinking / confirmLinking / returnToStandby 都会打 Debug 日志（strict mode 下算未预期）。
+    ignoreLogMessage("MAVLink.Crypto.CryptoController", QtDebugMsg,
+                     QRegularExpression("registration |beginLinking|linking confirmed|return to standby"));
+
+    // 设置项接线：JSON 的类型/默认值/范围在生成期校验，这里钉"运行时真的有一个名为
+    // `qgcUplinkHeartbeatRatio` 的 Fact 且缺省为 1"。默认 1 是安全侧——直接加密链路下
+    // PX4 的 GCS 心跳超时是 2.5s，任何 n>1 都会让它周期性判失联。
+    // （`UnitTest::init()` 每格清 QSettings ⇒ 这里读到的是元数据缺省值，不是残留用户值。）
+    QCOMPARE(SettingsManager::instance()->mavlinkSettings()->qgcUplinkHeartbeatRatio()->rawValue().toInt(), 1);
+
+    crypto->returnToStandby();
+    crypto->setRegistrationEnabled(false);
+    // 清空上一格残留的节拍表：`beginLinking` 会给每个目标补建一条空记录，前面几十格留下的
+    // 条目不会自己消失。`setResponsibleParty(false)` 是会话边界，它清整张表。
+    crypto->setResponsibleParty(false);
+    // `setResponsibleParty` 顺带把起/终维打回「未确定」⇒ `isInitiatorFor` fail-open，
+    // 这正是本端作为引入方的正常工作形态（站点视图还没推第一轮名单时的同一档）。
+    // ‼️ 别在这里调 `setInitiatorDevices(QVariantList())`：空名单**同样生效**（fail-closed），
+    //    a 立刻失去指令权，`beginLinking` 会停在 Standby。
+    crypto->setResponsibleParty(true);
+    crypto->setCryptoEnabled(false);
+
+    const DeviceID a = 0x0A0B0C0Du;  // 本端要引入并操作的那一架
+    const DeviceID b = 0x0A0B0C0Eu;  // 旁观的一架（本端有密钥、但不是 Active）
+    crypto->deviceKeyManager()->removeKey(a);
+    crypto->deviceKeyManager()->removeKey(b);
+    QCOMPARE(crypto->gcsHeartbeatEntryCountForTest(), 0);
+
+    // ---- ① 非加密：恒放行 ----
+    QVERIFY(crypto->shouldSendGcsHeartbeat(a, 1));
+    QVERIFY2(crypto->shouldSendGcsHeartbeat(kInvalidDeviceID, 1),
+             "非加密部署不得因 deviceID 无效而拦截上行心跳");
+    QVERIFY(crypto->shouldSendGcsHeartbeat(a, 0));
+
+    // ---- 加密但尚未建链：一律不放行 ----
+    crypto->setCryptoEnabled(true);
+    QVERIFY(!crypto->shouldSendGcsHeartbeat(a, 1));
+    QVERIFY(!crypto->shouldSendGcsHeartbeat(kInvalidDeviceID, 1));
+
+    // ---- ② bootstrap 装配 → 自动建链 → 放行 ----
+    // ‼️ 这三步复现的是生产顺序（`MAVLinkProtocol.cc` 同一帧内 noteStandbyHeartbeat 紧跟
+    //    beginLinking）。若 beginLinking 在锁内重置了 `bootstrapArmed`，下面两条断言全红
+    //    ——那正是 review 抓到的 P0-1（引导窗口被自动建链当场抹掉，qgc2 永远发不出首帧）。
+    crypto->noteStandbyHeartbeat(a);
+    QCOMPARE(crypto->gcsHeartbeatEntryCountForTest(), 1);
+    crypto->deviceKeyManager()->cacheKey(a, testKey());
+    crypto->deviceKeyManager()->cacheKey(b, testKey());
+    crypto->beginLinking(a);
+    QCOMPARE(crypto->state(), CryptoController::State::Active);
+    QCOMPARE(crypto->activeDeviceID(), a);
+    QCOMPARE(crypto->gcsHeartbeatEntryCountForTest(), 1);   // 只补空条目，不重建已有状态
+    QVERIFY2(crypto->shouldSendGcsHeartbeat(a, 10),
+             "bootstrap 被 beginLinking 清掉了：引入方发不出首帧");
+    QVERIFY(crypto->shouldSendGcsHeartbeat(a, 10, /*immediate=*/true));
+
+    // bootstrap 不受 n 限制，也不被消费：连发多帧仍在引导窗口内。
+    crypto->consumeGcsHeartbeatSlot(a);
+    QVERIFY(crypto->shouldSendGcsHeartbeat(a, 10));
+    QVERIFY(crypto->shouldSendGcsHeartbeat(a, 0));
+
+    // ---- ③ 首条加密下行心跳结束 bootstrap ⇒ 稳态按 n 计数 ----
+    crypto->noteDownlinkHeartbeat(a);
+    QVERIFY2(!crypto->shouldSendGcsHeartbeat(a, 10), "bootstrap 应在收到加密下行心跳后结束");
+    QVERIFY2(!crypto->shouldSendGcsHeartbeat(a, 10, /*immediate=*/true),
+             "immediate 只允许在 bootstrap 期放行，不得绕过稳态节拍");
+    for (int i = 1; i < 10; ++i) {
+        crypto->noteDownlinkHeartbeat(a);
+    }
+    QVERIFY(crypto->shouldSendGcsHeartbeat(a, 10));
+    crypto->consumeGcsHeartbeatSlot(a);
+    QVERIFY2(!crypto->shouldSendGcsHeartbeat(a, 10), "消费后计数必须归零，否则会逐帧放行");
+
+    // n=1：每条下行心跳都放行一条上行（直接加密链路部署的缺省口径）。
+    crypto->noteDownlinkHeartbeat(a);
+    QVERIFY(crypto->shouldSendGcsHeartbeat(a, 1));
+
+    // ---- ④ 单槽：只有当前 Active 的飞机可上行 ----
+    QVERIFY(!crypto->shouldSendGcsHeartbeat(b, 0));
+    // 旁观设备的加密下行**也要**记账：晚到的非引入方（降落站）从没见过明文待命心跳，
+    // 它的建链通行证就是这条记录（见 `_testIntroducerGate` 的晚到加入路径）。
+    // 记账不影响上行权——`shouldSendGcsHeartbeat` 先验 Active，b 仍被拒。
+    crypto->noteDownlinkHeartbeat(b);
+    QCOMPARE(crypto->gcsHeartbeatEntryCountForTest(), 2);
+    QVERIFY(!crypto->shouldSendGcsHeartbeat(b, 0));
+    QVERIFY(crypto->shouldSendGcsHeartbeat(a, 1));   // a 的稳态计数不受 b 影响
+
+    // ---- ④b 非引入方：即使有**新鲜**加密下行也一条不发（2026-11-10 用户裁定）----
+    // PX4 把任何一条合法加密上行都当作引入 ⇒ 非引入方只要发，PX4 重启的那一刻就可能
+    // 被它引入；滴答只能压低频率、关不死这个窗口。故与 ratio、immediate 均无关。
+    crypto->setIntroducerDevices(QVariantList{});
+    crypto->noteDownlinkHeartbeat(a);                // 计数、新鲜度都满足
+    QVERIFY2(!crypto->shouldSendGcsHeartbeat(a, 1), "非引入方发了上行心跳 ⇒ PX4 重启时会被它引入");
+    QVERIFY(!crypto->shouldSendGcsHeartbeat(a, 10));
+    QVERIFY(!crypto->shouldSendGcsHeartbeat(a, 10, /*immediate=*/true));
+    // 恢复为引入方（本用例后半段 ⑤–⑧ 都要走 bootstrap/稳态）
+    crypto->setIntroducerDevices(QVariantList{ static_cast<uint>(a) });
+    QVERIFY(crypto->shouldSendGcsHeartbeat(a, 1));
+
+    // ---- ⑤ 明文待命心跳重新装配 bootstrap（PX4 重启 / 回待命的唯一信号）----
+    // 当前稳态计数是 1（n=10 ⇒ 不放行）；明文心跳后必须立刻放行，不得再等下一条下行心跳。
+    QVERIFY(!crypto->shouldSendGcsHeartbeat(a, 10));
+    crypto->noteStandbyHeartbeat(a);
+    QVERIFY(crypto->shouldSendGcsHeartbeat(a, 10));
+
+    // ---- ⑥ 回待命 ⇒ **活跃目标**的条目清空（不得跨会话残留）----
+    // 旁观设备（b）的条目留着：它是"曾收到该机加密下行"的通行证，与活跃槽位无关。
+    crypto->returnToStandby();
+    QCOMPARE(crypto->state(), CryptoController::State::Standby);
+    QCOMPARE(crypto->gcsHeartbeatEntryCountForTest(), 1);
+
+    // ---- ⑦ 收回指令权（责任方）⇒ 整张表清空（会话边界，含旁观条目）----
+    crypto->noteStandbyHeartbeat(a);
+    QCOMPARE(crypto->gcsHeartbeatEntryCountForTest(), 2);
+    crypto->setResponsibleParty(false);
+    QCOMPARE(crypto->gcsHeartbeatEntryCountForTest(), 0);
+
+    // ---- ⑧ 名单缩小 ⇒ 只保留仍在名单内的 ----
+    crypto->setResponsibleParty(true);
+    crypto->noteStandbyHeartbeat(a);
+    crypto->noteStandbyHeartbeat(b);
+    QCOMPARE(crypto->gcsHeartbeatEntryCountForTest(), 2);
+    crypto->setInitiatorDevices(QVariantList{ static_cast<uint>(a) });
+    QCOMPARE(crypto->gcsHeartbeatEntryCountForTest(), 1);
+    crypto->setInitiatorDevices(QVariantList());
+
+    // 复原（单例 + 全局设置跨用例共享）
+    crypto->setCryptoEnabled(false);
+    crypto->returnToStandby();
+    crypto->setResponsibleParty(true);
+    crypto->resetIntroducerScopeForTest();
+    crypto->setNowMsForTest(-1);
+    crypto->deviceKeyManager()->removeKey(a);
+    crypto->deviceKeyManager()->removeKey(b);
+    crypto->resetReplay(a);
+    crypto->resetReplay(b);
+}
+
+void CryptoTest::_testIntroducerGate()
+{
+    CryptoController* const crypto = CryptoController::instance();
+
+    ignoreLogMessage("MAVLink.Crypto.CryptoController", QtDebugMsg,
+                     QRegularExpression("registration |beginLinking|linking confirmed|return to standby"));
+
+    crypto->returnToStandby();
+    crypto->setRegistrationEnabled(false);
+    crypto->setResponsibleParty(false);   // 清空上一格残留（含两维名单）
+    crypto->setResponsibleParty(true);
+    crypto->setCryptoEnabled(true);
+
+    const DeviceID a = 0x0A0B0C11u;       // bit24=0，签名位合法
+    const DeviceID b = 0x0A0B0C12u;       // 晚到的同一站：从没见过明文待命心跳
+    crypto->deviceKeyManager()->removeKey(a);
+    crypto->deviceKeyManager()->removeKey(b);
+    crypto->deviceKeyManager()->cacheKey(a, testKey());
+    crypto->deviceKeyManager()->cacheKey(b, testKey());
+
+    // ---- qgc1 形态：有指令权、无引入权（签入后的降落站）----
+    crypto->setInitiatorDevices(QVariantList{ static_cast<uint>(a), static_cast<uint>(b) });
+    crypto->setIntroducerDevices(QVariantList{});
+    QVERIFY(crypto->isInitiatorFor(a));
+    QVERIFY2(!crypto->isIntroducerFor(a), "降落站不应有引入权");
+
+    // ① PX4 待命（只有明文待命心跳）⇒ 非引入方不得建链。
+    crypto->noteStandbyHeartbeat(a);
+    crypto->beginLinking(a);
+    QCOMPARE(crypto->state(), CryptoController::State::Standby);
+    QCOMPARE(crypto->activeDeviceID(), kInvalidDeviceID);
+    // ‼️ 不只是"不建链"：非引入方在无近期加密下行时，**任何**上行都必须被拒
+    //    （PX4 把任何一条合法加密上行都当引入，只挡心跳挡不住）。
+    QVERIFY(!crypto->allowsUplink(a));
+
+    // ①b 晚到加入：本端启动时链路已被引入方建好，**没有**明文待命心跳可收。
+    //     唯一的通行证是"收到该机的认证加密下行"。条目须由这条记录自建
+    //     ——按"是否为 Active"过滤会把它永远挡在 Standby（此时它还不是 Active）。
+    QCOMPARE(crypto->gcsHeartbeatEntryCountForTest(), 1);   // 前置：只有 a 那条
+    crypto->noteDownlinkHeartbeat(b);
+    QCOMPARE(crypto->gcsHeartbeatEntryCountForTest(), 2);
+    crypto->beginLinking(b);
+    QCOMPARE(crypto->state(), CryptoController::State::Active);
+    QCOMPARE(crypto->activeDeviceID(), b);
+    crypto->returnToStandby();
+
+    // ② 收到该机的加密下行 ⇒ 证明链路是别人建好的，允许**搭车**（上行 counter 由下行派生）。
+    crypto->noteDownlinkHeartbeat(a);
+    crypto->beginLinking(a);
+    QCOMPARE(crypto->state(), CryptoController::State::Active);
+    QCOMPARE(crypto->activeDeviceID(), a);
+    // ‼️ 搭车 ≠ 可以上行：非引入方**一条心跳都不发**（2026-11-10 用户裁定）。
+    QVERIFY2(!crypto->shouldSendGcsHeartbeat(a, 1), "非引入方只要发心跳，PX4 重启时就会被它引入");
+    QVERIFY(!crypto->shouldSendGcsHeartbeat(a, 10, /*immediate=*/true));
+    // 但**有新鲜加密下行**时可以上行（搭车发命令是合法用途：监控员的回航/降落指令）。
+    QVERIFY2(crypto->allowsUplink(a), "搭车时若连命令都发不出去，监控员就失去了指令能力");
+
+    // ③ PX4 重启（明文待命心跳）⇒ 非引入方当场让出 Active，且不许再建链。
+    crypto->noteStandbyHeartbeat(a);
+    QCOMPARE(crypto->state(), CryptoController::State::Standby);
+    crypto->beginLinking(a);
+    QCOMPARE(crypto->state(), CryptoController::State::Standby);
+
+    // ③b 陈旧下行**不得**再当搭车通行证：超过 kDownlinkFreshnessMs 后必须拒绝。
+    //     2026-11-10 实测形状：PX4 已停 20 多秒，本端仍凭旧记录建链并发出一条上行心跳。
+    crypto->noteDownlinkHeartbeat(a);
+    crypto->setNowMsForTest(QDateTime::currentMSecsSinceEpoch() + 3000);
+    crypto->beginLinking(a);
+    QCOMPARE(crypto->state(), CryptoController::State::Standby);
+    QVERIFY2(!crypto->allowsUplink(a), "下行过期后任何上行都必须被拒——这正是 PX4 重启窗口");
+    crypto->setNowMsForTest(-1);
+    crypto->noteDownlinkHeartbeat(a);               // 重新变新鲜
+    crypto->beginLinking(a);
+    QCOMPARE(crypto->state(), CryptoController::State::Active);
+    QVERIFY(crypto->allowsUplink(a));
+    crypto->returnToStandby();
+
+    // ③c 会话边界**不在**明文心跳这一层。
+    //     `ReplayGuard` 只比 `counter > lastNonce`、没有会话概念；PX4 重启后 counter
+    //     不保证单调（2026-11-10 实测：旧会话推到 3.298e18，新会话从 1.618e18 起）
+    //     ⇒ 一直运行的 qgc1 会永久拒收，新起的 qgc2 因水位为空反而能接。
+    //     但明文待命心跳**无认证**（不加密、无 counter/tag）：若拿它清水位，伪造一条
+    //     明文帧就能诱使本端降水位、再重放旧加密帧（密钥未变，GCM 照过）。
+    //     故会话边界判据在解密侧（`MAVLinkProtocol::_processEncryptedFrame`）：被水位
+    //     拦下的**加密心跳**，GCM 通过且 EXT 的 GPS UTC 与本地时间相差 ≤5s 才清水位。
+    //     本格钉的是负半边：明文待命心跳**不得**清水位（正半边见
+    //     `MAVLinkCryptoFrameTest::_testSessionBoundaryLowersReplayWatermark`）。
+    crypto->resetReplay(a);
+    const uint64_t oldSessionCounter = 0x3000000000000000ull;
+    const uint64_t newSessionCounter = 0x1600000000000000ull;
+    QVERIFY(crypto->isIncomingAcceptable(a, oldSessionCounter));
+    crypto->commitIncoming(a, oldSessionCounter);
+    QVERIFY2(!crypto->isIncomingAcceptable(a, newSessionCounter),
+             "前置：新会话的低 counter 必须被旧水位拒——否则本格测不到任何东西");
+    crypto->noteStandbyHeartbeat(a);
+    QVERIFY2(!crypto->isIncomingAcceptable(a, newSessionCounter),
+             "明文待命心跳未经认证，不得据此清水位（否则伪造一条明文帧即可重放旧加密帧）");
+    crypto->resetReplay(a);
+
+    // ---- qgc2 形态：起飞档引入方 ----
+    crypto->setIntroducerDevices(QVariantList{ static_cast<uint>(a) });
+    QVERIFY(crypto->isIntroducerFor(a));
+    QVERIFY2(crypto->allowsUplink(a), "引入方不受「近期加密下行」限制——PX4 待命时就该它去建链");
+    crypto->noteStandbyHeartbeat(a);
+    crypto->beginLinking(a);
+    QCOMPARE(crypto->state(), CryptoController::State::Active);
+    QVERIFY2(crypto->shouldSendGcsHeartbeat(a, 10), "引入方在 bootstrap 期应放行");
+    // 引入方在 Active 中再次收到明文待命心跳 ⇒ 保留 Active（重新引导），不让位。
+    crypto->noteStandbyHeartbeat(a);
+    QCOMPARE(crypto->state(), CryptoController::State::Active);
+
+    // ④ 引入名单缩小 ⇒ 已装填的 bootstrap 当场失效（否则还能靠 10s 宽限继续发）。
+    crypto->setIntroducerDevices(QVariantList{});
+    QVERIFY(!crypto->shouldSendGcsHeartbeat(a, 10));
+
+    // ⑤ 会话边界两维一起回「未确定」⇒ fail-open（单机模式不跑站点视图）。
+    crypto->setResponsibleParty(false);
+    QCOMPARE(crypto->state(), CryptoController::State::Standby);
+    crypto->setResponsibleParty(true);
+    QVERIFY2(crypto->isIntroducerFor(a), "信息不可得时必须 fail-open，否则单机模式一架都建不了");
+    QVERIFY(crypto->isInitiatorFor(a));
+
+    // 复原（单例跨用例共享）
+    crypto->setCryptoEnabled(false);
+    QVERIFY2(crypto->allowsUplink(a), "非加密部署必须完全放行（零变化）");
+    crypto->returnToStandby();
+    crypto->setInitiatorDevices(QVariantList());
+    crypto->resetIntroducerScopeForTest();   // ‼️ 不要留空名单：那会让后续用例全变"非引入方"
+    crypto->setNowMsForTest(-1);
+    crypto->deviceKeyManager()->removeKey(a);
+    crypto->deviceKeyManager()->removeKey(b);
+    crypto->resetReplay(a);
+    crypto->resetReplay(b);
 }
 
 // 监控清单**内容变化**时，只对尚无本地密钥的 ID 触发一次批量拉取（主动时机之二）。

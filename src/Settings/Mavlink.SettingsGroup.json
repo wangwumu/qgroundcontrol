@@ -74,6 +74,17 @@
             "keywords": "heartbeat"
         },
         {
+            "name": "qgcUplinkHeartbeatRatio",
+            "shortDesc": "Encrypted uplink heartbeat ratio: send one encrypted GCS heartbeat per N received vehicle heartbeats. 0 disables steady-state uplink heartbeats. Only applies when MAVLink encryption is enabled.",
+            "longDesc": "In deployments where mavp2p intercepts encrypted GCS heartbeats (multi-QGC sites), a high ratio keeps a non-authoritative QGC from perturbing the link and lets the introducer rebuild the link cleanly after a vehicle restart. The introducer always sends a bootstrap burst on plaintext standby heartbeats, unaffected by this ratio.",
+            "type": "uint32",
+            "default": 1,
+            "min": 0,
+            "max": 100,
+            "label": "Encrypted uplink heartbeat ratio",
+            "keywords": "heartbeat crypto uplink ratio"
+        },
+        {
             "name": "gcsMavlinkSystemID",
             "shortDesc": "MAVLink system identifier (1-255) for this ground station.",
             "type": "uint32",

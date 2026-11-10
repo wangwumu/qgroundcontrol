@@ -220,6 +220,12 @@ public:
     QSet<DeviceID> registrationSentIdsForTest() const;
     void clearRegistrationSentIdsForTest();
 
+    /// 单测用：上行心跳节拍表里现存的条目数。
+    /// `shouldSendGcsHeartbeat()` 在非 Active 时一律 false，**看不出**条目是否存在 ⇒
+    /// 「释出/回待命/收回指令权/名单缩小是否清掉了状态」这一组断言只能落在这张表上。
+    /// 同样看不出的是"条目被重复创建"：`beginLinking` 只补空条目、不重建，条目数不变。
+    int gcsHeartbeatEntryCountForTest() const;
+
     /// 声明本 QGC 关联的 PX4 deviceID（加入登记心跳 payload）。
     /// 单设备场景：建链目标 deviceID 即关联对象。
     ///
@@ -257,6 +263,28 @@ public:
     /// ‼️ 用途：判断"现在能不能被动接引这个 ID"（`MAVLinkProtocol` 的明文待命心跳支）。
     ///    它与 `hasKey` 是**两件事**——`hasKey` 说"我手上有钥匙"，本函数说"这架归我管"。
     bool isInManifest(DeviceID deviceID) const;
+
+    /// 该 deviceID 是否在本端**权限范围**内——报文被处理的**前置闸**（2026-11-10 用户裁定）。
+    ///
+    /// 判据（按顺序）：
+    ///   ① 在 `_releasedDevices` 内 ⇒ **拒绝**（已释放，优先于任何授权证据）；
+    ///   ② 在**本端关联集合**内（`_linkedDevices` 或 `_monitorDevices`）⇒ 放行；
+    ///   ③ 本地已缓存该设备密钥（服务端按需拉取或本地注入）⇒ 放行。
+    ///
+    /// ‼️ ② 用的是**两个集合的并集**，不是 `isInManifest()` 的 `_manifestLocked()`：
+    ///    后者的口径受 `_monitorListActive`（单向闩）左右，回答的是"本视图此刻用哪份清单"
+    ///    （登记/被动接引），不是"本端有没有权限"。同机双角色下，站点操作员接手、
+    ///    但不在航线名册里的飞机必须仍被放行。
+    ///
+    /// ‼️ 用途：`MAVLinkProtocol` 在**任何状态写入之前**调用——明文待命心跳与加密帧
+    ///    两个入口都要过。未授权帧不 learn 映射、不记收帧时间戳、不判防重放、不取密钥、
+    ///    不建链、不喂解析器（事件日志的 per-device 状态也不写）。
+    ///
+    /// ⚠️ 未登录/名册未到期间，名册为空且无密钥 ⇒ 所有帧都不处理。这是**权限边界**，
+    ///    不是死锁：登录与名册拉取走 HTTP，不经过报文接收路径，到达后设备即恢复处理。
+    /// ⚠️ 与 `isInManifest` 的区别：后者只回答"这架归我管吗"；本函数还接受
+    ///    "我手上有它的密钥"作为授权证据（覆盖名册刷新间隙，以及本地注入的单机模式）。
+    bool isDeviceAuthorized(DeviceID deviceID) const;
 
     /// **签出释出**：某架飞机签出后，本站在本地交还关于它的一切。
     ///
@@ -322,8 +350,10 @@ public:
     ///      而 `_systemToDevice` 里若留着映射，本端就还能凭一个 systemID 为**已经交还出去**的
     ///      飞机重新建链——那正是要堵的）。
     ///    ⚠️ 清表**必须**配合 `_releasedDevices`：mavp2p 在配对老化前（`MAP_TTL`，实测云端
-    ///    部署未传 `--map-ttl` ⇒ 默认 60s）仍会把该机的加密帧转发过来，而 `MAVLinkProtocol.cc`
-    ///    的四条收帧记账是无条件的 ⇒ 只清不记的话，三张表会被**下一帧**原地写回。
+    ///    部署未传 `--map-ttl` ⇒ 默认 60s）仍会把该机的加密帧转发过来。收帧记账有**两重**保护：
+    ///    接收入口先过 `isDeviceAuthorized`（本集合是其第一条判据，未授权帧在记账前就被丢弃），
+    ///    `learnDeviceSystemMapping` / `noteDeviceFrame` 体内另有一道同样的黑名单闸（纵深防御，
+    ///    覆盖不经接收入口的直接调用方）⇒ 只清不记也不会被残余帧写回。
     ///    ⚠️ 删除 `_systemToDevice` 时**不能**只按正向表反查 systemID：反向表可能已被别的
     ///    deviceID 覆写（`learnDeviceSystemMapping` 是无条件 `insert`），按正向表反查会误删
     ///    别人的条目。判据必须是"**值等于本 id**"，实现见 .cc。
@@ -355,6 +385,52 @@ public:
     /// 取当前目标设备的密钥。
     /// @return true=成功，outKey 填充；false=无活跃设备或密钥未就绪
     bool activeKey(Key& outKey) const;
+
+    // -----------------------------------------------------------------------
+    // 上行 GCS 心跳节流（2026-11-10 定稿）
+    // -----------------------------------------------------------------------
+
+    /// 本端此刻是否允许为 `deviceID` 发一条上行加密 GCS 心跳（**无副作用**）。
+    ///
+    /// 判据顺序（前一条命中即返回）：
+    ///  · `!cryptoEnabled()` ⇒ true（非加密部署行为完全不变）；
+    ///  · 非本端 Active 目标 ⇒ false；
+    ///  · ‼️ **`!isIntroducerFor(deviceID)` ⇒ false（一律不发，与 ratio 无关）**。
+    ///    PX4 把任何一条合法加密上行都当作引入；非引入方只要发了，PX4 重启后
+    ///    就可能被它引入，滴答再稀也堵不住那个窗口（2026-11-10 用户实测后裁定）。
+    ///  · bootstrap：收到该机明文待命心跳 ∧ 是引入方 ∧ 尚未收到该机的加密下行心跳 ⇒ true
+    ///    （直到首条加密下行心跳，或 `kBootstrapArmTimeoutMs` 超时）；
+    ///    ‼️ 这里是**引入权**不是指令权：签入后的降落站有指令权、没有引入权。
+    ///  · 稳态：每 `ratio` 条加密下行心跳放行一条；`ratio <= 0` ⇒ 不发。
+    /// @param immediate  true 表示非 tick 的即时调用（建车时的 ASAP 心跳）：
+    ///                   只允许 bootstrap，不得消费稳态 slot。
+    bool shouldSendGcsHeartbeat(DeviceID deviceID, int ratio, bool immediate = false) const;
+
+    /// 一条心跳**确实发出**后消费本次许可：把稳态计数归零；bootstrap 不消费。
+    /// 由 `MultiVehicleManager::_sendGCSHeartbeatInternal` 在至少一条 link 发送成功后调用。
+    void consumeGcsHeartbeatSlot(DeviceID deviceID);
+
+    /// 收到该机的明文待命心跳：置/清 bootstrap 并清零稳态计数。
+    ///
+    /// ‼️ 附带一个**状态动作**：明文待命心跳证明 PX4 已丢失加密状态；若本端此刻不是该机的
+    ///    引入方却占着 Active（典型：签入后的降落站 qgc1），必须当场 `returnToStandby()`。
+    ///    否则本端会继续以 Active 发命令帧，而 PX4 把任何首条合法加密上行都当作引入。
+    /// ⚠️ `isIntroducerFor` 在锁外求值（`_mutex` 非递归）。
+    void noteStandbyHeartbeat(DeviceID deviceID);
+
+    /// 收到该机的加密下行心跳（msgid=0、GCM 认证通过、非退化空帧）：置 seen 并计数。
+    /// ‼️ 不按"是否为当前 Active"过滤：晚到的非引入方还要靠这条记录拿搭车通行证。
+    void noteDownlinkHeartbeat(DeviceID deviceID);
+
+    /// 测试专用：把「现在」固定到指定毫秒（负数＝恢复真实时钟）。
+    /// 用于验证 `kDownlinkFreshnessMs` 时间窗——否则只能真实等待 2 秒。
+    void setNowMsForTest(qint64 nowMs) { _testNowMs = nowMs; }
+
+    /// 测试专用：把「引入权名单已生效」打回「从未推送过」（fail-open）。
+    /// 会话边界 `setResponsibleParty` 也做这件事，但它会顺带清节拍表、且可能调用
+    /// `returnToStandby()` 打一条 Debug 日志（strict mode 下算未预期）⇒ 单测 `init()`
+    /// 需要这个无副作用的复位口，否则上一格留下的空名单会让后面所有用例变成「非引入方」。
+    void resetIntroducerScopeForTest();
 
     // -----------------------------------------------------------------------
     // 握手流程
@@ -467,10 +543,56 @@ public:
     ///    是**该建链的也建不了**（单机模式全废）。信息已知时严格 fail-closed。
     bool isInitiatorFor(DeviceID deviceID) const;
 
+    /// 本端是否为 `deviceID` 的**场内引入方**——PX4 待命（加密链路未建立）时，只有它允许
+    /// 主动把链路建起来（2026-11-10 用户裁定）。
+    ///
+    /// ‼️ 与 `isInitiatorFor` 是**两维**，这是本设计最容易写错的地方：
+    ///   · 指令权（`isInitiatorFor`）= 起飞档 ∪ **降落档**——「谁该说话」；
+    ///   · 引入权（本函数）= **只有起飞档**——「飞机停在本场机位时，谁去把链路建起来」。
+    ///     降落站签入（`landing_accepted`）后虽然持有指令权，但飞机还在空中/不在本场机位，
+    ///     PX4 待命时**不得**由它建链。实测（2026-11-10）：qgc1 签入后 `isInitiatorFor` 翻真，
+    ///     缺这一维就让它把重启后的 PX4 建了链。
+    ///
+    /// 三档判据（与 `isInitiatorFor` 同形）：
+    ///   ① 非责任方（观察员等）⇒ false；
+    ///   ② `deviceID == kInvalidDeviceID` 或 `!_introducerScopeValid` ⇒ **true**（信息不可得，
+    ///      刻意 fail-open：单机模式不跑站点视图，收紧会让它一架都建不了）；
+    ///   ③ 否则严格看 `_introducerDevices`（站点视图按**起飞支**推导）。
+    bool isIntroducerFor(DeviceID deviceID) const;
+
+    /// 任意上行帧（不只是 GCS 心跳）此刻是否允许发出到该机。
+    ///
+    /// ‼️ PX4 把**任何**一条合法加密上行都当作引入（规范 §2.5 的"上行确立下行基准"），
+    ///    所以"非引入方不发心跳"只是必要条件、不是充分条件：搭车进入 Active 的非引入方
+    ///    只要发一条 `MISSION_REQUEST_LIST` / `PARAM_REQUEST_LIST`，就足以在 PX4 重启后
+    ///    把它引入到错误一端（实测 2026-11-10：qgc1 在 PX4 重启前的 Active 窗口里发过上行）。
+    ///
+    /// 判据：
+    ///   · 非加密部署 ⇒ true（零变化）；
+    ///   · `deviceID` 非法 ⇒ false；
+    ///   · 引入方 ⇒ true；
+    ///   · 非引入方 ⇒ 要求 `_recentEncryptedDownlink`（`kDownlinkFreshnessMs` 内收到过该机
+    ///     的认证加密下行）—— 证明链路**此刻**仍由引入方建着，本端只是搭车。链路一断
+    ///     （PX4 重启后不再发加密下行），窗口立即关闭，本端在 PX4 重新被引入前发不出任何东西。
+    bool allowsUplink(DeviceID deviceID) const;
+
+    /// 声明本端**有引入权**的 deviceID 名单（站点视图按起飞支推、监控员视图推空）。
+    ///
+    /// ⚠️ 与 `setInitiatorDevices` **分成两份**、不得合并：降落站在整段飞行里都持有指令权，
+    ///    却始终没有引入权——合成一份名单就再也分不开这两维。
+    /// ⚠️ 空名单**同样生效**（fail-closed）；从未被调用过才退回 fail-open（见 `isIntroducerFor`）。
+    /// ⚠️ 本函数**不撤销**已有 Active 链路：引入权变窄 ≠ 失去指令权。PX4 待命时的那次让位
+    ///    由 `noteStandbyHeartbeat` 负责（它拿明文待命心跳当"PX4 已丢失加密状态"的证据）。
+    Q_INVOKABLE void setIntroducerDevices(const QVariantList& deviceIds);
+
     /// 任务建链：选定目标无人机，取密钥，进入 Linking。
     /// 由上层在「确定航线 + 选定无人机」时调用。
-    /// ⚠️ 无责任方资格、或本端不持有该机指令权时**直接返回、状态保持 Standby**
-    ///    （判据见 `isInitiatorFor` 与 `setResponsibleParty`）。
+    /// ⚠️ 两道闸，任一不过都**直接返回、状态保持 Standby**：
+    ///    ① `isInitiatorFor`：本端不持有该机指令权；
+    ///    ② `isIntroducerFor` **或** 已收到该机的加密下行（后者证明链路是别人建好的，
+    ///       本端只是加入）：非引入方在 PX4 待命期间不得建链。
+    ///    ‼️ 只挡上行心跳挡不住②——PX4 对**任何**首条合法加密上行都会确立下行基准，
+    ///    QGC 进 Active 后首条命令（`REQUEST_MESSAGE` 等）就足以完成引入。
     void beginLinking(DeviceID targetDeviceID);
 
     /// 按 systemID 触发建链（便捷方法：内部查 deviceID↔systemID 映射）。
@@ -569,8 +691,38 @@ private:
     /// 一次独立的发送机会，又不在 GUI 线程里阻塞。16 架约 16ms，远小于 10s 保活周期。
     static constexpr int kRegistrationPerDeviceIntervalMs = 1;
 
+    /// bootstrap 的兜底退出窗口：超过它仍未收到加密下行心跳，就不再按 bootstrap 放行。
+    /// 覆盖「mavp2p 已置 handshaked、但因扇出为空 QGC 收不到心跳」的情形。
+    static constexpr qint64 kBootstrapArmTimeoutMs = 10000;
+
+    /// 加密下行心跳的「新鲜」窗口。非引入方凭它证明链路**此刻**仍由别人持有
+    /// （搭车通行证），也是「PX4 已停发加密下行 ⇒ 本端不许再上行」的判据。
+    /// PX4 心跳 2 Hz（500 ms）⇒ 容忍连丢 2~3 条；PX4 重启到首个明文待命心跳之间
+    /// 通常数秒，2 s 足以在重启前收口。
+    static constexpr qint64 kDownlinkFreshnessMs = 2000;
+
+    /// 当前毫秒时刻（测试可经 `setNowMsForTest` 固定）。
+    qint64 _nowMs() const;
+
+    /// 上行 GCS 心跳节流状态（按 deviceID）。
+    struct GcsHeartbeatState {
+        bool bootstrapArmed = false;  ///< 收到明文待命心跳且本端是引入方
+        bool downlinkHbSeen = false;  ///< 收到过该机的加密下行心跳
+        int downlinkHbCount = 0;      ///< 自上次放行以来的加密下行心跳条数
+        qint64 bootstrapArmMs = 0;    ///< bootstrap 置位时刻（_nowMs）
+        qint64 lastDownlinkHbMs = 0;  ///< 最近一条加密下行心跳时刻（_nowMs）
+    };
+
     void _onKeyFetched(DeviceID deviceID);
     void _onFetchFailed(DeviceID deviceID, const QString& error);
+
+    /// 本端最近（`kDownlinkFreshnessMs` 内）是否收到过该机的**认证通过的加密下行心跳**。
+    /// 用作「链路**此刻**仍由别人建好」的证据：非引入方凭它才能 `beginLinking`（闸②）。
+    /// ‼️ 必须带新鲜度：只记「曾经收到过」时，PX4 停发几十秒后仍能凭旧证据建链，
+    ///    随后一条上行帧就会把它引入（2026-11-10 实测：PX4 已停，qgc1 仍凭陈旧记录
+    ///    在 22:33:15 建链并发出一条上行心跳）。
+    /// ‼️ 它还会被**明文待命心跳清零**（`noteStandbyHeartbeat`）——PX4 回到待命就说明加密状态丢了。
+    bool _recentEncryptedDownlink(DeviceID deviceID) const;
 
     /// 本机当前生效的清单（返回**成员本身的引用**，不拷贝）。
     ///
@@ -611,6 +763,13 @@ private:
     /// 持有方**。语义见 `setInitiatorDevices`。⚠️ 与 `_monitorDevices` 同样是"空集可以
     /// 生效"的口径，故"有没有生效"由下面那个标志回答，不由本容器的空否回答。
     QList<DeviceID> _initiatorDevices;
+    /// 本端有**引入权**的 deviceID（站点视图按**起飞支**推；监控员视图推空）。
+    /// 语义见 `setIntroducerDevices` / `isIntroducerFor`。⚠️ 空集可以生效，与 `_initiatorDevices` 同。
+    QList<DeviceID> _introducerDevices;
+    /// 引入权名单是否已生效（与 `_initiatorScopeValid` 同形、同生命周期）。
+    bool _introducerScopeValid = false;
+    /// 测试用的固定时钟（<0 ⇒ 读真实时钟）。见 `setNowMsForTest`。
+    qint64 _testNowMs = -1;
     /// 起/终维是否已生效（`setInitiatorDevices` 至少被推过一次）。缺省 false = 从未有过。
     /// ‼️ `isInitiatorFor` 靠它区分「本端不持有它的指令权」（false 的**阴性**结论）与
     ///    「本端还不知道自己持不持有」（尚未推送）——两者的建链答案相反。
@@ -625,18 +784,20 @@ private:
     ///    **60s**：`manager.go` 的 `fanoutTargets` 判据是 `now.Sub(e.qgcSeen) < ttl`，而
     ///    `qgcSeen` 只在 `processRegistration` 的 `for (i < num)` 循环体内刷新 ⇒ 签出后本端
     ///    不再把它写进 80005 payload ⇒ 该配对的 `qgcSeen` 冻结 ⇒ TTL 到期自然停发）。
-    ///    问题出在这 60s 里：`MAVLinkProtocol.cc` 那四条收帧记账是**无条件**的
-    ///    （`learnDeviceSystemMapping` / `noteDeviceFrame`，明文待命心跳支两条、加密帧支两条，
-    ///    见 `MAVLinkProtocol.cc` 明文待命心跳支「两处收帧点必须都记」那段注释），
-    ///    于是刚清掉的 `_deviceToSystem` / `_systemToDevice` /
-    ///    `_lastFrameMs` 会被**逐帧写回**——签出等于没签出。
+    ///    问题出在这 60s 里：`MAVLinkProtocol.cc` 的收帧记账（`learnDeviceSystemMapping` /
+    ///    `noteDeviceFrame`）会把刚清掉的 `_deviceToSystem` / `_systemToDevice` /
+    ///    `_lastFrameMs` 逐帧写回——签出等于没签出。
     ///
-    /// ‼️ 判据必须是**显式黑名单**，不能拿 `isInManifest()`（`_linkedDevices`）当闸：
-    ///    那是个白名单，"不在白名单里"既可能是"已签出"，也可能是"全新启动、还没登录、
-    ///    清单还没拉回来"，而后者**必须**照常学映射——`MAVLinkProtocol.cc` 那段注释写明了
-    ///    这个先有鸡先有蛋：
-    ///    无密钥 ⇒ 无法解密 ⇒ 学不到映射 ⇒ `beginLinkingForSystemID` 无从触发。
-    ///    两者形状相同、语义相反，只有黑名单能把它们分开。
+    /// ‼️ 2026-11-10 起，接收路径在**任何状态写入之前**统一过 `isDeviceAuthorized()`：
+    ///    已释放设备在那里就被拒（本集合是它的第 ① 条判据，优先于"在名册内"与"本地有密钥"
+    ///    两项授权证据）。因此本函数体**内**的黑名单闸（`learnDeviceSystemMapping` /
+    ///    `noteDeviceFrame` / `reRegisterDevice` 体内）是**纵深防御**，不再是唯一防线。
+    /// ⚠️ 旧结论「判据必须是显式黑名单，不能拿 `isInManifest()` 当闸」只对**函数体内**这层
+    ///    纵深防御继续成立；接收入口那一层的口径已按 2026-11-10 裁定改写为
+    ///    `isDeviceAuthorized`——它不再是纯白名单：名册外但本地有密钥同样放行（覆盖名册
+    ///    刷新间隙与单机模式），而已释放设备即使名册内、即使有密钥也一律拒绝。
+    ///    「全新启动、还没登录、名册未到 ⇒ 所有帧都不处理」现在是**明确的权限边界**，
+    ///    不是死锁：登录与名册拉取走 HTTP，不经过报文接收路径，到达后设备即恢复处理。
     ///    （`_onKeyFetched` 里那处"三集合都不认它"的判据同理不可搬来：那里必然处于 `Linking`
     ///    状态，全新启动进不去，所以"都不认"唯一可能是"已释出"。）
     ///
@@ -661,6 +822,9 @@ private:
     ///    读到 `-1`（`since < 0` 判据恒真）⇒ 每 2s 定向重发一次 80005 ⇒ mavp2p 那个配对的
     ///    `qgcSeen` 被重新刷新鲜 ⇒ 配对**永不过期**、残余帧无限期投喂。两件事必须同批。
     QHash<DeviceID, qint64> _lastFrameMs;
+    /// 上行 GCS 心跳节流状态。键 = 收到过明文待命心跳、或建链过该机的 deviceID。
+    /// 清理点：`returnToStandby` / `releaseDevice` / `failLinking` / 失去指令权。
+    QHash<DeviceID, GcsHeartbeatState> _gcsHeartbeat;
     /// `_lastFrameMs` 的时间基准。单调、不受系统时钟调整影响。
     QElapsedTimer _frameClock;
     QTimer* _registrationTimer = nullptr; ///< 80005 周期发送定时器

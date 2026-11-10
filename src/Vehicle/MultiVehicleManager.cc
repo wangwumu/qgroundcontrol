@@ -12,6 +12,7 @@
 #include "VehicleLinkManager.h"
 #include "LinkInterface.h"
 #include "QmlObjectListModel.h"
+#include "Crypto/CryptoController.h"
 #ifdef Q_OS_IOS
 #include "MobileScreenMgr.h"
 #elif defined(Q_OS_ANDROID)
@@ -128,8 +129,10 @@ void MultiVehicleManager::_vehicleHeartbeatInfo(LinkInterface* link, int vehicle
 
     _vehicles->append(vehicle);
 
-    // Send QGC heartbeat ASAP, this allows PX4 to start accepting commands
-    _sendGCSHeartbeat();
+    // Send QGC heartbeat ASAP, this allows PX4 to start accepting commands.
+    // `immediate = true`：这一发只允许走 bootstrap（引入方刚收到明文待命心跳的窗口），
+    // 不得消费稳态节拍槽——否则建车瞬间就把一轮 n=ratio 的配额用掉了。
+    _sendGCSHeartbeatInternal(true);
 
     SettingsManager::instance()->firmwareUpgradeSettings()->defaultFirmwareType()->setRawValue(vehicleFirmwareType);
 
@@ -273,10 +276,32 @@ void MultiVehicleManager::_vehicleParametersReadyChanged(bool parametersReady)
 
 void MultiVehicleManager::_sendGCSHeartbeat()
 {
+    _sendGCSHeartbeatInternal(false);
+}
+
+void MultiVehicleManager::_sendGCSHeartbeatInternal(bool immediate)
+{
     if (!SettingsManager::instance()->mavlinkSettings()->sendGCSHeartbeat()->rawValue().toBool()) {
         return;
     }
 
+    // 加密部署下上行心跳受节拍闸控（`CryptoController::shouldSendGcsHeartbeat`）：
+    // 只有「当前 Active 的那架飞机」的上行心跳允许放行，且要在 bootstrap 期或累计收到
+    // n 条加密下行心跳之后。非加密部署该闸恒为 true，行为与改动前完全一致。
+    // ⚠️ `cryptoEnabled()` 是**全局**开关、没有 per-link 加密标志 ⇒ 加密部署下这个闸盖住
+    //    所有链路（一个心跳广播到全部 link），不是"只挡加密链路"。节拍槽也只消费一次，
+    //    与广播了几条 link 无关。
+    auto crypto = MAVLinkCrypto::CryptoController::instance();
+    const bool cryptoOn = crypto->cryptoEnabled();
+    const MAVLinkCrypto::DeviceID activeDeviceID =
+        cryptoOn ? crypto->activeDeviceID() : MAVLinkCrypto::kInvalidDeviceID;
+    const int ratio =
+        SettingsManager::instance()->mavlinkSettings()->qgcUplinkHeartbeatRatio()->rawValue().toInt();
+    if (cryptoOn && !crypto->shouldSendGcsHeartbeat(activeDeviceID, ratio, immediate)) {
+        return;
+    }
+
+    bool sent = false;
     const QList<SharedLinkInterfacePtr> sharedLinks = LinkManager::instance()->links();
     for (const SharedLinkInterfacePtr &link: sharedLinks) {
         if (!link->isConnected()) {
@@ -302,6 +327,12 @@ void MultiVehicleManager::_sendGCSHeartbeat()
         );
 
         link->sendMessageThreadSafe(message);
+        sent = true;
+    }
+
+    // 只有真的发出去了才消费节拍槽：没有可用链路时（例如全部 highLatency）不消耗 n 的配额。
+    if (cryptoOn && sent) {
+        crypto->consumeGcsHeartbeatSlot(activeDeviceID);
     }
 }
 

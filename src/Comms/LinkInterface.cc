@@ -138,6 +138,27 @@ void LinkInterface::sendMessageThreadSafe(mavlink_message_t &message)
                 tr("发送被丢弃：加密已启用但链路未就绪（命令编号 %1）").arg(message.msgid));
             return;
         }
+        // 非引入方的上行闸（2026-11-10 实测后补）：PX4 把**任何**一条合法加密上行都当作引入，
+        // 所以"非引入方不发心跳"只是必要条件。搭车进入 Active 的非引入方只要发出一条
+        // MISSION_REQUEST_LIST / PARAM_REQUEST_LIST / COMMAND_LONG，就足以在 PX4 重启后把它
+        // 引入到错误一端——实测 qgc1（监控员）在 PX4 重启前的 Active 窗口里发过上行。
+        // 判据：引入方放行；非引入方必须有 `kDownlinkFreshnessMs` 内的认证加密下行（证明链路
+        // 此刻仍由引入方建着）。链路一断，窗口立即关闭，直到本端真正被授权引入为止。
+        // 心跳在这里静默（`shouldSendGcsHeartbeat` 已先拦，1 Hz 不能刷事件日志）；其余 msgid
+        // 是用户/管理器真下发的请求，必须留痕「没到飞控」。
+        if (!crypto->allowsUplink(crypto->activeDeviceID())) {
+            if (message.msgid == MAVLINK_MSG_ID_HEARTBEAT) {
+                qCDebug(LinkInterfaceLog) << "crypto uplink not allowed (no fresh encrypted downlink),"
+                                             " dropping GCS heartbeat";
+                return;
+            }
+            qCWarning(LinkInterfaceLog) << "crypto uplink not allowed (no fresh encrypted downlink), dropping msgid"
+                                        << message.msgid;
+            FlightEventLogger::instance()->logLinkEvent(
+                tr("发送被丢弃：本端非引入方且近期无加密下行（命令编号 %1）").arg(message.msgid));
+            return;
+        }
+
         MAVLinkCrypto::Key key;
         uint64_t counter = 0;
         if (crypto->activeKey(key) && crypto->nextOutgoingCounter(counter)) {

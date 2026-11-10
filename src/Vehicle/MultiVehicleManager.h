@@ -57,6 +57,7 @@ private slots:
     void _setActiveVehiclePhase2(Vehicle *vehicle);
     void _vehicleParametersReadyChanged(bool parametersReady);
     void _sendGCSHeartbeat();
+    void _sendGCSHeartbeatInternal(bool immediate);
     void _vehicleHeartbeatInfo(LinkInterface *link, int vehicleId, int componentId, int vehicleFirmwareType, int vehicleType,
                                MAVLinkCrypto::DeviceID deviceID);
 

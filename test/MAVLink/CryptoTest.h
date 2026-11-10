@@ -128,6 +128,18 @@ private slots:
     //    ⇒ 每格开头闩恒为 false，顺序**非硬约束**；格内再用 `setMonitorDevices` 显式钉两种取值。
     void _testIsInManifestUsesMonitorListActiveNotEmptiness();
 
+    // 接收权限前置闸（2026-11-10）：报文被处理的前提是 deviceID 在本端权限范围内。
+    void _testIsDeviceAuthorized();
+
+    // 上行加密心跳节拍（2026-11-10）：非加密恒放行 / 引入方收到明文待命心跳后的 bootstrap
+    // （不受 n 限制）/ 首条加密下行心跳后转入稳态「n 条下行 ⇒ 一条上行」/ 非活跃设备恒拒。
+    void _testGcsHeartbeatTicking();
+
+    // 引入权（2026-11-10 补）：PX4 待命（链路未建立）时，只有**场内引入方**（站点视图按
+    // 起飞支推导）允许建链。非引入方（签入后的降落站）必须等到收到加密下行才可加入，
+    // 且收到明文待命心跳时须当场让出 Active——命令帧同样能完成引入，只挡心跳不够。
+    void _testIntroducerGate();
+
     // 主动取密钥时机之二（规范 §2.7.2 e，Task 7）：监控清单**内容变化**时，对尚无本地
     // 密钥的 ID 触发**一次批量**拉取。
     // ⚠️ 三格都在钉 `changed` 这个判据：变了才拉 / 没变不拉 / 空清单不拉。

@@ -23,6 +23,7 @@ public:
     DEFINE_SETTINGFACT(forwardMavlinkHostName)
     DEFINE_SETTINGFACT(forwardMavlinkAPMSupportHostName)
     DEFINE_SETTINGFACT(sendGCSHeartbeat)
+    DEFINE_SETTINGFACT(qgcUplinkHeartbeatRatio)
     DEFINE_SETTINGFACT(gcsMavlinkSystemID)
 
     DEFINE_SETTINGFACT(noInitialDownloadWhenFlying)

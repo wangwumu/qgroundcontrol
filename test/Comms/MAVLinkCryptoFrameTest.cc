@@ -1,5 +1,6 @@
 #include "MAVLinkCryptoFrameTest.h"
 
+#include <QtCore/QDateTime>
 #include <QtCore/QObject>
 #include <QtCore/QRegularExpression>
 #include <QtCore/QScopeGuard>
@@ -16,6 +17,8 @@
 #include "MAVLinkLib.h"
 #include "MAVLinkProtocol.h"
 #include "MockLink.h"
+#include "MultiVehicleManager.h"
+#include "QmlObjectListModel.h"
 
 namespace {
 
@@ -47,6 +50,23 @@ constexpr MAVLinkCrypto::DeviceID kInManifestDeviceID =
 constexpr MAVLinkCrypto::DeviceID kOutOfManifestDeviceID =
     MAVLinkCrypto::makeDeviceID(0, 0, kOutOfManifestSysId, kOutOfManifestCompId);
 
+/// 「非引入方不建车」那一格的独占身份（2026-11-10）。
+/// ⚠️ **不能复用** kPlaintextDeviceID：前一个用例已用同一 sysid 建过 Vehicle（那时名单
+///    未推送、fail-open），复用它会让"阳性对照必须多出一辆"这一臂永远等不到新车。
+/// ⚠️ compid 必须是 `kNormalizedComponentID`(1)：明文支会把帧头 compid 归一化成 1 再喂
+///    标准解析器，而**不重算 CRC** ⇒ 用别的 compid 会造出 CRC 不匹配的帧，阳性对照永远建不出车
+///    （实测踩到：compid=0x46 时第一臂假绿、阳性对照 count 不增）。
+constexpr uint8_t kNonIntroducerSysId = 0x7B;
+constexpr uint8_t kNonIntroducerCompId = 1;
+constexpr MAVLinkCrypto::DeviceID kNonIntroducerDeviceID =
+    MAVLinkCrypto::makeDeviceID(0, 0, kNonIntroducerSysId, kNonIntroducerCompId);
+
+/// 会话边界格（2026-11-10）的独占身份：本文件唯一**真正解密成功**的用例。
+constexpr uint8_t kSessionBoundarySysId = 0x7C;
+constexpr uint8_t kSessionBoundaryCompId = 0x47;
+constexpr MAVLinkCrypto::DeviceID kSessionBoundaryDeviceID =
+    MAVLinkCrypto::makeDeviceID(0, 0, kSessionBoundarySysId, kSessionBoundaryCompId);
+
 /// 读数上界（毫秒）。`>= 0` 单独用区分不了「刚刚记的」与「很久以前记的」，真正把
 /// 「刚刚」钉死的是前面那句 `QCOMPARE(..., qint64(-1))`；这条上界是**加固**，用来抓
 /// 「在陈旧时刻记账」这类回归。
@@ -66,6 +86,56 @@ MAVLinkCrypto::Key testKey()
         key[i] = static_cast<uint8_t>(i);
     }
     return key;
+}
+
+/// 组装一条**可真正解密**的加密心跳帧：标准帧 = 10B 头 + HEARTBEAT payload(9B) + EXT(63B) + CRC。
+///
+/// EXT 的 gps_utc_us 在 EXT 偏移 55（= payload 偏移 9+55=64），属 60825.0 段；
+/// 传 0 表示「未定位/未同步」，正是会话边界判据必须 fail-closed 的输入。
+/// heartbeat.type（线上 offset 4）= MAV_TYPE_GCS：`MultiVehicleManager` 不给 GCS 建 Vehicle，本用例因此
+/// 不会牵出 InitialConnectStateMachine（它会发上行请求，污染严格模式日志）。
+QByteArray encryptedHeartbeatWithGpsUtc(uint64_t counter, uint64_t gpsUtcUs)
+{
+    const uint8_t crcExtra = mavlink_get_msg_entry(MAVLINK_MSG_ID_HEARTBEAT)->crc_extra;
+
+    // ⚠️ MAVLink v2 线上字段按宽度降序重排：custom_mode(4B) 在前，type 在 **offset 4**，
+    //    不是 offset 0。写错位置会让 type=MAV_TYPE_GENERIC ⇒ 真的被建出一架 Vehicle
+    //    （实测：写成 offset 0 时弹出「已连接到载具 124」并牵出后续上行）。
+    QByteArray payload(9 + 63, '\0');
+    payload[4] = static_cast<char>(MAV_TYPE_GCS);  // heartbeat.type
+    payload[8] = static_cast<char>(3);             // mavlink_version
+    for (int i = 0; i < 8; ++i) {                  // gps_utc_us：小端
+        payload[64 + i] = static_cast<char>((gpsUtcUs >> (8 * i)) & 0xFF);
+    }
+
+    QByteArray plain;
+    plain.append(static_cast<char>(0xFD));                 // magic
+    plain.append(static_cast<char>(payload.size()));       // len
+    plain.append(static_cast<char>(0));                    // incompat
+    plain.append(static_cast<char>(0));                    // compat
+    plain.append(static_cast<char>(0));                    // seq
+    plain.append(static_cast<char>(kSessionBoundarySysId));
+    plain.append(static_cast<char>(kSessionBoundaryCompId));
+    plain.append(static_cast<char>(0));                    // msgid=0 (HEARTBEAT)
+    plain.append(static_cast<char>(0));
+    plain.append(static_cast<char>(0));
+    plain.append(payload);
+    uint16_t crc = 0;
+    crc_init(&crc);
+    for (int i = 1; i < plain.size(); ++i) {
+        crc_accumulate(static_cast<uint8_t>(plain.at(i)), &crc);
+    }
+    crc_accumulate(crcExtra, &crc);
+    plain.append(static_cast<char>(crc & 0xFF));
+    plain.append(static_cast<char>(crc >> 8));
+
+    uint8_t enc[MAVLINK_MAX_PACKET_LEN + 64]{};
+    int encLen = 0;
+    if (!MAVLinkCrypto::encryptFrame(reinterpret_cast<const uint8_t*>(plain.constData()), plain.size(), crcExtra,
+                                     kSessionBoundaryDeviceID, counter, testKey(), enc, &encLen)) {
+        return {};
+    }
+    return QByteArray(reinterpret_cast<const char*>(enc), encLen);
 }
 
 /// 构造一个标准（明文）MAVLink v2 HEARTBEAT 帧的线上字节。
@@ -127,6 +197,25 @@ void MAVLinkCryptoFrameTest::cleanup()
     // 今天因 deviceID 独占看着无害，但这正是本文件在防的那类跨用例泄漏。
     crypto->resetReplay(kPlaintextDeviceID);
     crypto->resetReplay(kEncryptedDeviceID);
+    // 会话边界格会真的解密成功并建链（本文件唯一）：状态机与密钥都得在**失败路径**上
+    // 一并复位，否则后续用例面对的是一个 Active 着的单例、且自带别人的密钥。
+    if (crypto->state() != MAVLinkCrypto::CryptoController::State::Standby) {
+        crypto->returnToStandby();
+    }
+    crypto->resetReplay(kSessionBoundaryDeviceID);
+    crypto->deviceKeyManager()->removeKey(kSessionBoundaryDeviceID);
+    crypto->removeLinkedDevice(kSessionBoundaryDeviceID);
+
+    // 权限前置闸（2026-11-10）要求报文对应的 deviceID 在本端权限范围内：用例会给
+    // 自己的 deviceID 挂上 `_linkedDevices` 授权 ⇒ 必须在这里撤销。用例末尾那句
+    // `removeLinkedDevice` 在失败路径上不执行，残留下来会让别的用例的 `isInManifest`
+    // 多出真值（`_testPlaintextHeartbeatTriggersFetchOnlyWhenInManifest` 的"清单外"
+    // 一格正是靠清单归属的**真假**分开的）。含"清单外"那一格的 kOutOfManifestDeviceID：
+    // 它靠 `_linkedDevices` 取得授权而 `isInManifest` 仍为假。
+    crypto->removeLinkedDevice(kPlaintextDeviceID);
+    crypto->removeLinkedDevice(kEncryptedDeviceID);
+    crypto->removeLinkedDevice(kOutOfManifestDeviceID);
+    crypto->removeLinkedDevice(kNonIntroducerDeviceID);
 
     // gcs_server 地址同样是进程级的：`DeviceKeyManager` 挂在单例上，用例末尾那句
     // `setServerUrl(QString())` 在**失败路径**上不会执行。配了地址的用例会让 `fetchKeys`
@@ -182,6 +271,24 @@ void MAVLinkCryptoFrameTest::_testPlaintextHeartbeatNotesFrame()
     const MAVLinkCrypto::DeviceID deviceID = kPlaintextDeviceID;
     QCOMPARE(crypto->msSinceLastFrame(deviceID), qint64(-1));
 
+    // 权限前置闸（2026-11-10）：未授权设备的帧在**任何状态写入之前**丢弃，
+    // 因此连收帧时间戳都不该记。这一臂同时是下面正面断言的阴性对照——
+    // 单看"授权后记了"，分不清它记的是这一帧还是某个无条件记账的旁路。
+    QVERIFY2(!crypto->isDeviceAuthorized(deviceID), "初态必须未授权，否则阴性对照不成立");
+    _injectWithCryptoEnabled(plaintextHeartbeatFrame(kPlaintextSysId, kPlaintextCompId));
+    QCOMPARE(crypto->msSinceLastFrame(deviceID), qint64(-1));
+    // 收帧时间戳只覆盖 `noteDeviceFrame`；`learnDeviceSystemMapping` 是一条**独立**写点。
+    // 少了这条断言，把闸下移到 learn 之后（或删掉闸、只删 note）也能全绿。
+    MAVLinkCrypto::DeviceID mapped = MAVLinkCrypto::kInvalidDeviceID;
+    QVERIFY2(!crypto->deviceIDForSystemID(kPlaintextSysId, mapped) || mapped != deviceID,
+             "未授权帧不得学习 sysid 映射");
+
+    // 授权：挂进名册。⚠️ 先显式清空 serverUrl——`addLinkedDevice` 对"新加入且本地无密钥"
+    // 的设备会发一次批量拉取，配了地址就变成真实 HTTP（cleanup 复位它，但顺序依赖能免则免）。
+    crypto->deviceKeyManager()->setServerUrl(QString());
+    crypto->addLinkedDevice(deviceID);
+    QVERIFY2(crypto->isDeviceAuthorized(deviceID), "名册内必须放行");
+
     _injectWithCryptoEnabled(plaintextHeartbeatFrame(kPlaintextSysId, kPlaintextCompId));
 
     // 变异自证：删掉明文心跳分支那一行 ⇒ 此处变红，而 _testEncryptedFrameNotesFrame 仍绿
@@ -206,6 +313,18 @@ void MAVLinkCryptoFrameTest::_testEncryptedFrameNotesFrame()
     QVERIFY(crypto->isIncomingAcceptable(deviceID, 2000));
     crypto->commitIncoming(deviceID, 2000);
 
+    // 未授权设备的帧在权限闸处就返回，不记收帧时间戳、不学映射（阴性对照，同明文那一格）。
+    QVERIFY2(!crypto->isDeviceAuthorized(deviceID), "初态必须未授权，否则阴性对照不成立");
+    _injectWithCryptoEnabled(encryptedFrame(kEncryptedSysId, kEncryptedCompId, 1000));
+    QCOMPARE(crypto->msSinceLastFrame(deviceID), qint64(-1));
+    MAVLinkCrypto::DeviceID mapped = MAVLinkCrypto::kInvalidDeviceID;
+    QVERIFY2(!crypto->deviceIDForSystemID(kEncryptedSysId, mapped) || mapped != deviceID,
+             "未授权帧不得学习 sysid 映射");
+
+    crypto->deviceKeyManager()->setServerUrl(QString());
+    crypto->addLinkedDevice(deviceID);
+    QVERIFY2(crypto->isDeviceAuthorized(deviceID), "名册内必须放行");
+
     _injectWithCryptoEnabled(encryptedFrame(kEncryptedSysId, kEncryptedCompId, 1000));
 
     // 变异自证①：删掉加密帧分支那一行 ⇒ 此处变红，而明文那一格仍绿
@@ -213,6 +332,76 @@ void MAVLinkCryptoFrameTest::_testEncryptedFrameNotesFrame()
     const qint64 ms = crypto->msSinceLastFrame(deviceID);
     QVERIFY2(ms >= 0 && ms < kFreshFrameUpperBoundMs,
              qPrintable(QStringLiteral("加密帧支必须记收帧时间戳，且须记在防重放检查之前（读数 ms=%1）").arg(ms)));
+}
+
+/// 会话边界（2026-11-10 用户裁定）：**被防重放水位拦下的加密心跳**，解密后其 EXT 的
+/// GPS UTC 与本地时间相差 ≤5s 才清本机水位；否则仍按重放丢弃。
+///
+/// 复现：qgc1 一直运行（下行水位被旧会话推到 3.298e18），PX4 重启后新会话从 1.618e18 起
+/// ⇒ 恒运行的 qgc1 每一帧都被判重放、"没有数据"；新起的 qgc2 水位为空所以能接。
+/// 清水位必须由**认证过的新鲜证据**触发——明文待命心跳无认证（伪造它就能重放旧加密帧），
+/// 故判据只能放在解密侧：GCM 认证通过（伪造者没有密钥就过不了）+ UTC 新鲜（旧会话帧带旧时间戳）。
+///
+/// ‼️ 四臂必须同处一个函数：臂①②③（旧 UTC / UTC=0 / 未来 UTC）的断言形态都是"水位没动"，
+///    单看没有判别力（把整块实现删掉它们也绿）。判别力全部来自同一函数里的臂④阳性对照。
+/// ‼️ 走的是真入口：`_injectWithCryptoEnabled` → `MAVLinkProtocol::receiveBytes`。
+void MAVLinkCryptoFrameTest::_testSessionBoundaryLowersReplayWatermark()
+{
+    MAVLinkCrypto::CryptoController* const crypto = MAVLinkCrypto::CryptoController::instance();
+
+    _connectMockLinkNoInitialConnectSequence();
+    _mockLink->setCommLost(true);
+    // 会话边界本身要留一条生产告警（PX4 重启是需人工关注的运维事件）；它在**通过**用例里
+    // 也是预期输出，故按单条消息放行，而不是改断言或降成 debug 绕开 strict mode。
+    ignoreLogMessage("Comms.MAVLinkProtocol", QtWarningMsg, QRegularExpression("replay watermark lowered"));
+
+    const MAVLinkCrypto::DeviceID deviceID = kSessionBoundaryDeviceID;
+    // 授权 + 本地密钥是前置：缺任一条帧都走不到解密，本用例就恒绿（假绿）。
+    crypto->deviceKeyManager()->setServerUrl(QString());
+    crypto->addLinkedDevice(deviceID);
+    crypto->deviceKeyManager()->cacheKey(deviceID, testKey());
+    QVERIFY2(crypto->isDeviceAuthorized(deviceID), "前置：名册内");
+    QVERIFY2(crypto->deviceKeyManager()->hasKey(deviceID), "前置：本地密钥");
+
+    constexpr uint64_t kOldSessionCounter = 0x3000000000000000ull;  // 实测旧会话 ≈ 3.298e18
+    // 四臂各用**不同**的 counter：观测手段是「该 counter 之后一帧是否可收」——
+    // 帧被丢 ⇒ 水位仍在旧会话高处 ⇒ 不可收；帧被接受 ⇒ 水位压到该 counter ⇒ 下一帧可收。
+    // ⚠️ 不能用「该 counter 自身是否可收」：`commit` 之后严格大于才可收，两条路径读数相同
+    //    （实测：写成同值断言时，把 UTC 校验整个删掉用例依然全绿）。
+    constexpr uint64_t kStaleUtcCounter = 0x1500000000000000ull;
+    constexpr uint64_t kZeroUtcCounter = 0x1510000000000000ull;
+    constexpr uint64_t kFutureUtcCounter = 0x1520000000000000ull;
+    constexpr uint64_t kBoundaryCounter = 0x1600000000000000ull;  // 实测新会话 ≈ 1.618e18
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+
+    // 旧会话先把水位推高（PX4 重启前的最后一帧）。
+    crypto->commitIncoming(deviceID, kOldSessionCounter);
+    QVERIFY2(!crypto->isIncomingAcceptable(deviceID, kBoundaryCounter + 1),
+             "前置：旧水位必须高于新会话 counter，否则四臂都测不到任何东西");
+
+    // 臂① 旧 UTC（60s 前）⇒ 不构成会话边界：帧被丢、水位不动。
+    _injectWithCryptoEnabled(encryptedHeartbeatWithGpsUtc(kStaleUtcCounter,
+                                                          static_cast<uint64_t>(nowMs - 60'000) * 1000));
+    QVERIFY2(!crypto->isIncomingAcceptable(deviceID, kStaleUtcCounter + 1),
+             "旧 UTC 的加密心跳不得清水位——否则重放一条旧会话帧就能反复打开重放窗口");
+
+    // 臂② UTC=0（未定位/未同步）⇒ 无法判新鲜度，必须 fail-closed。
+    _injectWithCryptoEnabled(encryptedHeartbeatWithGpsUtc(kZeroUtcCounter, 0));
+    QVERIFY2(!crypto->isIncomingAcceptable(deviceID, kZeroUtcCounter + 1), "UTC=0 时必须 fail-closed，水位不动");
+
+    // 臂③ 未来 UTC（超前 10s）⇒ 与旧 UTC 同理：容差是**双向**的，时钟异常的一侧同样
+    //      不能当边界（否则对方时钟跑偏就能无限次压低本端水位）。
+    _injectWithCryptoEnabled(encryptedHeartbeatWithGpsUtc(kFutureUtcCounter,
+                                                          static_cast<uint64_t>(nowMs + 10'000) * 1000));
+    QVERIFY2(!crypto->isIncomingAcceptable(deviceID, kFutureUtcCounter + 1),
+             "未来 UTC（超前 >5s）不得清水位——新鲜度判据必须取绝对值");
+
+    // 臂④ 新鲜 UTC ⇒ 这就是会话边界：水位压到本帧 counter，后续新会话帧放行。
+    _injectWithCryptoEnabled(encryptedHeartbeatWithGpsUtc(kBoundaryCounter, static_cast<uint64_t>(nowMs) * 1000));
+    QVERIFY2(crypto->isIncomingAcceptable(deviceID, kBoundaryCounter + 1),
+             "新鲜 UTC 的加密心跳是会话边界：水位必须被压到本帧 counter");
+    QVERIFY2(!crypto->isIncomingAcceptable(deviceID, kBoundaryCounter),
+             "边界只前移一步：本帧之后同一 counter 重放仍必须被拒（不是永久放行）");
 }
 
 /// 被动取密钥时机（规范 §2.7.2 e，Task 8）：明文待命心跳支。
@@ -234,6 +423,16 @@ void MAVLinkCryptoFrameTest::_testPlaintextHeartbeatTriggersFetchOnlyWhenInManif
 
     _connectMockLinkNoInitialConnectSequence();
     _mockLink->setCommLost(true);
+
+    // ② 那一格（"清单外不拉"）的 deviceID 必须先通过**接收权限闸**（2026-11-10），
+    //    否则帧在 `MAVLinkProtocol.cc` 入口就被丢弃，根本到不了下面那个取密钥条件——
+    //    本格会变成"测权限闸"而不是"测 isInManifest"（删掉 `isInManifest` 合取项也照样绿）。
+    //    `addLinkedDevice` 给出的组合恰好是：权限判据（两个集合的并集）为真、`isInManifest`
+    //    为假（监控清单生效后它只看 `_monitorDevices`）。
+    // ⚠️ 必须放在配 serverUrl **之前**：此刻地址还是空的（上一格 cleanup 已复位），
+    //    `addLinkedDevice` 对"新加入且无密钥"设备那次拉取会静默早退，不制造额外请求。
+    crypto->deviceKeyManager()->setServerUrl(QString());
+    crypto->addLinkedDevice(kOutOfManifestDeviceID);
 
     // ‼️ 必须显式配一个 serverUrl，被动触发才可观测：`fetchKeys` 在 `!isConfigured()` 时
     //    **静默早退**，且早退排在 `emit keysRequested` **之前** ⇒ 不配的话信号永不发射，
@@ -304,6 +503,50 @@ void MAVLinkCryptoFrameTest::_testPlaintextHeartbeatTriggersFetchOnlyWhenInManif
     QVERIFY2(nam != nullptr, "DeviceKeyManager 必须持有一个以自身为 parent 的 QNAM");
     // ⚠️ 条件式等待，不是固定延时（本仓 Golden Rule 禁止 `QTest::qWait(<毫秒>)`）。
     QTRY_VERIFY_WITH_TIMEOUT(nam->findChildren<QNetworkReply*>().isEmpty(), 5000);
+}
+
+// 非引入方的明文待命心跳：记账照做，但**不得**喂标准解析器（2026-11-10 用户复现）。
+// 用户现象：qgc1（航线监控员）在 PX4 重启后"向 PX4 请求参数、弹围栏/集结点错误"。
+// 根因不是上行没被拦（拦住了），而是明文心跳建出了 Vehicle → InitialConnectStateMachine
+// 自动发起任务/围栏/集结点下载 → 全部被 Standby 丢弃 → 重试耗尽 → 三连弹窗。
+void MAVLinkCryptoFrameTest::_testNonIntroducerPlaintextHeartbeatDoesNotBuildVehicle()
+{
+    MAVLinkCrypto::CryptoController* const crypto = MAVLinkCrypto::CryptoController::instance();
+
+    // 阳性对照会建出第二架车，QGC 原生会弹"已连接到载具 N"（上游行为，见 c-connected-veh-popup）。
+    // strict mode 下未预期日志＝失败，故只忽略这一条；别顺手把整个 category 静音。
+    ignoreLogMessage("API.QGCApplication.AppMessage", QtDebugMsg, QRegularExpression("已连接到载具"));
+
+    _connectMockLinkNoInitialConnectSequence();
+    _mockLink->setCommLost(true);
+
+    // 过接收权限闸（名册并集），但**不**进引入名单。
+    crypto->deviceKeyManager()->setServerUrl(QString());
+    crypto->addLinkedDevice(kNonIntroducerDeviceID);
+    QVERIFY2(crypto->isDeviceAuthorized(kNonIntroducerDeviceID), "前置：必须过权限闸，否则测的是权限闸而不是引入权");
+
+    // 本文件此前从未推过责任方/引入名单 ⇒ 显式设成"责任方 + 有效空名单"。
+    // 这一臂的判别力全在 `setIntroducerDevices({})`：它是 fail-closed 的有效空集，
+    // 与"从未推送过"（fail-open）必须区分开。
+    crypto->setResponsibleParty(true);
+    crypto->setIntroducerDevices(QVariantList{});
+    QVERIFY2(!crypto->isIntroducerFor(kNonIntroducerDeviceID), "前置：本端此刻必须是该机的非引入方");
+
+    const int countBefore = MultiVehicleManager::instance()->vehicles()->count();
+    _injectWithCryptoEnabled(plaintextHeartbeatFrame(kNonIntroducerSysId, kNonIntroducerCompId));
+    QCOMPARE(MultiVehicleManager::instance()->vehicles()->count(), countBefore);
+
+    // 阳性对照：同一帧、同一 deviceID，只把引入名单放行 ⇒ 必须建出车辆。
+    // 没有这一臂，"不建"可能只是因为帧本身建不出车（心跳字段/授权/解析路径任一处坏了），
+    // 那样断言恒真、零判别力。
+    crypto->setIntroducerDevices(QVariantList{ static_cast<uint>(kNonIntroducerDeviceID) });
+    QVERIFY2(crypto->isIntroducerFor(kNonIntroducerDeviceID), "前置：阳性对照必须由引入方发起");
+    _injectWithCryptoEnabled(plaintextHeartbeatFrame(kNonIntroducerSysId, kNonIntroducerCompId));
+    QCOMPARE(MultiVehicleManager::instance()->vehicles()->count(), countBefore + 1);
+
+    // 复原：本用例是文件里最后一个，但责任方/名单是进程级状态，不能留给 cleanupTestCase。
+    crypto->setIntroducerDevices(QVariantList{});
+    crypto->setResponsibleParty(false);
 }
 
 UT_REGISTER_TEST(MAVLinkCryptoFrameTest, TestLabel::Integration, TestLabel::Comms)
