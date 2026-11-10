@@ -10,6 +10,7 @@
 #include "Crypto/ReplayGuard.h"
 #include "MAVLinkLib.h"
 #include "Extensions/VTOLSafetyMessages.h"
+#include "development/mavlink_msg_gnss_integrity.h"
 
 #include <checksum.h>   // crc_init/crc_accumulate*：测试侧自算帧尾 CRC（见 frameCrc）
 
@@ -132,15 +133,20 @@ uint8_t parseFrame(const QByteArray& frame, mavlink_message_t& message, mavlink_
     return framing;
 }
 
-/// 构造 EXT 55B（小端序，协议 60824.0 §4）。前 37B 为 60822.0 基段，尾部 9 字段为
-/// 60824.0 新增；新字段参数默认哨兵（供"仅解析基段"兼容用例复用）。
+/// 构造 EXT 84B（小端序，协议 61013.0 §4）。前 37B = 60822.0 基段，37–54 = 60824.0 段，
+/// 55–83 = 60825.0 段（gps_utc/健康位/负载/GNSS/振动/保留区）。
+/// 新字段参数默认值 = 「本段存在但值未知/健康」，供只用基段的用例复用；
+/// 模拟旧协议帧请显式 `left(55)` / `left(37)` 截断。
 QByteArray makeExtBytes(int32_t lat, int32_t lon, int32_t alt, int16_t vx, int16_t vy, int16_t vz,
                         uint8_t fix, uint8_t sat, uint16_t volt, int8_t rem, uint8_t nav, uint8_t arm,
                         uint32_t bootMs = 0, int32_t relAlt = HeartbeatExt::kInvalidInt32,
                         int16_t airspeed = HeartbeatExt::kInvalidInt16, uint8_t airsrc = HeartbeatExt::kAirspeedSourceDisabled,
                         uint8_t vtol = 0, uint8_t land = 0,
                         int16_t curr = HeartbeatExt::kInvalidInt16, int16_t temp = HeartbeatExt::kInvalidInt16,
-                        uint8_t fail = 0)
+                        uint8_t fail = 0,
+                        uint64_t gpsUtcUs = 0, uint32_t health = 0x7FFFFFFFu, uint8_t load = 255,
+                        uint8_t gnssErrors = 0, uint8_t gnssStates = 0,
+                        uint8_t vibXy = 0, uint8_t vibZFlags = 0, uint8_t resv0 = 0)
 {
     QByteArray b(HeartbeatExt::kExtSize, 0);
     const auto putI32 = [&b](int off, int32_t v) {
@@ -189,6 +195,20 @@ QByteArray makeExtBytes(int32_t lat, int32_t lon, int32_t alt, int16_t vx, int16
     putI16(50, curr);
     putI16(52, temp);
     b[54] = static_cast<char>(fail);
+    // 60825.0（offset 55-83）
+    const auto putU64 = [&b](int off, uint64_t v) {
+        for (int i = 0; i < 8; i++) {
+            b[off + i] = static_cast<char>((v >> (8 * i)) & 0xFF);
+        }
+    };
+    putU64(55, gpsUtcUs);
+    putU32(63, health);
+    b[67] = static_cast<char>(load);
+    b[68] = static_cast<char>(gnssErrors);
+    b[69] = static_cast<char>(gnssStates);
+    b[70] = static_cast<char>(vibXy);
+    b[71] = static_cast<char>(vibZFlags);
+    b[72] = static_cast<char>(resv0);
     return b;
 }
 
@@ -219,20 +239,24 @@ QByteArray makeHeartbeatExtFrameFromPayload(const QByteArray& payload)
     return frame;
 }
 
-/// 组装加密心跳标准帧：HEARTBEAT payload(9B) + EXT(55B)，len=64。
+/// 组装加密心跳标准帧：HEARTBEAT payload(9B) + EXT(84B)，payload len=93。
 QByteArray makeExtFrame(int32_t lat, int32_t lon, int32_t alt, int16_t vx, int16_t vy, int16_t vz,
                         uint8_t fix, uint8_t sat, uint16_t volt, int8_t rem, uint8_t nav, uint8_t arm,
                         uint32_t bootMs = 0, int32_t relAlt = HeartbeatExt::kInvalidInt32,
                         int16_t airspeed = HeartbeatExt::kInvalidInt16, uint8_t airsrc = HeartbeatExt::kAirspeedSourceDisabled,
                         uint8_t vtol = 0, uint8_t land = 0,
                         int16_t curr = HeartbeatExt::kInvalidInt16, int16_t temp = HeartbeatExt::kInvalidInt16,
-                        uint8_t fail = 0)
+                        uint8_t fail = 0,
+                        uint64_t gpsUtcUs = 0, uint32_t health = 0x7FFFFFFFu, uint8_t load = 255,
+                        uint8_t gnssErrors = 0, uint8_t gnssStates = 0,
+                        uint8_t vibXy = 0, uint8_t vibZFlags = 0, uint8_t resv0 = 0)
 {
     const QByteArray hbPayload = makeHeartbeatFrame(0x0C, 0x0D).mid(10, 9); // 标准 HEARTBEAT payload
-    // 9B HEARTBEAT + 55B EXT = 64
+    // 9B HEARTBEAT + 84B EXT = 93
     const QByteArray payload = hbPayload
         + makeExtBytes(lat, lon, alt, vx, vy, vz, fix, sat, volt, rem, nav, arm,
-                       bootMs, relAlt, airspeed, airsrc, vtol, land, curr, temp, fail);
+                       bootMs, relAlt, airspeed, airsrc, vtol, land, curr, temp, fail,
+                       gpsUtcUs, health, load, gnssErrors, gnssStates, vibXy, vibZFlags, resv0);
     return makeHeartbeatExtFrameFromPayload(payload);
 }
 
@@ -240,7 +264,7 @@ QByteArray makeExtFrame(int32_t lat, int32_t lon, int32_t alt, int16_t vx, int16
 /// 便捷封装：供往返与注入层测试复用。
 struct ExtRoundTrip {
     QByteArray encFrame;         // 加密帧（不含 CRC 读取用；原始完整）
-    QByteArray decFrame;         // 解密后的标准帧（len=46）
+    QByteArray decFrame;         // 解密后的标准帧（10B 头 + 9B HEARTBEAT + EXT + 2B CRC）
     HeartbeatExt ext;            // 解析出的 EXT
     DeviceID boundDeviceID = 0;
     uint64_t boundCounter = 0;
@@ -1445,22 +1469,25 @@ void CryptoTest::_testHeartbeatExt()
 {
     using namespace MAVLinkCrypto;
 
-    // --- 往返：加密（block=92）→ 解密 → 解析 EXT(55B) ---
+    // --- 往返：加密（block=121）→ 解密 → 解析 EXT(84B) ---
     // （makeExtBytes/makeExtFrame 为文件级辅助，供本方法与注入层测试复用）
     const Key key = testKey();
     const DeviceID deviceID = 66051u; // 0x00010203，PX4 段
     const uint64_t counter = 1000;    // 下行偶数
     const uint8_t crcExtra = heartbeatCrcExtra();
 
-    // 12 个基段参数 + 9 个 60824.0 新增字段参数（bootMs, relAlt, airspeed, airsrc, vtol, land, curr, temp, fail）
+    // 12 个基段参数 + 9 个 60824.0 字段 + 8 个 60825.0 字段
+    // （gpsUtcUs, health, load, gnssErrors, gnssStates, vibXy, vibZFlags, resv0）
     const QByteArray extFrame = makeExtFrame(312345678, 1214567890, 50000, 100, 200, -50, 3, 12, 11100, 85, 6, 1,
-                                             12345, 4321, 5678, 1, 4, 3, -5, 20, 0x03);
+                                             12345, 4321, 5678, 1, 4, 3, -5, 20, 0x03,
+                                             1700000000123456ULL, 0x7FFFFFFFu, 42, 0x03,
+                                             0b10'11'01'00, 0b1'0'101'011, 0b0001'1110, 0xAB);
     uint8_t encBuffer[MAVLINK_MAX_PACKET_LEN + 32];
     int encLen = 0;
     QVERIFY(encryptFrame(reinterpret_cast<const uint8_t*>(extFrame.constData()), extFrame.size(), crcExtra,
                          deviceID, counter, key, encBuffer, &encLen));
-    // block = counter(8) + ciphertext(4+9+55=68) + tag(16) = 92
-    QCOMPARE(encBuffer[1], static_cast<uint8_t>(92));
+    // block = counter(8) + ciphertext(4+9+84=97) + tag(16) = 121
+    QCOMPARE(encBuffer[1], static_cast<uint8_t>(121));
     QCOMPARE(counterFromFrame(encBuffer), counter);
 
     uint8_t plainOut[MAVLINK_MAX_PACKET_LEN];
@@ -1469,7 +1496,7 @@ void CryptoTest::_testHeartbeatExt()
     int plainOutLen = 0;
     QVERIFY(decryptFrame(encBuffer, encLen, crcExtra, key, &boundDev, &boundCounter, plainOut, &plainOutLen));
     QCOMPARE(boundDev, deviceID);
-    QCOMPARE(plainOut[1], static_cast<uint8_t>(64)); // HEARTBEAT(9) + EXT(55)
+    QCOMPARE(plainOut[1], static_cast<uint8_t>(93)); // HEARTBEAT(9) + EXT(84)
     QCOMPARE(plainOutLen, extFrame.size());
 
     HeartbeatExt ext;
@@ -1505,6 +1532,24 @@ void CryptoTest::_testHeartbeatExt()
     QCOMPARE(ext.failsafe, static_cast<uint8_t>(0x03));
     QVERIFY(ext.hasRelativeAltitude());
     QVERIFY(ext.hasCurrent());
+    // 60825.0 新增字段
+    QVERIFY(ext.hasGpsUtc);
+    QVERIFY(ext.hasSystemStatus);
+    QVERIFY(ext.hasReserved);
+    QCOMPARE(ext.gpsUtcUs, static_cast<uint64_t>(1700000000123456ULL));
+    QCOMPARE(ext.sensorsHealth, static_cast<uint32_t>(0x7FFFFFFFu));
+    QCOMPARE(ext.loadPct, static_cast<uint8_t>(42));
+    QCOMPARE(ext.gnssErrors, static_cast<uint8_t>(0x03));
+    QCOMPARE(ext.gnssJam, static_cast<uint8_t>(0));   // 0b00
+    QCOMPARE(ext.gnssSpoof, static_cast<uint8_t>(1)); // 0b01
+    QCOMPARE(ext.gnssAuth, static_cast<uint8_t>(3));  // 0b11
+    QCOMPARE(ext.gnssRaim, static_cast<uint8_t>(2));  // 0b10
+    QCOMPARE(ext.vibX, static_cast<uint8_t>(3));
+    QCOMPARE(ext.vibY, static_cast<uint8_t>(5));
+    QCOMPARE(ext.vibZ, static_cast<uint8_t>(6));
+    QCOMPARE(ext.vibClip, static_cast<uint8_t>(0b110)); // Y + Z（线上 clip_y=1, clip_z=1）
+    QVERIFY(ext.vibValid);
+    QCOMPARE(ext.reserved[0], static_cast<uint8_t>(0xAB));
 
     // --- 哨兵：无效位置/速度/电池须被识别（不得当作 0 坐标 / 0V 真实数据） ---
     const QByteArray sentinelFrame = makeExtFrame(HeartbeatExt::kInvalidInt32, HeartbeatExt::kInvalidInt32,
@@ -1552,7 +1597,7 @@ void CryptoTest::_testHeartbeatExt()
         QByteArray ext37 = makeExtBytes(312345678, 1214567890, 50000, 100, 200, -50, 3, 12, 11100, 85, 6, 1);
         ext37.resize(HeartbeatExt::kExtBaseSize); // 截断到 37B（模拟旧 PX4 发送）
         const QByteArray hbPayload = makeHeartbeatFrame(0x0C, 0x0D).mid(10, 9);
-        const QByteArray frame37 = makeHeartbeatExtFrameFromPayload(hbPayload + ext37); // len=46
+        const QByteArray frame37 = makeHeartbeatExtFrameFromPayload(hbPayload + ext37); // payload=46（9+37）
 
         uint8_t enc37[MAVLINK_MAX_PACKET_LEN + 32];
         int enc37Len = 0;
@@ -1575,6 +1620,67 @@ void CryptoTest::_testHeartbeatExt()
         QVERIFY(!ext37out.hasRelativeAltitude());
         QVERIFY(!ext37out.hasCurrent());
         QVERIFY(!ext37out.hasExtendedFields); // 37B 兼容帧无扩展段
+    }
+
+    // --- 兼容：55B EXT（60824.0）→ 60825 段缺失；hasExtendedFields 仍为 true，
+    //     但 hasSystemStatus/hasReserved 为 false（不得越界读、不得伪造 system_status） ---
+    {
+        const QByteArray ext55 = makeExtBytes(312345678, 1214567890, 50000, 100, 200, -50, 3, 12, 11100, 85, 6, 1,
+                                              12345, 4321, 5678, 1, 4, 3, -5, 20, 0x03)
+                                     .left(HeartbeatExt::kExt60824Size);
+        HeartbeatExt e55;
+        QVERIFY(parseHeartbeatExt(reinterpret_cast<const uint8_t*>(ext55.constData()), ext55.size(), &e55));
+        QVERIFY(e55.hasExtendedFields);
+        QVERIFY(!e55.hasGpsUtc);
+        QVERIFY(!e55.hasSystemStatus);
+        QVERIFY(!e55.hasReserved);
+        QCOMPARE(e55.timeBootMs, static_cast<uint32_t>(12345));
+        QCOMPARE(e55.vtolState, static_cast<uint8_t>(4));
+        QCOMPARE(e55.loadPct, static_cast<uint8_t>(255));       // 缺段保持默认「未知」
+        QCOMPARE(e55.sensorsHealth, static_cast<uint32_t>(0));  // 缺段 = 未提供，不是「全故障」
+        QVERIFY(!e55.vibValid);
+    }
+
+    // --- 分段边界：62/63/72/83/84B 各一格 ---
+    // 只测 55/71/84 会放过 off-by-one：`>=63` 写成 `>=62` 会在 62B 帧读 ext[62]；
+    // `>=84` 写成 `>=83` 会在 83B 帧 memcpy 越界；`>=72` 写成 `>=73..83` 会让系统状态段整段丢失。
+    {
+        const QByteArray full = makeExtBytes(312345678, 1214567890, 50000, 100, 200, -50, 3, 12, 11100, 85, 6, 1,
+                                              12345, 4321, 5678, 1, 4, 3, -5, 20, 0x03,
+                                              1700000000123456ULL, 0x5A5A5A5Au, 42, 0x0A,
+                                              0b00'01'10'11, 0b0'0'110'101, 0b0001'1'111, 0xAB);
+        struct BoundaryCase {
+            int len;
+            bool gpsUtc;
+            bool systemStatus;
+            bool reserved;
+        };
+        const BoundaryCase cases[] = {
+            {62, false, false, false},
+            {63, true, false, false},
+            {72, true, true, false},
+            {83, true, true, false},
+            {84, true, true, true},
+        };
+        for (const BoundaryCase& c : cases) {
+            const QByteArray e = full.left(c.len);
+            HeartbeatExt parsed;
+            QVERIFY2(parseHeartbeatExt(reinterpret_cast<const uint8_t*>(e.constData()), e.size(), &parsed),
+                     qPrintable(QStringLiteral("parse len=%1").arg(c.len)));
+            QVERIFY2(parsed.hasGpsUtc == c.gpsUtc, qPrintable(QStringLiteral("hasGpsUtc len=%1").arg(c.len)));
+            QVERIFY2(parsed.hasSystemStatus == c.systemStatus,
+                     qPrintable(QStringLiteral("hasSystemStatus len=%1").arg(c.len)));
+            QVERIFY2(parsed.hasReserved == c.reserved, qPrintable(QStringLiteral("hasReserved len=%1").arg(c.len)));
+        }
+        // 72B 恰含系统状态段：值也要对（不是只把 flag 翻开）
+        HeartbeatExt sys72;
+        const QByteArray e72 = full.left(72);
+        QVERIFY(parseHeartbeatExt(reinterpret_cast<const uint8_t*>(e72.constData()), e72.size(), &sys72));
+        QCOMPARE(sys72.sensorsHealth, static_cast<uint32_t>(0x5A5A5A5Au));
+        QCOMPARE(sys72.loadPct, static_cast<uint8_t>(42));
+        QCOMPARE(sys72.gnssErrors, static_cast<uint8_t>(0x0A));
+        QCOMPARE(sys72.vibX, static_cast<uint8_t>(5));
+        QCOMPARE(sys72.vibValid, true);
     }
 
     // --- 明文待命心跳（payload=9B）→ 不解析 EXT ---
@@ -1613,6 +1719,24 @@ void CryptoTest::_testHeartbeatExt()
         logExt.current = -5;
         logExt.temperature = 20;
         logExt.failsafe = 0x03;
+        // 60825.0 段
+        logExt.hasGpsUtc = true;
+        logExt.gpsUtcUs = 1700000000123456ULL;
+        logExt.hasSystemStatus = true;
+        logExt.sensorsHealth = 0xDEADBEEFu; // 8 位十六进制全宽显示（含高位非 0）
+        logExt.loadPct = 42;
+        logExt.gnssErrors = 0x05;
+        logExt.gnssJam = 3;
+        logExt.gnssSpoof = 2;
+        logExt.gnssAuth = 1;
+        logExt.gnssRaim = 0;
+        logExt.vibX = 1;
+        logExt.vibY = 7;
+        logExt.vibZ = 5;
+        logExt.vibClip = 2;
+        logExt.vibValid = true;
+        logExt.hasReserved = true;
+        logExt.reserved[0] = 0xAB;
         const QString text = CryptoLinkLogger::heartbeatExtToText(logExt);
         QVERIFY2(text.contains(QStringLiteral("lat=31.2345678")) && text.contains(QStringLiteral("alt=50.0m")) &&
                      text.contains(QStringLiteral("batt=11100mV/85%")) && text.contains(QStringLiteral("nav=6")) &&
@@ -1620,7 +1744,12 @@ void CryptoTest::_testHeartbeatExt()
                      text.contains(QStringLiteral("boot=12345")) && text.contains(QStringLiteral("relalt=4.3m")) &&
                      text.contains(QStringLiteral("air=5678")) && text.contains(QStringLiteral("airsrc=1")) &&
                      text.contains(QStringLiteral("vtol=4,land=3")) && text.contains(QStringLiteral("curr=-5")) &&
-                     text.contains(QStringLiteral("temp=20")) && text.contains(QStringLiteral("fail=3")),
+                     text.contains(QStringLiteral("temp=20")) && text.contains(QStringLiteral("fail=3")) &&
+                     text.contains(QStringLiteral("utc=1700000000123456")) &&
+                     text.contains(QStringLiteral("health=0xdeadbeef")) && text.contains(QStringLiteral("load=42")) &&
+                     text.contains(QStringLiteral("gnsserr=0x05")) && text.contains(QStringLiteral("gnss=3/2/1/0")) &&
+                     text.contains(QStringLiteral("vib=1/7/5,clip=2,vibvalid=1")) &&
+                     text.contains(QStringLiteral("resv0=171")),
                  qPrintable(QStringLiteral("EXT 日志文本异常: %1").arg(text)));
         // 哨兵 → NA / DIS
         const QString invalidText = CryptoLinkLogger::heartbeatExtToText(HeartbeatExt{});
@@ -1630,6 +1759,16 @@ void CryptoTest::_testHeartbeatExt()
                      invalidText.contains(QStringLiteral("airsrc=DIS")) && invalidText.contains(QStringLiteral("curr=NA")) &&
                      invalidText.contains(QStringLiteral("temp=NA")),
                  qPrintable(QStringLiteral("EXT 哨兵日志文本异常: %1").arg(invalidText)));
+        // 60825.0 段缺失（<63 / <72 / <84）⇒ 整段不出现，不得打印成 utc=0/health=00000000/resv0=0
+        QVERIFY2(!invalidText.contains(QStringLiteral(",utc=")) && !invalidText.contains(QStringLiteral(",health=")) &&
+                     !invalidText.contains(QStringLiteral(",load=")) && !invalidText.contains(QStringLiteral(",gnss=")) &&
+                     !invalidText.contains(QStringLiteral(",vib=")) && !invalidText.contains(QStringLiteral(",resv0=")),
+                 qPrintable(QStringLiteral("缺段却打印了 60825 字段: %1").arg(invalidText)));
+        // hasGpsUtc + gpsUtcUs==0（有该段但时间不可用）⇒ 显示 NA，而不是 0
+        HeartbeatExt utcZero;
+        utcZero.hasGpsUtc = true;
+        const QString utcZeroText = CryptoLinkLogger::heartbeatExtToText(utcZero);
+        QVERIFY2(utcZeroText.contains(QStringLiteral("utc=NA")), qPrintable(utcZeroText));
     }
 
     // --- 日志文件写入（仅联调宏 QGC_CRYPTO_LINK_LOG 启用时；默认关则跳过） ---
@@ -1658,22 +1797,27 @@ void CryptoTest::_testHeartbeatExtInjection()
     const DeviceID deviceID = 66051u; // 0x00010203 → sys=0x02, comp=0x03
     const uint64_t counter = 1000;
 
-    // --- 有效 EXT(55B) → 6 条遥测：GLOBAL_POSITION_INT / ATTITUDE / GPS_RAW_INT / BATTERY_STATUS
-    //     / VFR_HUD / EXTENDED_SYS_STATE ---
+    // --- 有效 EXT(84B) → 9 条遥测：GLOBAL_POSITION_INT / ATTITUDE / GPS_RAW_INT / BATTERY_STATUS
+    //     / VFR_HUD / EXTENDED_SYS_STATE / SYS_STATUS / GNSS_INTEGRITY / VIBRATION ---
     const ExtRoundTrip good = roundTripExt(
         makeExtFrame(312345678, 1214567890, 50000, 100, 200, -50, 3, 12, 11100, 85, 6, 1,
-                     12345, 4321, 5678, 1, 4, 3, -5, 20, 0x03),
+                     12345, 4321, 5678, 1, 4, 3, -5, 20, 0x03,
+                     1700000000123456ULL, 0x5A5A5A5Au, 42, 0x03,
+                     0b10'11'01'00, 0b1'0'101'011, 0b0001'1110, 0xAB),
         key, deviceID, counter);
     QVERIFY(!good.decFrame.isEmpty());
     const QList<mavlink_message_t> goodMsgs = buildHeartbeatExtTelemetry(
         reinterpret_cast<const uint8_t*>(good.decFrame.constData()), good.ext);
-    QCOMPARE(goodMsgs.size(), 6);
+    QCOMPARE(goodMsgs.size(), 9);
     QCOMPARE(goodMsgs[0].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_GLOBAL_POSITION_INT));
     QCOMPARE(goodMsgs[1].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_ATTITUDE));
     QCOMPARE(goodMsgs[2].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_GPS_RAW_INT));
     QCOMPARE(goodMsgs[3].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_BATTERY_STATUS));
     QCOMPARE(goodMsgs[4].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_VFR_HUD));
     QCOMPARE(goodMsgs[5].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_EXTENDED_SYS_STATE));
+    QCOMPARE(goodMsgs[6].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_SYS_STATUS));
+    QCOMPARE(goodMsgs[7].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_GNSS_INTEGRITY));
+    QCOMPARE(goodMsgs[8].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_VIBRATION));
     // sysid 从解密帧头还原（deviceID 拆分）；compid 归一化（P0-1）。
     // 合成遥测必须与同一帧喂给标准解析器的那份（_feedStandardFrame）**同源**，
     // 否则同一个物理帧在两条消费路径上会带着两个不同的 compid。
@@ -1722,6 +1866,51 @@ void CryptoTest::_testHeartbeatExtInjection()
     QCOMPARE(ess.vtol_state, static_cast<uint8_t>(4));   // 与 MAV_VTOL_STATE_FW 1:1（PX4 保证）
     QCOMPARE(ess.landed_state, static_cast<uint8_t>(MAV_LANDED_STATE_ON_GROUND)); // landed 位掩码 bit0=1
 
+    // SYS_STATUS（60825，≥72B）：present/enabled 全 1；health 原样透传（PX4 已补未映射位）；
+    // load 是 d‰（EXT 42% → 420）。
+    mavlink_sys_status_t sys;
+    mavlink_msg_sys_status_decode(&goodMsgs[6], &sys);
+    // health 刻意取与 present/enabled **不同**的值：三者同为 0x7FFFFFFF 时，
+    // 把 health 实参错接到 present（或反之）本用例仍会全绿。
+    QCOMPARE(sys.onboard_control_sensors_present, static_cast<uint32_t>(0x7FFFFFFFu));
+    QCOMPARE(sys.onboard_control_sensors_enabled, static_cast<uint32_t>(0x7FFFFFFFu));
+    QCOMPARE(sys.onboard_control_sensors_health, static_cast<uint32_t>(0x5A5A5A5Au));
+    QCOMPARE(sys.load, static_cast<uint16_t>(420));
+    QCOMPARE(sys.voltage_battery, static_cast<uint16_t>(UINT16_MAX));
+    QCOMPARE(sys.current_battery, static_cast<int16_t>(-1));
+    QCOMPARE(sys.battery_remaining, static_cast<int8_t>(-1));
+    // extended 三参必须是 0：置任意位会打开「extended 已使用」语义，而 EXT 不搬运 extended 位
+    QCOMPARE(sys.onboard_control_sensors_present_extended, static_cast<uint32_t>(0));
+    QCOMPARE(sys.onboard_control_sensors_enabled_extended, static_cast<uint32_t>(0));
+    QCOMPARE(sys.onboard_control_sensors_health_extended, static_cast<uint32_t>(0));
+
+    // GNSS_INTEGRITY：id 是 GPS 实例号 0（不是 device_id），四个 quality/hfom/vfom 填哨兵。
+    mavlink_gnss_integrity_t gni;
+    mavlink_msg_gnss_integrity_decode(&goodMsgs[7], &gni);
+    QCOMPARE(gni.id, static_cast<uint8_t>(0));
+    QCOMPARE(gni.system_errors, static_cast<uint32_t>(0x03));
+    QCOMPARE(gni.jamming_state, static_cast<uint8_t>(0));
+    QCOMPARE(gni.spoofing_state, static_cast<uint8_t>(1));
+    QCOMPARE(gni.authentication_state, static_cast<uint8_t>(3));
+    QCOMPARE(gni.raim_state, static_cast<uint8_t>(2));
+    QCOMPARE(gni.raim_hfom, static_cast<uint16_t>(UINT16_MAX));
+    QCOMPARE(gni.raim_vfom, static_cast<uint16_t>(UINT16_MAX));
+    QCOMPARE(gni.corrections_quality, static_cast<uint8_t>(255));
+    QCOMPARE(gni.system_status_summary, static_cast<uint8_t>(255));
+    QCOMPARE(gni.gnss_signal_quality, static_cast<uint8_t>(255));
+    QCOMPARE(gni.post_processing_quality, static_cast<uint8_t>(255));
+
+    // VIBRATION：档位 → 中位（3→25、5→52.5、6→80）；clipping 一律 0（轴语义无法对应）。
+    mavlink_vibration_t vib;
+    mavlink_msg_vibration_decode(&goodMsgs[8], &vib);
+    QCOMPARE(vib.time_usec, static_cast<uint64_t>(12345) * 1000ULL);
+    QCOMPARE(vib.vibration_x, 25.0f);
+    QCOMPARE(vib.vibration_y, 52.5f);
+    QCOMPARE(vib.vibration_z, 80.0f);
+    QCOMPARE(vib.clipping_0, static_cast<uint32_t>(0));
+    QCOMPARE(vib.clipping_1, static_cast<uint32_t>(0));
+    QCOMPARE(vib.clipping_2, static_cast<uint32_t>(0));
+
     // --- 位置全哨兵 → GLOBAL/GPS 跳过、无电池数据跳过；但 ATTITUDE 恒发，
     //     VFR_HUD 与 EXTENDED_SYS_STATE 也恒发（两者都不依赖位置） ---
     const ExtRoundTrip sentinelRt = roundTripExt(
@@ -1732,10 +1921,13 @@ void CryptoTest::_testHeartbeatExtInjection()
     QVERIFY(!sentinelRt.decFrame.isEmpty());
     const QList<mavlink_message_t> sentinelMsgs = buildHeartbeatExtTelemetry(
         reinterpret_cast<const uint8_t*>(sentinelRt.decFrame.constData()), sentinelRt.ext);
-    QCOMPARE(sentinelMsgs.size(), 3);
+    QCOMPARE(sentinelMsgs.size(), 6);
     QCOMPARE(sentinelMsgs[0].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_ATTITUDE));
     QCOMPARE(sentinelMsgs[1].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_VFR_HUD));
     QCOMPARE(sentinelMsgs[2].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_EXTENDED_SYS_STATE));
+    QCOMPARE(sentinelMsgs[3].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_SYS_STATUS));
+    QCOMPARE(sentinelMsgs[4].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_GNSS_INTEGRITY));
+    QCOMPARE(sentinelMsgs[5].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_VIBRATION));
 
     // --- lat/lon 有效但 alt 哨兵 → GLOBAL/GPS 跳过（避免 0m 假高度），仅 ATTITUDE + BATTERY ---
     const ExtRoundTrip noAltRt = roundTripExt(
@@ -1744,11 +1936,14 @@ void CryptoTest::_testHeartbeatExtInjection()
     QVERIFY(!noAltRt.decFrame.isEmpty());
     const QList<mavlink_message_t> noAltMsgs = buildHeartbeatExtTelemetry(
         reinterpret_cast<const uint8_t*>(noAltRt.decFrame.constData()), noAltRt.ext);
-    QCOMPARE(noAltMsgs.size(), 4);
+    QCOMPARE(noAltMsgs.size(), 7);
     QCOMPARE(noAltMsgs[0].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_ATTITUDE));
     QCOMPARE(noAltMsgs[1].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_BATTERY_STATUS));
     QCOMPARE(noAltMsgs[2].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_VFR_HUD));
     QCOMPARE(noAltMsgs[3].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_EXTENDED_SYS_STATE));
+    QCOMPARE(noAltMsgs[4].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_SYS_STATUS));
+    QCOMPARE(noAltMsgs[5].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_GNSS_INTEGRITY));
+    QCOMPARE(noAltMsgs[6].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_VIBRATION));
 
     // --- 电池第三分支：voltage=0（未知）但 remaining=50 → 打包 BATTERY，voltages[0]=UINT16_MAX（NaN） ---
     // 位置设哨兵以聚焦电池映射（仅 ATTITUDE + BATTERY 两条）。
@@ -1760,15 +1955,22 @@ void CryptoTest::_testHeartbeatExtInjection()
     QVERIFY(!battOnlyRt.decFrame.isEmpty());
     const QList<mavlink_message_t> battOnlyMsgs = buildHeartbeatExtTelemetry(
         reinterpret_cast<const uint8_t*>(battOnlyRt.decFrame.constData()), battOnlyRt.ext);
-    QCOMPARE(battOnlyMsgs.size(), 4);
+    QCOMPARE(battOnlyMsgs.size(), 7);
     QCOMPARE(battOnlyMsgs[0].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_ATTITUDE));
     QCOMPARE(battOnlyMsgs[1].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_BATTERY_STATUS));
     QCOMPARE(battOnlyMsgs[2].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_VFR_HUD));
     QCOMPARE(battOnlyMsgs[3].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_EXTENDED_SYS_STATE));
+    QCOMPARE(battOnlyMsgs[4].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_SYS_STATUS));
+    QCOMPARE(battOnlyMsgs[5].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_GNSS_INTEGRITY));
+    QCOMPARE(battOnlyMsgs[6].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_VIBRATION));
     mavlink_battery_status_t battOnly;
     mavlink_msg_battery_status_decode(&battOnlyMsgs[1], &battOnly);
     QCOMPARE(battOnly.voltages[0], static_cast<uint16_t>(UINT16_MAX)); // 未知电压 → NaN
     QCOMPARE(battOnly.battery_remaining, static_cast<int8_t>(50));
+    // load=255（本帧用默认值）→ SYS_STATUS.load=0；直接乘 10 会得到 2550，断言红
+    mavlink_sys_status_t sysLoadUnknown;
+    mavlink_msg_sys_status_decode(&battOnlyMsgs[4], &sysLoadUnknown);
+    QCOMPARE(sysLoadUnknown.load, static_cast<uint16_t>(0));
 
     // --- 电流/温度有效但电压未知（voltage=0, remaining=-1）→ BATTERY 仍打包（门控含 hasCurrent/hasTemperature），
     // 电流/温度按 cA/cdegC 注入，电压保持 NaN ---
@@ -1785,15 +1987,67 @@ void CryptoTest::_testHeartbeatExtInjection()
     QVERIFY(currTempRt.ext.hasTemperature());
     const QList<mavlink_message_t> currTempMsgs = buildHeartbeatExtTelemetry(
         reinterpret_cast<const uint8_t*>(currTempRt.decFrame.constData()), currTempRt.ext);
-    QCOMPARE(currTempMsgs.size(), 4);  // ATTITUDE + BATTERY（门控含 current/temp，BATTERY 不丢）+ VFR_HUD + EXT_SYS_STATE
+    QCOMPARE(currTempMsgs.size(), 7);  // ATTITUDE + BATTERY（门控含 current/temp，BATTERY 不丢）+ VFR_HUD + EXT_SYS_STATE + 3 条 60825
     QCOMPARE(currTempMsgs[1].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_BATTERY_STATUS));
     QCOMPARE(currTempMsgs[2].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_VFR_HUD));
     QCOMPARE(currTempMsgs[3].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_EXTENDED_SYS_STATE));
+    QCOMPARE(currTempMsgs[4].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_SYS_STATUS));
+    QCOMPARE(currTempMsgs[5].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_GNSS_INTEGRITY));
+    QCOMPARE(currTempMsgs[6].msgid, static_cast<uint32_t>(MAVLINK_MSG_ID_VIBRATION));
     mavlink_battery_status_t ctBatt;
     mavlink_msg_battery_status_decode(&currTempMsgs[1], &ctBatt);
     QCOMPARE(ctBatt.voltages[0], static_cast<uint16_t>(UINT16_MAX)); // 电压未知 → NaN
     QCOMPARE(ctBatt.current_battery, static_cast<int16_t>(350));     // 35 0.1A × 10 = 350 cA
     QCOMPARE(ctBatt.temperature, static_cast<int16_t>(2550));        // 255 0.1°C × 10 = 2550 cdegC
+
+    // --- 兼容：55B 帧（60824.0）→ 不产生 60825 的三条伪报文 ---
+    // ≥72B 是系统状态段「已提供」的唯一判据；55B 帧若也注入，会把「未提供」的
+    // health=0 显示成「全部传感器故障」。
+    {
+        const QByteArray hbPayload = makeHeartbeatFrame(0x0C, 0x0D).mid(10, 9);
+        const QByteArray ext55 = makeExtBytes(312345678, 1214567890, 50000, 100, 200, -50, 3, 12, 11100, 85, 6, 1,
+                                              12345, 4321, 5678, 1, 4, 3, -5, 20, 0x03)
+                                     .left(HeartbeatExt::kExt60824Size);
+        const QByteArray frame55 = makeHeartbeatExtFrameFromPayload(hbPayload + ext55);
+        const ExtRoundTrip rt55 = roundTripExt(frame55, key, deviceID, counter + 10);
+        QVERIFY(!rt55.decFrame.isEmpty());
+        QVERIFY(rt55.ext.hasExtendedFields);
+        QVERIFY(!rt55.ext.hasSystemStatus);
+        const QList<mavlink_message_t> msgs55 = buildHeartbeatExtTelemetry(
+            reinterpret_cast<const uint8_t*>(rt55.decFrame.constData()), rt55.ext);
+        QCOMPARE(msgs55.size(), 6); // 6 条基础遥测，无 SYS_STATUS/GNSS_INTEGRITY/VIBRATION
+        for (const mavlink_message_t& m : msgs55) {
+            QVERIFY(m.msgid != static_cast<uint32_t>(MAVLINK_MSG_ID_SYS_STATUS));
+            QVERIFY(m.msgid != static_cast<uint32_t>(MAVLINK_MSG_ID_GNSS_INTEGRITY));
+            QVERIFY(m.msgid != static_cast<uint32_t>(MAVLINK_MSG_ID_VIBRATION));
+        }
+    }
+
+    // --- 中间档 71B（有 gps_utc，系统状态段未齐）：hasGpsUtc=true、hasSystemStatus=false ---
+    // 两段的门控不同（63 vs 72），只测 55/84 两端会让「用同一个长度判两段」的错误全绿。
+    {
+        const QByteArray hbPayload = makeHeartbeatFrame(0x0C, 0x0D).mid(10, 9);
+        const QByteArray ext71 = makeExtBytes(312345678, 1214567890, 50000, 100, 200, -50, 3, 12, 11100, 85, 6, 1,
+                                              12345, 4321, 5678, 1, 4, 3, -5, 20, 0x03,
+                                              1700000000123456ULL)
+                                    .left(71); // 截掉系统状态段末字节（vib_z_flags）
+        const QByteArray frame71 = makeHeartbeatExtFrameFromPayload(hbPayload + ext71);
+        const ExtRoundTrip rt71 = roundTripExt(frame71, key, deviceID, counter + 12);
+        QVERIFY(!rt71.decFrame.isEmpty());
+        QVERIFY(rt71.ext.hasExtendedFields);
+        QVERIFY(rt71.ext.hasGpsUtc);
+        QCOMPARE(rt71.ext.gpsUtcUs, static_cast<uint64_t>(1700000000123456ULL));
+        QVERIFY(!rt71.ext.hasSystemStatus);
+        QVERIFY(!rt71.ext.hasReserved);
+        const QList<mavlink_message_t> msgs71 = buildHeartbeatExtTelemetry(
+            reinterpret_cast<const uint8_t*>(rt71.decFrame.constData()), rt71.ext);
+        QCOMPARE(msgs71.size(), 6); // 系统状态段缺 ⇒ 仍是 6 条
+        for (const mavlink_message_t& m : msgs71) {
+            QVERIFY(m.msgid != static_cast<uint32_t>(MAVLINK_MSG_ID_SYS_STATUS));
+            QVERIFY(m.msgid != static_cast<uint32_t>(MAVLINK_MSG_ID_GNSS_INTEGRITY));
+            QVERIFY(m.msgid != static_cast<uint32_t>(MAVLINK_MSG_ID_VIBRATION));
+        }
+    }
 
     // --- hasBattery 谓词三分支（直接构造结构体） ---
     {

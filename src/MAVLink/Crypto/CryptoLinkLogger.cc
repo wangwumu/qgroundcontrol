@@ -377,6 +377,22 @@ QString CryptoLinkLogger::heartbeatExtToText(const HeartbeatExt& ext)
     s += QStringLiteral(",curr=%1").arg(ext.current == HeartbeatExt::kInvalidInt16 ? QStringLiteral("NA") : QString::number(ext.current));
     s += QStringLiteral(",temp=%1").arg(ext.temperature == HeartbeatExt::kInvalidInt16 ? QStringLiteral("NA") : QString::number(ext.temperature));
     s += QStringLiteral(",fail=%1").arg(ext.hasExtendedFields ? QString::number(ext.failsafe) : QStringLiteral("NA"));
+    // 60825.0（offset 55-83）：按长度分段显示——旧帧没有的段显示为不出现（而非 0）
+    if (ext.hasGpsUtc) {
+        // 0 = 未定位/未同步，与「字段缺失」不同
+        s += QStringLiteral(",utc=%1").arg(ext.gpsUtcUs == 0 ? QStringLiteral("NA") : QString::number(ext.gpsUtcUs));
+    }
+    if (ext.hasSystemStatus) {
+        s += QStringLiteral(",health=0x%1").arg(ext.sensorsHealth, 8, 16, QLatin1Char('0'));
+        s += QStringLiteral(",load=%1").arg(ext.loadPct == 255 ? QStringLiteral("NA") : QString::number(ext.loadPct));
+        s += QStringLiteral(",gnsserr=0x%1").arg(ext.gnssErrors, 2, 16, QLatin1Char('0'));
+        s += QStringLiteral(",gnss=%1/%2/%3/%4").arg(ext.gnssJam).arg(ext.gnssSpoof).arg(ext.gnssAuth).arg(ext.gnssRaim);
+        s += QStringLiteral(",vib=%1/%2/%3,clip=%4,vibvalid=%5").arg(ext.vibX).arg(ext.vibY).arg(ext.vibZ)
+                 .arg(ext.vibClip).arg(ext.vibValid ? 1 : 0);
+    }
+    if (ext.hasReserved) {
+        s += QStringLiteral(",resv0=%1").arg(ext.reserved[0]);
+    }
     return s;
 }
 
