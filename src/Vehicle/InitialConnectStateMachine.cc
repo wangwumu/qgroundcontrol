@@ -99,6 +99,11 @@ void InitialConnectStateMachine::_createStates()
         QStringLiteral("RequestParameters"),
         this,
         [this]() {
+            // 部署级开关优先于"飞行中"判据：它是明确的配置意图，不是自适应行为。
+            if (_skipInitialDownloads()) {
+                _lastSkipReason = QStringLiteral("(skip initial downloads enabled)");
+                return true;
+            }
             if (_shouldSkipForFlying()) {
                 // PX4 can try a lightweight hash-check cache load
                 if (vehicle()->px4Firmware()) {
@@ -285,6 +290,11 @@ bool InitialConnectStateMachine::_shouldSkipAutopilotVersionRequest() const
     return false;
 }
 
+bool InitialConnectStateMachine::_skipInitialDownloads() const
+{
+    return SettingsManager::instance()->mavlinkSettings()->skipInitialDownloads()->rawValue().toBool();
+}
+
 bool InitialConnectStateMachine::_shouldSkipForFlying() const
 {
     if (!SettingsManager::instance()->mavlinkSettings()->noInitialDownloadWhenFlying()->rawValue().toBool()) {
@@ -313,6 +323,12 @@ bool InitialConnectStateMachine::_hasPrimaryLink() const
 
 bool InitialConnectStateMachine::_shouldSkipForPlanLoad()
 {
+    // 部署级开关：任务/围栏/集结点三者一起跳过。本系统的航线由 OpsRouteSync 独立下发，
+    // 机上 plan 不参与业务，故这三步的上行请求没有意义。
+    if (_skipInitialDownloads()) {
+        _lastSkipReason = QStringLiteral("(skip initial downloads enabled)");
+        return true;
+    }
     if (_shouldSkipForFlying()) {
         _lastSkipReason = QStringLiteral("(vehicle is flying)");
         return true;

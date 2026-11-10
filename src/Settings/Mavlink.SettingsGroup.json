@@ -91,6 +91,15 @@
             "default": false,
             "label": "Skip param/plan download if flying on connect",
             "keywords": "initial download"
+        },
+        {
+            "name": "skipInitialDownloads",
+            "shortDesc": "Never download parameters, mission, geofence or rally points when connecting.",
+            "longDesc": "When enabled, the initial connect sequence still requests the autopilot version, standard modes and component information, but skips the parameter, mission, geofence and rally point downloads entirely. Use this for deployments where the flight plan is delivered by an external controller and the QGC parameter/plan pages are not used.",
+            "type": "bool",
+            "default": false,
+            "label": "Skip parameter/plan download on connect",
+            "keywords": "initial download,parameters,mission,geofence,rally"
         }
     ]
 }

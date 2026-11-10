@@ -57,6 +57,7 @@ private:
     bool _hasPrimaryLink() const;
     bool _shouldSkipForPlanLoad();
     bool _shouldSkipForNoResponsibleParty() const;
+    bool _skipInitialDownloads() const;
 
     QString _lastSkipReason;
 
