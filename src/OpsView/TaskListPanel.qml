@@ -214,8 +214,9 @@ ColumnLayout {
     //    `DIVERT`（备降）/ `EMERGENCY_LANDING`（迫降）。接线时由视图侧决定每个动作走哪条链路。
     // 2026-11-07：`RESUME` 已接线（`POST /tasks/:id/resume` → 切 `AUTO_MISSION`，见
     // `RomView._onEmergencyAction`）；2026-11-08：`EMERGENCY_LANDING` 已接线（确认框 →
-    // `POST /tasks/:id/disposition` → 写库成功后下发就地降落）。剩 `DIVERT` 仍是 UI 壳，
-    // 视图收到后明确告诉用户"尚未接入"。
+    // `POST /tasks/:id/disposition` → 写库成功后下发就地降落）；2026-11-09：`DIVERT` 已接线
+    // （`RomView._onEmergencyAction` → `OpsDivertFlow`：查候选 → 选点 → 确认 → `POST /divert`
+    // → 上传备降航线）。四项动作现在都有出口，本文件仍只负责抛出动作名。
     // 置灰判据由视图经 `resumeAvailable` 注入——本文件不知道"异常状态"是什么。
     signal emergencyActionRequested(var task, string action)
 
@@ -1434,10 +1435,11 @@ ColumnLayout {
                             // （同一条 `card._monitorHandoverVisible`），位置由上面的 spacer 推到本行右缘。
                             // ‼️ 本文件只发 `emergencyActionRequested`，不发任何数据库请求、不下发任何
                             //    MAVLink 指令。`RESUME` 的"写库 → 切 AUTO_MISSION"、`RETURN` 的
-                            //    选点流程、`EMERGENCY_LANDING` 的"写库 → 就地降落"都在 `RomView` /
-                            //    `OpsReturnFlow` 里。唯一仍未接入的是 `DIVERT`，视图侧明确告诉用户
-                            //    "尚未接入"——这一点是必需的：点了没反应的按钮在应急处置里会被
-                            //    误读成"指令已下发"。
+                            //    选点流程、`DIVERT` 的"选点 → 写库 → 上传备降航线"、
+                            //    `EMERGENCY_LANDING` 的"写库 → 就地降落"都在 `RomView` /
+                            //    `OpsReturnFlow` / `OpsDivertFlow` 里。四项动作均已接线；
+                            //    视图侧的出口缺失会让按钮点了没反应，在应急处置里会被误读成
+                            //    "指令已下发"——所以任何新增动作都必须同时给出视图侧出口。
                             visible: card._monitorHandoverVisible
                             readonly property real baseWidth: Math.round(contentItem.implicitWidth + Math.round(24 * ScreenTools.uiTextScaleFactor))
                             readonly property real preferredWidth: Math.round(baseWidth * 1.5)

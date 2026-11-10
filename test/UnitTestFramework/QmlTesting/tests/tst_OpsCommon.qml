@@ -3936,4 +3936,130 @@ TestCase {
         verify(OpsCommon.confirmButtonKind(undefined) === "danger", "undefined ⇒ danger")
         verify(OpsCommon.confirmButtonKind(null) === "danger", "null ⇒ danger")
     }
+
+    //-------------------------------------------------------------------------
+    // 备降选点（2026-11-09）
+    //-------------------------------------------------------------------------
+    // ‼️ `flown` / `departed` 走参数而不是「拿到响应后再改字段」：QML 里
+    //    `resp.own_route.flown_distance_m = 3000` 对**嵌套** JS 对象的赋值不生效
+    //    （顶层 `resp.departed = true` 生效，实测 2026-11-09）。夹具直接构造目标形状，
+    //    免得用例在"改没改成功"上有一层看不见的依赖。
+    function _divertResp(opts) {
+        opts = opts || {}
+        return {
+            departed: opts.departed === true,
+            landing_alt_agl_m: 20,
+            own_route: {
+                flown_distance_m: opts.flown === undefined ? 1500 : opts.flown,
+                waypoints: [
+                    { waypoint_id: 1, kind: "start", seq: 0, command: 16,
+                      name: "W1", lat: 39.900, lon: 116.4, altitude: 50,
+                      cum_distance_m: 0, flown: true },
+                    { waypoint_id: 2, kind: "mid", seq: 1, command: 16,
+                      name: "W2", lat: 39.910, lon: 116.4, altitude: 50,
+                      cum_distance_m: 1112, flown: true },
+                    { waypoint_id: 3, kind: "mid", seq: 2, command: 16,
+                      name: "W3", lat: 39.920, lon: 116.4, altitude: 50,
+                      cum_distance_m: 2224, flown: false },
+                    { waypoint_id: 4, kind: "end", seq: 3, command: 16,
+                      name: "W4", lat: 39.930, lon: 116.4, altitude: 50,
+                      cum_distance_m: 3336, flown: false }
+                ]
+            },
+            candidates: [
+                { seq: 0, site_id: 9, waypoint_id: 3,
+                  own_route_seq: opts.targetOwnSeq === undefined ? 2 : opts.targetOwnSeq,
+                  waypoint_name: "W3", command: 16, lat: 39.920, lon: 116.4,
+                  altitude: 50, distance_m: 700,
+                  category: "OWN_ROUTE", category_zh: "本航线",
+                  site_ground_msl_m: 50, site_clear_alt_agl_m: 30,
+                  receivable: true },
+                { seq: 1, site_id: 10, waypoint_id: 7, own_route_seq: -1,
+                  waypoint_name: "W7", command: 16, lat: 39.95, lon: 116.5,
+                  altitude: 60, distance_m: 1200,
+                  category: "ROSTER_ROUTE", category_zh: "名册航线",
+                  site_ground_msl_m: 60, site_clear_alt_agl_m: 25,
+                  receivable: false }
+            ]
+        }
+    }
+
+    function test_divertCategoryColor_mapsThreeCategories() {
+        compare(OpsCommon.divertCategoryColor("OWN_ROUTE"), OpsCommon.DIVERT_CATEGORY_OWN_COLOR)
+        compare(OpsCommon.divertCategoryColor("ROSTER_ROUTE"), OpsCommon.DIVERT_CATEGORY_ROSTER_COLOR)
+        compare(OpsCommon.divertCategoryColor("OTHER"), OpsCommon.DIVERT_CATEGORY_OTHER_COLOR)
+    }
+
+    function test_divertCategoryColor_unknownFallsBackToOther() {
+        compare(OpsCommon.divertCategoryColor("WHATEVER"), OpsCommon.DIVERT_CATEGORY_OTHER_COLOR)
+    }
+
+    function test_divertWaypoints_ownRouteForward() {
+        var wps = OpsCommon.divertMissionWaypoints(_divertResp(), 0)
+        compare(wps.length, 1) // 投影在 1112~2224 之间，目标 seq=2 是第一个未飞点
+        compare(wps[0].waypoint_id, 3)
+    }
+
+    /// 目标恰是最后一个已飞点 ⇒ 单点直达（不是「目标→…→起点」）。
+    function test_divertWaypoints_ownRouteBehindIsSingleTarget() {
+        var resp = _divertResp({ flown: 3000 }) // 目标 own_route_seq=2 (W3，cum 2224)
+        var wps = OpsCommon.divertMissionWaypoints(resp, 0)
+        compare(wps.length, 1)
+        compare(wps[0].waypoint_id, 3)
+    }
+
+    /// 目标在更早的已飞点：从最后一个已飞点倒着回到目标。
+    /// ‼️ **末项必须是目标**：`OpsDivertRoute` 的 `applyLandingAltitude` 只改末项，
+    ///    末项错位会把降落高度写到「航线起点」上（2026-11-09 复核发现的 Critical）。
+    function test_divertWaypoints_ownRouteBehindReversed() {
+        var resp = _divertResp({ flown: 3000, targetOwnSeq: 1 }) // 目标 = W2
+        var wps = OpsCommon.divertMissionWaypoints(resp, 0)
+        compare(wps.length, 2)
+        compare(wps[0].waypoint_id, 3)  // 最后一个已飞点 W3
+        compare(wps[1].waypoint_id, 2)  // 末项 = 目标
+    }
+
+    /// 正向支的**末项也必须是目标**：`flown=0` 时 W1~W3 都没飞过，但只有 `a <= seq`
+    /// 才把 W4 排除在外。去掉那个上界，会把 `[W2,W3,W4]` 交出去，
+    /// `applyLandingAltitude` 就把降落高度写到 W4（2026-11-09 二次复核 Minor-5）。
+    function test_divertWaypoints_ownRouteForwardStopsAtTarget() {
+        var resp = _divertResp({ flown: 0 }) // 目标 own_route_seq=2 (W3)
+        var wps = OpsCommon.divertMissionWaypoints(resp, 0)
+        compare(wps.length, 2)
+        compare(wps[0].waypoint_id, 2)  // W1 的 cum=0 不算"未飞"，从 W2 起
+        compare(wps[1].waypoint_id, 3)  // 末项 = 目标，不是航线终点 W4
+    }
+
+    function test_divertWaypoints_otherRouteIsSingleTarget() {
+        var wps = OpsCommon.divertMissionWaypoints(_divertResp(), 1)
+        compare(wps.length, 1)
+        compare(wps[0].site_id, 10)
+        compare(wps[0].waypoint_id, 7)
+    }
+
+    function test_divertWaypoints_departedOwnRouteIsSingleTarget() {
+        var resp = _divertResp({ departed: true })
+        var wps = OpsCommon.divertMissionWaypoints(resp, 0)
+        compare(wps.length, 1)
+        compare(wps[0].waypoint_id, 3)
+    }
+
+    function test_divertWaypoints_missingTargetReturnsEmpty() {
+        compare(OpsCommon.divertMissionWaypoints(_divertResp(), 99).length, 0)
+    }
+
+    function test_divertRouteNote_otherRouteSaysStraightLine() {
+        var resp = _divertResp()
+        verify(OpsCommon.divertRouteNote(resp.candidates[1], false).indexOf("直线可达") >= 0)
+    }
+
+    function test_divertRouteNote_departedOwnRoute() {
+        var resp = _divertResp()
+        verify(OpsCommon.divertRouteNote(resp.candidates[0], true).indexOf("已偏离") >= 0)
+    }
+
+    function test_divertRouteNote_ownRouteNormal() {
+        var resp = _divertResp()
+        verify(OpsCommon.divertRouteNote(resp.candidates[0], false).indexOf("沿原航线") >= 0)
+    }
 }

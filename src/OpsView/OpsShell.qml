@@ -3073,4 +3073,18 @@ Item {
     }
     property alias returnFlow: _returnFlow
 
+    //-------------------------------------------------------------------------
+    // 备降选点流程（2026-11-09，设计稿 §7；监控员视图）
+    //-------------------------------------------------------------------------
+    OpsDivertFlow {
+        id: _divertFlow
+        // ‼️ 同 `_returnFlow`：本文件根 id 是 `opsShell`，**没有** `root`。
+        shell: opsShell
+        // 取飞机的钩子由视图写 `divertFlow.vehicleFn` 注入（各视图有自己的 `_vehicleForTask`）。
+        onMessage: function (title, text) {
+            QGroundControl.showMessageDialog(opsShell, title, text)
+        }
+    }
+    property alias divertFlow: _divertFlow
+
 }

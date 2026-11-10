@@ -2176,6 +2176,71 @@ function routeMissionItems(wps, isVtol, endWaypointId, cruiseAGL) {
     return out
 }
 
+//==========================================================================
+// 备降选点（2026-11-09，设计稿 §7.6）—— 纯函数
+//==========================================================================
+/// 备降候选的类别色。未知类别退回「其它」色——界面不得出现裸枚举，也不得因后端新增
+/// 类别而整块变透明。
+function divertCategoryColor(category) {
+    if (category === "OWN_ROUTE")    return DIVERT_CATEGORY_OWN_COLOR
+    if (category === "ROSTER_ROUTE") return DIVERT_CATEGORY_ROSTER_COLOR
+    return DIVERT_CATEGORY_OTHER_COLOR
+}
+
+/// 候选行的航线标注（设计稿 §7.6）。文案单点在这里，弹窗与确认框共用。
+function divertRouteNote(candidate, departed) {
+    if (departed) return qsTr("已偏离航线，直达目标")
+    if (candidate && candidate.category === "OWN_ROUTE") return qsTr("沿原航线")
+    // 「直线可达（未评估）」必须同时说明**飞机将怎么飞**：当前评估只看距离，
+    // 天气/地形/航路均未评估（设计稿 §6.5 的对外口径）。
+    return qsTr("直线可达（未评估），飞机将直接飞向该点")
+}
+
+/// 把备降响应转成 mission 航点数组（交给 `routeMissionItems`）。
+///   · 目标非本航线 / departed=true  ⇒ [目标]（直线可达）
+///   · 目标在前方（cum >= 投影里程）  ⇒ 投影之后到目标，正序
+///   · 目标在后方                     ⇒ 最后一个已飞点 → 目标，倒序
+///
+/// ‼️ **末项永远是目标**：`OpsDivertRoute` 随后用 `applyLandingAltitude` 只改写末项，
+///    末项错位会让降落高度落在别的航点上（实测 bug：写成「目标…起点」，飞机会在
+///    航线起点下降）。形状与 `returnRouteWaypoints` 同法。
+/// ‼️ 任何形态都**不以飞机当前位置开头**（2026-11-07 SITL 裁定：占位首项会让 FW 永久绕圈）。
+///   拿不准时回 `[目标]` / `[]`，绝不靠"补一点当前位置"来凑形状。
+function divertMissionWaypoints(resp, targetSeq) {
+    if (!resp || !resp.candidates) return []
+    var target = null
+    for (var i = 0; i < resp.candidates.length; i++)
+        if (resp.candidates[i].seq === targetSeq) { target = resp.candidates[i]; break }
+    if (!target) return []
+    var own = resp.own_route
+    if (resp.departed === true || target.category !== "OWN_ROUTE"
+            || !own || !own.waypoints || own.waypoints.length === 0)
+        return [target]
+
+    var seq = target.own_route_seq
+    if (seq < 0 || seq >= own.waypoints.length) return [target]
+    var flown = own.flown_distance_m
+    var wps = own.waypoints
+    var targetCum = wps[seq].cum_distance_m
+
+    if (targetCum >= flown) {
+        var fwd = []
+        for (var a = 0; a < wps.length; a++)
+            if (wps[a].cum_distance_m > flown && a <= seq) fwd.push(wps[a])
+        return fwd.length ? fwd : [target]
+    }
+    // 最后一个已飞点（含目标自己：本支已保证 `targetCum < flown` ⇒ 至少 seq 命中）。
+    var lastFlown = -1
+    for (var f = 0; f < wps.length; f++)
+        if (wps[f].cum_distance_m <= flown) lastFlown = f
+    if (lastFlown < seq) lastFlown = seq
+    // ‼️ 从**最后一个已飞点**倒着回到目标：末项 = 目标。别写成「从 seq 倒到航线起点」
+    //    ——那会把降落高度（只改末项）写到起点上，飞机先到目标再倒退去起点落地。
+    var back = []
+    for (var b = lastFlown; b >= seq; b--) back.push(wps[b])
+    return back.length ? back : [target]
+}
+
 /// 把「**降落站点对应的航点**」追加为航点序列的**末项**（NRRSM A1，2026-10-01）。
 ///
 /// 用户 A1 原话：「qgc发给px4的航线中**没有降落点**，是由一系列航点组成。A1 就是**最后一个航点**
@@ -2910,6 +2975,17 @@ var BUTTON_ON_COLOR           = "#ffffff"   // 绿/红底上的字色
 // 确认弹框的主按钮仍走 `confirmButtonKind`（`land` 归绿），**未**随之改成黄。
 var BUTTON_WARNING_COLOR      = "#ffca28"
 var BUTTON_WARNING_TEXT_COLOR = "#0f2f2c"   // 黄底上的字色（9.38:1）
+
+//==========================================================================
+// 备降候选类别色（2026-11-09，备降选点）
+//==========================================================================
+/// 三档类别色，与后端 `category` 一一对应（`divert_candidates.go`）：
+///   绿 = 本航线（沿原航线飞，最可控）｜蓝 = 名册航线（直线可达）｜橘黄 = 其它航线（直线可达）
+/// ‼️ 绿与 `BUTTON_PRIMARY_COLOR` 同值是有意的：两处都在表达「推荐路径」。
+///    别在 QML 里另写一份 hex —— 取色一律走 `divertCategoryColor()`。
+var DIVERT_CATEGORY_OWN_COLOR    = "#1a7f46"
+var DIVERT_CATEGORY_ROSTER_COLOR = "#2f7fd8"
+var DIVERT_CATEGORY_OTHER_COLOR  = "#ff9800"
 
 //==========================================================================
 // 动作按钮语义档（2026-11-07 用户裁定）

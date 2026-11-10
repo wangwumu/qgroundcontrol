@@ -477,21 +477,23 @@ OpsShell {
     /// ⚠️ 本视图不持有 `OpsRouteSync`，`routeResetFn` 保持 null（没有原航线轮询要停）。
     Component.onCompleted: {
         returnFlow.vehicleFn = function (task) { return romView._vehicleForTask(task) }
+        // 备降同理（2026-11-09）：与回航共用同一份「任务 → 飞机」匹配逻辑。
+        divertFlow.vehicleFn = function (task) { return romView._vehicleForTask(task) }
     }
 
     /// 卡片上的「应急情况处理」菜单（用户 2026-11-06）。
-    /// 2026-11-07：`RESUME` 与 `RETURN` 已接线；2026-11-08：`EMERGENCY_LANDING` 已接线。
-    /// `DIVERT` 仍是 UI 壳，明确告诉用户"尚未接入"。这不是多余的提示——在应急处置里，
-    /// 点了没反应的菜单项会被当成"指令已下发"，那正是本项目反复防的那类"谎报成功"。
+    /// 2026-11-07：`RESUME` 与 `RETURN` 已接线；2026-11-08：`EMERGENCY_LANDING` 已接线；
+    /// 2026-11-09：`DIVERT` 已接线（《备降选点-设计稿》§7）。
+    /// 四个动作都有真实链路；走到末尾的兜底分支只应出现在后端/前端菜单不同步的情况，
+    /// 届时明确告诉用户"尚未接入"，而不是假装下发成功。
     /// ⚠️ 各链路的差别：
     ///    · `RESUME`  → 确认框 → `POST /tasks/:id/resume` → 切 `AUTO_MISSION`。
     ///    · `RETURN`  → 选点流程（`OpsReturnFlow.begin`）：查候选 → 选点 → 写库 →
     ///      构造倒序航线并上传。写库与上传都在流程内完成；**不发 RTL**。
+    ///    · `DIVERT`  → 选点流程（`OpsDivertFlow.begin`）：查候选（按距离三类）→ 选点 →
+    ///      `POST /tasks/:id/divert` → 构造备降航线并上传。**同样不发 RTL**。
     ///    · `EMERGENCY_LANDING` → 确认框（红确认）→ `POST /tasks/:id/disposition` →
     ///      写库成功后下发 `MAV_CMD_NAV_LAND`（就地降落）。见 `_execEmergencyLanding`。
-    ///    · `DIVERT`  → `POST /tasks/:id/divert` 需要备降场 `site_id` + 经纬度；而"生成并
-    ///      上传到备降站点的续飞航线"在设计稿 §6.1-g 里仍是**未实现缺口**——只调后端
-    ///      而天上不飞，同样是谎报成功。
     function _onEmergencyAction(task, action) {
         if (action === "RESUME") {
             romView._beginResumeConfirm(task)
@@ -501,6 +503,12 @@ OpsShell {
             // `returnFlow` 由 `OpsShell` 以 `property alias` 暴露；RomView 是它的子视图，直接可见。
             // 若将来 RomView 被提到独立窗口导致作用域断开，改为在实例化时注入回调。
             returnFlow.begin(task)
+            return
+        }
+        if (action === "DIVERT") {
+            // 备降选点流程（2026-11-09）：查候选 → 选点 → 写库 → 构造并上传航线。
+            // `divertFlow` 由 `OpsShell` 以 `property alias` 暴露，作用域同 `returnFlow`。
+            divertFlow.begin(task)
             return
         }
         if (action === "EMERGENCY_LANDING") {
@@ -1132,9 +1140,10 @@ OpsShell {
                     // 「继续完成航线任务」的置灰判据（异常派生状态 / 模式 / 链路 / disposition）。
                     // 注入函数而不是值：面板只消费，判据唯一实现在本视图（`_resumeAvailable`）。
                     resumeAvailable: romView._resumeAvailable
-                    // 「应急情况处理」菜单的四项（用户 2026-11-06）。`RESUME` 已接线
-                    // （`_onEmergencyAction` → 确认框 → 先写库 → 切 AUTO_MISSION）；其余三项
-                    // 仍只给出"尚未接入"的明确提示，不写库、不下发指令。
+                    // 「应急情况处理」菜单的四项（用户 2026-11-06）。截至 2026-11-09 **四项全部
+                    // 已接线**：`RESUME`（确认框 → 写库 → 切 AUTO_MISSION）、`RETURN` / `DIVERT`
+                    // （选点流程 → 写库 → 构造并上传航线）、`EMERGENCY_LANDING`（红确认 → 写库 →
+                    // 下发 NAV_LAND）。分支说明见 `_onEmergencyAction` 的文档注释。
                     onEmergencyActionRequested: function(task, action) {
                         romView._onEmergencyAction(task, action)
                     }

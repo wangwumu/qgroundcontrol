@@ -17,6 +17,10 @@ qt_add_qml_module(OpsViewModule
         OpsDialogButton.qml
         OpsWarnIcon.qml
         OpsRouteSync.qml
+        OpsMissionUpload.qml
+        OpsDivertRoute.qml
+        OpsDivertDialog.qml
+        OpsDivertFlow.qml
         OpsReturnDialog.qml
         OpsReturnFlow.qml
         OpsReturnRoute.qml
