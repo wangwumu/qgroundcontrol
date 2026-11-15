@@ -3376,6 +3376,82 @@ TestCase {
         }
     }
 
+    //-------------------------------------------------------------------------
+    // 引入权（2026-11-10）：**第二维**，与上面的指令权不是一回事。
+    //
+    //   指令权（`siteHoldsControl`）= 该由谁**发言**（下发命令帧）。
+    //   引入权（`siteMayIntroduce`）= PX4 待命（链路未建立）时，该由谁**先建链**。
+    //
+    // 判据 = **只有起飞档**（`takeoff_site_id == 本端` 且 `checkout_state !== 'ACCEPTED'`），
+    // 不含监控员档、不含降落站档。真实复现：qgc2 签出、qgc1 签入 → 停 PX4、停 qgc2、
+    // 起 PX4 ⇒ qgc1 收到明文待命心跳后建链进 Active，把 PX4 引入到了错误的一端。
+    // 签入只是拿到指令权，不代表本端在现场、也不是该由它重建链路。
+    //-------------------------------------------------------------------------
+
+    /// 起飞档独有：签入（降落站档）拿的是指令权，**不是**引入权。
+    function test_siteMayIntroduce_isTakeoffTierOnly() {
+        verify(OpsCommon.siteMayIntroduce(_ctlSiteTask(1, 2, "", false), 1) === true,
+               "无交接 ⇒ 起飞站是引入方")
+        verify(OpsCommon.siteMayIntroduce(_ctlSiteTask(1, 2, "PENDING", false), 1) === true,
+               "签出等待确认 ⇒ 责任仍在起飞站，仍是引入方")
+        var ended = ["REJECTED", "CANCELLED", "TIMEOUT"]
+        for (var i = 0; i < ended.length; i++) {
+            verify(OpsCommon.siteMayIntroduce(_ctlSiteTask(1, 2, ended[i], false), 1) === true,
+                   "签出终态 " + ended[i] + " ⇒ 责任退回起飞站，仍是引入方")
+        }
+        verify(OpsCommon.siteMayIntroduce(_ctlSiteTask(1, 2, "ACCEPTED", false), 1) === false,
+               "已交棒 ⇒ 起飞站不再引入（否则交棒后原起飞站还能重建链路）")
+
+        // ‼️ 核心格：降落站**有指令权**但**没有引入权**。
+        verify(OpsCommon.siteHoldsControl(_ctlSiteTask(1, 2, "ACCEPTED", true), 2) === true,
+               "前提：签入 LANDING 后降落站确实持有指令权")
+        verify(OpsCommon.siteMayIntroduce(_ctlSiteTask(1, 2, "ACCEPTED", true), 2) === false,
+               "降落站持有指令权 ≠ 有引入权（漏掉本格即 2026-11-10 复现的缺陷）")
+        verify(OpsCommon.siteMayIntroduce(_ctlSiteTask(1, 2, "ACCEPTED", true), 1) === false,
+               "已交棒 ⇒ 起飞站也不得引入")
+    }
+
+    /// 站点字段与参数防御：缺 `takeoff_site_id`、本站无效都不得误判为真。
+    function test_siteMayIntroduce_siteFieldIsRequired() {
+        verify(OpsCommon.siteMayIntroduce(_ctlSiteTask(1, 2, "", false), 3) === false,
+               "既非起飞也非降落 ⇒ 不得引入")
+        verify(OpsCommon.siteMayIntroduce(_ctlSiteTask(1, 2, "", false), 0) === false,
+               "本站无效（0 / 未登录）⇒ fail-closed")
+        verify(OpsCommon.siteMayIntroduce(_ctlSiteTask(1, 2, "", false), undefined) === false,
+               "`mySiteId` 为 undefined ⇒ false（不得让 NaN 比较蒙混过关）")
+        verify(OpsCommon.siteMayIntroduce(null, 1) === false, "无任务 ⇒ false，且不得抛错")
+        verify(OpsCommon.siteMayIntroduce({ task_id: 1, landing_site_id: 1, checkout_state: "" }, 1) === false,
+               "缺 takeoff_site_id ⇒ false（不得把 undefined 强转成 0 再与本站相等）")
+    }
+
+    /// 引入权是指令权的**子集**：任何一格为真时，`siteHoldsControl` 必须也为真。
+    /// 反向不成立正是本功能存在的理由（降落站档）；同时钉住"每架至多一个引入方"。
+    function test_siteMayIntroduce_subsetOfControlHolders() {
+        var combos = [
+            { checkout: "",         accepted: false },
+            { checkout: "PENDING",  accepted: false },
+            { checkout: "REJECTED", accepted: false },
+            { checkout: "ACCEPTED", accepted: false },
+            { checkout: "ACCEPTED", accepted: true  }
+        ]
+        for (var i = 0; i < combos.length; i++) {
+            var task = _ctlSiteTask(1, 2, combos[i].checkout, combos[i].accepted)
+            var introducers = 0
+            for (var site = 1; site <= 2; site++) {
+                if (OpsCommon.siteMayIntroduce(task, site)) {
+                    introducers++
+                    verify(OpsCommon.siteHoldsControl(task, site),
+                           "checkout_state=" + combos[i].checkout + " landing_accepted=" +
+                           combos[i].accepted + " ⇒ 站点 " + site +
+                           " 有引入权却无指令权（引入权必须是指令权的子集）")
+                }
+            }
+            verify(introducers <= 1,
+                   "checkout_state=" + combos[i].checkout + " landing_accepted=" + combos[i].accepted +
+                   " ⇒ 引入方不得超过一个（两端各自建链 ⇒ nonce 重复）")
+        }
+    }
+
     /// ② 监控员档：`signed_in` **且** `!landing_accepted`。
     ///
     /// 两格缺一不可，且各自钉掉一种错法：

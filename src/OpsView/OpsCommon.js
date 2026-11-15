@@ -633,6 +633,27 @@ function siteHoldsControl(task, mySiteId) {
     return false
 }
 
+/// 本端（站点侧）此刻是不是这架飞机的**场内引入方**：PX4 待命（加密链路未建立）时，
+/// 只有它允许主动发加密帧把链路建起来。**判据 = 上面的起飞支，不含降落支。**
+///
+/// ‼️ 与 `siteHoldsControl` 是**两维**：降落站在整段飞行里都持有指令权（`landing_accepted`），
+///    但飞机不在本场机位 ⇒ 没有引入权。2026-11-10 实测缺口：qgc2 签出、qgc1 签入后重启 PX4，
+///    qgc1 凭指令权把链路建了起来（`beginLinking: 未接引 → 已建链 Active`，随后命令帧把
+///    PX4 拉进加密链路），与用户裁定「引入只能由场内那台完成」相反。
+///
+/// ⚠️ 起飞支的 `checkoutState !== "ACCEPTED"` 不可省：签出之后飞机已离场/离地，
+///    起飞站同样不再是场内引入方（此时任何人都不得引入——PX4 空中禁止重启）。
+/// ⚠️ 监控员侧没有本函数可用的字段（`opsMonitorDevice` 不带 `takeoff_site_id`），
+///    且监控员永远不是场内那台 ⇒ 监控员视图**推空名单**，不走本函数。
+function siteMayIntroduce(task, mySiteId) {
+    if (!task) return false
+    var sid = Number(mySiteId)
+    if (!(sid > 0)) return false
+    if (task.takeoff_site_id === undefined || task.takeoff_site_id === null) return false
+    if (Number(task.takeoff_site_id) !== sid) return false
+    return checkoutState(task) !== "ACCEPTED"
+}
+
 /// 本端（监控员侧，吃 ③ 的 `devices[]` 行）此刻是不是这架飞机的指令权持有方。
 ///
 /// ‼️ `!landingAccepted` 不可省：LANDING 被签入后降落站接手，本端必须**当场让出**。

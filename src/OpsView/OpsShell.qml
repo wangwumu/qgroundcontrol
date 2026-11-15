@@ -732,19 +732,17 @@ Item {
     ///       在 `keyForDevice` 处打 `no key for device ... dropping encrypted frame` 并丢弃
     ///       ⇒ 没有 HEARTBEAT 上浮到 `MultiVehicleManager`。
     ///     · **明文待命心跳**（msgID=0 且 payload block < 28，规范 §2.2）：`MAVLinkProtocol.cc`
-    ///       那条分支要先过被动取密钥的合取闸 `!hasKey(deviceID) && isInManifest(deviceID)`。
-    ///       签出后本端是**场地操作员**：`releaseDevice` 已把它从 `_linkedDevices` 摘掉，
-    ///       而 `isInManifest` 的口径是 `_monitorListActive ? _monitorDevices : _linkedDevices`
-    ///       ——`_monitorListActive` 只由 `setMonitorDevices` 置位，全仓唯一的调用点是
-    ///       `RomView.qml`（监控员视图）⇒ 场地视图下恒 false ⇒ 读的是不含它的 `_linkedDevices`
-    ///       ⇒ 不合取 ⇒ **不拉密钥**；紧随其后的建链闸 `Standby && hasKey` 也因此为假。
-    ///       （这就是本次 `_releasedDevices` 那道闸要保的东西：不挡的话残余帧会把刚清掉的
-    ///       映射与收帧记录逐帧写回，而 `learnDeviceSystemMapping` 是"全新启动学映射"的唯一入口，
-    ///       白名单式的闸会同时封死冷启动——两者形状相同、语义相反。）
+    ///       那条分支的**第一句**就是接收权限闸 `isDeviceAuthorized`（2026-11-10）：
+    ///       签出后 `releaseDevice` 已把它从 `_linkedDevices` / `_monitorDevices` 摘净并记入
+    ///       `_releasedDevices`，而该集合在权限闸里**优先于任何授权证据** ⇒ 帧在任何状态
+    ///       写入之前就被丢弃：不学 sysid 映射、不记收帧时间戳、不拉密钥、不建 Vehicle。
+    ///       这是比旧的"被动取密钥合取闸 + 建链闸"更早的一道：合取闸将来被改动，残余帧
+    ///       也到不了它。（闸要保的就是这个：不挡的话残余帧会把刚清掉的映射与收帧记录
+    ///       逐帧写回。）
     ///   ⚠️ **例外**（刻意留的，不是漏洞）：本端若**同时**是这架飞机的监控员，则
-    ///   `_monitorDevices` 含它 ⇒ 上面那道取密钥闸成立、`_releasedDevices` 也被撤销
-    ///   ⇒ 载具会被重新建出来。那是**正当**的：监控员名册是**航线名册**投影、与"场地签出"
-    ///   正交，本端确实需要收它的遥测。判据是「谁在收」，不是「帧从哪来」。
+    ///   `setMonitorDevices` 会把该 id 纳入名册并**撤销它的 `_releasedDevices` 记号**
+    ///   ⇒ 权限闸恢复放行 ⇒ 载具会被重新建出来。那是**正当**的：监控员名册是**航线名册**
+    ///   投影、与"场地签出"正交，本端确实需要收它的遥测。判据是「谁在收」，不是「帧从哪来」。
     ///   ⚠️ UDP link 本身会在 1s 内被 `LinkManager::_addUDPAutoConnectLink()` 重建，
     ///   但那只是个空链接对象，不产生载具。
     ///   ⚠️ 销载具会走 `PlanMasterController` / `MissionController` 的 `_managerVehicle`
@@ -898,6 +896,9 @@ Item {
             var _mySid = Number(_mySiteId)
             if (!routeLayersEnabled && _mySid > 0 && !_ovAnomaly) {
                 var _initIds = []
+                // 引入权名单：与指令权**同步整份替换**（两维取自同一份行快照，分两次读会让
+                // 两者落在不同轮次上）。判据见 `OpsCommon.siteMayIntroduce` 头注。
+                var _introIds = []
                 for (var _ri = 0; _ri < data.length; _ri++) {
                     var _rrow = data[_ri]
                     if (!_rrow) continue
@@ -905,6 +906,9 @@ Item {
                     // 与上面登记集合**同一判据**（`isValidAircraftDeviceId`）：非法 ID 不进建链名单。
                     // 告警已由 `overviewDeviceIds` 按值打过一次，这里不再重复。
                     if (!OpsCommon.isValidAircraftDeviceId(_rdid)) continue
+                    // ‼️ 引入权是**另一维**：只含起飞档，不含降落档。降落站签入后虽有指令权，
+                    //    但飞机不在本场机位，PX4 待命时不得由它建链（用户 2026-11-10 裁定）。
+                    if (OpsCommon.siteMayIntroduce(_rrow, _mySid)) _introIds.push(_rdid)
                     // 判据 = `OpsCommon.siteHoldsControl`（纯函数、有单测，**唯一**判据点）：
                     //   起飞档 `takeoff_site_id == 本端 ∧ checkout_state !== "ACCEPTED"`
                     //   降落档 `landing_site_id == 本端 ∧ landing_accepted`
@@ -926,6 +930,7 @@ Item {
                     _initIds.push(_rdid)
                 }
                 cryptoController.setInitiatorDevices(_initIds)
+                cryptoController.setIntroducerDevices(_introIds)
             }
             // ‼️ **内容没变就不要重新赋值**（理由同 `_fetchRouteTasks`）。`property var` 一旦换身份，
             //    吃 `_tasks` 的 `MapItemView`（飞机 marker）与右栏列表都会销毁重建全部委托。

@@ -443,6 +443,11 @@ OpsShell {
     ///    把"请求失败"当成"本端不持有任何一架的指令权"会让本端在监控员阶段**静默让出**上行权，
     ///    而失败原因可能只是一次网络抖动（§3.5.4）——那时本端仍该说话。
     function _pushInitiatorDevices() {
+        // 监控员**永远没有引入权**（用户 2026-11-10 裁定：引入只能由飞机所在场地的
+        // 站点操作员完成）。这一条与本轮数据无关 ⇒ 在异常闸**之前**无条件推空，
+        // 不能等"数据正常时再推"：那样第一次轮询异常时它会停在 fail-open，
+        // 监控员就有可能在 PX4 待命时把链路建起来。
+        cryptoController.setIntroducerDevices([])
         // ‼️ 与登记名册**共用同一个异常闸**（`deviceRowsAreAnomalous`）：全非法行集会算出
         //    空名单，而 `CryptoController::setInitiatorDevices([])` 把它当作**有效结论**
         //    （`_initiatorScopeValid=true`、全拒），且当前不在 Standby 时会当场
