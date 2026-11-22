@@ -2569,14 +2569,10 @@ OpsShell {
         //    ⚠️ `y` **不读 `_confirmAnchorY`**：本框由"降落校验未通过/指令下发失败"弹出，
         //       触发它的**不是某张卡片上的按钮** ⇒ 没有锚点来源，读了只会用到上一次动作
         //       留下的残值、贴着一张不相干的卡片。故直接垂直居中。
-        width: Math.min(Math.round(Math.max(opsView.rightPanelWidth, 320) * ScreenTools.uiTextScaleFactor),
-                        Math.round(opsView.width * 0.95))
-               // 320 = 100% 时沿用的内容基线（源自确认框的旧下限；本框没有 132/96 按钮行）；
-               // 整体再乘字号因子，否则字号缩放后弹框宽度不变、内容与留白比例失衡。
-               // 封顶 95% 窗宽：字号因子最高 4×（UI 200% × 字体 200%），无上限时宽度会超出窗口、
-               // 左缘跑到屏幕外。100% 时右栏硬上限 55% 窗宽
-               // （`layoutSettings.rightPanelMaxPercent` 的 max，该项默认 20%），
-               // 封顶不生效；极窄窗下弹框才会被收到 95% 窗宽。
+        // ‼️ 2026-11-22：宽度**去掉 320 下限与字号因子**，只跟右栏（规则单点在
+        //    `OpsCommon.panelDialogWidth`）。旧式的两项在宽窗下看不出、窄窗/平板上会把
+        //    弹框顶得比右栏宽。
+        width: OpsCommon.panelDialogWidth(opsView.rightPanelWidth, opsView.width)
         x: opsView.width - width
         y: (opsView.height - height) / 2
         modal: true
@@ -2638,22 +2634,14 @@ OpsShell {
     OpsDialog {
         id: slotDialog
         parent: opsView
-        // ‼️ 宽度 = max(右边栏宽, 320) × 字号因子（用户 2026-10-08 第四轮要求与右栏等宽）。
-        //    100% 时栏宽 ≥320 才等宽；栏宽 <320 时取 320 这个内容下限（不随栏宽走）。
-        //    原为**硬编码 360**。而右边栏是**可变宽**的 —— `rightPanelWidth` = 站点视图下
-        //    `clamp(机位图所需宽, 下限, 上限)`（下限/上限按窗口宽比例折算，见 OpsShell 的声明）
-        //    ⇒ 机位图宽时弹框比栏窄、机位图窄时又比栏宽，两边永远对不齐。
+        // ‼️ 宽度 = 右边栏宽（用户 2026-10-08 第四轮要求与右栏等宽）。原为**硬编码 360**，
+        //    而右栏是**可变宽**的 —— `rightPanelWidth` = 站点视图下
+        //    `clamp(机位图所需宽, 下限, 上限)`（下限/上限按窗口宽比例折算，见 OpsShell 的声明）。
+        // ‼️ 2026-11-22：规则单点在 `OpsCommon.panelDialogWidth`（去掉 320 下限与字号因子）。
         //    与 `actionConfirmDialog` / `handoverDialog` 逐字同款。
         // ⚠️ 宽度变成可变值后，下面机位格 `Flow` 的**列数会随栏宽变**（原注释按 360 算的
         //    固定 3 列已失效）—— 这是 `Flow` 的正常行为，不需要按宽度补分支。
-        width: Math.min(Math.round(Math.max(opsView.rightPanelWidth, 320) * ScreenTools.uiTextScaleFactor),
-                        Math.round(opsView.width * 0.95))
-               // 320 = 100% 时沿用的内容基线（源自确认框的旧下限；本框没有 132/96 按钮行）；
-               // 整体再乘字号因子，否则字号缩放后弹框宽度不变、内容与留白比例失衡。
-               // 封顶 95% 窗宽：字号因子最高 4×（UI 200% × 字体 200%），无上限时宽度会超出窗口、
-               // 左缘跑到屏幕外。100% 时右栏硬上限 55% 窗宽
-               // （`layoutSettings.rightPanelMaxPercent` 的 max，该项默认 20%），
-               // 封顶不生效；极窄窗下弹框才会被收到 95% 窗宽。
+        width: OpsCommon.panelDialogWidth(opsView.rightPanelWidth, opsView.width)
         modal: true
         // ‼️ 位置与 `actionConfirmDialog` **逐字同款**：贴右边栏、上部对齐**触发它的那张任务卡片**
         //    的下缘（留 6px，卡片靠下时向上收，别顶出屏幕底）。用户 2026-10-08 第三轮：
@@ -2663,9 +2651,12 @@ OpsShell {
         //    锚点由 `_beginLandFlow` / `onAssignSlotRequested` 在 `open()` 之前写入
         //    —— 两个入口都写，缺一个就会用到上一次动作的残留值。
         x: opsView.width - width
+        // ‼️ 2026-11-22：再夹 `Math.max(0, …)` —— 弹框与右栏等宽后正文折行更多，极小窗口
+        //    （横屏手机）里高度可能超过窗口，原式会给出负 `y`，把标题和正文顶到窗口上方。
+        //    ⚠️ 只保证"从上缘起可见"；比窗口还高时仍需滚动才能看完（尚未实现）。
         y: opsView._confirmAnchorY < 0
-           ? (opsView.height - height) / 2
-           : Math.min(opsView._confirmAnchorY + 6, opsView.height - height - 12)
+           ? Math.max(0, (opsView.height - height) / 2)
+           : Math.max(0, Math.min(opsView._confirmAnchorY + 6, opsView.height - height - 12))
         title: opsView._slotDialogMode === "land" ? qsTr("选择降落机位") : qsTr("指定降落机位")
         // ‼️ 深色卡片皮肤（底 `#0f2f2c` / 描边 `#26a69a` / **覆写 `header`**）已**上移**到
         //    `OpsDialog.qml` —— 本框 2026-10-08 第三轮时只在这里写了一份；第四轮四个框
@@ -2739,7 +2730,9 @@ OpsShell {
                         // 44/104 只是**下限**（随字号因子缩放）：字号放大时两行内容会超过 44，
                         // 固定高度会让第二行压出卡片边框（`clip: false`，还会吃到行间距）；
                         // 字号缩小时若不跟着缩，机位卡会撑出弹框。100% 时仍取 44/104，外观不变。
-                        width: Math.round(104 * ScreenTools.uiTextScaleFactor)
+                        // ‼️ 2026-11-22：弹框宽度改与右栏严格相等后，窄栏（手机/平板竖屏）
+                        //    可能连一张 104 的卡都放不下 ⇒ 再夹到本行可用宽（`Flow` 的 width）。
+                        width: Math.min(Math.round(104 * ScreenTools.uiTextScaleFactor), parent ? parent.width : 0)
                         height: Math.max(Math.round(44 * ScreenTools.uiTextScaleFactor),
                                          Math.ceil(contentItem.implicitHeight + Math.round(8 * ScreenTools.uiTextScaleFactor)))
                         enabled: opsView._slotAssignable(modelData)
@@ -2765,13 +2758,20 @@ OpsShell {
                         contentItem: Column {
                             spacing: 2
                             anchors.centerIn: parent
+                            // ‼️ 2026-11-22：卡片宽度现在会夹到行宽（见上面的 `width`），
+                            //    两行文字必须跟着卡片宽走 —— 原先只 `anchors.centerIn`、
+                            //    没有宽度约束，窄卡片里文字会画到卡外、压住相邻机位。
+                            width: parent.width
                             Text {
                                 anchors.horizontalCenter: parent.horizontalCenter
+                                width: parent.width
                                 text: modelData.slot_code
                                 color: slotBtn.enabled ? "#e6edf7" : "#5c6b85"
                                 font.pixelSize: Math.round(13 * ScreenTools.uiTextScaleFactor)
                                 font.bold: slotBtn._isCurrent
                                 horizontalAlignment: Text.AlignHCenter
+                                // 机位编号通常很短；放不下时省略，避免压出卡片。
+                                elide: Text.ElideRight
                             }
                             Text {
                                 anchors.horizontalCenter: parent.horizontalCenter
@@ -2788,6 +2788,9 @@ OpsShell {
                                 color: slotBtn.enabled ? "#9fb3d4" : "#5c6b85"
                                 font.pixelSize: Math.round(10 * ScreenTools.uiTextScaleFactor)
                                 horizontalAlignment: Text.AlignHCenter
+                                // 不可用原因是**决策依据**，不能省略 ⇒ 折行显示（卡高自适应）。
+                                width: parent.width
+                                wrapMode: Text.Wrap
                             }
                         }
                         onClicked: {
@@ -2838,23 +2841,19 @@ OpsShell {
     OpsDialog {
         id: actionConfirmDialog
         parent: opsView
-        // 宽度 = max(右边栏宽, 320) × 字号因子（100% 且栏宽 ≥320 时与右栏等宽）、
-        // 右边缘贴窗口右缘（用户 2026-09-28）。原先没写 `x`/`y`，`Dialog` 缺省落在 (0,0)
-        // ⇒ 看起来在屏幕左上角。
-        width: Math.min(Math.round(Math.max(opsView.rightPanelWidth, 320) * ScreenTools.uiTextScaleFactor),
-                        Math.round(opsView.width * 0.95))
-               // 320 = 100% 时的内容基线：按钮行 132 + 96 + 2×16(行间距) = 260，
-               // 含两侧 padding 24 共 284，留有余量；整体再乘字号因子，否则字号缩放后
-               // 弹框宽度不变、内容与留白比例失衡。
-               // 封顶 95% 窗宽：字号因子最高 4×（UI 200% × 字体 200%），无上限时宽度会超出窗口、
-               // 左缘跑到屏幕外。100% 时右栏硬上限 55% 窗宽
-               // （`layoutSettings.rightPanelMaxPercent` 的 max，该项默认 20%），封顶不生效；
-               // 极窄窗下弹框才会被收到 95% 窗宽。
+        // 宽度 = 右边栏宽、右边缘贴窗口右缘（用户 2026-09-28）。原先没写 `x`/`y`，
+        // `Dialog` 缺省落在 (0,0) ⇒ 看起来在屏幕左上角。
+        // ‼️ 2026-11-22：规则单点在 `OpsCommon.panelDialogWidth`（去掉 320 下限与字号因子）——
+        //    右栏窄于 320 时，按钮行由下面的 `Flow` 折行承接，不再靠加宽弹框。
+        width: OpsCommon.panelDialogWidth(opsView.rightPanelWidth, opsView.width)
         x: opsView.width - width
         // 上部与**触发它的那张任务卡片**的下缘对齐，留 6px。卡片靠下时向上收，别顶出屏幕底。
+        // ‼️ 2026-11-22：再夹 `Math.max(0, …)` —— 弹框与右栏等宽后正文折行更多，极小窗口
+        //    （横屏手机）里高度可能超过窗口，原式会给出负 `y`，把标题和正文顶到窗口上方。
+        //    ⚠️ 只保证"从上缘起可见"；比窗口还高时仍需滚动才能看完（尚未实现）。
         y: opsView._confirmAnchorY < 0
-           ? (opsView.height - height) / 2
-           : Math.min(opsView._confirmAnchorY + 6, opsView.height - height - 12)
+           ? Math.max(0, (opsView.height - height) / 2)
+           : Math.max(0, Math.min(opsView._confirmAnchorY + 6, opsView.height - height - 12))
         modal: true
         // 标题与提示语都在 `_pendingConfirmTitle` / `_pendingConfirmHint` 里按 kind 分派（含"未识别"
         // 兜底）；此处保持绑定式调用，`_pendingAction` 一变两处一起重估。
@@ -2982,23 +2981,32 @@ OpsShell {
                     text: qsTr("无人机：") + opsView._landConfirmUAVNo(opsView._pendingAction)
                 }
             }
-            RowLayout {
+            // ‼️ `Flow` 而不是 `RowLayout`（2026-11-22）：弹框宽度与右栏严格相等后，窄栏
+            //    （平板/手机）可能放不下「132 + 96 + 16」，`RowLayout` 不折行会横向溢出；
+            //    `Flow` 放不下就折行，弹框高度自适应（与 `TaskListPanel` 的按钮行同一口径）。
+            //    ‼️ `layoutDirection: Qt.RightToLeft`：`Flow` 默认从左缘起排，按钮会停靠左缘；
+            //    置 RTL 后从右缘往左排，保持「贴右缘」的观感。因此**声明顺序反转**
+            //    （取消在前 ⇒ 先排到最右），视觉顺序仍是【确认执行】【取消】。
+            //    `width: Math.min(implicitWidth, parent.width)`：极窄栏里单颗按钮也夹到行宽。
+            Flow {
                 Layout.fillWidth: true
+                layoutDirection: Qt.RightToLeft
                 // 行间距也随字号因子走，否则极低档（因子 0.2×）时按钮行会溢出内容宽。
                 spacing: Math.round(16 * ScreenTools.uiTextScaleFactor)
-                Item { Layout.fillWidth: true }
+                // 白 = 取消（安全退出，不改变任何状态）
+                OpsDialogButton {
+                    text: qsTr("取消")
+                    kind: "cancel"
+                    width: Math.min(implicitWidth, parent.width)
+                    onClicked: actionConfirmDialog.close()
+                }
                 // 绿 = 推荐执行（正常业务、无危险）；红只留给救济与未识别动作。
                 // 色值与尺寸单点在 `OpsDialogButton.qml`，这里只给语义。
                 OpsDialogButton {
                     text: qsTr("确认执行")
                     kind: opsView._pendingConfirmButtonKind()
+                    width: Math.min(implicitWidth, parent.width)
                     onClicked: { actionConfirmDialog.close(); opsView._execPendingAction() }
-                }
-                // 白 = 取消（安全退出，不改变任何状态）
-                OpsDialogButton {
-                    text: qsTr("取消")
-                    kind: "cancel"
-                    onClicked: actionConfirmDialog.close()
                 }
             }
         }

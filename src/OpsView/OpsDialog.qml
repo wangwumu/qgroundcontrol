@@ -113,10 +113,18 @@ Dialog {
     /// 与框内其它字色同源，不会引入第三个色相。
     readonly property color warnIconColor: alert ? "#ffe082" : "#ffc107"
 
-    /// ‼️ 内容留白随字号因子缩放：Basic 风格 `Dialog` 的 padding 默认是**固定 12**
-    ///    （Qt 6.11.1 `Basic/Dialog.qml` 的 `padding: 12`）。不缩放的话，字号 0.2×
-    ///    时弹框宽约 64，两侧 24 的内边距占去 38%，剩下能用 40（占内容区 60%）。
-    padding: Math.round(12 * ScreenTools.uiTextScaleFactor)
+    /// 内容留白：Basic 风格 `Dialog` 的 padding 默认是**固定 12**
+    /// （Qt 6.11.1 `Basic/Dialog.qml` 的 `padding: 12`）。不缩放的话，字号 0.2×
+    /// 时弹框宽约 64，两侧 24 的内边距占去 38%，剩下能用 40（占内容区 60%）。
+    /// ‼️ 2026-11-22：弹框宽度改为**与右边栏严格相等**（`OpsCommon.panelDialogWidth`）后，
+    ///    留白不能再**只**跟字号因子走 —— 字号 4×（UI 200% × 字体 200%，两项设置的上限）
+    ///    时 12×4=48，会占去 205 宽右栏的 47%，内容区只剩 109，正文退化成两三字一行。
+    ///    ⇒ 再按**宽度**封顶：留白最多占宽度的 1/12。100% 时 320 宽 ⇒ 上限 26，不生效；
+    ///    只有窄栏 + 大字号同时出现时才由它接管。
+    /// ⚠️ 本组件的实例（当前 13 处，分布在 7 个文件）**都显式给 `width`**，所以
+    ///    `padding ← width` 不会与 `width ← implicitWidth ← padding` 形成环；
+    ///    新增实例必须同样显式给宽度。
+    padding: Math.round(Math.min(12 * ScreenTools.uiTextScaleFactor, width / 12))
 
     background: Rectangle {
         color: opsDialogRoot.cardColor

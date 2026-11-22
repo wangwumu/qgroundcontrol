@@ -76,5 +76,9 @@ Button {
         font.bold: true
         horizontalAlignment: Text.AlignHCenter
         verticalAlignment: Text.AlignVCenter
+        // ‼️ 2026-11-22：弹框宽度改为与右边栏严格相等后，极窄栏（平板竖屏/手机）里按钮会被
+        //    夹到行宽（见按钮行的 `width: Math.min(implicitWidth, parent.width)`）。
+        //    没有 `elide` 时文字会**画到按钮外**、压住相邻控件；这里省略收尾，宁可截字不越界。
+        elide: Text.ElideRight
     }
 }

@@ -2770,28 +2770,25 @@ Item {
     OpsDialog {
         id: handoverDialog
         parent: opsShell
-        // 宽度 = max(右边栏宽, 320) × 字号因子（100% 且栏宽 ≥320 时与右栏等宽）、右边缘贴窗口右缘、
-        // 上部与**那条交接对应的任务卡片**下缘对齐——
+        // 宽度 = 右边栏宽、右边缘贴窗口右缘、上部与**那条交接对应的任务卡片**下缘对齐——
         // 与签出确认框（`OpsView.actionConfirmDialog`）同一套规则（用户 2026-09-28 要求）。
         // 原先没写 `x`/`y`，`Dialog` 缺省落 (0,0) ⇒ 用户报的"左上角"。
         // ‼️ 与签出确认框唯一的差别在**锚点怎么来**：那个框只由"点卡片上的按钮"触发，坐标随
         //    信号带回；这个框还能由**待办到达自动弹出**（`_notifyNewPending`），那一路没有触发
         //    卡片 ⇒ 按 `task_id` 回列表里找（`_handoverAnchorFn`，视图侧注入）。两条路都收进
         //    `_handoverAnchorY`，这里只管消费，不认识自己是被谁打开的。
-        width: Math.min(Math.round(Math.max(opsShell.rightPanelWidth, 320) * ScreenTools.uiTextScaleFactor),
-                        Math.round(opsShell.width * 0.95))
-               // 320 = 100% 时沿用的内容基线（源自确认框的旧下限；本框没有 132/96 按钮行）；
-               // 整体再乘字号因子，否则字号缩放后弹框宽度不变、内容与留白比例失衡。
-               // 封顶 95% 窗宽：字号因子最高 4×（UI 200% × 字体 200%），无上限时宽度会超出窗口、
-               // 左缘跑到屏幕外。100% 时右栏硬上限 55% 窗宽
-               // （`layoutSettings.rightPanelMaxPercent` 的 max，该项默认 20%），
-               // 封顶不生效；极窄窗下弹框才会被收到 95% 窗宽。
+        // ‼️ 2026-11-22：宽度只跟右栏（去掉 320 下限与字号因子），规则单点在
+        //    `OpsCommon.panelDialogWidth`。内容由正文折行、按钮 `Flow` 折行适配。
+        width: OpsCommon.panelDialogWidth(opsShell.rightPanelWidth, opsShell.width)
         x: opsShell.width - width
         // 卡片靠下时向上收，别顶出屏幕底；无锚点（交接对应的任务不在本视图列表里，或卡片滚出
         // 可视区）则垂直居中——兜底与 `actionConfirmDialog` 的 `_confirmAnchorY < 0` 那条一致。
+        // ‼️ 2026-11-22：再夹 `Math.max(0, …)` —— 弹框与右栏等宽后正文折行更多，极小窗口
+        //    （横屏手机）里高度可能超过窗口，原式会给出负 `y`，把标题和正文顶到窗口上方。
+        //    ⚠️ 只保证"从上缘起可见"；比窗口还高时仍需滚动才能看完（尚未实现）。
         y: opsShell._handoverAnchorY < 0
-           ? (opsShell.height - height) / 2
-           : Math.min(opsShell._handoverAnchorY + 6, opsShell.height - height - 12)
+           ? Math.max(0, (opsShell.height - height) / 2)
+           : Math.max(0, Math.min(opsShell._handoverAnchorY + 6, opsShell.height - height - 12))
         modal: true
         title: qsTr("交接确认")
 
@@ -2849,25 +2846,18 @@ Item {
                 visible: _handoverActionError !== ""
                 text: _handoverActionError
             }
-            RowLayout {
+            // ‼️ `Flow` 而不是 `RowLayout`（2026-11-22）：弹框宽度与右栏严格相等后，窄栏
+            //    （平板/手机）放不下「132 + 96 + 8」，`RowLayout` 不折行会横向溢出；`Flow`
+            //    放不下就折行，弹框高度自适应（与 `OpsView` 的确认框同一口径）。
+            //    ‼️ `layoutDirection: Qt.RightToLeft`：`Flow` 默认从左缘起排，按钮会停靠左缘；
+            //    置 RTL 后从右缘往左排，保持「贴右缘」的观感。因此**声明顺序反转**
+            //    （主按钮在前 ⇒ 先排到最右），视觉顺序仍是【拒绝】【确认接管/撤回】。
+            //    `width: Math.min(implicitWidth, parent.width)`：极窄栏里单颗按钮也夹到行宽。
+            Flow {
                 Layout.fillWidth: true
-                spacing: 8
-                Item { Layout.fillWidth: true }
-                OpsDialogButton {
-                    text: qsTr("拒绝")
-                    // 2026-11-07 用户裁定：白 = 取消/拒绝/撤回（不改变状态的一侧）。
-                    // ⚠️ 这**不是**回到"白按钮"那个老问题：那次是主操作也没有颜色；
-                    //    现在【确认接管】是绿的，白只表示"这一侧是退出"。
-                    kind: "cancel"
-                    // ‼️ 成功分支**什么都不做**（2026-10-10）：关框与清账已由
-                    //    `_onHandoverActionSucceeded` 在动作函数**内部**做掉。这里再关一次
-                    //    虽无害，但会让"谁负责关这个框"多出一个落点——本轮要消掉的正是这类
-                    //    多落点（弹框两个按钮 + 卡片两个入口，四处各关一次必然漂移）。
-                    onClicked: _rejectHandover(OpsCommon.handoverId(_confirmHandover), function(ok, err) {
-                        if (ok) return
-                        _handoverActionError = err + qsTr("；仍失败请通知提出方撤回重提")
-                    })
-                }
+                layoutDirection: Qt.RightToLeft
+                // 行间距也随字号因子走，否则字号缩小时按钮行仍按 8px 排、白白多占宽度。
+                spacing: Math.round(8 * ScreenTools.uiTextScaleFactor)
                 OpsDialogButton {
                     id: handoverPrimaryBtn
                     /// 这张单据是不是自己提的 ⇒ 主按钮是【撤回】（作废自己的申请）而不是【确认接管】。
@@ -2878,13 +2868,30 @@ Item {
                     //   白 = 不改变状态/作废 ⇒ 【撤回】
                     //   （旧的蓝 `#1f6fd0` 已取消：主操作统一用绿，不再引入第三种色相。）
                     kind: _mine ? "cancel" : "primary"
+                    width: Math.min(implicitWidth, parent.width)
                     onClicked: {
                         var act = _mine ? _cancelHandover : _acceptHandover
                         act(OpsCommon.handoverId(_confirmHandover), function(ok, err) {
-                            if (ok) return   // 同上：关框由 `_onHandoverActionSucceeded` 单点负责
+                            if (ok) return   // 关框由 `_onHandoverActionSucceeded` 单点负责
                             _handoverActionError = err + qsTr("；仍失败请通知对方人工处理")
                         })
                     }
+                }
+                OpsDialogButton {
+                    text: qsTr("拒绝")
+                    // 2026-11-07 用户裁定：白 = 取消/拒绝/撤回（不改变状态的一侧）。
+                    // ⚠️ 这**不是**回到"白按钮"那个老问题：那次是主操作也没有颜色；
+                    //    现在【确认接管】是绿的，白只表示"这一侧是退出"。
+                    kind: "cancel"
+                    width: Math.min(implicitWidth, parent.width)
+                    // ‼️ 成功分支**什么都不做**（2026-10-10）：关框与清账已由
+                    //    `_onHandoverActionSucceeded` 在动作函数**内部**做掉。这里再关一次
+                    //    虽无害，但会让"谁负责关这个框"多出一个落点——本轮要消掉的正是这类
+                    //    多落点（弹框两个按钮 + 卡片两个入口，四处各关一次必然漂移）。
+                    onClicked: _rejectHandover(OpsCommon.handoverId(_confirmHandover), function(ok, err) {
+                        if (ok) return
+                        _handoverActionError = err + qsTr("；仍失败请通知提出方撤回重提")
+                    })
                 }
             }
         }
@@ -2903,24 +2910,22 @@ Item {
     OpsDialog {
         id: handoverGoneDialog
         parent: opsShell
-        width: Math.min(Math.round(Math.max(opsShell.rightPanelWidth, 320) * ScreenTools.uiTextScaleFactor),
-                        Math.round(opsShell.width * 0.95))
-               // 320 = 100% 时沿用的内容基线（源自确认框的旧下限；本框没有 132/96 按钮行）；
-               // 整体再乘字号因子，否则字号缩放后弹框宽度不变、内容与留白比例失衡。
-               // 封顶 95% 窗宽：字号因子最高 4×（UI 200% × 字体 200%），无上限时宽度会超出窗口、
-               // 左缘跑到屏幕外。100% 时右栏硬上限 55% 窗宽
-               // （`layoutSettings.rightPanelMaxPercent` 的 max，该项默认 20%），
-               // 封顶不生效；极窄窗下弹框才会被收到 95% 窗宽。
+        // ‼️ 2026-11-22：宽度只跟右栏（去掉 320 下限与字号因子），规则单点在
+        //    `OpsCommon.panelDialogWidth`。内容由正文折行、按钮 `Flow` 折行适配。
+        width: OpsCommon.panelDialogWidth(opsShell.rightPanelWidth, opsShell.width)
         x: opsShell.width - width
+        // ‼️ 2026-11-22：再夹 `Math.max(0, …)` —— 弹框与右栏等宽后正文折行更多，极小窗口
+        //    （横屏手机）里高度可能超过窗口，原式会给出负 `y`，把标题和正文顶到窗口上方。
+        //    ⚠️ 只保证"从上缘起可见"；比窗口还高时仍需滚动才能看完（尚未实现）。
         y: opsShell._handoverAnchorY < 0
-           ? (opsShell.height - height) / 2
-           : Math.min(opsShell._handoverAnchorY + 6, opsShell.height - height - 12)
+           ? Math.max(0, (opsShell.height - height) / 2)
+           : Math.max(0, Math.min(opsShell._handoverAnchorY + 6, opsShell.height - height - 12))
         modal: false
         // ‼️ 告警档（用户 2026-10-10 第五轮）：「告警类提示框不应该与其他提示框采用
         //    相同色系」。分档判据不是"重要不重要"，是**要不要人做决定** ——
         //    `handoverDialog` 是等你选【取消】还是【回航】的**对话**，这个是**广播**
         //    （只告知、10 秒自关、不需要人做任何决定）⇒ 换色系，让人一眼看出"这条不用回"。
-        //    ⚠️ 别写回"没有任何可选项"：本框底下有一颗【知道了】按钮（框内 `RowLayout` 里，
+        //    ⚠️ 别写回"没有任何可选项"：本框底下有一颗【知道了】按钮（框内按钮行的 `Flow` 里，
         //       `onClicked: handoverGoneDialog.close()`）。"可选项"在这里指**要不要人做决定**，
         //       不是"有没有按钮" —— 关闭只算"看完就走"。
         // ⚠️ 色值一个都不在这里写：全在 `OpsDialog.qml`，这里只传开关。
@@ -2963,10 +2968,13 @@ Item {
                     text: _handoverGoneText
                 }
             }
-            RowLayout {
+            // ‼️ `Flow` + RTL（2026-11-22）：原先 `RowLayout` + 前导 `Item{fillWidth}`
+            //    把按钮推到右缘；弹框与右栏严格等宽后窄栏可能放不下按钮文字，改由 RTL
+            //    `Flow` 既贴右缘又能在放不下时夹到行宽（单颗按钮同样夹）。
+            Flow {
                 Layout.fillWidth: true
-                spacing: 8
-                Item { Layout.fillWidth: true }
+                layoutDirection: Qt.RightToLeft
+                spacing: Math.round(8 * ScreenTools.uiTextScaleFactor)
                 // 手动出口：对正在看别处的人，倒计时是必要的；对已经读完的人，它是白等。
                 // ⚠️ 这里**刻意不写死秒数** —— 2026-10-10 倒计时由 5 秒改成 10 秒时，原句里
                 //    两处写死的"5 秒"都得跟着改。**别再写回数字**，要改只改 `handoverGoneTimer`。
@@ -2976,6 +2984,7 @@ Item {
                     // ⇒ 归入取消档（白），不算"推荐执行"的绿。判据与 `alert: true` 同一条：
                     // 这个框要不要人做决定 —— 不要。
                     kind: "cancel"
+                    width: Math.min(implicitWidth, parent.width)
                     onClicked: handoverGoneDialog.close()
                 }
             }

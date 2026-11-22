@@ -1204,8 +1204,9 @@ OpsShell {
     OpsDialog {
         id: resumeConfirmDialog
         parent: romView
-        width: Math.min(Math.round(Math.max(romView.rightPanelWidth, 320) * ScreenTools.uiTextScaleFactor),
-                        Math.round(romView.width * 0.95))
+        // ‼️ 2026-11-22：宽度只跟右栏（去掉 320 下限与字号因子），规则单点在
+        //    `OpsCommon.panelDialogWidth`。内容由正文折行、按钮 `Flow` 折行适配。
+        width: OpsCommon.panelDialogWidth(romView.rightPanelWidth, romView.width)
         x: romView.width - width
         y: (romView.height - height) / 2
         modal: true
@@ -1241,21 +1242,27 @@ OpsShell {
                 // 必须写明后果（§5.1）：恢复是按机上 `current_seq` 继续，可能掉头飞回已过航点。
                 text: qsTr("将切回原航线任务：飞机飞回离开时的下一个航点，可能掉头飞回已经过的航点。")
             }
-            RowLayout {
+            // ‼️ `Flow` 而不是 `RowLayout`（2026-11-22）：弹框宽度与右栏严格相等后，窄栏放不下
+            //    两颗按钮，`RowLayout` 不折行会横向溢出；`Flow` 折行、弹框高度自适应。
+            //    ‼️ `layoutDirection: Qt.RightToLeft` 保持贴右缘的观感 ⇒ **声明顺序反转**
+            //    （取消在前 ⇒ 先排到最右），视觉顺序仍是【继续任务】【取消】。
+            Flow {
                 Layout.fillWidth: true
+                layoutDirection: Qt.RightToLeft
                 spacing: Math.round(16 * ScreenTools.uiTextScaleFactor)
-                Item { Layout.fillWidth: true }
-                // 绿 = 继续任务（正常业务流程，非应急/救济）
-                OpsDialogButton {
-                    text: qsTr("继续任务")
-                    kind: "primary"
-                    onClicked: { resumeConfirmDialog.close(); romView._execResume() }
-                }
                 // 白 = 取消
                 OpsDialogButton {
                     text: qsTr("取消")
                     kind: "cancel"
+                    width: Math.min(implicitWidth, parent.width)
                     onClicked: { romView._resumePendingTask = null; resumeConfirmDialog.close() }
+                }
+                // 绿 = 继续任务（正常业务流程，非应急/救济）
+                OpsDialogButton {
+                    text: qsTr("继续任务")
+                    kind: "primary"
+                    width: Math.min(implicitWidth, parent.width)
+                    onClicked: { resumeConfirmDialog.close(); romView._execResume() }
                 }
             }
         }
@@ -1274,8 +1281,9 @@ OpsShell {
     OpsDialog {
         id: emergencyLandingConfirmDialog
         parent: romView
-        width: Math.min(Math.round(Math.max(romView.rightPanelWidth, 320) * ScreenTools.uiTextScaleFactor),
-                        Math.round(romView.width * 0.95))
+        // ‼️ 2026-11-22：宽度只跟右栏（去掉 320 下限与字号因子），规则单点在
+        //    `OpsCommon.panelDialogWidth`。内容由正文折行、按钮 `Flow` 折行适配。
+        width: OpsCommon.panelDialogWidth(romView.rightPanelWidth, romView.width)
         x: romView.width - width
         y: (romView.height - height) / 2
         modal: true
@@ -1317,24 +1325,29 @@ OpsShell {
                            + "飞机将在当前位置下降着陆，不再飞向接机机位，落点由飞机自行决定；"
                            + "本操作不可撤销。")
             }
-            RowLayout {
+            // ‼️ `Flow` 而不是 `RowLayout`（2026-11-22）：同上，窄栏折行不溢出。
+            //    ‼️ RTL ⇒ **声明顺序反转**（取消在前 ⇒ 先排到最右），
+            //    视觉顺序仍是【确认迫降】【取消】。
+            Flow {
                 Layout.fillWidth: true
+                layoutDirection: Qt.RightToLeft
                 spacing: Math.round(16 * ScreenTools.uiTextScaleFactor)
-                Item { Layout.fillWidth: true }
-                // 红 = 迫降（应急处理；`OpsDialogButton` 三档语义里唯一的红档）
-                OpsDialogButton {
-                    text: qsTr("确认迫降")
-                    kind: "danger"
-                    onClicked: {
-                        emergencyLandingConfirmDialog.close()
-                        romView._execEmergencyLanding()
-                    }
-                }
                 // 白 = 取消（不改变任何状态）
                 OpsDialogButton {
                     text: qsTr("取消")
                     kind: "cancel"
+                    width: Math.min(implicitWidth, parent.width)
                     onClicked: { romView._emergencyPendingTask = null; emergencyLandingConfirmDialog.close() }
+                }
+                // 红 = 迫降（应急处理；`OpsDialogButton` 三档语义里唯一的红档）
+                OpsDialogButton {
+                    text: qsTr("确认迫降")
+                    kind: "danger"
+                    width: Math.min(implicitWidth, parent.width)
+                    onClicked: {
+                        emergencyLandingConfirmDialog.close()
+                        romView._execEmergencyLanding()
+                    }
                 }
             }
         }
