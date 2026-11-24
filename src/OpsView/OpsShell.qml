@@ -1891,6 +1891,11 @@ Item {
             guidedValueSlider:  null
         }
 
+        /// 右侧窗口按钮组须让开的遥测指示器区宽。窗口按钮的锚定与命令条可用宽的计算
+        /// **共用这一个值**：两处各写一份 `6 + indicatorsWidth` 时，改一处忘一处就会
+        /// 出现「按钮让开了、文字没让开」的重叠。
+        readonly property real windowButtonsRightMargin: 6 + commandBar.indicatorsWidth
+
         // 自定义工具——靠右停放（操作员名 + 时间 + 视图专属控件），
         // 锚到最右侧全屏/锁屏按钮组的左边。外层加深色圆角底条，
         // 保证白色文字/白色对勾在命令条浅底上清晰可见。
@@ -1906,8 +1911,83 @@ Item {
                 id: commandBarExtras
                 anchors.left: parent.left; anchors.leftMargin: 12
                 anchors.verticalCenter: parent.verticalCenter
-                spacing: 18
                 visible: AuthController.loggedIn
+
+                //-------------------------------------------------------------------------
+                // 窄屏自适应（2026-11-25 用户方案；前一版「按平台字号整体放大」已否决并回退）
+                //-------------------------------------------------------------------------
+                // 进视图时按**实测字宽**算间距档与显隐：字号由设置参数（`uiScalePercent` ×
+                // `fontScalePercent`）决定，本块只做适配，**不改字号**、**不加新配置参数**。
+                // 退让顺序（用户 2026-11-25 裁定，按此顺序逐级，不许换行）：
+                //   ① 间距 18 → 10 → 6（各项之间**始终保留间隔**，6 px 为下限）
+                //   ② 去掉「操作员」
+                //   ③ 去掉「日期时间」
+                //   ④ 再不够**不再处理**（已知极限：会压到左侧 Q 标/主状态/飞行模式上）
+                // ‼️ 间距是**绝对像素**，不随 `fontScalePercent` 缩放：放大字号时若间距同步
+                //    放大，等于把"缝吃掉的宽度"再翻一倍（2026-11-24 手机实测教训）。
+                // ‼️ 不只"进入时算一次"：左侧原生区（建链后冒出飞行模式指示器）与右侧遥测
+                //    指示器都会变宽 ⇒ 这里做成绑定重算，对外仍是三个**稳定状态位**。
+                // ‼️ 宽度未就绪（进入首帧全为 0）⇒ 一律按"全显示 + 最宽间距"，避免闪一下。
+                readonly property real _scale:   ScreenTools.uiTextScaleFactor
+                readonly property real _fontPx:  Math.round(13 * _scale)
+                readonly property var  _spacings: [18, 10, 6]
+
+                FontMetrics {
+                    id: _extrasFm
+                    font.pixelSize: commandBarExtras._fontPx
+                    font.bold: true
+                }
+
+                /// 可用宽 = 命令条宽 − 左侧原生区 − 右侧窗口按钮 − 遥测指示器 − 左右边距；
+                /// 布局没算出宽度时返回 -1（见 `_plan` 的兜底）。
+                readonly property real _available: {
+                    if (commandBarWrap.width <= 0 || commandBar.leftPanelWidth <= 0
+                            || commandBarWindowButtons.width <= 0) {
+                        return -1
+                    }
+                    return Math.max(0, commandBarWrap.width
+                        - commandBar.leftPanelWidth
+                        - commandBarWindowButtons.width
+                        - commandBarWrap.windowButtonsRightMargin
+                        - 24)
+                }
+
+                readonly property real _operatorW: _extrasFm.advanceWidth(operatorText.text)
+                /// 时钟宽度取**定长样串**：格式固定但数字字宽不等，逐秒量真实文本会让
+                /// 间距档在阈值上每秒跳一次（整排左右晃）。
+                readonly property real _clockW: _extrasFm.advanceWidth("8888年88月88日 88:88:88")
+                readonly property real _extrasW: extrasLoader.implicitWidth
+
+                function _fitsSet(showOperator, showClock, spacing) {
+                    var w = (showOperator ? _operatorW : 0)
+                          + (showClock ? _clockW : 0)
+                          + _extrasW
+                    var n = (showOperator ? 1 : 0) + (showClock ? 1 : 0) + (_extrasW > 0 ? 1 : 0)
+                    return w + spacing * Math.max(0, n - 1) <= _available
+                }
+
+                readonly property var _plan: {
+                    if (_available < 0) {
+                        return { spacing: _spacings[0], showOperator: true, showClock: true }
+                    }
+                    // 三档显隐：全显示 → 去操作员 → 再去日期时间；每档内先试宽间距
+                    var sets = [[true, true], [false, true], [false, false]]
+                    for (var i = 0; i < sets.length; ++i) {
+                        for (var s = 0; s < _spacings.length; ++s) {
+                            if (_fitsSet(sets[i][0], sets[i][1], _spacings[s])) {
+                                return { spacing: _spacings[s],
+                                         showOperator: sets[i][0], showClock: sets[i][1] }
+                            }
+                        }
+                    }
+                    return { spacing: _spacings[2], showOperator: false, showClock: false }
+                }
+
+                readonly property real _spacing:      _plan.spacing
+                readonly property bool _showOperator: _plan.showOperator
+                readonly property bool _showClock:    _plan.showClock
+
+                spacing: _spacing
 
                 // 当前日期时间（中国习惯 yyyy年MM月dd日 hh:mm:ss），每秒刷新
                 property date nowTime: new Date()
@@ -1917,24 +1997,30 @@ Item {
                 }
 
             Text {
+                id: operatorText
                 anchors.verticalCenter: parent.verticalCenter
+                visible: commandBarExtras._showOperator
                 color: "#e6edf7"
-                font.pixelSize: Math.round(13 * ScreenTools.uiTextScaleFactor); font.bold: true
+                font.pixelSize: commandBarExtras._fontPx; font.bold: true
                 text: qsTr("操作员：") + (AuthController.displayName !== "" ? AuthController.displayName : AuthController.currentUser)
             }
 
             // 当前年月日时分秒（操作员与视图专属控件之间）
             Text {
+                id: clockText
                 anchors.verticalCenter: parent.verticalCenter
+                visible: commandBarExtras._showClock
                 color: "#e6edf7"
-                font.pixelSize: Math.round(13 * ScreenTools.uiTextScaleFactor); font.bold: true
+                font.pixelSize: commandBarExtras._fontPx; font.bold: true
                 text: Qt.formatDateTime(commandBarExtras.nowTime, "yyyy年MM月dd日 hh:mm:ss")
             }
 
             // 视图专属控件注入槽（站点视图：出站/进站、机位朝向；监控员视图：留空或自有控件）。
             // ‼️ 槽位对两个视图**对称**：骨架不给任何一方开小灶，谁都不必改本文件就能挂控件。
-            // 展开后的根项是 `Row`，本 Row 的 `spacing: 18` 因此同时作用于"时间↔扩展区"与扩展区内部。
+            // 展开后的根项是 `Row`：本 Row 的 spacing 只作用于"操作员↔时钟↔扩展区"这三段；
+            // 扩展区**内部**的间距归子类自己管（见 `OpsView.qml` 的同名注释）。
             Loader {
+                id: extrasLoader
                 anchors.verticalCenter: parent.verticalCenter
                 sourceComponent: opsShell.commandBarExtras
             }
@@ -1952,7 +2038,7 @@ Item {
             id: commandBarWindowButtons
             anchors {
                 right:         parent.right
-                rightMargin:   6 + commandBar.indicatorsWidth
+                rightMargin:   commandBarWrap.windowButtonsRightMargin
                 verticalCenter: parent.verticalCenter
             }
             spacing: 4
@@ -2810,13 +2896,135 @@ Item {
             color: QGroundControl.globalPalette.windowTransparent
             z: 5
 
+            //-------------------------------------------------------------------------
+            // 窄屏自适应（2026-11-25 用户方案）——与命令条同一思路，但**分别处理**：
+            // 字号由设置参数（`uiScalePercent` × `fontScalePercent`）决定，本块不改字号；
+            // 按**实测字宽**选间距档，放不下再按固定顺序隐项。退让顺序（用户裁定）：
+            //   ① 间距 18 → 12 → 8 → 4（各项之间**始终保留间隔**，4 px 为下限）
+            //   ② 去掉「上行灯后面的文字」（只留灯点）
+            //   ③ 去掉「航向」
+            //   ④ 去掉「状态」
+            // ‼️ 灯宽按**常量**算（灯点 + 可选的**最宽**文字），不读灯当前宽度：
+            //    否则会形成「去文字 ⇒ 灯变窄 ⇒ 又放得下 ⇒ 文字回来」的绑定环路。
+            // ‼️ 但必须按**该档自己的**灯宽算可用宽：若一律按最宽文字预留，「去灯文字」
+            //    这一档的判定就与上一档完全相同 ⇒ 它永远选不中（2026-11-25 审查发现）。
+            // ⚠️ 判据用实时字宽：遥测数值变宽/变窄时档位可能随之切换（整排随之一动）。
+            //    这是"永远按真实内容判断"的必然代价；真要稳压只能加滞回，暂不做。
+            readonly property real _scale:    ScreenTools.uiTextScaleFactor
+            readonly property real _fontPx:   Math.round(13 * _scale)
+            readonly property real _margin:   16
+            readonly property real _lightGap: 24
+            /// 间距是**绝对像素**，不随 `fontScalePercent` 缩放：放大字号时若间距同步
+            /// 放大，等于把"缝吃掉的宽度"再翻一倍（2026-11-24 手机实测教训）。
+            /// 末档 4 px 是"必要的间隔"的下限，不再往下压。
+            readonly property var  _spacings: [18, 12, 8, 4]
+
+            FontMetrics { id: _statusFm; font.pixelSize: instrumentPanel._fontPx; font.bold: true }
+            /// 灯文字用的字体（`QGCLabel` 缺省：defaultFontPointSize + 常规字重）。
+            FontMetrics {
+                id: _lightFm
+                font.pointSize: ScreenTools.defaultFontPointSize
+                font.family:    ScreenTools.normalFontFamily
+            }
+            /// 灯点（含与文字之间的间距）宽；与 `UplinkLightIndicator.qml` 的算式同源。
+            readonly property real _lightDotW: Math.round(ScreenTools.defaultFontPixelHeight * 0.55)
+                                             + ScreenTools.defaultFontPixelWidth * 0.5
+            /// 灯文字的最宽形态（noPermission + 最长的链路词）。
+            readonly property real _lightLabelW:
+                _lightFm.advanceWidth(qsTr("上行 无权限（链路未建链）"))
+
+            function _statusItemText(key, label) {
+                return label + "：" + _instrumentValue(key)
+            }
+            /// 逐项实测宽（`key → 宽`）。**每次重算只量 7 次**：下面的档位表会把同一批
+            /// 条目在「4 个隐项档 × 4 档间距」上反复试，逐组合去量就是 100+ 次字符串
+            /// 格式化（`_instrumentValue` 不是纯取值，`status` 还要走一次状态映射）。
+            readonly property var _itemWidths: {
+                var m = {}
+                for (var i = 0; i < _itemsAll.length; ++i) {
+                    var it = _itemsAll[i]
+                    m[it[0]] = _statusFm.advanceWidth(_statusItemText(it[0], it[1]))
+                }
+                return m
+            }
+            /// `items`（`[key, label]` 数组）在给定间距下的实测宽。
+            function _statusRowWidth(items, spacing) {
+                var w = 0
+                for (var i = 0; i < items.length; ++i) {
+                    w += _itemWidths[items[i][0]]
+                }
+                return w + spacing * Math.max(0, items.length - 1)
+            }
+            /// 给定档位（灯文字显/隐）下的右排可用宽；布局未就绪（首帧）返回 -1。
+            /// 就绪时**夹到 0 以上**：负宽不是"未就绪"，而是"这一档放不下任何东西"。
+            function _availFor(showLightLabel) {
+                if (width <= 0 || selectedTaskText.width <= 0) return -1
+                var avail = width - _margin * 2 - 8 - selectedTaskText.width
+                if (uplinkLight.visible) {
+                    avail -= _lightGap + _lightDotW + (showLightLabel ? _lightLabelW : 0)
+                }
+                return Math.max(0, avail)
+            }
+
+            // 三套候选条目。**稳定数组**（只在翻译变化时重建）⇒ `Repeater.model` 只在
+            // **档位切换**时换引用，同一档内值变化不重建代理。
+            readonly property var _itemsAll: [
+                ["alt", qsTr("高度")], ["speed", qsTr("水平速度")], ["airspeed", qsTr("空速")],
+                ["climb", qsTr("爬升")], ["battery", qsTr("电量")], ["heading", qsTr("航向")],
+                ["status", qsTr("状态")]]
+            function _withoutKey(items, key) {
+                var out = []
+                for (var i = 0; i < items.length; ++i) {
+                    if (items[i][0] !== key) out.push(items[i])
+                }
+                return out
+            }
+            readonly property var _itemsNoHeading: _withoutKey(_itemsAll, "heading")
+            readonly property var _itemsNoStatus:  _withoutKey(_itemsNoHeading, "status")
+
+            /// 档位表按用户裁定的顺序：先全显示（灯带文字），再去灯文字，再去航向，
+            /// 再去状态；每一档内都从最宽间距试起。
+            /// ‼️ 每档用**自己的** `_availFor(showLightLabel)`：去灯文字后灯确实变窄，
+            ///    这一档必须按"窄下来的宽度"判定，否则它是一档永远选不中的死档。
+            readonly property var _statusPlan: {
+                var tiers = [
+                    { items: _itemsAll,       showLightLabel: true  },
+                    { items: _itemsAll,       showLightLabel: false },
+                    { items: _itemsNoHeading, showLightLabel: false },
+                    { items: _itemsNoStatus,  showLightLabel: false }
+                ]
+                for (var t = 0; t < tiers.length; ++t) {
+                    var avail = _availFor(tiers[t].showLightLabel)
+                    // 布局未就绪（首帧）：全显示 + 最宽间距，不砍项
+                    if (avail < 0) {
+                        return { items: _itemsAll, spacing: _spacings[0], showLightLabel: true }
+                    }
+                    for (var s = 0; s < _spacings.length; ++s) {
+                        if (_statusRowWidth(tiers[t].items, _spacings[s]) <= avail) {
+                            return { items: tiers[t].items, spacing: _spacings[s],
+                                     showLightLabel: tiers[t].showLightLabel }
+                        }
+                    }
+                }
+                // 只剩 5 项 × 最小间距仍放不下：按最后一档画（已知极限，会压到左端）
+                return { items: _itemsNoStatus, spacing: _spacings[3], showLightLabel: false }
+            }
+            // 拆成三个**值**属性：`_statusPlan` 重算时是新对象，但同一档内的数组引用 /
+            // 数值不变 ⇒ `Repeater` 与 `Row` 收不到变更通知。
+            readonly property var  _statusItems:    _statusPlan.items
+            readonly property real _statusSpacing:  _statusPlan.spacing
+            readonly property bool _showLightLabel: _statusPlan.showLightLabel
+
             // 选中任务 —— 靠左
             Text {
                 id: selectedTaskText
-                anchors.left: parent.left; anchors.leftMargin: 16
+                anchors.left: parent.left; anchors.leftMargin: instrumentPanel._margin
                 anchors.verticalCenter: parent.verticalCenter
-                color: "#e6edf7"; font.pixelSize: Math.round(13 * ScreenTools.uiTextScaleFactor); font.bold: true
-                text: qsTr("选中任务：") + OpsCommon.taskNo(_selectedTask())
+                color: "#e6edf7"; font.pixelSize: instrumentPanel._fontPx; font.bold: true
+                // 只显示编号本身（用户 2026-11-25：「选中任务：」四个字去掉）。
+                // 注意取的是 `OpsCommon.taskNo()`：优先 `uav_no`（无人机编号），
+                // 机号为空时回退 `task_no`——两种值的长度不同，宽度由下面的实测兜住。
+                text: OpsCommon.taskNo(_selectedTask())
             }
 
             // 加密**上行灯**（规范 §3.1.1 节末「界面灯」）：跟**选中任务**的载具走。
@@ -2825,24 +3033,24 @@ Item {
             UplinkLightIndicator {
                 id: uplinkLight
                 vehicle: opsShell._selectedVehicle
+                // 窄屏退让第 ② 步：放不下时只留灯点，去掉后面的文字（悬停提示仍在）
+                showText: instrumentPanel._showLightLabel
                 anchors.left: selectedTaskText.right
-                anchors.leftMargin: 24
+                anchors.leftMargin: instrumentPanel._lightGap
                 anchors.verticalCenter: parent.verticalCenter
             }
 
-            // 参数排：标题：数值横向一行 —— 靠右
+            // 参数排：标题：数值横向一行 —— 靠右（条目取 `_statusItems`、间距取 `_statusSpacing`）
             Row {
                 id: telemetryRow
-                anchors.right: parent.right; anchors.rightMargin: 16
+                anchors.right: parent.right; anchors.rightMargin: instrumentPanel._margin
                 anchors.verticalCenter: parent.verticalCenter
-                spacing: 18
+                spacing: instrumentPanel._statusSpacing
                 Repeater {
-                    model: [["alt", qsTr("高度")], ["speed", qsTr("水平速度")], ["airspeed", qsTr("空速")],
-                            ["climb", qsTr("爬升")], ["battery", qsTr("电量")], ["heading", qsTr("航向")],
-                            ["status", qsTr("状态")]]
+                    model: instrumentPanel._statusItems
                     delegate: Text {
                         textFormat: Text.RichText
-                        font.pixelSize: Math.round(13 * ScreenTools.uiTextScaleFactor); font.bold: true
+                        font.pixelSize: instrumentPanel._fontPx; font.bold: true
                         color: "#e6edf7"
                         text: "<span style='color:#8fa1bd;'>%1：</span>%2".arg(modelData[1]).arg(_instrumentValue(modelData[0]))
                     }

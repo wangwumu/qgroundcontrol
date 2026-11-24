@@ -50,6 +50,12 @@ RowLayout {
     /// **不能**用 `activeVehicle` 代替——多机同屏时两者可以不是同一架。
     property var vehicle: QGroundControl.multiVehicleManager.activeVehicle
 
+    /// 是否显示灯点后面的文字（「上行 正常」等）。窄屏放不下时由状态栏置 false，
+    /// 只留灯点；**悬停提示不受影响**（提示挂在根项上，见文件末）。
+    /// ⚠️ 关掉文字会让本组件变窄——调用方若要预留宽度，必须按"文字开着"的最宽形态预留，
+    ///    不要读本组件当前宽度（否则形成「去文字⇒变窄⇒又放得下⇒文字回来」的振荡）。
+    property bool showText: true
+
     spacing: ScreenTools.defaultFontPixelWidth * 0.5
 
     readonly property int _deviceID: vehicle ? vehicle.deviceID() : 0
@@ -125,6 +131,7 @@ RowLayout {
 
     QGCLabel {
         Layout.alignment:   Qt.AlignVCenter
+        visible:            root.showText
         text:               root._text()
     }
 
