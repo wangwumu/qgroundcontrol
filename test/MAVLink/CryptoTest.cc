@@ -2887,9 +2887,16 @@ void CryptoTest::_testReleaseDevice()
     crypto->setRegistrationEnabled(false);
     crypto->setMonitorDevices(QVariantList(), 3000);
     crypto->returnToStandby();
-    QVERIFY(crypto->removeLinkedDevice(other));        // ④段的诱饵
+    // ‼️ 2026-11-24 起（规范 §2.7.2 i），`other` 走到这里**已经**被名册判据释出了，不再是
+    //    "④段留下的诱饵待清理"。推演：2713 行它随 `{released, other}` 进名册；`released` 两度
+    //    被 `releaseDevice` 摘出后名册只剩它；2873 行名册换成 `{released}` ⇒ 它第一次缺席；
+    //    2877 行再换空 ⇒ 第二次缺席、且本地有密钥 ⇒ `releaseDevice(other)` 把它从
+    //    `_linkedDevices` 摘掉、删密钥、记入 `_releasedDevices`。
+    //    下面两条因此是**这条新判据的真正观测点**，不是走个清理流程——删掉 i 的实现它们会红。
+    QVERIFY2(!crypto->deviceKeyManager()->hasKey(other),
+             "名册确认期满的释出没删密钥 ⇒ 本端还能给已结束任务的飞机解密");
+    QVERIFY(!crypto->removeLinkedDevice(other));       // 已由上面的释出摘掉
     QVERIFY(!crypto->removeLinkedDevice(released));    // ③段已被 releaseDevice 摘掉
-    crypto->deviceKeyManager()->removeKey(other);
     crypto->deviceKeyManager()->removeKey(third);   // ③b 切走的那架：`beginLinking` 只装不删，
                                                     // 留着会渗进后续用例的密钥缓存
     QCOMPARE(crypto->monitorDeviceCount(), 0);
@@ -2976,11 +2983,18 @@ void CryptoTest::_testMonitorListInvalidatedAtSessionBoundary()
     QVERIFY2(crypto->monitorListActiveForTest(), "前提不成立：清单没生效，本用例测不出东西");
     QCOMPARE(crypto->monitorDeviceCount(), 2);
 
+    // 缺席计数与清单**同一归属**（规范 §2.7.2 i，2026-11-24）：先造一个「已缺席一次」的
+    // 状态，再走会话边界。留着的后果不是"多一条记录"：新会话第一次推清单时，`prevSet`
+    // 已空、这一格直接进入 ③ 的"仍缺席 ⇒ +1" ⇒ **一轮即达阈值、当场释出**（本该两轮）。
+    crypto->setMonitorDevices(QVariantList{ QVariant(static_cast<uint>(a)) }, 3000);
+    QCOMPARE(crypto->monitorAbsentPushCountForTest(b), 1);   // 阳性对照：计数确实起来了
+
     // 会话边界：责任方身份被重新判定一次（登录成功 / 被拒登录都走这里）。
     crypto->setResponsibleParty(false);
     QVERIFY2(!crypto->monitorListActiveForTest(),
              "会话边界没作废监控清单 ⇒ 取列表口径仍钉在上一会话的 `_monitorDevices` 上");
     QCOMPARE(crypto->monitorDeviceCount(), 0);
+    QCOMPARE(crypto->monitorAbsentPushCountForTest(b), 0);   // 与清单同批作废
 
     // 反向：重新推一份清单，闩必须能**再**置上 —— "作废监控清单"不得把 setMonitorDevices 一起废掉。
     crypto->setMonitorDevices(QVariantList{ QVariant(static_cast<uint>(a)) }, 3000);
@@ -3601,6 +3615,132 @@ void CryptoTest::_testGcsHeartbeatTicking()
     crypto->resetReplay(b);
 }
 
+void CryptoTest::_testSafetyUplinkBypassesTiers()
+{
+    // 规范 §3.1.1 右列：红档与黄（持续）档暂停常规上行，但安全类指令（回航/备降/迫降）
+    // 仍可盲发；前提是角色闸通过且**本任期已发过至少一帧**（R5 的「刚取得控制权不许盲发」）。
+    CryptoController* const crypto = CryptoController::instance();
+
+    ignoreLogMessage("MAVLink.Crypto.CryptoController", QtDebugMsg,
+                     QRegularExpression("beginLinking|linking confirmed|return to standby"));
+    crypto->returnToStandby();
+    crypto->setRegistrationEnabled(false);
+    crypto->setResponsibleParty(false);
+    crypto->setResponsibleParty(true);
+    crypto->setCryptoEnabled(true);
+
+    const DeviceID a = 0x0A0B0C31u;
+    crypto->deviceKeyManager()->removeKey(a);
+    crypto->deviceKeyManager()->cacheKey(a, testKey());
+    crypto->setInitiatorDevices(QVariantList{ static_cast<uint>(a) });
+    crypto->setIntroducerDevices(QVariantList{ static_cast<uint>(a) });
+    crypto->resetReplay(a);
+
+    const qint64 base = QDateTime::currentMSecsSinceEpoch();
+    crypto->setNowMsForTest(base);
+
+    crypto->noteStandbyHeartbeat(a);   // 握手期：放行根帧
+    crypto->beginLinking(a);
+    QCOMPARE(crypto->state(), CryptoController::State::Active);
+    QVERIFY2(!crypto->allowsSafetyUplink(a), "还没发出任何上行 ⇒ 不允许盲发（R5）");
+    uint64_t root = 0;
+    QVERIFY(crypto->nextOutgoingCounter(root));
+
+    crypto->noteDownlinkHeartbeat(a);  // 链路建起来 ⇒ 握手期结束，绿档
+    QCOMPARE(crypto->uplinkTier(a), CryptoController::UplinkTier::Green);
+    QVERIFY(crypto->allowsUplink(a));
+    QVERIFY(crypto->allowsSafetyUplink(a));
+
+    crypto->setNowMsForTest(base + 6000);  // 黄（持续）
+    QCOMPARE(crypto->uplinkTier(a), CryptoController::UplinkTier::YellowSustained);
+    QVERIFY2(!crypto->allowsUplink(a), "黄（持续）暂停常规上行");
+    QVERIFY2(crypto->allowsSafetyUplink(a), "安全类指令在黄（持续）档仍可盲发");
+
+    crypto->setNowMsForTest(base + 11000);  // 红
+    QCOMPARE(crypto->uplinkTier(a), CryptoController::UplinkTier::Red);
+    QVERIFY(!crypto->allowsUplink(a));
+    QVERIFY(crypto->allowsSafetyUplink(a));
+
+    crypto->setNowMsForTest(-1);
+    crypto->releaseDevice(a);
+}
+
+void CryptoTest::_testStandbyHandshakeClearsWatermarks()
+{
+    // 规范 §2.5.1 R1（2026-11-23）：持上行权限的一方收到明文待命 ⇒ 清双向水位，下一帧
+    // 即随机根 X；节流窗口内不重复触发；窗口到期仍只见到明文时**不重新随机**（续发 +2）；
+    // 本端正在飞另一架时，其它飞机的待命不得抢槽。
+    CryptoController* const crypto = CryptoController::instance();
+
+    ignoreLogMessage("MAVLink.Crypto.CryptoController", QtDebugMsg,
+                     QRegularExpression("beginLinking|linking confirmed|return to standby|standby heartbeat"));
+    crypto->returnToStandby();
+    crypto->setRegistrationEnabled(false);
+    crypto->setResponsibleParty(false);
+    crypto->setResponsibleParty(true);
+    crypto->setCryptoEnabled(true);
+
+    const DeviceID a = 0x0A0B0C21u;
+    const DeviceID b = 0x0A0B0C22u;
+    crypto->deviceKeyManager()->removeKey(a);
+    crypto->deviceKeyManager()->removeKey(b);
+    crypto->deviceKeyManager()->cacheKey(a, testKey());
+    crypto->deviceKeyManager()->cacheKey(b, testKey());
+    crypto->setInitiatorDevices(QVariantList{ static_cast<uint>(a), static_cast<uint>(b) });
+    crypto->setIntroducerDevices(QVariantList{ static_cast<uint>(a), static_cast<uint>(b) });
+    crypto->resetReplay(a);
+    crypto->resetReplay(b);
+
+    const qint64 base = QDateTime::currentMSecsSinceEpoch();
+    crypto->setNowMsForTest(base);
+
+    // 造一条既有会话：下行 2000、上行 2001。
+    crypto->commitIncoming(a, 2000);
+    crypto->noteDownlinkHeartbeat(a);
+    crypto->beginLinking(a);
+    QCOMPARE(crypto->state(), CryptoController::State::Active);
+    uint64_t c1 = 0;
+    QVERIFY(crypto->nextOutgoingCounter(c1));
+    QCOMPARE(c1, 2001ull);
+
+    // 明文待命 ⇒ 双向清零；首帧改为 62 位随机奇数根 X；同机待命不打断自己的 Active 链路。
+    crypto->noteStandbyHeartbeat(a);
+    QVERIFY2(crypto->isIncomingAcceptable(a, 1999), "握手必须清下行水位");
+    QCOMPARE(crypto->state(), CryptoController::State::Active);
+    uint64_t x = 0;
+    QVERIFY(crypto->nextOutgoingCounter(x));
+    QCOMPARE(x & 1ull, 1ull);
+    QVERIFY2(x >= (1ull << 40), "首帧应是随机根 X，不是 2003（旧序列续值）");
+
+    // 节流：5 s 内的第二条待命不再清零，序列按 +2 续。
+    crypto->noteStandbyHeartbeat(a);
+    uint64_t c3 = 0;
+    QVERIFY(crypto->nextOutgoingCounter(c3));
+    QCOMPARE(c3, x + 2);
+
+    // 窗口到期仍只收到明文 ⇒ 不取新随机，继续 +2。
+    crypto->setNowMsForTest(base + 5001); // > kHandshakeThrottleMs（5 s）
+    crypto->noteStandbyHeartbeat(a);
+    uint64_t c4 = 0;
+    QVERIFY(crypto->nextOutgoingCounter(c4));
+    QCOMPARE(c4, c3 + 2);
+    crypto->setNowMsForTest(base);
+
+    // 槽位守卫：本端正 Active 在 a 上，b 的待命不得抢槽、也不得被当成握手放行。
+    crypto->noteStandbyHeartbeat(b);
+    QCOMPARE(crypto->activeDeviceID(), a);
+    QVERIFY2(!crypto->allowsUplink(b), "未抢到槽的待命不得给 b 打开上行许可");
+
+    // 握手期在收到首条认证加密下行心跳后结束，改由分档治理（此处应仍为绿档）。
+    crypto->noteDownlinkHeartbeat(a);
+    QCOMPARE(crypto->uplinkTier(a), CryptoController::UplinkTier::Green);
+    QVERIFY(crypto->allowsUplink(a));
+
+    crypto->setNowMsForTest(-1);
+    crypto->releaseDevice(a);
+    crypto->releaseDevice(b);
+}
+
 void CryptoTest::_testIntroducerGate()
 {
     CryptoController* const crypto = CryptoController::instance();
@@ -3666,11 +3806,17 @@ void CryptoTest::_testIntroducerGate()
 
     // ③b 陈旧下行**不得**再当搭车通行证：超过 kDownlinkFreshnessMs 后必须拒绝。
     //     2026-11-10 实测形状：PX4 已停 20 多秒，本端仍凭旧记录建链并发出一条上行心跳。
+    //     ⚠️ 建链闸（2 s）与上行许可分档（§3.1.1：2/5/10 s）是两件事——3 s 时不能建链，
+    //        但上行许可按黄档仍放行；到 5 s 以上才暂停。
+    const qint64 tierBase = QDateTime::currentMSecsSinceEpoch();
+    crypto->setNowMsForTest(tierBase);
     crypto->noteDownlinkHeartbeat(a);
-    crypto->setNowMsForTest(QDateTime::currentMSecsSinceEpoch() + 3000);
+    crypto->setNowMsForTest(tierBase + 3000);
     crypto->beginLinking(a);
     QCOMPARE(crypto->state(), CryptoController::State::Standby);
-    QVERIFY2(!crypto->allowsUplink(a), "下行过期后任何上行都必须被拒——这正是 PX4 重启窗口");
+    QVERIFY2(crypto->allowsUplink(a), "3 s 属黄档（2–5 s）：建链闸拒绝，但常规上行仍放行");
+    crypto->setNowMsForTest(tierBase + 6000);
+    QVERIFY2(!crypto->allowsUplink(a), "5–10 s 属黄（持续）：暂停常规上行");
     crypto->setNowMsForTest(-1);
     crypto->noteDownlinkHeartbeat(a);               // 重新变新鲜
     crypto->beginLinking(a);
@@ -3703,8 +3849,11 @@ void CryptoTest::_testIntroducerGate()
     // ---- qgc2 形态：起飞档引入方 ----
     crypto->setIntroducerDevices(QVariantList{ static_cast<uint>(a) });
     QVERIFY(crypto->isIntroducerFor(a));
-    QVERIFY2(crypto->allowsUplink(a), "引入方不受「近期加密下行」限制——PX4 待命时就该它去建链");
+    // 2026-11-23：引入权只是**资格**；§2.5.1 规定「明文待命 / 加密下行两个事件皆未到
+    // ⇒ 不发任何加密上行」。收到明文待命才进握手期、才放行根帧 X。
+    QVERIFY2(!crypto->allowsUplink(a), "只有资格、没有事件时不得发（§2.5.1）");
     crypto->noteStandbyHeartbeat(a);
+    QVERIFY2(crypto->allowsUplink(a), "收到明文待命 ⇒ 握手期放行根帧 X");
     crypto->beginLinking(a);
     QCOMPARE(crypto->state(), CryptoController::State::Active);
     QVERIFY2(crypto->shouldSendGcsHeartbeat(a, 10), "引入方在 bootstrap 期应放行");
@@ -3861,6 +4010,140 @@ void CryptoTest::_testSetMonitorDevicesEmptyFetchesNothing()
     absorbPendingKeyFetches(crypto, 2); // 撑开时 1 次 + 阳性对照 1 次
     crypto->setMonitorDevices(QVariantList(), 5000);
     keyMgr->setServerUrl(QString());
+}
+
+// ============================================================================================
+// 监控员视图「任务完成 ⇒ 释出」（2026-11-24 定，规范 §2.7.2 i）
+//
+// 判据：某 deviceID 连续 `kMonitorReleaseConfirmPushes`（=2）次**成功推送**都不在 ③ 名册里
+// ⇒ 它的任务已结束（服务端 Park 一次事务写 task→COMPLETED、uav→PARKED，后者不在在航白名单）
+// ⇒ 走 `releaseDevice`（删密钥、清双向水位、移出登记集合、让出上行权）。
+// 与站点视图「离开 view=site ⇒ 释出」是同一原语的两个判据，差异只在时机。
+//
+// 本组用例的判别力来自三处：
+//   · 第一轮缺席**必须不释出**（否则「一次即释出」的实现也能过）；
+//   · 第二轮缺席**必须释出**，且判据落在密钥真的被删（不是只看计数）；
+//   · 中间回返必须清零（否则「缺席计数永不归零」的实现也能过）。
+// ============================================================================================
+void CryptoTest::_testMonitorRosterReleaseAfterConfirmPushes()
+{
+    CryptoController* const crypto = CryptoController::instance();
+    ignoreLogMessage("MAVLink.Crypto.CryptoController", QtDebugMsg,
+                     QRegularExpression("registration |linked device|released device|return to standby"));
+
+    crypto->returnToStandby();
+    crypto->setRegistrationEnabled(false);
+
+    const DeviceID a = makeDeviceID(0, 0, 0xB2, 0x01);
+    const DeviceID b = makeDeviceID(0, 0, 0xB2, 0x02);
+    // 两架都先给密钥：没有密钥时 `releaseDevice` 的成员资格闸会早退，
+    // 「密钥被删」这条判据就成了假绿（不是因为被释出，而是本来就没有）。
+    crypto->deviceKeyManager()->cacheKey(a, testKey());
+    crypto->deviceKeyManager()->cacheKey(b, testKey());
+
+    QSignalSpy releasedSpy(crypto, &CryptoController::monitorDeviceReleased);
+
+    // 前提：两架都在名册里。
+    crypto->setMonitorDevices(QVariantList{ static_cast<uint>(a), static_cast<uint>(b) }, 3000);
+    QCOMPARE(crypto->monitorDeviceCount(), 2);
+    QCOMPARE(crypto->monitorAbsentPushCountForTest(b), 0);
+
+    // ---- 第一轮缺席：只计数，不释出 ----
+    crypto->setMonitorDevices(QVariantList{ static_cast<uint>(a) }, 3000);
+    QCOMPARE(crypto->monitorAbsentPushCountForTest(b), 1);
+    QVERIFY2(crypto->deviceKeyManager()->hasKey(b),
+             "第一轮缺席就删密钥 ⇒ 单轮脏响应会打断在飞链路（确认轮形同虚设）");
+    QCOMPARE(releasedSpy.count(), 0);
+
+    // ---- 第二轮缺席：释出 ----
+    crypto->setMonitorDevices(QVariantList{ static_cast<uint>(a) }, 3000);
+    QVERIFY2(!crypto->deviceKeyManager()->hasKey(b), "连续两轮缺席必须释出（密钥被删）");
+    QCOMPARE(crypto->monitorAbsentPushCountForTest(b), 0);
+    QCOMPARE(crypto->monitorDeviceCount(), 1);
+    // 在名册的那一架不得被误释出。
+    QVERIFY(crypto->deviceKeyManager()->hasKey(a));
+    // 信号恰好一次、且带的是 b（视图侧据此关载具、清轨迹）。
+    QCOMPARE(releasedSpy.count(), 1);
+    QCOMPARE(releasedSpy.at(0).at(0).toUInt(), static_cast<uint>(b));
+
+    // 复原：清名册 + 撤销 b 的「已释出」记号（撤销点是接手，不是 `removeLinkedDevice`）。
+    crypto->setMonitorDevices(QVariantList(), 3000);
+    crypto->addLinkedDevice(b);
+    crypto->removeLinkedDevice(b);
+    crypto->deviceKeyManager()->removeKey(a);
+    crypto->deviceKeyManager()->removeKey(b);
+}
+
+void CryptoTest::_testMonitorRosterReturnCancelsRelease()
+{
+    CryptoController* const crypto = CryptoController::instance();
+    ignoreLogMessage("MAVLink.Crypto.CryptoController", QtDebugMsg,
+                     QRegularExpression("registration |linked device|released device|return to standby"));
+
+    crypto->returnToStandby();
+    crypto->setRegistrationEnabled(false);
+
+    const DeviceID a = makeDeviceID(0, 0, 0xB4, 0x01);
+    const DeviceID b = makeDeviceID(0, 0, 0xB4, 0x02);
+    crypto->deviceKeyManager()->cacheKey(a, testKey());
+    crypto->deviceKeyManager()->cacheKey(b, testKey());
+
+    crypto->setMonitorDevices(QVariantList{ static_cast<uint>(a), static_cast<uint>(b) }, 3000);
+    crypto->setMonitorDevices(QVariantList{ static_cast<uint>(a) }, 3000);
+    QCOMPARE(crypto->monitorAbsentPushCountForTest(b), 1);
+
+    // ---- 回返：计数清零，不释出 ----
+    crypto->setMonitorDevices(QVariantList{ static_cast<uint>(a), static_cast<uint>(b) }, 3000);
+    QCOMPARE(crypto->monitorAbsentPushCountForTest(b), 0);
+    QVERIFY2(crypto->deviceKeyManager()->hasKey(b), "回返后计数没清零 ⇒ 下一次缺席会立刻触发释出");
+
+    // ---- 再次缺席：必须重新从 1 数起（说明上一轮确实没留下半截计数） ----
+    crypto->setMonitorDevices(QVariantList{ static_cast<uint>(a) }, 3000);
+    QCOMPARE(crypto->monitorAbsentPushCountForTest(b), 1);
+    QVERIFY2(crypto->deviceKeyManager()->hasKey(b), "第二次缺席的第一轮不得释出");
+
+    crypto->setMonitorDevices(QVariantList(), 3000);
+    crypto->deviceKeyManager()->removeKey(a);
+    crypto->deviceKeyManager()->removeKey(b);
+}
+
+// ============================================================================================
+// 释出必须清「握手期」标记（2026-11-24 补）
+//
+// `releaseDevice` 此前清 `_gcsHeartbeat` / `_everLinked` / `_lastHandshakeMs`，**漏了
+// `_handshakeArmed`**。残留的置位会让该机日后重新认领时，`noteStandbyHeartbeat` 走
+// 「已置位 ⇒ 不清水位」的重试分支 ⇒ 旧纪元双向水位原样保留 ⇒ 新纪元下行被判重放拒收
+// （与 2026-11-24 观测到的「PX4 重新拉起后监控员迟到约 30 s」同一形态）。
+// `returnToStandby` 一直清它，两条释出路径行为不一致——本格钉的就是这条缝。
+// ============================================================================================
+void CryptoTest::_testReleaseDeviceClearsHandshakeArmed()
+{
+    CryptoController* const crypto = CryptoController::instance();
+    ignoreLogMessage("MAVLink.Crypto.CryptoController", QtDebugMsg,
+                     QRegularExpression("registration |linked device|released device|return to standby"));
+
+    crypto->returnToStandby();
+    crypto->setRegistrationEnabled(false);
+
+    const DeviceID dev = makeDeviceID(0, 0, 0xB3, 0x01);
+    // 不给密钥：`noteStandbyHeartbeat` 的引入方分支在 `hasKey` 未命中时只置位、不建链，
+    // 让本格的观测点只剩「握手期标记」一件事。
+    crypto->deviceKeyManager()->removeKey(dev);
+    // 先成为本端关联设备，否则 `releaseDevice` 的成员资格闸会早退、根本走不到清理段。
+    crypto->addLinkedDevice(dev);
+
+    // 前提：`init()` 已把责任方置 true，且引入名单处于 fail-open（`_introducerScopeValid=false`）
+    // ⇒ 这条明文待命心跳会走引入方分支、置上握手期标记。
+    crypto->noteStandbyHeartbeat(dev);
+    QVERIFY2(crypto->handshakeArmedForTest(dev), "前提：握手期标记没置上 ⇒ 本格必假绿");
+
+    crypto->releaseDevice(dev);
+    QVERIFY2(!crypto->handshakeArmedForTest(dev),
+             "释出后残留握手期标记 ⇒ 该机日后重新认领时，下一次握手会跳过「清双向水位」");
+
+    // 复原：撤销「已释出」记号（撤销点是接手）。
+    crypto->addLinkedDevice(dev);
+    crypto->removeLinkedDevice(dev);
 }
 
 UT_REGISTER_TEST_LIGHTWEIGHT(CryptoTest, TestLabel::Unit)

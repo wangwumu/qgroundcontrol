@@ -370,6 +370,31 @@ Item {
         }
     }
 
+    //-------------------------------------------------------------------------
+    // 监控员视图的「任务完成 ⇒ 释出」——UI 侧收尾（规范 §2.7.2 i，2026-11-24）
+    //-------------------------------------------------------------------------
+    // C++ 侧在监控名册连续 2 次成功缺席后已做完 `releaseDevice` 的全部动作
+    // （移出登记集合、删密钥、清双向水位、让出上行权）。这里只补 UI 侧两件事，
+    // 与站点视图 `_releaseSiteDevice` 的后半同形：
+    //   · 清该机轨迹 —— `TrajectoryPoints` 是纯内存、与那条加密链路同生命周期；
+    //   · 关载具 —— 帧已被 `_releasedDevices` 一律拒绝，不关的话 3.5 s 后会冒出
+    //     「通信丢失 + 断开」两个误导性红块（链路本来就该断，不是故障）。
+    // ‼️ 用 `Qt.callLater`：本信号在 `setMonitorDevices` 的调用栈里发出（QGC 由 QML 调进
+    //    C++），在同一栈帧里销毁载具会把别的 QML 的 `activeVehicleChanged` 处理塞进来。
+    // ⚠️ 站点视图永远收不到本信号（它不调 `setMonitorDevices`），两个视图互不干扰。
+    Connections {
+        target: cryptoController
+        function onMonitorDeviceReleased(deviceID) {
+            Qt.callLater(function () {
+                var v = OpsCommon.matchDeviceToVehicle({ device_id: deviceID },
+                                                       QGroundControl.multiVehicleManager.vehicles)
+                if (!v) return
+                if (v.trajectoryPoints) v.trajectoryPoints.clear()
+                v.closeVehicle()
+            })
+        }
+    }
+
     /// ‼️ **供 L1/L2 的 `model` 用：把航线按「是否选中」拆成两个互斥列表。**
     ///    两态（淡/亮）用两个 model 表达而不是在委托里写 `line.color: _lit ? A : B`：
     ///    选中变化时两个数组都重建 ⇒ `MapItemView` 重建委托 ⇒ 每个委托**整个**带着自己的

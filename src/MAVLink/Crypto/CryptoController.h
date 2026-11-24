@@ -47,6 +47,16 @@ public:
     };
     Q_ENUM(State)
 
+    /// 上行许可分档（规范 §3.1.1）。判据见 `uplinkTier()`。
+    enum class UplinkTier {
+        Gray,            ///< 未建链 / 本纪元尚无下行：本表不约束
+        Green,           ///< 最近一条加密下行心跳 < 2 s
+        Yellow,          ///< [2 s, 5 s)：放行
+        YellowSustained, ///< [5 s, 10 s]：暂停常规上行
+        Red,             ///< > 10 s：只留安全类指令盲发
+    };
+    Q_ENUM(UplinkTier)
+
     /// 80005 登记心跳默认周期（毫秒）。规范 §3.2/附录 A：`GCS_KEEPALIVE_INTERVAL`
     /// 须远小于 mavp2p 的 MAP_TTL 且小于 NAT UDP idle timeout。默认 10s。
     static constexpr int kRegistrationIntervalMs = 10000;
@@ -106,6 +116,16 @@ public:
     ///
     /// ‼️ 阈值与清单**必须同一次调用传入**：拆成两个 setter 会造出
     ///    "新阈值配旧清单"的中间态（§3.6.4）。
+    ///
+    /// ‼️ **名册收窄 ⇒ 释出**（2026-11-24 定，规范 §2.7.2 i）：本端名录里消失的 deviceID
+    ///    若**连续 `kMonitorReleaseConfirmPushes` 次成功推送**都不在名册里，就认定其任务已结束
+    ///    （服务端 `Park` 一次事务写 `task→COMPLETED`、`uav→PARKED`，后者不在名册的在航白名单），
+    ///    逐个走 `releaseDevice`（删密钥、清双向水位、移出登记集合、让出上行权）并发
+    ///    `monitorDeviceReleased` 供视图清 UI 侧状态。
+    ///    ⚠️ 缺席计数**不能**放在"名册内容变了"的闸内：名册不变的后续轮次正是第 2 次确认。
+    ///    ⚠️ 第一次缺席只计数、不释出——释出是破坏性动作，用约 2 s 换掉单轮脏响应的风险。
+    ///    ⚠️ 调用方对**失败响应与异常行集**不调用本函数（`RomView._pushMonitorDevices` 的异常闸），
+    ///    因此本函数把"每一次调用"当作一次**成功**轮询，不需要再区分。
     Q_INVOKABLE void setMonitorDevices(const QVariantList& deviceIds, int frameTimeoutMs);
 
     /// 当前生效的超时阈值（毫秒）。
@@ -225,6 +245,15 @@ public:
     /// 「释出/回待命/收回指令权/名单缩小是否清掉了状态」这一组断言只能落在这张表上。
     /// 同样看不出的是"条目被重复创建"：`beginLinking` 只补空条目、不重建，条目数不变。
     int gcsHeartbeatEntryCountForTest() const;
+
+    /// 单测用：该 deviceID 是否处于「握手期」（§2.5.1 R1 的 `_handshakeArmed`）。
+    /// 用于钉住 `releaseDevice` 必须清它——残留的置位会让该机日后重新认领时，
+    /// 下一次握手走「已置位 ⇒ 不清水位」分支，旧纪元水位原样保留。
+    bool handshakeArmedForTest(quint32 deviceID) const;
+
+    /// 单测用：该 deviceID 当前的「连续缺席」计数（`_monitorAbsentPushes`）。
+    /// 0 = 在名册里（或从未进过名册）；1 = 已缺席一次、等下一次确认。
+    int monitorAbsentPushCountForTest(quint32 deviceID) const;
 
     /// 声明本 QGC 关联的 PX4 deviceID（加入登记心跳 payload）。
     /// 单设备场景：建链目标 deviceID 即关联对象。
@@ -560,21 +589,43 @@ public:
     ///   ③ 否则严格看 `_introducerDevices`（站点视图按**起飞支**推导）。
     bool isIntroducerFor(DeviceID deviceID) const;
 
+    /// 上行许可分档（规范 §3.1.1，2026-11-23 定稿）。
+    ///
+    /// 判据是「**本纪元**是否收到过该机的加密下行、以及距最近一条加密下行心跳多久」：
+    ///   · `Gray`            —— 未建链（本进程从未收到该机的认证加密下行心跳），或本纪元
+    ///                          下行水位为空（握手清零之后、首条下行之前）。本表不约束，
+    ///                          能不能发由 §2.5.1 决定；
+    ///   · `Green`           —— 距最近一条加密下行心跳 `< kDownlinkFreshnessMs`（2 s）；
+    ///   · `Yellow`          —— `[2 s, 5 s)`；
+    ///   · `YellowSustained` —— `[5 s, 10 s]`（暂停常规上行，只留安全类指令）；
+    ///   · `Red`             —— `> 10 s`（只留安全类指令的盲发）。
+    ///
+    /// ‼️ 「能不能发出」≠「有没有权限」：网络原因发不出去不影响本表，也不做任何补偿。
+    UplinkTier uplinkTier(DeviceID deviceID) const;
+
     /// 任意上行帧（不只是 GCS 心跳）此刻是否允许发出到该机。
     ///
-    /// ‼️ PX4 把**任何**一条合法加密上行都当作引入（规范 §2.5 的"上行确立下行基准"），
-    ///    所以"非引入方不发心跳"只是必要条件、不是充分条件：搭车进入 Active 的非引入方
-    ///    只要发一条 `MISSION_REQUEST_LIST` / `PARAM_REQUEST_LIST`，就足以在 PX4 重启后
-    ///    把它引入到错误一端（实测 2026-11-10：qgc1 在 PX4 重启前的 Active 窗口里发过上行）。
+    /// 判据（两道闸，**与**关系，任一不放行即不发）：
+    ///   ① **角色闸**：非本端**指令权持有方**（`isInitiatorFor`，即 §2.5.1 的「上行权限」）
+    ///      **任何档位**都不得发常规上行。
+    ///      PX4 把**任何**一条合法加密上行都当作引入（规范 §2.5 的"上行确立下行基准"），
+    ///      所以"非引入方不发心跳"只是必要条件：搭车进 Active 的非引入方只要发一条
+    ///      `MISSION_REQUEST_LIST` / `PARAM_REQUEST_LIST`，就足以在 PX4 重启后把它引入到
+    ///      错误一端（实测 2026-11-10：qgc1 在 PX4 重启前的 Active 窗口里发过上行）。
+    ///   ② **分档闸**：`uplinkTier()` 为 `YellowSustained` / `Red` 时暂停常规上行。
     ///
-    /// 判据：
-    ///   · 非加密部署 ⇒ true（零变化）；
-    ///   · `deviceID` 非法 ⇒ false；
-    ///   · 引入方 ⇒ true；
-    ///   · 非引入方 ⇒ 要求 `_recentEncryptedDownlink`（`kDownlinkFreshnessMs` 内收到过该机
-    ///     的认证加密下行）—— 证明链路**此刻**仍由引入方建着，本端只是搭车。链路一断
-    ///     （PX4 重启后不再发加密下行），窗口立即关闭，本端在 PX4 重新被引入前发不出任何东西。
+    /// 例外：本端**上行水位为空**（刚完成握手清零 / 尚未发出任何加密上行）⇒ 放行——
+    /// 「建链首帧不受本表约束」，它正是握手根帧 X（或 R7 加入后的首帧）。
     bool allowsUplink(DeviceID deviceID) const;
+
+    /// 安全类指令（回航/备降/迫降）的上行许可（规范 §3.1.1 表格右列）。
+    ///
+    /// 与 `allowsUplink()` 的差别只有分档闸：红档 / 黄（持续）档**暂停常规上行**，
+    /// 但安全类指令仍允许**盲发**（按 R2 取值）。前置条件同样必须满足：
+    ///   · 本端是该 deviceID 的指令权持有方（角色闸）；
+    ///   · **本任期已发过至少一帧**（上行水位非空）——刚取得控制权、还没发过帧的状态
+    ///     不允许盲发（等价于恢复清零前的旧值，见 §2.5.1 R5）。
+    bool allowsSafetyUplink(DeviceID deviceID) const;
 
     /// 声明本端**有引入权**的 deviceID 名单（站点视图按起飞支推、监控员视图推空）。
     ///
@@ -586,7 +637,11 @@ public:
     Q_INVOKABLE void setIntroducerDevices(const QVariantList& deviceIds);
 
     /// 任务建链：选定目标无人机，取密钥，进入 Linking。
-    /// 由上层在「确定航线 + 选定无人机」时调用。
+    /// 由上层在「确定航线 + 选定无人机」时调用；也是 §2.5.1 的两种进链路径的共同落点：
+    ///   ① **握手（R1）**：`noteStandbyHeartbeat` 先在同一处理路径内清双向水位，再调本函数；
+    ///      下一次上行即随机根 X（首帧 X，此后 +2）；
+    ///   ② **加入既有会话（R7）**：登录后收到加密下行 / 交接接手，锚取「接手后下行最大值 + 1」，
+    ///      不握手、不换纪元。
     /// ⚠️ 两道闸，任一不过都**直接返回、状态保持 Standby**：
     ///    ① `isInitiatorFor`：本端不持有该机指令权；
     ///    ② `isIntroducerFor` **或** 已收到该机的加密下行（后者证明链路是别人建好的，
@@ -685,6 +740,12 @@ signals:
     /// 由上层（如 QGCApplication）连接做 UI 弹窗告警。
     void px4LinkLost(DeviceID deviceID);
 
+    /// 监控名册连续 `kMonitorReleaseConfirmPushes` 次缺席 ⇒ 本端已释出该 deviceID
+    /// （规范 §2.7.2 i）。供视图清 UI 侧状态：关载具、清轨迹。
+    /// ⚠️ 在 `setMonitorDevices` 的锁**外**发出；QML 侧应 `Qt.callLater` 处理，
+    ///    避免在调用本函数的同一栈帧里销毁载具。
+    void monitorDeviceReleased(quint32 deviceID);
+
 private:
     /// 同一轮登记中相邻两帧的间隔（毫秒）。
     /// 每帧只携带一个 deviceID，用 `QTimer::singleShot` 串行推进：既给每个 UDP 数据报
@@ -700,6 +761,17 @@ private:
     /// PX4 心跳 2 Hz（500 ms）⇒ 容忍连丢 2~3 条；PX4 重启到首个明文待命心跳之间
     /// 通常数秒，2 s 足以在重启前收口。
     static constexpr qint64 kDownlinkFreshnessMs = 2000;
+    /// 暂停常规上行的下界（§3.1.1 黄档持续）。
+    static constexpr qint64 kUplinkSuspendMs = 5000;
+    /// 判红的上界（§3.1.1 红档）。
+    static constexpr qint64 kUplinkRedMs = 10000;
+    /// 握手节流：一次握手发起后，窗口内的明文待命心跳不再重复触发（规范 §2.5.1）。
+    static constexpr qint64 kHandshakeThrottleMs = 5000;
+
+    /// 监控名册缺席的确认轮数（规范 §2.7.2 i）：连续 N 次成功推送都不含某 deviceID
+    /// 才释出。语义上 1 轮已足够（服务端 `Park` 把任务终结与飞机离册写在同一个事务里），
+    /// 取 2 只是为了用约 2 s 挡掉「服务端偶发少返回一行」这一类风险。可整为 1。
+    static constexpr int kMonitorReleaseConfirmPushes = 2;
 
     /// 当前毫秒时刻（测试可经 `setNowMsForTest` 固定）。
     qint64 _nowMs() const;
@@ -776,6 +848,17 @@ private:
     /// 复位点只有一处：`setResponsibleParty`（会话边界），与监控清单的作废同处同源。
     bool _initiatorScopeValid = false;
     ReplayGuard _replayGuard;
+    /// 本进程**曾经**收到过该机认证加密下行心跳（§3.1.1 的 `everLinked` 状态量）。
+    /// ⚠️ 与 `GcsHeartbeatState::downlinkHbSeen` **分开存放**：后者会被明文待命心跳清零
+    ///    （PX4 回到待命），而 `everLinked` 只在本进程生命周期内保留——
+    ///    灰档判的是「本进程从未建过链」，不是「此刻没有新鲜下行」。
+    QSet<DeviceID> _everLinked;
+    /// 「握手期」标记（§2.5.1 R1）：收到明文待命心跳并清双向后置位，收到该机首条
+    /// **认证加密下行心跳**（链路真的建起来）后清除。置位期间放行握手根帧与引导心跳
+    /// （`allowsUplink`），此后改由 §3.1.1 分档治理。
+    QSet<DeviceID> _handshakeArmed;
+    /// 最近一次握手触发时刻（`_nowMs`），用于 `kHandshakeThrottleMs` 节流。
+    QHash<DeviceID, qint64> _lastHandshakeMs;
     /// 「本端已主动签出（`releaseDevice`）过、且此后**未以任何身份重新接手**」的 deviceID。
     /// 签出后它一概拒绝重新激活本端关于这架飞机的任何本地状态。
     ///
@@ -811,6 +894,11 @@ private:
     /// （量级几十），而"过期"等于把刚堵上的窗口重新打开。QGC 重启后集合为空，与
     /// "重启后 `_linkedDevices` / `_keyCache` 也空"一致，不会出现"重启后意外认领"。
     QSet<DeviceID> _releasedDevices;
+    /// 监控名册的「连续缺席」计数（规范 §2.7.2 i）：deviceID → 连续多少次成功推送不在名册里。
+    /// 达 `kMonitorReleaseConfirmPushes` 即释出并删条目；该 id 重新出现在名册里也删条目。
+    /// 会话边界（`setResponsibleParty`）随监控清单一并作废。
+    /// ⚠️ 只有**曾经在名册里**的 id 才会入表——「从未见过」与「已离开」不可混同。
+    QHash<DeviceID, int> _monitorAbsentPushes;
     QHash<DeviceID, uint8_t> _deviceToSystem; ///< deviceID → systemID 映射（接收端学习）
     QHash<uint8_t, DeviceID> _systemToDevice; ///< systemID → deviceID 反向映射
     /// deviceID → 最近一次收帧时 `_frameClock` 的毫秒读数。

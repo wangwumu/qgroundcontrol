@@ -139,6 +139,8 @@ private slots:
     // 起飞支推导）允许建链。非引入方（签入后的降落站）必须等到收到加密下行才可加入，
     // 且收到明文待命心跳时须当场让出 Active——命令帧同样能完成引入，只挡心跳不够。
     void _testIntroducerGate();
+    void _testStandbyHandshakeClearsWatermarks();
+    void _testSafetyUplinkBypassesTiers();
 
     // 主动取密钥时机之二（规范 §2.7.2 e，Task 7）：监控清单**内容变化**时，对尚无本地
     // 密钥的 ID 触发**一次批量**拉取。
@@ -162,4 +164,13 @@ private slots:
     // 清掉时间戳后 `RomView.qml` 的 `since < 0` 判据恒真 ⇒ 每 2s 重发会把 mavp2p 那个配对的
     // `qgcSeen` 重新刷新鲜 ⇒ 配对永不过期。
     void _testReleaseDeviceBlocksReRegister();
+
+    // 监控员视图「任务完成 ⇒ 释出」（2026-11-24，规范 §2.7.2 i）：
+    // 名册连续 `kMonitorReleaseConfirmPushes`（=2）次成功缺席才释出；中间回返则清零。
+    void _testMonitorRosterReleaseAfterConfirmPushes();
+    void _testMonitorRosterReturnCancelsRelease();
+
+    // 释出必须清「握手期」标记（2026-11-24 补）：残留的置位会让该机日后重新认领时，
+    // 下一次握手走「已置位 ⇒ 不清水位」分支，旧纪元水位原样保留。
+    void _testReleaseDeviceClearsHandshakeArmed();
 };
