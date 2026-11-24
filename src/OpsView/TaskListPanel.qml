@@ -295,6 +295,12 @@ ColumnLayout {
                 // `_handoverFor(modelData)`，此处抽成一条绑定——纯函数、依赖不变，行为等价。
                 readonly property var  _handover: OpsCommon.handoverFor(modelData, panel.handoverById)
                 readonly property bool _timedOut: OpsCommon.isTimeout(_handover, panel.nowMs)
+                // 这条交接与**本视图**有没有关系（单点：`OpsCommon.handoverNoticeVisible`）。
+                // 倒计时徽标与其「超时红边框」都挂在它上面：`_handover` 是**事实**口径、不按角色
+                // 过滤 ⇒ 不加这一条，起飞机场签出的倒计时会出现在降落站点（2026-11-24 用户实测）。
+                readonly property bool _handoverRelevant:
+                    OpsCommon.handoverNoticeVisible(modelData, panel.mySiteId, panel.handoverById,
+                                                    _handover, panel.isRouteMonitor)
                 // ── 报文侧实时量（2026-09-27 起，源＝加密心跳 EXT 重建的合成遥测）──
                 // 本任务对应的**真实 Vehicle**（按 deviceID 在载具模型里认领；不在线即 null）。
                 // ‼️ 下面三个属性存在的唯一理由：`OpsCommon.*` 是 `.pragma library` 的**纯函数**，
@@ -475,7 +481,9 @@ ColumnLayout {
                 // 「段色」= 进站青绿，否则 `panel.cardBorderColor`（两个视图都传浅蓝，见该属性）。
                 // ⚠️ 浅蓝落在**最后一档**，是有意的：它是"没有别的状态可报"时的底色，一旦提到
                 //    前面两档之前，超时卡和选中卡就再也显示不出自己的状态了。
-                border.color: _timedOut ? "#ff3b3b"
+                // ‼️ 超时红只给**当事人**（`_handoverRelevant`）：否则降落站点会看到一张
+                //    因为"别人那条 ROUTE 交接超时"而变红的卡片，却没有任何可做的事。
+                border.color: (_timedOut && _handoverRelevant) ? "#ff3b3b"
                               : (panel.selectedTaskId === modelData.task_id ? "#2f6bd8"
                                  : (_inboundCard ? panel.inboundCardBorderColor : panel.cardBorderColor))
 
@@ -627,7 +635,9 @@ ColumnLayout {
                     Rectangle {
                         width: parent.width
                         height: noticeText.contentHeight + (card._awaitingMe ? 8 : 0)
-                        visible: card._handover ? true : false
+                        // ‼️ 可见性走 `_handoverRelevant`，不是 `card._handover`：后者是事实口径，
+                        //    会在降落站点上也画出「待航线监控确认：Ns」——那条交接与它无关。
+                        visible: card._handoverRelevant
                         color: card._awaitingMe
                                ? (card._timedOut ? "#4a1414" : "#463a0e")
                                : "transparent"
@@ -813,8 +823,14 @@ ColumnLayout {
                             //    但它不是显式判据，故在此标注。
                             // 6.0-A 申请切出（签出）：起飞经航迹确认后发起 ROUTE 交接；仅巡航(FW)且有实时遥测可切出，
                             // 无遥测置灰（6.0-C 失联不签发；DB 在 Propose ROUTE 时落 IN_FLIGHT=责任里程碑）。
-                            visible: panel.showSiteActions && modelData.status === "TAKEOFF"
-                                     && !OpsCommon.pendingPhase(modelData, "ROUTE", panel.handoverById)
+                            // ‼️ 三条判据（出站卡 / TAKEOFF / 无在途 ROUTE 交接）由
+                            //    `OpsCommon.canRequestCheckout` 单点定义并配单测——2026-11-24
+                            //    用户实测缺陷：原来这里只判 `status === "TAKEOFF"`，降落站点
+                            //    也长出这颗按钮（`isInbound` 第④支把同一任务也列进了降落站点），
+                            //    点它必得 403「仅起飞机场操作员可申请切出」（后端 `ops.Propose`
+                            //    按**任务起飞机场**比对 `roleSiteIDs`）。
+                            visible: panel.showSiteActions
+                                     && OpsCommon.canRequestCheckout(modelData, panel.mySiteId, panel.handoverById)
                             enabled: card._vtolFwd && OpsCommon.hasLiveTelemetry(card._uav)
                             readonly property real baseWidth: Math.round(contentItem.implicitWidth + Math.round(24 * ScreenTools.uiTextScaleFactor))
                             readonly property real preferredWidth: Math.round(baseWidth * 1.5)
@@ -893,10 +909,10 @@ ColumnLayout {
                         Button {
                             font.pointSize: Qt.application.font.pointSize * ScreenTools.uiTextScaleFactor
                             // 回航：任何状态下都在（用户规格：「选择签出，则……"回航"保留」）。
-                            // 落点由用户在「回航选点」弹窗里选择。后端只改 `landing_site_id`
-                            // 并释放机位；**不再预派原机位、不再自动签入 LANDING**。QGC 随后
-                            // 构造倒序航线并上传；到站后由监控员签出、目标场地签入、AssignSlot、
-                            // Land（先写库、再下指令）。
+                            // 本按钮的可见条件 `_inFlightOutbound` 恰好等价于「本站仍持有控制权」
+                            // ⇒ 点击后走**回本场**（2026-11-24）：不选点、不选机位，落点＝原机位。
+                            // 后端 A 支保留原机位、预派它、补一条 ACCEPTED LANDING（所以随后
+                            // 卡片上会长出【降落】）；QGC 构造倒序航线并上传。先写库、再下指令。
                             visible: card._inFlightOutbound
                             readonly property real baseWidth: Math.round(contentItem.implicitWidth + Math.round(24 * ScreenTools.uiTextScaleFactor))
                             readonly property real preferredWidth: Math.round(baseWidth * 1.5)

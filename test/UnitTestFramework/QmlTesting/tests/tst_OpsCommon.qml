@@ -750,6 +750,101 @@ TestCase {
                "签出已发起、待监控员确认期间，出站方仍须看得见该任务（出站重叠期）")
     }
 
+    //-------------------------------------------------------------------------
+    // 卡片【申请切出】的可见判据（`OpsCommon.canRequestCheckout`，2026-11-24）
+    //   用户实测缺陷（真机三台）：跑「平谷-北七家」起飞后，两个 qgc2（平谷＝起飞站、
+    //   北七家＝降落站）**都**长出【申请切出】；在北七家点它弹「只有起飞站点…」。
+    //   根因见 `canRequestCheckout` 头注；后端权威是 `handlers/ops.go` 的 `Propose`
+    //   （按任务起飞机场比对 `roleSiteIDs`，必 403）。
+    //-------------------------------------------------------------------------
+
+    /// 阳性对照：起飞机场 + TAKEOFF + 无在途交接 ⇒ 出按钮。
+    function test_canRequestCheckout_atTakeoffSite() {
+        verify(OpsCommon.canRequestCheckout(_siteTask(1, "TAKEOFF", 1, 2), 1, {}),
+               "TAKEOFF 任务在起飞机场 ⇒ 必须出现【申请切出】")
+    }
+
+    /// ‼️ 缺陷正身：降落站**也**看得见这张卡（`isInbound` 第④支：飞机已起飞），
+    /// 但场地不是起飞机场 ⇒ 不得出按钮。
+    /// ⚠️ `uav_status: "TAKEOFF"` 是夹具前提，不是装饰：少了它 `isInbound` 恒假，
+    ///    这条就退化成"测一个本站根本看不到的卡片"，对可见性判据零判别力。
+    function test_canRequestCheckout_hiddenAtLandingSite() {
+        var t = _inboundTask(1, "TAKEOFF", 1, 2, "TAKEOFF")
+        verify(OpsCommon.isInbound(t, 2, {}),
+               "夹具前提：飞机已起飞 ⇒ 降落站确实看得见这张卡（正是本缺陷的入口）")
+        verify(OpsCommon.canRequestCheckout(t, 2, {}) === false,
+               "降落站不是起飞机场 ⇒ 不得出现【申请切出】（点它必得 403「仅起飞机场操作员…」）")
+    }
+
+    /// 起飞机场 + 已有在途 ROUTE 交接 ⇒ 按钮换成【撤回交接】，不得两个并存。
+    function test_canRequestCheckout_hiddenWhileRoutePending() {
+        var t = _siteTask(1, "TAKEOFF", 1, 2, _embeddedHo(7, "ROUTE", 16))
+        verify(!OpsCommon.canRequestCheckout(t, 1, {}),
+               "已有 PENDING 的 ROUTE 交接 ⇒ 不得再出【申请切出】")
+    }
+
+    /// 状态闸与场地闸都不可省：同一起飞场地，别的状态是别的按钮（【起飞】/【签出】）。
+    function test_canRequestCheckout_onlyForTakeoffStatus() {
+        verify(!OpsCommon.canRequestCheckout(_siteTask(1, "SCHEDULED", 1, 2), 1, {}),
+               "SCHEDULED ⇒ 那是【起飞】，不是【申请切出】")
+        verify(!OpsCommon.canRequestCheckout(_siteTask(1, "IN_FLIGHT", 1, 2), 1, {}),
+               "IN_FLIGHT ⇒ 那是【签出】（_inFlightOutbound），不是【申请切出】")
+        verify(OpsCommon.canRequestCheckout(null, 1, {}) === false, "task 为 null ⇒ 真 bool false")
+    }
+
+    //-------------------------------------------------------------------------
+    // 交接倒计时徽标的适用面（`OpsCommon.handoverNoticeVisible`，2026-11-24）
+    //   用户实测缺陷：起飞机场签出后，**降落站点**的卡片上也出现「待航线监控确认：Ns」。
+    //   根因见该函数头注：徽标读 `task.handover`（**事实**口径，后端按任务维度下发、
+    //   不按角色过滤）⇒ 凡是看得见这张卡的站点都会画出来。
+    //-------------------------------------------------------------------------
+
+    /// 夹具：带在途交接的在飞任务。`uav_status` 必须给——没有它 `isInbound` 恒假，
+    /// 降落站那几格就退化成"测一个本站根本看不见的卡片"（对可见性判据零判别力）。
+    function _hoCard(taskId, takeoff, landing, phaseTo) {
+        var t = _siteTask(taskId, "IN_FLIGHT", takeoff, landing, _embeddedHo(9, phaseTo, 16))
+        t.checkout_state = "PENDING"
+        t.uav_status = "IN_FLIGHT"
+        return t
+    }
+
+    function test_handoverNoticeVisible_routeOnlyAtTakeoffSite() {
+        var t = _hoCard(1, 1, 2, "ROUTE")
+        verify(OpsCommon.isInbound(t, 2, {}),
+               "夹具前提：飞机在飞 ⇒ 降落站确实看得见这张卡（正是本缺陷的入口）")
+        verify(OpsCommon.handoverNoticeVisible(t, 1, {}, t.handover, false),
+               "ROUTE 交接：起飞机场是提出方 ⇒ 倒计时可见")
+        verify(OpsCommon.handoverNoticeVisible(t, 2, {}, t.handover, false) === false,
+               "ROUTE 交接：降落机场不是当事人 ⇒ 倒计时**不得**出现（本次 bug）")
+    }
+
+    function test_handoverNoticeVisible_landingOnlyAtLandingSite() {
+        var t = _hoCard(2, 1, 2, "LANDING")
+        verify(OpsCommon.handoverNoticeVisible(t, 2, {}, t.handover, false),
+               "LANDING 交接：降落机场是接收方 ⇒ 倒计时可见")
+        verify(OpsCommon.handoverNoticeVisible(t, 1, {}, t.handover, false) === false,
+               "LANDING 交接：起飞机场不是当事人 ⇒ 不得出现")
+    }
+
+    /// 监控员视图：ROUTE 是接收方、LANDING 是提出方 ⇒ 两条相位都该看见。
+    /// `mySiteId = -1` 是监控员的真实形状（`AuthController.siteId` 无场地）。
+    function test_handoverNoticeVisible_monitorViewSeesBoth() {
+        var r = _hoCard(3, 1, 2, "ROUTE")
+        var l = _hoCard(4, 1, 2, "LANDING")
+        verify(OpsCommon.handoverNoticeVisible(r, -1, {}, r.handover, true),
+               "监控员是 ROUTE 接收方 ⇒ 可见")
+        verify(OpsCommon.handoverNoticeVisible(l, -1, {}, l.handover, true),
+               "监控员是 LANDING 提出方 ⇒ 可见")
+    }
+
+    function test_handoverNoticeVisible_noHandoverOrUnknownPhaseIsFalse() {
+        var t = _siteTask(5, "IN_FLIGHT", 1, 2)
+        verify(OpsCommon.handoverNoticeVisible(t, 1, {}, undefined, false) === false,
+               "无交接 ⇒ 真 bool false（undefined 会让 visible 退回默认 true）")
+        verify(OpsCommon.handoverNoticeVisible(t, 1, {}, { phase_to: "XXX" }, false) === false,
+               "站点视图遇未知相位 ⇒ fail-closed")
+    }
+
     /// 缺口②：提出方（ATC）必须能拿到交接对象，否则「撤回交接」按钮的可见条件恒假。
     /// 按钮判据 = `card._handover ? isMine(card._handover, AuthController.userId) : false`。
     function test_proposerSeesWithdrawEntryWithoutPendingList() {

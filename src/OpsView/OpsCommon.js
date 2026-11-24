@@ -746,6 +746,24 @@ function isOutbound(task, mySiteId, handoverById) {
            && !landingAccepted(task)
 }
 
+/// 站点视图卡片【申请切出】是否出现（单点定义：QML 与单测共用）。
+///
+/// 判据 = `status === "TAKEOFF"` ∧ **出站卡** ∧ 没有在途 ROUTE 交接。
+///
+/// ‼️ 出站那一半**不可省**（2026-11-24 用户实测缺陷：降落站点也长出这颗按钮）。
+///    只判状态时，降落站点也会出按钮——`isInbound` 第④支（飞机已起飞）把**同一个任务**
+///    也列进了降落站点的卡片里；在那边点它必得 403「仅起飞机场操作员可申请切出」：
+///    后端 `ops.Propose` 用的场地是**任务的起飞机场**（`table_flight_task.site_id`），
+///    比对 `roleSiteIDs`。故这里复用 `isOutbound` 的场地半句，与后端同源，
+///    不另写一份 `takeoff_site_id === mySiteId`。
+/// ⚠️ 一律返回**真 bool**：`undefined` 会让调用点的 `visible` 退回默认值 `true`（见 `isMine` 头注）。
+function canRequestCheckout(task, mySiteId, handoverById) {
+    if (!task) return false
+    if (task.status !== "TAKEOFF") return false
+    if (!isOutbound(task, mySiteId, handoverById)) return false
+    return !pendingPhase(task, "ROUTE", handoverById)
+}
+
 // 入场=本站=降落点。四项 **OR**（与 `gcs_server/handlers/ops.go` 的 `view=site` 进站半句
 // **逐项对应**）：
 //   ① 已发降落指令（`status === "LANDING"`）
@@ -791,6 +809,31 @@ function isInbound(task, mySiteId, handoverById) {
            || pendingPhase(task, "LANDING", handoverById)
            || landingAccepted(task)
            || isAirborneReady(task.uav_status)
+}
+
+/// 交接倒计时徽标（「待〈相位〉确认：Ns」）与「超时红边框」对**本视图**是否成立（单点定义）。
+///
+/// ‼️ 2026-11-24 用户实测缺陷：起飞机场签出后的倒计时**也出现在降落站点**。
+///    根因：徽标读 `card._handover`，那是 `handoverFor` 的**事实口径**（优先
+///    `task.handover`，后端按任务维度下发、**不按角色过滤**）⇒ 凡是看得见这张卡的站点
+///    都看得见这条交接。而 `ROUTE` 交接的当事人只有**起飞机场（提出方）**与
+///    **航线监控员（接收方）**；降落站点此刻只是"飞机正飞过来"的旁观者，那条倒计时
+///    会让它误以为有自己要确认的事。
+///
+/// 判据（当事人口径）：
+///   · 监控员视图（`isRouteMonitor`）：两条相位都是当事人（ROUTE 接收方 / LANDING 提出方）
+///     ⇒ 一律成立。
+///   · 站点视图：`ROUTE` ⇒ 只有**起飞机场**（`isOutbound`）；`LANDING` ⇒ 只有**降落机场**
+///     （`isInbound`）。同站起降两者都真，不受影响。
+///   ‼️ 视图身份用 `isRouteMonitor` 判，**不用** `!showSiteActions`：后者还叠了 `_isSiteATC`
+///     ——"不是站点按钮组" ≠ "我是监控员"（见 `TaskListPanel.qml` 的 `_checkinNotice` 注）。
+/// 未知相位 ⇒ false（fail-closed：宁可少一条提示，也不给一条指向错误动作的提示）。
+function handoverNoticeVisible(task, mySiteId, handoverById, handover, isRouteMonitor) {
+    if (!handover) return false
+    if (isRouteMonitor) return true
+    if (handover.phase_to === "ROUTE") return isOutbound(task, mySiteId, handoverById)
+    if (handover.phase_to === "LANDING") return isInbound(task, mySiteId, handoverById)
+    return false
 }
 
 // ---- 站点视图的四段（用户 2026-10-02 裁定）：排序与配色**同源** ----
