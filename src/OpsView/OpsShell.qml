@@ -1884,6 +1884,12 @@ Item {
         opacity: 0.8
         z: 100
 
+        // 右侧窗口按钮组须让开的遥测指示器区宽。窗口按钮的锚定与扩展区的可用宽
+        // **共用这一个值**：两处各写一份 `6 + indicatorsWidth` 时，改一处忘一处就会
+        // 出现「按钮让开了、文字没让开」的重叠。
+        readonly property real windowButtonsRightMargin:
+            ScreenTools.uiPx(6) + commandBar.indicatorsWidth
+
         FlyViewToolBar {
             id:                 commandBar
             anchors.fill:       parent
@@ -1896,17 +1902,49 @@ Item {
         // 保证白色文字/白色对勾在命令条浅底上清晰可见。
         Rectangle {
             id: extrasBar
-            anchors { right: commandBarWindowButtons.left; rightMargin: 12; verticalCenter: parent.verticalCenter }
+            anchors { right: commandBarWindowButtons.left; rightMargin: ScreenTools.uiPx(12); verticalCenter: parent.verticalCenter }
             height: ScreenTools.defaultFontPixelHeight * 3
-            width: commandBarExtras.width + 24
+            width: commandBarExtras.width + ScreenTools.uiPx(24)
             radius: 6
             color: "transparent"
 
             Row {
                 id: commandBarExtras
-                anchors.left: parent.left; anchors.leftMargin: 12
+                anchors.left: parent.left; anchors.leftMargin: ScreenTools.uiPx(12)
                 anchors.verticalCenter: parent.verticalCenter
-                spacing: 18
+                // 窄屏收敛（2026-11-24 用户裁定）：命令条**保持一行**，放不下先压缩间距，
+                // 不许换行、不许把字叠到左边原生控件（Q 标 / 主状态 / 飞行模式）上。
+                // `_available` 扣的是实测占宽：左侧原生区 + 右侧窗口按钮 + 遥测指示器 + 边距。
+                readonly property real _spacingWide:  ScreenTools.uiPx(18)
+                readonly property real _spacingMid:   ScreenTools.uiPx(10)
+                readonly property real _spacingTight: ScreenTools.uiPx(6)
+                readonly property real _available: Math.max(0, commandBarWrap.width
+                    - commandBar.leftPanelWidth
+                    - commandBarWindowButtons.width - commandBarWrap.windowButtonsRightMargin
+                    - ScreenTools.uiPx(24))
+
+                // 时宽按**定长样串**取上限：时钟格式固定，但数字字宽不等，逐秒量真实宽度
+                // 会让间距档在阈值上下每秒跳一次（整排左右晃）。取「全 8」样串与实测
+                // 的较大者 ⇒ 档位稳定，且真实时钟变宽时仍然算得进去。
+                FontMetrics {
+                    id: _extrasFm
+                    font.pixelSize: commandBarExtras._fontPx
+                    font.bold: true
+                }
+                readonly property real _fontPx: ScreenTools.uiPx(13)
+                readonly property real _clockWorstWidth:
+                    _extrasFm.advanceWidth("8888年88月88日 88:88:88")
+                // 子项只有这三个：操作员名、时钟、视图扩展槽（Loader）。直接按 id 求和，
+                // 比遍历 `children` 稳——遍历会把后加的任何 Item 也算进来。
+                readonly property int _visibleCount: extrasLoader.item !== null ? 3 : 2
+                readonly property real _contentWidth: operatorText.implicitWidth
+                    + Math.max(clockText.implicitWidth, _clockWorstWidth)
+                    + extrasLoader.implicitWidth
+                function _fits(spacing) {
+                    return _contentWidth + spacing * Math.max(0, _visibleCount - 1) <= _available
+                }
+                spacing: _fits(_spacingWide) ? _spacingWide
+                       : _fits(_spacingMid) ? _spacingMid : _spacingTight
                 visible: AuthController.loggedIn
 
                 // 当前日期时间（中国习惯 yyyy年MM月dd日 hh:mm:ss），每秒刷新
@@ -1917,24 +1955,27 @@ Item {
                 }
 
             Text {
+                id: operatorText
                 anchors.verticalCenter: parent.verticalCenter
                 color: "#e6edf7"
-                font.pixelSize: Math.round(13 * ScreenTools.uiTextScaleFactor); font.bold: true
+                font.pixelSize: commandBarExtras._fontPx; font.bold: true
                 text: qsTr("操作员：") + (AuthController.displayName !== "" ? AuthController.displayName : AuthController.currentUser)
             }
 
             // 当前年月日时分秒（操作员与视图专属控件之间）
             Text {
+                id: clockText
                 anchors.verticalCenter: parent.verticalCenter
                 color: "#e6edf7"
-                font.pixelSize: Math.round(13 * ScreenTools.uiTextScaleFactor); font.bold: true
+                font.pixelSize: commandBarExtras._fontPx; font.bold: true
                 text: Qt.formatDateTime(commandBarExtras.nowTime, "yyyy年MM月dd日 hh:mm:ss")
             }
 
             // 视图专属控件注入槽（站点视图：出站/进站、机位朝向；监控员视图：留空或自有控件）。
             // ‼️ 槽位对两个视图**对称**：骨架不给任何一方开小灶，谁都不必改本文件就能挂控件。
-            // 展开后的根项是 `Row`，本 Row 的 `spacing: 18` 因此同时作用于"时间↔扩展区"与扩展区内部。
+            // 展开后的根项是 `Row`，本 Row 的 spacing 因此同时作用于"时间↔扩展区"与扩展区内部。
             Loader {
+                id: extrasLoader
                 anchors.verticalCenter: parent.verticalCenter
                 sourceComponent: opsShell.commandBarExtras
             }
@@ -1952,10 +1993,10 @@ Item {
             id: commandBarWindowButtons
             anchors {
                 right:         parent.right
-                rightMargin:   6 + commandBar.indicatorsWidth
+                rightMargin:   commandBarWrap.windowButtonsRightMargin
                 verticalCenter: parent.verticalCenter
             }
-            spacing: 4
+            spacing: ScreenTools.uiPx(4)
             visible: AuthController.loggedIn
 
             QGCToolBarButton {
@@ -2810,12 +2851,91 @@ Item {
             color: QGroundControl.globalPalette.windowTransparent
             z: 5
 
+            // 本栏的**单位换算与窄屏自适应**（2026-11-24 安卓截图：字极小、缝极大、
+            // 左右两段直接叠在一起）。
+            //   ① 字号与间距一律走 `ScreenTools.uiPx()`：自绘像素是"桌面 9 pt 基准"，
+            //      Android 的平台基准是 14 pt ⇒ 不换算的话字号只有原生的一半；
+            //   ② 用户裁定：**保持一行**；放不下先压缩间距，仍放不下就去掉「航向」，
+            //      再放不下再去掉「状态」。判据用真实字宽（`FontMetrics`），不猜字符数
+            //      ——「·」「m/s」与汉字的宽度差一倍以上。
+            readonly property real _fontPx:   ScreenTools.uiPx(13)
+            readonly property real _margin:   ScreenTools.uiPx(16)
+            readonly property real _lightGap: ScreenTools.uiPx(24)
+
+            FontMetrics { id: _statusFm; font.pixelSize: instrumentPanel._fontPx; font.bold: true }
+
+            function _statusItemText(key, label) {
+                return label + "：" + _instrumentValue(key)
+            }
+            /// `items` 为 `[key, label]` 数组；返回这一行在给定间距下的宽度。
+            function _statusRowWidth(items, spacing) {
+                var w = 0
+                for (var i = 0; i < items.length; ++i) {
+                    w += _statusFm.advanceWidth(_statusItemText(items[i][0], items[i][1]))
+                }
+                return w + spacing * Math.max(0, items.length - 1)
+            }
+            /// 可用宽 = 本栏宽 − 左端「选中任务」− 上行灯（可见才占位）− 两侧边距 − 余量。
+            /// 余量 `uiPx(8)`：富文本经 HTML 解析后的实际排布比 `advanceWidth` 略宽。
+            function _statusAvailWidth() {
+                var avail = width - _margin * 2 - ScreenTools.uiPx(8) - selectedTaskText.width
+                if (uplinkLight.visible) {
+                    avail -= uplinkLight.width + _lightGap
+                }
+                return avail
+            }
+            // 三套候选条目。**必须是稳定数组**（`readonly property` 只在翻译变化时重建）：
+            // 遥测值每秒要变好几次，`_statusPlan` 也随之重算；若每次都 `new` 一个数组，
+            // `Repeater` 会把整排 Text 拆掉重建——值一变就重建，白白抖一次。
+            readonly property var _itemsAll: [
+                ["alt", qsTr("高度")], ["speed", qsTr("水平速度")],
+                ["airspeed", qsTr("空速")], ["climb", qsTr("爬升")],
+                ["battery", qsTr("电量")], ["heading", qsTr("航向")],
+                ["status", qsTr("状态")]]
+            function _withoutKey(items, key) {
+                var out = []
+                for (var i = 0; i < items.length; ++i) {
+                    if (items[i][0] !== key) out.push(items[i])
+                }
+                return out
+            }
+            readonly property var _itemsNoHeading: _withoutKey(_itemsAll, "heading")
+            readonly property var _itemsNoStatus:  _withoutKey(_itemsNoHeading, "status")
+
+            /// 在给定条目集里挑**最宽**的可行间距；四档都放不下返回 -1。
+            function _pickSpacing(items, avail) {
+                var cands = [ScreenTools.uiPx(18), ScreenTools.uiPx(12),
+                             ScreenTools.uiPx(8),  ScreenTools.uiPx(4)]
+                for (var i = 0; i < cands.length; ++i) {
+                    if (_statusRowWidth(items, cands[i]) <= avail) return cands[i]
+                }
+                return -1
+            }
+            /// 用户裁定（2026-11-24）：**保持一行**，放不下先压缩间距；仍放不下才去掉
+            /// 「航向」，再不够去掉「状态」。每去掉一项都**从最宽间距重新试起**——
+            /// 少掉一整列后往往立刻放得下宽松间距，没必要顺延上一档的紧凑间距。
+            readonly property var _statusPlan: {
+                var avail = _statusAvailWidth()
+                var sets = [_itemsAll, _itemsNoHeading, _itemsNoStatus]
+                for (var i = 0; i < sets.length; ++i) {
+                    var s = _pickSpacing(sets[i], avail)
+                    if (s >= 0) return { items: sets[i], spacing: s }
+                }
+                // 连 5 项 × 最小间距都放不下：按最后一档硬画（已知极限，会压到左端）
+                return { items: _itemsNoStatus, spacing: ScreenTools.uiPx(4) }
+            }
+            // 拆成两个**值**属性：`_statusPlan` 每次重算都是新对象，但这里取出的数组
+            // 引用 / 数值在同一档位内不变 ⇒ `Repeater.model` 与 `Row.spacing` 不收到
+            // 变更通知，不重建代理。
+            readonly property var  _statusItems:   _statusPlan.items
+            readonly property real _statusSpacing: _statusPlan.spacing
+
             // 选中任务 —— 靠左
             Text {
                 id: selectedTaskText
-                anchors.left: parent.left; anchors.leftMargin: 16
+                anchors.left: parent.left; anchors.leftMargin: instrumentPanel._margin
                 anchors.verticalCenter: parent.verticalCenter
-                color: "#e6edf7"; font.pixelSize: Math.round(13 * ScreenTools.uiTextScaleFactor); font.bold: true
+                color: "#e6edf7"; font.pixelSize: instrumentPanel._fontPx; font.bold: true
                 text: qsTr("选中任务：") + OpsCommon.taskNo(_selectedTask())
             }
 
@@ -2826,23 +2946,21 @@ Item {
                 id: uplinkLight
                 vehicle: opsShell._selectedVehicle
                 anchors.left: selectedTaskText.right
-                anchors.leftMargin: 24
+                anchors.leftMargin: instrumentPanel._lightGap
                 anchors.verticalCenter: parent.verticalCenter
             }
 
-            // 参数排：标题：数值横向一行 —— 靠右
+            // 参数排：标题：数值横向一行 —— 靠右（条目取 `_statusItems`、间距取 `_statusSpacing`）
             Row {
                 id: telemetryRow
-                anchors.right: parent.right; anchors.rightMargin: 16
+                anchors.right: parent.right; anchors.rightMargin: instrumentPanel._margin
                 anchors.verticalCenter: parent.verticalCenter
-                spacing: 18
+                spacing: instrumentPanel._statusSpacing
                 Repeater {
-                    model: [["alt", qsTr("高度")], ["speed", qsTr("水平速度")], ["airspeed", qsTr("空速")],
-                            ["climb", qsTr("爬升")], ["battery", qsTr("电量")], ["heading", qsTr("航向")],
-                            ["status", qsTr("状态")]]
+                    model: instrumentPanel._statusItems
                     delegate: Text {
                         textFormat: Text.RichText
-                        font.pixelSize: Math.round(13 * ScreenTools.uiTextScaleFactor); font.bold: true
+                        font.pixelSize: instrumentPanel._fontPx; font.bold: true
                         color: "#e6edf7"
                         text: "<span style='color:#8fa1bd;'>%1：</span>%2".arg(modelData[1]).arg(_instrumentValue(modelData[0]))
                     }
