@@ -3665,6 +3665,261 @@ void CryptoTest::_testSafetyUplinkBypassesTiers()
     crypto->releaseDevice(a);
 }
 
+void CryptoTest::_testUplinkLightMatchesGate()
+{
+    // 规范 §3.1.1 节末「界面灯」（2026-11-24 接线）：**灯与闸同源**。本格钉三件事：
+    //   ① `tier` 逐档取自 `uplinkTier()`，且「灯 ∈ {绿, 黄}」⇔ `allowsUplink`
+    //      （握手期除外——**首次**建链时 tier 还是灰，但闸因根帧豁免而放行，界面另有「握手」态）；
+    //   ② 角色 / 握手两维如实报告：非指令权方的灯**不得**是绿（否则就是
+    //      「灯绿却发不出去」，规范 §3.1.1「与角色闸的合成关系」）；
+    //   ③ 新鲜度的**清除点**逐个钉住（回待命 / 会话边界 / 建链失败），且清完落**红**档。
+    CryptoController* const crypto = CryptoController::instance();
+
+    ignoreLogMessage("MAVLink.Crypto.CryptoController", QtDebugMsg,
+                     QRegularExpression("beginLinking|linking confirmed|return to standby"));
+    // ③ 的最后一格会调 `failLinking`，它按设计打一条 qCWarning。
+    ignoreLogMessage("MAVLink.Crypto.CryptoController", QtWarningMsg,
+                     QRegularExpression("linking failed"));
+    crypto->returnToStandby();
+    crypto->setRegistrationEnabled(false);
+    crypto->setResponsibleParty(false);
+    crypto->setResponsibleParty(true);
+    crypto->setCryptoEnabled(true);
+
+    // ‼️ 用一个**别处没用过**的 deviceID：`_everLinked` 是进程级的（唯一移除点是
+    //    `releaseDevice`，本格末尾才调，开头必然还在），复用别的用例用过的 id 就测不到
+    //    「灰档起步」。同理**不**在开头调 `releaseDevice`：
+    //    未关联的 id 会打一条告警，strict 模式下直接判失败（而它删密钥的行为又必须在
+    //    装密钥之前——两头都不讨好，换个干净 id 最省事）。
+    const DeviceID a = 0x0A0B0C77u;
+    crypto->deviceKeyManager()->removeKey(a);
+    crypto->deviceKeyManager()->cacheKey(a, testKey());
+    crypto->setInitiatorDevices(QVariantList{ static_cast<uint>(a) });
+    crypto->setIntroducerDevices(QVariantList{ static_cast<uint>(a) });
+    crypto->resetReplay(a);
+
+    const qint64 base = QDateTime::currentMSecsSinceEpoch();
+    crypto->setNowMsForTest(base);
+
+    // 灰档：从未收到该机的加密下行 ⇒ 本表不约束，闸仍不放行（§2.5.1）。
+    {
+        const QVariantMap l = crypto->uplinkLight(a);
+        QCOMPARE(l.value("crypto").toBool(), true);
+        QCOMPARE(l.value("roleAllowed").toBool(), true);
+        QCOMPARE(l.value("handshake").toBool(), false);
+        QCOMPARE(l.value("tier").toString(), QStringLiteral("gray"));
+        QVERIFY(!crypto->allowsUplink(a));
+    }
+
+    // 握手期（**首次**建链）：`tier` 仍是灰，但闸因根帧豁免而放行 ⇒ 界面必须用 `handshake`
+    // 区分，否则会出现「灯灰却发得出」这种看似矛盾的画面。
+    crypto->noteStandbyHeartbeat(a);
+    crypto->beginLinking(a);
+    QCOMPARE(crypto->state(), CryptoController::State::Active);
+    uint64_t root = 0;
+    QVERIFY(crypto->nextOutgoingCounter(root));
+    {
+        const QVariantMap l = crypto->uplinkLight(a);
+        QCOMPARE(l.value("handshake").toBool(), true);
+        QCOMPARE(l.value("tier").toString(), QStringLiteral("gray"));
+        QVERIFY2(crypto->allowsUplink(a), "握手期由根帧豁免放行——灯靠 handshake 位解释");
+    }
+
+    // 绿档：链路建起来，握手位清除。
+    crypto->noteDownlinkHeartbeat(a);
+    {
+        const QVariantMap l = crypto->uplinkLight(a);
+        QCOMPARE(l.value("handshake").toBool(), false);
+        QCOMPARE(l.value("tier").toString(), QStringLiteral("green"));
+        QVERIFY(crypto->allowsUplink(a));
+    }
+
+    // 黄档（2–5 s）：**灯黄但常规上行仍放行**（宽限）——灯色不是"禁发"的同义词。
+    crypto->setNowMsForTest(base + 3000);
+    {
+        const QVariantMap l = crypto->uplinkLight(a);
+        QCOMPARE(l.value("tier").toString(), QStringLiteral("yellow"));
+        QVERIFY(crypto->allowsUplink(a));
+    }
+
+    // 黄（持续）5–10 s：暂停常规上行，安全类仍可盲发。
+    crypto->setNowMsForTest(base + 6000);
+    {
+        const QVariantMap l = crypto->uplinkLight(a);
+        QCOMPARE(l.value("tier").toString(), QStringLiteral("yellowSustained"));
+        QVERIFY(!crypto->allowsUplink(a));
+        QVERIFY(crypto->allowsSafetyUplink(a));
+    }
+
+    // 红 > 10 s：只留安全类盲发。
+    crypto->setNowMsForTest(base + 11000);
+    {
+        const QVariantMap l = crypto->uplinkLight(a);
+        QCOMPARE(l.value("tier").toString(), QStringLiteral("red"));
+        QVERIFY(!crypto->allowsUplink(a));
+        QVERIFY(crypto->allowsSafetyUplink(a));
+    }
+
+    // 角色闸：本端不再持有该机指令权 ⇒ 即使下行新鲜，灯也**不得**回报 roleAllowed=true
+    // （界面据它把灯画成「无权限」，而不是绿）。
+    crypto->noteDownlinkHeartbeat(a);
+    QCOMPARE(crypto->uplinkLight(a).value("tier").toString(), QStringLiteral("green"));
+    crypto->setInitiatorDevices(QVariantList{});
+    {
+        const QVariantMap l = crypto->uplinkLight(a);
+        QCOMPARE(l.value("roleAllowed").toBool(), false);
+        QVERIFY2(!crypto->allowsUplink(a), "非指令权方任何档位都不发常规上行");
+    }
+
+    // 非法 deviceID（0 / 签名位置位，规范 §1.4 同一口径）：`roleAllowed` 为假、`tier` 回落灰；
+    // 未加密部署：`crypto` 为假，界面据此**隐藏**（不是灰灯）。
+    {
+        const QVariantMap l = crypto->uplinkLight(kInvalidDeviceID);
+        QCOMPARE(l.value("crypto").toBool(), true);
+        QCOMPARE(l.value("roleAllowed").toBool(), false);
+        QCOMPARE(l.value("tier").toString(), QStringLiteral("gray"));
+    }
+    {
+        const QVariantMap l = crypto->uplinkLight(0x01000000u);   // incompatFlag bit0 = 1
+        QCOMPARE(l.value("roleAllowed").toBool(), false);
+        QCOMPARE(l.value("tier").toString(), QStringLiteral("gray"));
+    }
+    crypto->setCryptoEnabled(false);
+    QCOMPARE(crypto->uplinkLight(a).value("crypto").toBool(), false);
+    crypto->setCryptoEnabled(true);
+
+    // ③ 三个清除点。每次都先把新鲜度点亮，判据才有判别力；清完必须是**红**档，
+    //    不是灰档——「曾建过链、如今断了」与「从未建过链」是两回事。
+    //
+    // ① 回待命（让出上行权）。`returnToStandby` 只清**当前 Active 那一架**的条目，
+    //    而上面那次 `setInitiatorDevices({})` 已经把 Active 收走了（该函数见到 Active 者
+    //    不在新名单里也会让位）⇒ 先重新把 a 建到 Active，判据才作用在 a 上。
+    crypto->setInitiatorDevices(QVariantList{ static_cast<uint>(a) });
+    crypto->beginLinking(a);
+    QCOMPARE(crypto->state(), CryptoController::State::Active);
+    crypto->noteDownlinkHeartbeat(a);
+    QCOMPARE(crypto->uplinkTier(a), CryptoController::UplinkTier::Green);
+    crypto->returnToStandby();
+    QCOMPARE(crypto->uplinkTier(a), CryptoController::UplinkTier::Red);
+
+    // ② 会话边界（让出上行权）：先把 a 拿回指令权并建链，再翻转责任方。
+    crypto->setInitiatorDevices(QVariantList{ static_cast<uint>(a) });
+    crypto->beginLinking(a);
+    QCOMPARE(crypto->state(), CryptoController::State::Active);
+    crypto->noteDownlinkHeartbeat(a);
+    QCOMPARE(crypto->uplinkTier(a), CryptoController::UplinkTier::Green);
+    crypto->setResponsibleParty(false);
+    QCOMPARE(crypto->uplinkTier(a), CryptoController::UplinkTier::Red);
+    QCOMPARE(crypto->state(), CryptoController::State::Standby);   // 收回发言权当场降回待命
+    crypto->setResponsibleParty(true);
+
+    // ③ 建链失败：同上再建一次，然后让它失败。
+    crypto->setInitiatorDevices(QVariantList{ static_cast<uint>(a) });
+    crypto->beginLinking(a);
+    QCOMPARE(crypto->state(), CryptoController::State::Active);
+    crypto->noteDownlinkHeartbeat(a);
+    QCOMPARE(crypto->uplinkTier(a), CryptoController::UplinkTier::Green);
+    crypto->failLinking(QStringLiteral("test"));
+    QCOMPARE(crypto->uplinkTier(a), CryptoController::UplinkTier::Red);
+    QCOMPARE(crypto->state(), CryptoController::State::Standby);
+
+    crypto->setNowMsForTest(-1);
+    // 复位本格动过的全局开关（`init()` 不管这两样）：否则后续用例会继承
+    // 「加密部署 + 引入方名单已生效」这两个前提。
+    crypto->setCryptoEnabled(false);
+    crypto->setIntroducerDevices(QVariantList{});
+    crypto->releaseDevice(a);
+}
+
+void CryptoTest::_testUplinkTierSurvivesInitiatorListShrink()
+{
+    // 2026-11-24 用户实测：qgc1 上同一架飞机的灯**红圈、绿圈交替**。
+    // 根因：`uplinkTier()` 读的新鲜度原先只存在 `_gcsHeartbeat` 条目里，而
+    // `setInitiatorDevices` 在名单收窄时**删掉整条**（那是为 bootstrap 服务的、有
+    // ⑦⑧ 两格钉住的设计，不能改）。监控员/非起飞站的 QGC **每 2 s** 整份重推一次
+    // 空名单 ⇒ 条目被删（红档）⇒ 下一条加密心跳又插回来（绿档）⇒ 来回跳。
+    // 本格钉两件事：
+    //   ① 删除节拍条目**不得**改变分档（另几个清除点——回待命 / 会话边界 / 建链失败——
+    //      在 `_testUplinkLightMatchesGate` 里逐格钉）；
+    //   ② `_recentEncryptedDownlink()`（非引入方的「搭车」建链闸）读的是**同一个量**，
+    //      因此名单重推也不能把它清掉，否则非引入方会在每次名单收缩后白等 2 s。
+    CryptoController* const crypto = CryptoController::instance();
+
+    ignoreLogMessage("MAVLink.Crypto.CryptoController", QtDebugMsg,
+                     QRegularExpression("beginLinking|linking confirmed|return to standby"));
+    crypto->returnToStandby();
+    crypto->setRegistrationEnabled(false);
+    crypto->setResponsibleParty(false);
+    crypto->setResponsibleParty(true);
+    crypto->setCryptoEnabled(true);
+
+    // 又一个**别处没用过**的 id（`_everLinked` 进程级、本格不调 `releaseDevice` 所以只增，
+    // 同上一格的注释）。
+    const DeviceID a = 0x0A0B0C78u;
+    crypto->deviceKeyManager()->removeKey(a);
+    crypto->deviceKeyManager()->cacheKey(a, testKey());
+    crypto->setInitiatorDevices(QVariantList{ static_cast<uint>(a) });
+    crypto->setIntroducerDevices(QVariantList{ static_cast<uint>(a) });
+    crypto->resetReplay(a);
+
+    const qint64 base = QDateTime::currentMSecsSinceEpoch();
+    crypto->setNowMsForTest(base);
+
+    // 收到一条认证加密下行心跳 ⇒ 绿档，条目被建出来。
+    crypto->noteDownlinkHeartbeat(a);
+    QCOMPARE(crypto->uplinkTier(a), CryptoController::UplinkTier::Green);
+    const int before = crypto->gcsHeartbeatEntryCountForTest();
+    QVERIFY(before >= 1);
+
+    // 名单收缩（QML 每 2 s 一次）⇒ 节拍条目被删（已有 ⑧ 格钉住这一点）……
+    crypto->setInitiatorDevices(QVariantList{});
+    QCOMPARE(crypto->gcsHeartbeatEntryCountForTest(), before - 1);
+    // ……但**分档不能跟着掉成红档**：新鲜度是链路事实，与"本端此刻持不持权"无关。
+    QCOMPARE(crypto->uplinkTier(a), CryptoController::UplinkTier::Green);
+    {
+        const QVariantMap l = crypto->uplinkLight(a);
+        QCOMPARE(l.value("tier").toString(), QStringLiteral("green"));
+        QCOMPARE(l.value("roleAllowed").toBool(), false);   // 角色如实为"无权限"
+    }
+
+    // 再推两轮（证明不是"只扛住一次"）。
+    crypto->setInitiatorDevices(QVariantList{});
+    crypto->setInitiatorDevices(QVariantList{});
+    QCOMPARE(crypto->uplinkTier(a), CryptoController::UplinkTier::Green);
+
+    // 时刻表确实在被"老化"：+11 s 判红（而不是永远绿）。
+    crypto->setNowMsForTest(base + 11000);
+    QCOMPARE(crypto->uplinkTier(a), CryptoController::UplinkTier::Red);
+
+    // 链路侧事件才作废新鲜度：明文待命（PX4 重启/回待命）⇒ 立刻红档。
+    crypto->setNowMsForTest(base);
+    crypto->noteStandbyHeartbeat(a);
+    QCOMPARE(crypto->uplinkTier(a), CryptoController::UplinkTier::Red);
+    // 下一条加密下行心跳重新点亮。
+    crypto->noteDownlinkHeartbeat(a);
+    QCOMPARE(crypto->uplinkTier(a), CryptoController::UplinkTier::Green);
+
+    // ② 搭车建链闸读同一个量：非引入方在「心跳 → 名单收缩 → 重新拿到指令权」之后，
+    //    只要心跳还在 2 s 窗口内，`beginLinking` 就必须放行（判据是那条日志文案
+    //    「搭车（近期加密下行已确认）」所代表的路径，这里用状态 Active 观察）。
+    //    ⚠️ 旧实现读 `_gcsHeartbeat`：中间的 `setInitiatorDevices({})` 会把条目删掉 ⇒
+    //    这一步会停在 Standby（本格因此在 2026-11-24 前会是红的）。
+    crypto->setInitiatorDevices(QVariantList{});
+    crypto->setIntroducerDevices(QVariantList{});          // 本端不是场内引入方
+    crypto->setNowMsForTest(base + 1000);                  // 仍在 2 s 窗口内
+    crypto->setInitiatorDevices(QVariantList{ static_cast<uint>(a) });   // 指令权回来
+    crypto->beginLinking(a);
+    QCOMPARE(crypto->state(), CryptoController::State::Active);
+
+    crypto->setNowMsForTest(-1);
+    crypto->returnToStandby();                             // 别把 Active 留给后续用例
+    crypto->deviceKeyManager()->removeKey(a);
+    // ‼️ 不调 `releaseDevice(a)`：本格从未把这架关联进本端（无 `_linkedDevices` 条目），
+    //    它会打一条「该 deviceID 未与本端关联」的告警，strict mode 直接判失败。
+    //    残留的 `_everLinked` / `_lastDownlinkHbAtMs` 无害——本 id 是本格专用的。
+    crypto->setIntroducerDevices(QVariantList{});
+}
+
 void CryptoTest::_testStandbyHandshakeClearsWatermarks()
 {
     // 规范 §2.5.1 R1（2026-11-23）：持上行权限的一方收到明文待命 ⇒ 清双向水位，下一帧

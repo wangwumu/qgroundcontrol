@@ -141,6 +141,13 @@ private slots:
     void _testIntroducerGate();
     void _testStandbyHandshakeClearsWatermarks();
     void _testSafetyUplinkBypassesTiers();
+    // 状态栏上行灯（§3.1.1 节末，2026-11-24）：灯色必须与闸同源——`tier` 取自
+    // `uplinkTier()`、角色位取自角色闸，且「灯 ∈ {绿,黄}」⇔ `allowsUplink`（握手期除外）。
+    void _testUplinkLightMatchesGate();
+    // 灯的新鲜度不得被**角色簿记**改写（2026-11-24 用户报「qgc1 红圈绿圈交替」）：
+    // `setInitiatorDevices` 每 2 s 整份重推、不在名单里的条目会被删；那一刻灯必须
+    // 仍按**上一条加密下行心跳**的时刻分档，而不是掉成红档。
+    void _testUplinkTierSurvivesInitiatorListShrink();
 
     // 主动取密钥时机之二（规范 §2.7.2 e，Task 7）：监控清单**内容变化**时，对尚无本地
     // 密钥的 ID 触发**一次批量**拉取。

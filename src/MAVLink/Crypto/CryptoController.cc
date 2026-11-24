@@ -578,6 +578,7 @@ void CryptoController::releaseDevice(quint32 deviceID)
         // 上行心跳节拍状态随释出一起清：否则这架飞机若日后重新认领，残存的
         // `downlinkHbSeen` / 计数会跳过 bootstrap，直接按旧计数放行/拦截。
         _gcsHeartbeat.remove(id);
+        _lastDownlinkHbAtMs.remove(id);
         // §3.1.1 的会话状态与释出同清：再次认领时从灰档重新开始，不继承旧档位。
         _everLinked.remove(id);
         _lastHandshakeMs.remove(id);
@@ -869,6 +870,7 @@ void CryptoController::setResponsibleParty(bool responsible)
         // 与上面两张表同一归属，跨会话留着会按上一个站点的名单继续档/放上行心跳。
         if (!responsible) {
             _gcsHeartbeat.clear();
+            _lastDownlinkHbAtMs.clear();
             // §3.1.1 / §2.5.1 的会话状态同属一个会话边界：跨会话留着会让新账号按上一个
             // 站点的握手期/节流记录继续放行上行。
             _handshakeArmed.clear();
@@ -1055,11 +1057,14 @@ CryptoController::UplinkTier CryptoController::uplinkTier(DeviceID deviceID) con
     }
     // 「本纪元尚无下行」由握手期标记（`_handshakeArmed`）表达并被 `allowsUplink` 豁免；
     // 这里只判「最近一条加密下行心跳有多旧」。
-    const auto it = _gcsHeartbeat.constFind(deviceID);
-    if (it == _gcsHeartbeat.constEnd() || !it.value().downlinkHbSeen) {
+    // ‼️ 读 `_lastDownlinkHbAtMs` 而**不是** `_gcsHeartbeat` 里的同名量：后者会随
+    //    「名单缩小/会话边界/让出上行权」被删掉，而那不是链路事件 ⇒ 非责任方 QGC
+    //    的灯会在红/绿之间来回跳（详见该成员头注）。
+    const qint64 last = _lastDownlinkHbAtMs.value(deviceID, 0);
+    if (last <= 0) {
         return UplinkTier::Red;
     }
-    const qint64 age = now - it.value().lastDownlinkHbMs;
+    const qint64 age = now - last;
     if (age < kDownlinkFreshnessMs) {
         return UplinkTier::Green;
     }
@@ -1123,15 +1128,50 @@ bool CryptoController::allowsUplink(DeviceID deviceID) const
     return false;
 }
 
+QVariantMap CryptoController::uplinkLight(DeviceID deviceID) const
+{
+    QVariantMap out;
+    const bool encrypted = cryptoEnabled();
+    // 「合法 deviceID」与全仓其余入口同一口径（规范 §1.4）：0 与签名位置位都算非法。
+    // 非法 ⇒ `tier="gray"`、`roleAllowed=false`（头注 @note 的判据），且不读任何 per-device 表。
+    const bool valid = deviceID != kInvalidDeviceID && hasValidSignatureBit(deviceID);
+    out.insert(QStringLiteral("crypto"), encrypted);
+    // ‼️ 角色闸与分档闸各自取锁（`isInitiatorFor` / `uplinkTier` 内部各取一次 `_mutex`），
+    //    本函数**不得**在外面再包一层：既有路径的锁序是 CryptoController → ReplayGuard，
+    //    嵌套一层只会多出一处可死锁的形状，买不到任何东西。
+    out.insert(QStringLiteral("roleAllowed"), valid && encrypted && isInitiatorFor(deviceID));
+    bool handshake = false;
+    if (valid) {
+        const QMutexLocker locker(&_mutex);
+        handshake = _handshakeArmed.contains(deviceID);
+    }
+    out.insert(QStringLiteral("handshake"), handshake);
+    // tier 只做枚举→字符串的映射，阈值一个都不在这里判（灯与闸同源，见头注）。
+    QString tier = QStringLiteral("gray");
+    if (valid) {
+        switch (uplinkTier(deviceID)) {
+        case UplinkTier::Gray:            tier = QStringLiteral("gray");            break;
+        case UplinkTier::Green:           tier = QStringLiteral("green");           break;
+        case UplinkTier::Yellow:          tier = QStringLiteral("yellow");          break;
+        case UplinkTier::YellowSustained: tier = QStringLiteral("yellowSustained"); break;
+        case UplinkTier::Red:             tier = QStringLiteral("red");             break;
+        }
+    }
+    out.insert(QStringLiteral("tier"), tier);
+    return out;
+}
+
 bool CryptoController::_recentEncryptedDownlink(DeviceID deviceID) const
 {
     const qint64 now = _nowMs();
     const QMutexLocker locker(&_mutex);
-    const auto it = _gcsHeartbeat.constFind(deviceID);
-    if (it == _gcsHeartbeat.constEnd() || !it.value().downlinkHbSeen) {
+    // 与 `uplinkTier()` 读**同一个**量（`_lastDownlinkHbAtMs`），理由见该成员头注：
+    // 这不是"节拍簿记"，是链路事实。
+    const qint64 last = _lastDownlinkHbAtMs.value(deviceID, 0);
+    if (last <= 0) {
         return false;
     }
-    return (now - it.value().lastDownlinkHbMs) <= kDownlinkFreshnessMs;
+    return (now - last) <= kDownlinkFreshnessMs;
 }
 
 qint64 CryptoController::_nowMs() const
@@ -1341,6 +1381,7 @@ void CryptoController::failLinking(const QString& error)
         _activeDeviceID = kInvalidDeviceID;
         _state = State::Standby;
         _gcsHeartbeat.remove(failedDevice);
+        _lastDownlinkHbAtMs.remove(failedDevice);
         _handshakeArmed.remove(failedDevice);
     }
     qCWarning(CryptoControllerLog) << "linking failed device" << failedDevice << error;
@@ -1361,6 +1402,7 @@ void CryptoController::returnToStandby()
         _state = State::Standby;
         // 让出上行权即结束这一轮节拍；bootstrap 状态不得跨会话残留。
         _gcsHeartbeat.remove(releasedDevice);
+        _lastDownlinkHbAtMs.remove(releasedDevice);
         _handshakeArmed.remove(releasedDevice);
         _lastHandshakeMs.remove(releasedDevice);
     }
@@ -1652,6 +1694,11 @@ void CryptoController::noteStandbyHeartbeat(DeviceID deviceID)
     hb.downlinkHbSeen = false;
     hb.downlinkHbCount = 0;
     hb.lastDownlinkHbMs = 0;
+    // 明文待命 = PX4 已丢失加密状态（重启/回待命）⇒ **链路真的断了**，新鲜度必须作废。
+    // 这是 `_lastDownlinkHbAtMs` 的五个清除点之一（其余：`releaseDevice` / 会话边界
+    // `setResponsibleParty(false)` / `failLinking` / `returnToStandby`，清单见成员头注）。
+    // ‼️ 与 `setInitiatorDevices` 的名单收窄**不是一类事件**：那个只是角色变了，链路还在。
+    _lastDownlinkHbAtMs.remove(deviceID);
 }
 
 void CryptoController::noteDownlinkHeartbeat(DeviceID deviceID)
@@ -1672,7 +1719,10 @@ void CryptoController::noteDownlinkHeartbeat(DeviceID deviceID)
     GcsHeartbeatState& hb = it.value();
     hb.downlinkHbSeen = true;
     hb.lastDownlinkHbMs = _nowMs();
-    // §3.1.1 的 `everLinked`：本进程曾经建过链（只增不减；明文待命心跳不清它）。
+    // §3.1.1 的核心量：**独立**记一份（不随名单/会话簿记删除），理由见成员头注。
+    _lastDownlinkHbAtMs.insert(deviceID, hb.lastDownlinkHbMs);
+    // §3.1.1 的 `everLinked`：本进程曾经建过链（明文待命心跳不清它；唯一移除点是
+    // `releaseDevice` 释出——那相当于重新变成一台"陌生"设备）。
     _everLinked.insert(deviceID);
     // 链路真的建起来了 ⇒ 握手期结束，改由分档治理。
     _handshakeArmed.remove(deviceID);

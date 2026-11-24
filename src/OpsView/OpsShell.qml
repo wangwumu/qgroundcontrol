@@ -2248,6 +2248,20 @@ Item {
                                                              opsShell._mySiteId, opsShell._handoverById,
                                                              opsShell._now,
                                                              OpsCommon.isLandedOnGround(_veh ? _veh.flying : undefined))
+                    // 加密**上行灯点**（规范 §3.1.1 节末「界面灯」）：与任务卡灯点**同一规则、
+                    // 同一套颜色**（`OpsCommon.uplinkLightKey/Color/DotStyle/DotColor`）。
+                    // 两条视觉通道：颜色 = 链路档；实心 = 本端持该机指令权，空心环 = 无权限仍画
+                    // （环色仍是链路档）；`off` / 有权时的 `gray`（从未建链）不画。
+                    // ‼️ 箭头本体的颜色已被"出站黄 / 进站绿 / 告警"占用（`siteMarkerColor`），
+                    //    上行档因此画在**机号标签**里，**不得**去改 `_markerColor` 的语义。
+                    // ‼️ `opsShell._now` 那一读是**依赖注册**（理由见任务卡同一段注释）。
+                    readonly property int _uplinkDeviceID: _veh ? _veh.deviceID() : 0
+                    readonly property var _uplinkLight: {
+                        var tick = opsShell._now
+                        if (_uplinkDeviceID <= 0 || typeof cryptoController === "undefined") return null
+                        return cryptoController.uplinkLight(_uplinkDeviceID)
+                    }
+                    readonly property string _uplinkKey: OpsCommon.uplinkLightKey(_uplinkLight)
                     // ‼️ 图标（箭头）与编号标这两块，与 L3（监控员视图）marker **基本重复**，
                     //    是**刻意**重复的（同上面 `_veh`/`_pos` 那两段）。不抽共用组件的理由：
                     //    抽了就会让监控员视图跟着站点视图的改动一起变，而两者本就可以各自演进。
@@ -2330,6 +2344,9 @@ Item {
                                     PathSvg { path: "M35.5 2.118v51.573L1.118 70.882zM36.5 53.691V2.118l34.382 68.764z" }
                                 }
                             }
+                            // 加密上行灯点**不画在箭头旁**了（用户 2026-11-24：先嫌它随航向
+                            // 在箭头左右乱窜，改到随航向旋转后又觉得难看）⇒ 移进右侧的
+                            // 无人机编号标签里、放在编号**前面**，见 `siteLabelBox`。
                         }
                         // 无人机编号标在图标右侧（自绘，**不用 ToolTip**：地图项是画在场景里的，
                         // ToolTip 的 parent 会落到地图根而非被悬停项上，位置会漂移）
@@ -2345,13 +2362,38 @@ Item {
                             id: siteLabelBox
                             x: 27                        // = 图标宽 24 + 间距 3（与上面的 width 同源，别只改一处）
                             anchors.verticalCenter: parent.verticalCenter
-                            width: siteLabel.width + 8; height: siteLabel.height + 4
+                            // 上行灯点的画法（2026-11-24 改）：**颜色=链路档、实心/空心=有无发送权**，
+                            // 规则单点在 `OpsCommon.uplinkDotStyle/DotColor`（状态栏灯、任务卡灯点同读）。
+                            // ⚠️ `opsShell._now` 的依赖已在上面 `_uplinkLight` 里注册过，这里只读结果。
+                            readonly property string _dotStyle: OpsCommon.uplinkDotStyle(siteMarker._uplinkKey)
+                            readonly property bool   _dotVisible: _dotStyle !== "none"
+                            // 灯点可见时整块宽 13px（点 9 + 间距 4），文字右移同一距离；
+                            // 不可见时回到原样（左右各 4px 内边距）。
+                            width: siteLabel.width + 8 + (_dotVisible ? 13 : 0)
+                            height: siteLabel.height + 4
                             radius: 3
-                            color: "#cc0d1526"
+                            // 2026-11-24 用户：底色半透明（原 `#cc0d1526` 的 80% 看着像实心）⇒ 降到 50%。
+                            color: "#800d1526"
                             border.color: "#3a4a66"; border.width: 1
+                            // 加密**上行灯点**：放在无人机编号**前面**（用户 2026-11-24：放箭头旁难看）。
+                            // 实心=本端持该机指令权；**空心环=只能看、发不出去**（无权限），环色仍是链路档。
+                            // 深色描边：底图可能是亮色卫星图，没有描边的浅色点会糊掉。
+                            Rectangle {
+                                visible: siteLabelBox._dotVisible
+                                x: 4
+                                anchors.verticalCenter: parent.verticalCenter
+                                width: 9; height: 9; radius: 4.5
+                                color: siteLabelBox._dotStyle === "hollow" ? "transparent"
+                                                                            : OpsCommon.uplinkDotColor(siteMarker._uplinkLight)
+                                border.width: siteLabelBox._dotStyle === "hollow" ? 2 : 1
+                                border.color: siteLabelBox._dotStyle === "hollow"
+                                              ? OpsCommon.uplinkDotColor(siteMarker._uplinkLight) : "#0d1526"
+                            }
                             Text {
                                 id: siteLabel
-                                anchors.centerIn: parent
+                                // 点可见时让出「点 9 + 间隔 4」；不可见时回到 4px 内边距。
+                                x: 4 + (siteLabelBox._dotVisible ? 13 : 0)
+                                anchors.verticalCenter: parent.verticalCenter
                                 color: "#e6edf7"; font.pixelSize: Math.round(10 * ScreenTools.uiTextScaleFactor); font.bold: true
                                 text: modelData.uav_no ? modelData.uav_no : ("#" + modelData.device_id)
                             }
@@ -2480,6 +2522,17 @@ Item {
                     readonly property color _markerColor: OpsCommon.markerColor(
                                                              modelData, _task, opsShell._now, opsShell._handoverById,
                                                              OpsCommon.isLandedOnGround(_veh ? _veh.flying : undefined))
+                    // 加密**上行灯点**（规范 §3.1.1 节末「界面灯」）：与站点视图 marker 逐条同源
+                    // （规则、颜色、画法都同 `OpsCommon.uplinkLightKey/Color/DotStyle/DotColor`），
+                    // 改一处要看另一处。
+                    // ‼️ `opsShell._now` 那一读是**依赖注册**（理由见任务卡同一段注释）。
+                    readonly property int _uplinkDeviceID: _veh ? _veh.deviceID() : 0
+                    readonly property var _uplinkLight: {
+                        var tick = opsShell._now
+                        if (_uplinkDeviceID <= 0 || typeof cryptoController === "undefined") return null
+                        return cryptoController.uplinkLight(_uplinkDeviceID)
+                    }
+                    readonly property string _uplinkKey: OpsCommon.uplinkLightKey(_uplinkLight)
 
                     // 无载具 / 坐标无效 ⇒ **不画**（2026-10-03 裁定：位置**只吃报文**，没有库兜底）
                     visible: _pos !== null
@@ -2577,6 +2630,8 @@ Item {
                                     PathSvg { path: "M35.5 2.118v51.573L1.118 70.882zM36.5 53.691V2.118l34.382 68.764z" }
                                 }
                             }
+                            // 加密上行灯点不画在箭头旁，与站点视图 marker 同改（2026-11-24）：
+                            // 移进右侧的机号标签里、放在编号前面，见 `markerLabelBox`。
                         }
                         // 机号标在图标右侧（自绘，**不用 ToolTip**：地图项是画在场景里的，
                         // ToolTip 的 parent 会落到地图根而非被悬停项上，位置会漂移）
@@ -2592,13 +2647,37 @@ Item {
                             id: markerLabelBox
                             x: 27                        // = 图标宽 24 + 间距 3（与上面的 width 同源，别只改一处）
                             anchors.verticalCenter: parent.verticalCenter
-                            width: markerLabel.width + 8; height: markerLabel.height + 4
+                            // 上行灯点画法：与站点视图 marker 逐条同源（规则在 `OpsCommon`）。
+                            // ‼️ 监控员视图里本端**大多数时刻不是指令权方**（签入航线段之前责任在
+                            //    起飞站、签入降落段之后在降落站）⇒ 不能把 `noPermission` 当"不画"，
+                            //    否则这张图上永远没有点（2026-11-24 用户报的正是这个）。
+                            readonly property string _dotStyle: OpsCommon.uplinkDotStyle(devMarker._uplinkKey)
+                            readonly property bool   _dotVisible: _dotStyle !== "none"
+                            // 灯点可见时整块宽 13px（点 9 + 间距 4），文字右移同一距离。
+                            width: markerLabel.width + 8 + (_dotVisible ? 13 : 0)
+                            height: markerLabel.height + 4
                             radius: 3
-                            color: "#cc0d1526"
+                            // 2026-11-24 用户：底色半透明（同站点视图）。
+                            color: "#800d1526"
                             border.color: "#3a4a66"; border.width: 1
+                            // 加密**上行灯点**：放在机号**前面**（与站点视图 marker 同款）。
+                            // 实心=持指令权；空心环=只能看、发不出去，环色仍是链路档。
+                            Rectangle {
+                                visible: markerLabelBox._dotVisible
+                                x: 4
+                                anchors.verticalCenter: parent.verticalCenter
+                                width: 9; height: 9; radius: 4.5
+                                color: markerLabelBox._dotStyle === "hollow" ? "transparent"
+                                                                             : OpsCommon.uplinkDotColor(devMarker._uplinkLight)
+                                border.width: markerLabelBox._dotStyle === "hollow" ? 2 : 1
+                                border.color: markerLabelBox._dotStyle === "hollow"
+                                              ? OpsCommon.uplinkDotColor(devMarker._uplinkLight) : "#0d1526"
+                            }
                             Text {
                                 id: markerLabel
-                                anchors.centerIn: parent
+                                // 点可见时让出「点 9 + 间隔 4」；不可见时回到 4px 内边距。
+                                x: 4 + (markerLabelBox._dotVisible ? 13 : 0)
+                                anchors.verticalCenter: parent.verticalCenter
                                 color: "#e6edf7"; font.pixelSize: Math.round(10 * ScreenTools.uiTextScaleFactor); font.bold: true
                                 text: modelData.uav_no ? modelData.uav_no
                                       : (modelData.task_no ? modelData.task_no : ("#" + modelData.device_id))
@@ -2733,10 +2812,22 @@ Item {
 
             // 选中任务 —— 靠左
             Text {
+                id: selectedTaskText
                 anchors.left: parent.left; anchors.leftMargin: 16
                 anchors.verticalCenter: parent.verticalCenter
                 color: "#e6edf7"; font.pixelSize: Math.round(13 * ScreenTools.uiTextScaleFactor); font.bold: true
                 text: qsTr("选中任务：") + OpsCommon.taskNo(_selectedTask())
+            }
+
+            // 加密**上行灯**（规范 §3.1.1 节末「界面灯」）：跟**选中任务**的载具走。
+            // ‼️ 传 `_selectedVehicle` 而不是让组件用 `activeVehicle`：多机同屏时
+            //    两者可以不是同一架，灯必须描述状态栏这排遥测所描述的那一架。
+            UplinkLightIndicator {
+                id: uplinkLight
+                vehicle: opsShell._selectedVehicle
+                anchors.left: selectedTaskText.right
+                anchors.leftMargin: 24
+                anchors.verticalCenter: parent.verticalCenter
             }
 
             // 参数排：标题：数值横向一行 —— 靠右

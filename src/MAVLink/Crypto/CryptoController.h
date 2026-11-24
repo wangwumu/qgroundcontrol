@@ -27,6 +27,7 @@
 #include <QtCore/QString>
 #include <QtCore/QTimer>
 #include <QtCore/QVariantList>
+#include <QtCore/QVariantMap>
 
 #include "DeviceID.h"
 #include "DeviceKeyManager.h"
@@ -591,14 +592,18 @@ public:
 
     /// 上行许可分档（规范 §3.1.1，2026-11-23 定稿）。
     ///
-    /// 判据是「**本纪元**是否收到过该机的加密下行、以及距最近一条加密下行心跳多久」：
-    ///   · `Gray`            —— 未建链（本进程从未收到该机的认证加密下行心跳），或本纪元
-    ///                          下行水位为空（握手清零之后、首条下行之前）。本表不约束，
+    /// 判据是「**本进程**是否收到过该机的加密下行、以及距最近一条加密下行心跳多久」：
+    ///   · `Gray`            —— 未建链（本进程从未收到该机的认证加密下行心跳）。本表不约束，
     ///                          能不能发由 §2.5.1 决定；
     ///   · `Green`           —— 距最近一条加密下行心跳 `< kDownlinkFreshnessMs`（2 s）；
     ///   · `Yellow`          —— `[2 s, 5 s)`；
     ///   · `YellowSustained` —— `[5 s, 10 s]`（暂停常规上行，只留安全类指令）；
     ///   · `Red`             —— `> 10 s`（只留安全类指令的盲发）。
+    ///
+    /// ⚠️ 「曾建过链但最近心跳时刻已被清掉」（如 `setResponsibleParty(false)` 让出上行权）
+    ///    落 `Red`（**不是** `Gray`）：那是"链路断了"，不是"从未建链"。
+    ///    握手期「本纪元尚无下行」由 `_handshakeArmed` 表达、由 `allowsUplink` 豁免，
+    ///    与本表无关——所以握手期这里可能就是 `Red`，界面靠 `handshake` 位盖住。
     ///
     /// ‼️ 「能不能发出」≠「有没有权限」：网络原因发不出去不影响本表，也不做任何补偿。
     UplinkTier uplinkTier(DeviceID deviceID) const;
@@ -626,6 +631,23 @@ public:
     ///   · **本任期已发过至少一帧**（上行水位非空）——刚取得控制权、还没发过帧的状态
     ///     不允许盲发（等价于恢复清零前的旧值，见 §2.5.1 R5）。
     bool allowsSafetyUplink(DeviceID deviceID) const;
+
+    /// 工具栏**上行灯**的状态（规范 §3.1.1 节末「界面灯」，2026-11-24 接线）。
+    ///
+    /// 返回 `{ crypto, roleAllowed, handshake, tier }`：
+    ///   · `crypto`      —— 是否加密部署；`false` ⇒ 本表不适用，界面**隐藏**（不是灰灯）；
+    ///   · `roleAllowed` —— 本端是否持有该机指令权（角色闸 `isInitiatorFor`）；
+    ///   · `handshake`   —— 握手期标记（置位期间 `allowsUplink` 直接放行根帧）；
+    ///   · `tier`        —— `"gray"/"green"/"yellow"/"yellowSustained"/"red"`，
+    ///                      **直接取自 `uplinkTier()`**。
+    ///
+    /// ‼️ **灯与闸同源**：阈值判据只在 `uplinkTier()` 一处，本函数**不得**重算新鲜度。
+    ///    另写一份阈值的后果是「灯绿却发不出去」/「灯红了其实能发」，而两处一旦漂移
+    ///    没有任何东西会报错。角色闸同理——非指令权方任何档位都不发常规上行（§3.1.1
+    ///    「与角色闸的合成关系」），故它的灯**不能**是绿。
+    ///
+    /// @note `deviceID` 非法（0 / 签名位）⇒ `tier="gray"`、`roleAllowed=false`。
+    Q_INVOKABLE QVariantMap uplinkLight(quint32 deviceID) const;
 
     /// 声明本端**有引入权**的 deviceID 名单（站点视图按起飞支推、监控员视图推空）。
     ///
@@ -782,7 +804,10 @@ private:
         bool downlinkHbSeen = false;  ///< 收到过该机的加密下行心跳
         int downlinkHbCount = 0;      ///< 自上次放行以来的加密下行心跳条数
         qint64 bootstrapArmMs = 0;    ///< bootstrap 置位时刻（_nowMs）
-        qint64 lastDownlinkHbMs = 0;  ///< 最近一条加密下行心跳时刻（_nowMs）
+        /// 最近一条加密下行心跳时刻（_nowMs）。⚠️ 2026-11-24 起**只写不读**：
+        /// 分档/`_recentEncryptedDownlink()` 一律读 `CryptoController::_lastDownlinkHbAtMs`
+        /// （本表条目会被角色簿记删掉，见该成员头注）。保留它是为了记账现场与既有测试。
+        qint64 lastDownlinkHbMs = 0;
     };
 
     void _onKeyFetched(DeviceID deviceID);
@@ -850,9 +875,29 @@ private:
     ReplayGuard _replayGuard;
     /// 本进程**曾经**收到过该机认证加密下行心跳（§3.1.1 的 `everLinked` 状态量）。
     /// ⚠️ 与 `GcsHeartbeatState::downlinkHbSeen` **分开存放**：后者会被明文待命心跳清零
-    ///    （PX4 回到待命），而 `everLinked` 只在本进程生命周期内保留——
+    ///    （PX4 回到待命），而 `everLinked` 不受待命心跳影响——
     ///    灰档判的是「本进程从未建过链」，不是「此刻没有新鲜下行」。
+    ///    ⚠️ 唯一移除点是 `releaseDevice`（签出释出 = 重新成为一个"陌生"设备）。
     QSet<DeviceID> _everLinked;
+    /// 最近一条**通过 GCM 认证的加密下行心跳**的时刻（`_nowMs`）——规范 §3.1.1 分档判据的核心量。
+    ///
+    /// ‼️ **必须独立于 `_gcsHeartbeat` 存放**（2026-11-24 实测缺陷）。同一份时刻以前只存在
+    ///    `GcsHeartbeatState::lastDownlinkHbMs` 里，而那个条目会被**角色簿记**删掉，最要命的
+    ///    一处是 `setInitiatorDevices` 名单缩小/整份为空（QML **每 2 s** 整份重推一次）——
+    ///    那是**任何非责任方 QGC 的常态**（监控员签入前、非起飞站……）。条目一被删，
+    ///    `uplinkTier()` 就读成红档；下一条加密心跳（≈1 Hz）又把条目插回来 ⇒ 读成绿档
+    ///    ⇒ **灯在红/绿之间来回跳**（qgc1 2026-11-24 实测，用户报「红圈绿圈交替」）。
+    ///    「链路新鲜度」是**链路事实**，不该被角色簿记改写——故单列一张表。
+    ///
+    /// 清除点**只有下面五处**（都是「链路或会话真的换了」）：
+    ///   ① `releaseDevice`（签出释出该机）；
+    ///   ② `setResponsibleParty(false)`（会话边界，让出上行权）；
+    ///   ③ `failLinking`（建链失败）；
+    ///   ④ `returnToStandby`（回到待命、让出上行权）；
+    ///   ⑤ `noteStandbyHeartbeat`（收到 PX4 明文待命心跳 ⇒ 本纪元结束）。
+    /// ‼️ `setInitiatorDevices` **不碰本表**——那正是它存在的理由。动这里之前先看
+    ///    `_testUplinkTierSurvivesInitiatorListShrink`（它钉的就是这一条）。
+    QHash<DeviceID, qint64> _lastDownlinkHbAtMs;
     /// 「握手期」标记（§2.5.1 R1）：收到明文待命心跳并清双向后置位，收到该机首条
     /// **认证加密下行心跳**（链路真的建起来）后清除。置位期间放行握手根帧与引导心跳
     /// （`allowsUplink`），此后改由 §3.1.1 分档治理。

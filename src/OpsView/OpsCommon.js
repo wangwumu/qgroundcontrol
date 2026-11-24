@@ -1091,6 +1091,165 @@ function abnormalLabel(kind) {
     }
 }
 
+/// 上行灯（规范 §3.1.1 节末「界面灯」，2026-11-24 接线）：把 `CryptoController::uplinkLight()`
+/// 的返回折成**一个呈现档**。三处界面共用本函数——状态栏那盏带字的灯（`UplinkLightIndicator`）、
+/// 任务卡片上的灯点、地图机号标签里的灯点 ⇒ 档位→表现只有这一份（同 `abnormalColor` 的理由）。
+///
+/// 入参 `light` 就是 `uplinkLight(deviceID)` 原样返回的 map：`{crypto, roleAllowed, handshake, tier}`。
+/// ‼️ **阈值不在本函数判**：`tier` 由 C++ 的 `uplinkTier()` 决定（灯与闸同源，见该函数头注）。
+///    这里只做「哪一档优先显示」的排序。
+///
+/// 返回：`"off"` 未加密部署 / 无该机；`"noPermission"` 本端非指令权方；`"handshake"` 握手期；
+///       `"green"/"yellow"/"yellowSustained"/"red"` 四档；`"gray"` 已加密但从未建链
+///       （本表不约束，**不是故障**）。
+///
+/// ⚠️ 顺序即优先级：没有指令权时档位再新也发不出去，必须先报 `noPermission`；
+///    **首次**建链时握手期 `tier` 还是灰（从未收到加密下行），而闸对根帧放行 ⇒ 靠 `handshake`
+///    位区分，否则画面上会出现「灯灰却发得出」。重建链（已 `_everLinked`）时 `tier` 可能
+///    已是红/黄，同样由 `handshake` 位盖住——握手期不谈档位。
+function uplinkLightKey(light) {
+    if (!light || light.crypto !== true) return "off"
+    if (light.roleAllowed !== true) return "noPermission"
+    if (light.handshake === true) return "handshake"
+    switch (light.tier) {
+    case "green":           return "green"
+    case "yellow":          return "yellow"
+    case "yellowSustained": return "yellowSustained"
+    case "red":             return "red"
+    default:                return "gray"
+    }
+}
+
+/// 上行灯档 → 颜色。与 `uplinkLightKey` **同组**：加一档必须两处同加，否则要么没颜色、
+/// 要么颜色错档。
+/// ⚠️ 未知档返回**灰**而不是红：红是「只剩安全类指令」的语义，兜红会把未知画成最坏状态。
+function uplinkLightColor(key) {
+    switch (key) {
+    case "green":           return "#2ecc71"
+    case "yellow":          return "#ffc107"
+    case "yellowSustained": return "#ff8f00"   // 琥珀：暂停常规上行
+    case "red":             return "#ff3b3b"
+    case "handshake":       return "#3b9cff"
+    default:                return "#8a8a8a"
+    }
+}
+
+/// 灯点的**画法**（2026-11-24，用户报「RomView 里地图上没有点、状态栏是灰的」）。
+///
+/// 上一版把 `noPermission` / `gray` / `off` 三个档**一律不画**。监控员视图里绝大多数
+/// 时刻都不是指令权方（`signed_in` 之前责任在起飞站、`landing_accepted` 之后在降落站），
+/// 于是那张图上**一个点都没有**，状态栏也只剩兜底灰——用户看到的就是「OpsView 有、RomView 没有」。
+///
+/// 改法是把两个语义拆开，各用一条视觉通道，缺一不可：
+///   · **颜色 = 呈现档**（`uplinkDotColor`：四档链路色 + 握手蓝；`noPermission` 绕回 `tier`，
+///     灯与闸同源不变）；
+///   · **实心/空心 = 本端有没有发送权**（本函数）。空心 = 只能看、发不出去。
+/// 这样监控员不必等签出就能看到链路健康，也不会因为一个实心绿点误以为「现在能发指令」
+/// ——规范 §3.1.1「界面呈现必须与执行闸读同一个判据」正是要求这个区分，不是要求把
+/// `noPermission` 画成档位色了事。
+///
+/// 返回：`"none"` 不画；`"hollow"` 空心环（无发送权）；`"solid"` 实心点（有权）。
+/// ⚠️ `gray`（从未建链）**只在"无权"时**画：本端无权限时链路档由 `light.tier` 决定
+///    （`noPermission` 档里没有自己的色，颜色只能回读 `tier`），那一档可能是灰 ⇒ 会看到
+///    灰空心环，含义是「无权限、且没有任何加密下行」——与「有链路但无权限」（彩色空心环）
+///    可区分。本端**有**权限时 `gray` 仍不画：它是「无加密链路、不适用」，规范 §3.1.1
+///    明确灰灯不是故障，画一个灰实心点反而像告警。
+/// ⚠️ `default` 落 `"none"`（fail-closed）：将来 C++ 若加新档而这里忘了同加，
+///    宁可不画，也不要画成实心绿/实心红去误导「此刻能发」。
+function uplinkDotStyle(key) {
+    switch (key) {
+    case "noPermission": return "hollow"
+    case "handshake":
+    case "green":
+    case "yellow":
+    case "yellowSustained":
+    case "red":          return "solid"
+    default:             return "none"      // off / gray / 未知档
+    }
+}
+
+/// 灯点颜色：**永远按呈现档**上色，与"有没有发送权"无关（空心环也用这个色画边）。
+/// ‼️ 这里的"档"是 `uplinkLightKey` 的呈现档（四档链路色 + 握手蓝），不是原始 `tier`；
+///    唯一的例外是 `noPermission`——该档把链路档吞掉了，颜色只能回读 `light.tier`
+///    （由 C++ 的 `uplinkTier()` 给出，不是本文件另算的）。
+/// ⚠️ 读不到 `tier` 时退回兜底灰，不要猜成绿。
+function uplinkDotColor(light) {
+    if (!light) return "#8a8a8a"
+    var key = uplinkLightKey(light)
+    if (key === "noPermission") return uplinkLightColor(String(light.tier || "gray"))
+    return uplinkLightColor(key)
+}
+
+/// 链路档 → 两到三个字的中文（只给"无权限"时拼进标签用）。
+/// ‼️ `red` 在这里是「超时」而不是灯标签的「仅安全指令」：括号里的字只描述**链路新鲜度**，
+///    无权时本来就不发任何东西，"仅安全指令"会与"无权限"自相矛盾。
+function uplinkTierWord(tier) {
+    switch (tier) {
+    case "green":           return qsTr("正常")
+    case "yellow":          return qsTr("延迟")
+    case "yellowSustained": return qsTr("暂停")
+    case "red":             return qsTr("超时")
+    default:                return qsTr("未建链")
+    }
+}
+
+/// 灯点的**一行文字**。与 `uplinkDotColor` 配对：无权限时颜色表示链路档，文字必须把这个
+/// 色说清楚，否则"绿环 + 上行 无权限"会被读成两个矛盾的结论。
+/// ⚠️ 只有状态栏那一处直接显示它；任务卡把它当作悬停提示的第一行（`uplinkDotHint`），
+///    地图上的机号标签只有灯点、没有任何文字。
+function uplinkDotLabel(light) {
+    var key = uplinkLightKey(light)
+    if (key !== "noPermission") return uplinkLightLabel(key)
+    return uplinkLightLabel(key) + qsTr("（链路%1）").arg(uplinkTierWord(String((light && light.tier) || "gray")))
+}
+
+/// 灯点悬停提示：一行标签 + 完整说明。
+/// ⚠️ 当前只有任务卡片用它（`TaskListPanel.qml`）；地图上的机号标签是自绘、**不挂 ToolTip**
+///    （理由见 `OpsShell.qml` 标签那一段：ToolTip 的 parent 会落到地图根上、位置漂移）。
+function uplinkDotHint(light) {
+    return uplinkDotLabel(light) + "\n" + uplinkLightHint(uplinkLightKey(light))
+}
+
+/// 上行灯档 → **短标签**（状态栏那盏灯的文字；任务卡与地图机号标签只有灯点、没有字）。
+/// ‼️ 返回中文不是枚举值——界面不出现裸枚举。与 `uplinkLightKey` 同组：加档必须同加。
+function uplinkLightLabel(key) {
+    switch (key) {
+    case "noPermission":    return qsTr("上行 无权限")
+    case "handshake":       return qsTr("上行 握手")
+    case "green":           return qsTr("上行 正常")
+    case "yellow":          return qsTr("上行 延迟")
+    case "yellowSustained": return qsTr("上行 暂停")
+    case "red":             return qsTr("上行 仅安全指令")
+    default:                return qsTr("上行 —")
+    }
+}
+
+/// 上行灯档 → **完整说明**（悬停提示）。
+/// ‼️ 两句话必须留着：「暂停 / 仅安全指令」是**我方主动静默**（下行锚过期），**不是链路故障**；
+///    灰灯（未建链）也**不是故障**。少了它们，操作员会去查网络（规范 §3.1.1「界面必须区分」）。
+function uplinkLightHint(key) {
+    switch (key) {
+    case "noPermission":
+        return qsTr("本端不是该机的指令权持有方：任何档位都不发常规上行，安全类指令也不发。") + "\n" +
+               qsTr("灯点画成空心环表示这一点；环的颜色仍是链路档位（可看不可发）。")
+    case "handshake":
+        return qsTr("握手期：正在发出建链根帧，此刻允许的只有根帧与引导心跳。")
+    case "green":
+        return qsTr("加密下行 < 2 s：常规上行与安全类指令均放行。")
+    case "yellow":
+        return qsTr("加密下行 2–5 s：常规上行仍放行（宽限），安全类指令放行。")
+    case "yellowSustained":
+        return qsTr("加密下行 5–10 s：常规上行已由本端主动暂停，回航/备降/迫降仍可盲发。") + "\n" +
+               qsTr("这不是链路故障——下行锚过期即自动恢复。")
+    case "red":
+        return qsTr("加密下行 > 10 s：只保留安全类指令（回航/备降/迫降）盲发。") + "\n" +
+               qsTr("这不是链路故障——下行锚过期即自动恢复。")
+    default:
+        return qsTr("未建链：尚未收到该机的加密下行，本表不约束；灰灯不是故障。")
+    }
+}
+
+
 // 飞机 marker 的着色（§5.3，**入参是 device 不是 task**）。
 // 优先级：异常 > 按飞机状态。
 // ⚠️ 第 2 条**没有**复用 `statusColor`：那个函数的 switch 判的是**任务**状态

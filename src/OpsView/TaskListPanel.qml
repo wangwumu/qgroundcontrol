@@ -317,6 +317,21 @@ ColumnLayout {
                 }
                 readonly property bool _vtolFwd:  OpsCommon.isCruising(_uav ? _uav.vtolInFwdFlight : undefined)
                 readonly property bool _onGround: OpsCommon.isLandedOnGround(_uav ? _uav.flying : undefined)
+                // ── 加密上行灯点（规范 §3.1.1 节末「界面灯」，2026-11-24）──
+                // 本卡那架飞机的上行档；**只有一个灯点、没有文字**。多机**列表**里这是唯一
+                // 能一眼看到"每架各自什么档"的地方（状态栏那盏带字的灯只照选中任务；
+                // 地图上另有机号标签里的灯点。三处同读 `OpsCommon.uplinkLightKey/Color/DotStyle/DotColor`）。
+                // ‼️ `panel.nowMs` 那一读是**依赖注册**、不是短路：`uplinkLight()` 是
+                //    `Q_INVOKABLE` 纯调用，QML 不会为它建依赖，而档位**只随时间衰减**
+                //    （下行一停，2 s / 5 s / 10 s 三档自己往下掉）⇒ 少了这一读，灯点会
+                //    永远停在第一次算出的颜色上，且不报任何错（同 `_uav` 上 `vs.count` 的坑）。
+                readonly property int _uplinkDeviceID: _uav ? _uav.deviceID() : 0
+                readonly property var _uplinkLight: {
+                    var tick = panel.nowMs
+                    if (_uplinkDeviceID <= 0 || typeof cryptoController === "undefined") return null
+                    return cryptoController.uplinkLight(_uplinkDeviceID)
+                }
+                readonly property string _uplinkKey: OpsCommon.uplinkLightKey(_uplinkLight)
                 // 本卡是否处在**已宣告迫降**的状态（结构性判断，**不含**"飞机此刻在哪"）：
                 //   ① 【移交降落指挥】/【应急情况处理】**隐藏**的判据（`_monitorHandoverVisible`
                 //      里取反）—— 迫降是不可撤销的终态，移交与其它应急处置都已是回头路
@@ -565,6 +580,38 @@ ColumnLayout {
                             visible: panel.showTaskNature
                             color: "#8fa1bd"; font.pixelSize: Math.round(11 * ScreenTools.uiTextScaleFactor)
                             text: qsTr("性质：") + OpsCommon.taskNature(modelData, panel.mySiteId)
+                        }
+                        // 加密**上行灯点**（规范 §3.1.1 节末「界面灯」）：只有灯，**没有文字**
+                        // （带文字的那盏在底部状态栏，且只照选中任务）。
+                        // 画法规则单点在 `OpsCommon.uplinkDotStyle/DotColor`（三处同读）：
+                        //   · **颜色跟呈现档走**（四档链路色 + 握手蓝），本端有无发送权不影响颜色；
+                        //     唯一绕回 `light.tier` 的是 `noPermission`（该档没有自己的色）；
+                        //   · **实心 / 空心环 = 有无该机指令权**，空心 = 只能看、发不出去；
+                        //   · `off`（未加密/无该机）与本端**有**权限时的 `gray`（从未建链）不画
+                        //     ——那两档没有「链路健康」可言，规范 §3.1.1 明确它们不是故障。
+                        //     （无权限时 `gray` 会画成灰空心环，那是另一回事：无权限仍要可见。）
+                        // ‼️ 2026-11-24 改：原先 `noPermission` 一律不画，理由是"监控员视图每张卡
+                        //    都会是灰点"。那个理由只在"颜色也取 `uplinkLightKey`"时成立（兜底灰），
+                        //    而监控员**签入前**本就是常态无权限 ⇒ 整张列表一个点都没有，用户报为缺陷。
+                        //    现在颜色改取 `tier`，无权限也可以正常显示链路档，于是不再隐藏。
+                        // ⚠️ 与状态栏那盏灯、地图标签点**同档同色**，只是这里不写字；悬停有完整说明。
+                        Rectangle {
+                            readonly property string _dotStyle: OpsCommon.uplinkDotStyle(card._uplinkKey)
+                            visible: _dotStyle !== "none"
+                            width: 8; height: 8; radius: 4
+                            anchors.verticalCenter: parent.verticalCenter
+                            color: _dotStyle === "hollow" ? "transparent"
+                                                          : OpsCommon.uplinkDotColor(card._uplinkLight)
+                            // 深色描边：本行另有任务状态点（同为 8×8 圆点），不描边会被读成
+                            // 「同一颗点画了两遍」。空心档下描边就是环本身（2px，环色=链路档）。
+                            border.width: _dotStyle === "hollow" ? 2 : 1
+                            border.color: _dotStyle === "hollow" ? OpsCommon.uplinkDotColor(card._uplinkLight)
+                                                                 : "#16233c"
+
+                            HoverHandler { id: uplinkHover }
+                            ToolTip.visible: uplinkHover.hovered
+                            ToolTip.delay: 300
+                            ToolTip.text: OpsCommon.uplinkDotHint(card._uplinkLight)
                         }
                     }
                     Text {

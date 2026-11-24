@@ -4307,4 +4307,128 @@ TestCase {
         var resp = _divertResp()
         verify(OpsCommon.divertRouteNote(resp.candidates[0], false).indexOf("沿原航线") >= 0)
     }
+
+    //-------------------------------------------------------------------------
+    // 上行灯（tier→呈现档/颜色/文字，规范 §3.1.1 节末）
+    // 三处界面（状态栏灯、任务卡灯点、地图角标）同读这一对函数 ⇒ 这里钉的是
+    // **顺序即优先级**：没有指令权时档位再新也不得画成绿。
+    //-------------------------------------------------------------------------
+    function _uplinkLight(over) {
+        var l = { crypto: true, roleAllowed: true, handshake: false, tier: "green" }
+        for (var k in over) l[k] = over[k]
+        return l
+    }
+
+    function test_uplinkLightKey_tierOrder() {
+        compare(OpsCommon.uplinkLightKey(null), "off")
+        compare(OpsCommon.uplinkLightKey(_uplinkLight({ crypto: false })), "off")
+        compare(OpsCommon.uplinkLightKey(_uplinkLight({})), "green")
+        compare(OpsCommon.uplinkLightKey(_uplinkLight({ tier: "yellow" })), "yellow")
+        compare(OpsCommon.uplinkLightKey(_uplinkLight({ tier: "yellowSustained" })), "yellowSustained")
+        compare(OpsCommon.uplinkLightKey(_uplinkLight({ tier: "red" })), "red")
+        compare(OpsCommon.uplinkLightKey(_uplinkLight({ tier: "gray" })), "gray")
+        // 未知 tier ⇒ gray，不兜成红（红是「只剩安全指令」的语义）
+        compare(OpsCommon.uplinkLightKey(_uplinkLight({ tier: "purple" })), "gray")
+    }
+
+    function test_uplinkLightKey_roleAndHandshakeWin() {
+        // 无指令权：档位再新鲜也不得是绿
+        compare(OpsCommon.uplinkLightKey(_uplinkLight({ roleAllowed: false })), "noPermission")
+        compare(OpsCommon.uplinkLightKey(_uplinkLight({ roleAllowed: false, tier: "red" })),
+                "noPermission")
+        // 握手期：tier 仍是灰而闸放行（根帧豁免）⇒ 必须是独立档，否则画面是「灯灰却发得出」
+        compare(OpsCommon.uplinkLightKey(_uplinkLight({ handshake: true, tier: "gray" })), "handshake")
+    }
+
+    function test_uplinkLightColor_mapsEveryKey() {
+        compare(OpsCommon.uplinkLightColor("green"), "#2ecc71")
+        compare(OpsCommon.uplinkLightColor("yellow"), "#ffc107")
+        compare(OpsCommon.uplinkLightColor("yellowSustained"), "#ff8f00")
+        compare(OpsCommon.uplinkLightColor("red"), "#ff3b3b")
+        compare(OpsCommon.uplinkLightColor("handshake"), "#3b9cff")
+        // 未知档 ⇒ 灰，不兜红
+        compare(OpsCommon.uplinkLightColor("nonsense"), "#8a8a8a")
+        compare(OpsCommon.uplinkLightColor("off"), "#8a8a8a")
+    }
+
+    function test_uplinkLightLabel_noRawEnum() {
+        // 界面不出现裸枚举：**会被画出来**的每一档都必须有中文短标签，且互不相同。
+        // ⚠️ `"off"` 不在集合里：它让整个灯隐藏（`visible: _key() !== "off"`），文字永远不显示
+        //    ⇒ 与灰档共用「上行 —」是刻意的，不是漏配。
+        var keys = ["gray", "noPermission", "handshake", "green", "yellow", "yellowSustained", "red"]
+        var seen = {}
+        for (var i = 0; i < keys.length; i++) {
+            var t = OpsCommon.uplinkLightLabel(keys[i])
+            verify(t.length > 0)
+            verify(t.indexOf(keys[i]) < 0, "标签里出现了裸枚举：" + t)
+            verify(!seen[t], "两个档共用了同一个标签：" + t)
+            seen[t] = true
+        }
+        // 未知档也要有字（防御：万一档位枚举扩容而本表忘补，界面不应出现空串）
+        verify(OpsCommon.uplinkLightLabel("nonsense").length > 0)
+    }
+
+    function test_uplinkLightHint_silenceIsNotFault() {
+        // 规范 §3.1.1「界面必须区分」：暂停/红是我方主动静默，不是链路故障；灰也不是故障
+        verify(OpsCommon.uplinkLightHint("yellowSustained").indexOf("不是链路故障") >= 0)
+        verify(OpsCommon.uplinkLightHint("red").indexOf("不是链路故障") >= 0)
+        verify(OpsCommon.uplinkLightHint("gray").indexOf("不是故障") >= 0)
+    }
+
+    //-------------------------------------------------------------------------
+    // 灯点画法（2026-11-24 用户报「RomView 里地图没有点、状态栏是灰的」后新增）
+    // 两维分开：颜色跟呈现档走（`uplinkDotColor`，四档链路色 + 握手蓝；`noPermission`
+    // 绕回 `light.tier`），实心/空心=有无发送权（`uplinkDotStyle`）。
+    //-------------------------------------------------------------------------
+    function test_uplinkDotStyle_noPermissionStillDrawn() {
+        // ‼️ 回归钉子：监控员视图签入前**常态**是 noPermission，那时必须画点（空心环）。
+        //    上一版把 noPermission 当"不画"，整张图一个点都没有。
+        compare(OpsCommon.uplinkDotStyle("noPermission"), "hollow")
+        compare(OpsCommon.uplinkDotStyle("handshake"), "solid")
+        compare(OpsCommon.uplinkDotStyle("green"), "solid")
+        compare(OpsCommon.uplinkDotStyle("yellow"), "solid")
+        compare(OpsCommon.uplinkDotStyle("yellowSustained"), "solid")
+        compare(OpsCommon.uplinkDotStyle("red"), "solid")
+        // 未加密 / 本端有权时的「从未建链」：没有「链路健康」可言（规范 §3.1.1：灰灯不是故障）⇒ 不画
+        compare(OpsCommon.uplinkDotStyle("off"), "none")
+        compare(OpsCommon.uplinkDotStyle("gray"), "none")
+        // fail-closed：将来 C++ 加新档而本函数没同加 ⇒ 宁可不画，也不画成实心去误导
+        compare(OpsCommon.uplinkDotStyle("nonsense"), "none")
+        compare(OpsCommon.uplinkDotStyle(""), "none")
+    }
+
+    function test_uplinkDotColor_keepsTierWhenNoPermission() {
+        // ‼️ 回归钉子：无权限时颜色**仍按 tier**，不得退回兜底灰——否则 RomView 是一片灰点。
+        compare(OpsCommon.uplinkDotColor(_uplinkLight({ roleAllowed: false, tier: "green" })), "#2ecc71")
+        compare(OpsCommon.uplinkDotColor(_uplinkLight({ roleAllowed: false, tier: "red" })), "#ff3b3b")
+        // tier 缺失/未知 ⇒ 灰（不猜成绿）
+        compare(OpsCommon.uplinkDotColor(_uplinkLight({ roleAllowed: false, tier: "gray" })), "#8a8a8a")
+        compare(OpsCommon.uplinkDotColor(_uplinkLight({ roleAllowed: false, tier: "" })), "#8a8a8a")
+        compare(OpsCommon.uplinkDotColor(null), "#8a8a8a")
+        // 有权时与 uplinkLightColor 同档同色（三处界面共用一份颜色）
+        compare(OpsCommon.uplinkDotColor(_uplinkLight({})), OpsCommon.uplinkLightColor("green"))
+        compare(OpsCommon.uplinkDotColor(_uplinkLight({ handshake: true, tier: "gray" })),
+                OpsCommon.uplinkLightColor("handshake"))
+    }
+
+    function test_uplinkDotLabel_noPermissionCarriesTierWord() {
+        // 无权限时环形颜色表示链路档，文字必须同报两者，否则「绿环 + 上行 无权限」自相矛盾。
+        var t = OpsCommon.uplinkDotLabel(_uplinkLight({ roleAllowed: false, tier: "green" }))
+        verify(t.indexOf("无权限") >= 0)
+        verify(t.indexOf("正常") >= 0)
+        verify(t.indexOf("noPermission") < 0, "标签里出现了裸枚举：" + t)
+        var t2 = OpsCommon.uplinkDotLabel(_uplinkLight({ roleAllowed: false, tier: "red" }))
+        verify(t2.indexOf("超时") >= 0)
+        // 有权时与 uplinkLightLabel 逐字相同（不多加括号）
+        compare(OpsCommon.uplinkDotLabel(_uplinkLight({})), OpsCommon.uplinkLightLabel("green"))
+    }
+
+    function test_uplinkDotHint_labelPlusHint() {
+        var light = _uplinkLight({ roleAllowed: false, tier: "green" })
+        var hint = OpsCommon.uplinkDotHint(light)
+        verify(hint.indexOf(OpsCommon.uplinkDotLabel(light)) === 0)
+        verify(hint.indexOf("指令权") >= 0)
+        // 空心环的说法要在提示里交代，否则使用者不知道"环"是什么意思
+        verify(hint.indexOf("空心环") >= 0)
+    }
 }

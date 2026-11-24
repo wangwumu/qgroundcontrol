@@ -30,6 +30,7 @@ qt_add_qml_module(OpsViewModule
         RouteListPanel.qml
         SlotLayout.qml
         TaskListPanel.qml
+        UplinkLightIndicator.qml
         OpsCommon.js
     NO_PLUGIN
 )
