@@ -2225,12 +2225,9 @@ OpsShell {
     // 注入槽 ①：命令条中段扩展区（骨架把它塞进命令条那行 Row 的末尾）
     //=========================================================================
     commandBarExtras: Component {
-        // 根项是 `Row`：外层 Row 的 spacing 同时作用于"时间↔本扩展区"与下面三组之间。
-        // ⚠️ 间距/字号/按钮宽高都走 `ScreenTools.uiPx()`（"桌面参考像素"→当前平台）：
-        //    写死的绝对像素在 Android（平台基准 14 pt）上只有原生控件的一半大
-        //    （2026-11-24 手机截图「字很小、缝很大」）。
+        // 根项是 `Row`：外层 Row 的 `spacing: 18` 同时作用于"时间↔本扩展区"与下面三组之间。
         Row {
-            spacing: ScreenTools.uiPx(18)
+            spacing: 18
 
             // 出站/进站勾选（站点操作员；控制右侧列表过滤）
             //
@@ -2241,7 +2238,7 @@ OpsShell {
             // 用户报的就是这个）。加了锚点之后本 Row 的中线实测 23 == 勾选框中线 23。
             Row {
                 anchors.verticalCenter: parent.verticalCenter
-                spacing: ScreenTools.uiPx(6)
+                spacing: 6
                 visible: opsView._isSiteATC
                 CheckBox {
                     id: outboundCheck
@@ -2256,7 +2253,7 @@ OpsShell {
                         verticalAlignment: Text.AlignVCenter
                         text: parent.text
                         color: "#ffffff"
-                        font.pixelSize: ScreenTools.uiPx(13)
+                        font.pixelSize: Math.round(13 * ScreenTools.uiTextScaleFactor)
                     }
                     // 勾选框两个状态各一个图标（Q 图标风格对勾徽标）：
                     // 选中=实心对勾 /res/selected.svg；未选中=半透明对勾 /res/unselected.svg（清晰可见）。
@@ -2288,7 +2285,7 @@ OpsShell {
                         verticalAlignment: Text.AlignVCenter
                         text: parent.text
                         color: "#ffffff"
-                        font.pixelSize: ScreenTools.uiPx(13)
+                        font.pixelSize: Math.round(13 * ScreenTools.uiTextScaleFactor)
                     }
                     // 进站独立勾选框：选中=实心对勾 /res/selected.svg；未选中=半透明对勾 /res/unselected.svg
                     indicator: Rectangle {
@@ -2312,18 +2309,18 @@ OpsShell {
             // ⚠️ 两个按钮的文案**不是枚举**（"N"/"E" 只活在代码里），故不需要走 uavStatusLabel 那类映射。
             Row {
                 anchors.verticalCenter: parent.verticalCenter   // 见上：本 Row 比勾选框矮 24px
-                spacing: ScreenTools.uiPx(4)
+                spacing: 4
                 // 只在机位图真的在场时出现：监控员视图里没有机位图，切了也没有东西会转
                 visible: opsView._showSlotLayout
                 Text {
                     anchors.verticalCenter: parent.verticalCenter
-                    color: "#8fa1bd"; font.pixelSize: ScreenTools.uiPx(11)
+                    color: "#8fa1bd"; font.pixelSize: Math.round(11 * ScreenTools.uiTextScaleFactor)
                     text: qsTr("机位")
                 }
                 Repeater {
                     model: [qsTr("北"), qsTr("东")]
                     Rectangle {
-                        width: ScreenTools.uiPx(56); height: ScreenTools.uiPx(22)
+                        width: 56; height: 22
                         radius: 3
                         color: (opsView._slotOrient === (index === 0 ? "N" : "E")) ? "#2f6bd8" : "transparent"
                         border.color: "#9aa7bd"; border.width: 1
@@ -2334,7 +2331,7 @@ OpsShell {
                             // 背景（直接透出地图）上实测只有 **1.72:1**，肉眼只剩一个空框。
                             // 状态差异改由**底色**（选中 #2f6bd8）与**框线**表达，文字不再承担状态编码。
                             color: "#ffffff"
-                            font.pixelSize: ScreenTools.uiPx(11)
+                            font.pixelSize: Math.round(11 * ScreenTools.uiTextScaleFactor)
                             text: modelData
                         }
                         MouseArea {
@@ -3065,3 +3062,4 @@ OpsShell {
         }
     }
 }
+

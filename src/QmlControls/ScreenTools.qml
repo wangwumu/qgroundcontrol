@@ -64,32 +64,6 @@ Item {
                                               ? defaultFontPointSize / platformFontPointSize
                                               : 1
 
-    /// 自绘界面的**像素换算因子**（2026-11-24，安卓手机截图「字很小、缝很大」后新增）。
-    ///
-    /// 自绘 QML（`OpsView` 等）里写死的 `font.pixelSize` / `spacing` / 按钮宽高，都是按
-    /// **桌面参考环境**（Qt 缺省字体 9 pt）调出来的。而 QGC 在 Android 上把平台基准字号
-    /// 固定成 14 pt（`platformFontPointSize`）⇒ 同一串绝对像素在手机上只有原生控件的一半
-    /// 大；反过来，由 `defaultFontPixelHeight/Width` 派生出来的尺寸在手机上却是桌面的
-    /// 两倍。一屏之内两种单位混用，结果就是「字很小、间距很大」，窄屏上还会左右叠字。
-    ///
-    /// 本因子 = 当前基准字号 / 桌面基准 9 pt：
-    ///   · Windows / Linux 桌面（Qt 缺省字体 9 pt、两个缩放参数 100 %）⇒ **恒为 1**，
-    ///     外观一字不变——那批像素值本来就是在这套环境里调出来的；
-    ///   · macOS（Qt 缺省字体 13 pt）⇒ ≈ 1.44：**有意如此**，让自绘像素与 macOS 原生
-    ///     控件保持同一比例；否则自绘部分会明显小于旁边的原生文字；
-    ///   · Android（14 pt）⇒ ≈ 1.56，自绘像素等比放大到与原生控件同一比例；
-    ///   · `uiScalePercent × fontScalePercent` 下调时同步缩小（与原生控件同进退）。
-    /// ⚠️ 与 `uiTextScaleFactor` 的区别：那个**只**反映两个缩放参数，本因子还含平台基准字号。
-    readonly property real uiPixelScaleFactor: defaultFontPointSize / 9
-
-    /// 自绘尺寸换算：入参是"桌面参考像素"（那批 10/11/12/13/16/18/24 的来历），
-    /// 返回当前平台应使用的像素值。字号、间距、边距、按钮宽高统一走这里。
-    /// ⚠️ **不取整**：`spacing` / `font.pixelSize` 都接受小数；取整会把压缩档里
-    ///    6.2 与 6.8 抹成同一个值，恰好毁掉"缩间距"这件事本身。
-    function uiPx(desktopPx) {
-        return desktopPx * uiPixelScaleFactor
-    }
-
     /// The default amount of space in between controls in a dialog
     property real defaultDialogControlSpacing: defaultFontPixelHeight / 2
 

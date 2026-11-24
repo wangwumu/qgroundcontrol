@@ -15,10 +15,6 @@ Item {
     /// 随指示器显隐动态变化：无载具时仅剩两侧边距，建链后为整排图标宽。
     readonly property real indicatorsWidth: flyViewIndicators.width
 
-    /// 左侧原生控件（Q 图标 / 主状态 / 飞行模式）的**实际占宽**。命令条上的自绘扩展区
-    /// 靠右停放，必须知道左边占到哪，才能在窄屏上判断"还剩多少可叠"（`OpsShell.qml` 用它）。
-    readonly property real leftPanelWidth: leftPanelLayout.width
-
     id:     control
     width:  parent.width
     height: ScreenTools.toolbarHeight
