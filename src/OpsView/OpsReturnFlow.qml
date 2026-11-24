@@ -8,6 +8,10 @@ import "."
 
 /// 回航流程（2026-11-07）：查候选 → 选点 → 二次确认 → POST /return → 构造上传。
 ///
+/// 2026-11-24 增补 `beginHome()`：**回本场不选点**（站点视图的唯一入口）。
+/// 两条路的差别只有三处：不弹选点框、`POST /return` 不带 `landing_site_id`、
+/// 写库后后端会预派原机位并补签入(LANDING)（设计稿《回航回本场》§3.1 A 支）。
+///
 /// ‼️ 顺序是硬的：**先写库、再下指令**（用户 2026-09-23 工程指令）。写库失败 ⇒
 ///    不构造、不上传；上传失败 ⇒ 保留候选与选中项，重试时**只重传**（后端已记录）。
 Item {
@@ -32,6 +36,10 @@ Item {
     /// ‼️ 不是 `waypoint_id`：`/return` 写的是 `table_flight_task.landing_site_id`，
     ///    后端拿它跑 `siteUseReady` 与管辖判定；传航点 id 会命中另一个站点（或 0）。
     property int _selectedSiteId: -1
+    /// 「回本场」标志：`true` 时 `POST /return` **不带** `landing_site_id`（缺省即回本场），
+    /// 从而也不吃 `siteUseReady` 那道闸——回本场是安全动作，不该因为"本站此刻没有空闲机位"
+    /// 被 409 挡在门外。落点由后端按 A 支预派给原机位。
+    property bool _homeMode: false
     property real _aircraftLat: NaN
     property real _aircraftLon: NaN
     property string _busyStage: "" // "" | "query" | "write" | "upload" | "mode"
@@ -52,6 +60,7 @@ Item {
         // 再点一次直接忽略。否则会并发两个 POST /return——后一个可能把监控员刚 Propose
         // 的那条交接一并作废（`closeReturnLoopTx` 取消所有 PENDING）。
         if (_busyStage !== "") return
+        _homeMode = false
         _task = task
         _selectedSeq = -1
         _selectedWaypointId = -1
@@ -65,6 +74,60 @@ Item {
         // 记下本次查询使用的坐标：写库时回传同一组值，保证「已飞距离」与落库位置一致。
         _aircraftLat = v.coordinate.latitude
         _aircraftLon = v.coordinate.longitude
+        _queryCandidates(task, function (data) {
+            _candidates = data
+            _dialog.open()
+        })
+    }
+
+    /// **回本场**（2026-11-24，站点视图唯一入口）：不选点、不选机位。
+    ///
+    /// 为什么仍要查候选：倒序航线的几何与高度全部来自响应里的 `waypoints`
+    /// （目标航点的地面海拔、站点最低安全高度、航线降落 AGL），**没有它构造不出航线**。
+    /// 只是这次不把列表摆给用户看——落点由后端按「回本场」补齐（预派原机位 + 补签 LANDING）。
+    ///
+    /// 起飞机场航点找不到时**不猜**：退回选点框，让操作员自己指（猜错就是一条飞向错误站点的航线）。
+    function beginHome(task) {
+        if (!task) return
+        if (!shell) {
+            message(qsTr("无法回航"), qsTr("后台连接未就绪。数据库与飞机均未做任何改动。"))
+            return
+        }
+        if (_busyStage !== "") return
+        _homeMode = true
+        _task = task
+        _selectedSeq = -1
+        _selectedWaypointId = -1
+        _selectedSiteId = -1
+        _candidates = null
+        var v = vehicleFn ? vehicleFn(task) : null
+        if (!v || !v.coordinate || !v.coordinate.isValid) {
+            message(qsTr("无法回航"), qsTr("未收到飞机位置。数据库与飞机均未做任何改动。"))
+            return
+        }
+        _aircraftLat = v.coordinate.latitude
+        _aircraftLon = v.coordinate.longitude
+        _queryCandidates(task, function (data) {
+            _candidates = data
+            var w = _homeWaypoint()
+            if (!w) {
+                // 明确告诉用户为什么退了回来，再摆出选点框（**不静默**、**不猜**）。
+                message(qsTr("未能确定起飞机场航点"),
+                        qsTr("请在列表里手动选择落点。数据库与飞机均未做任何改动。"))
+                _homeMode = false
+                _dialog.open()
+                return
+            }
+            _selectedSeq = w.seq
+            _selectedWaypointId = w.waypoint_id
+            _selectedSiteId = w.site_id
+            _execute()
+        })
+    }
+
+    /// 查候选的公共前半段（`begin` / `beginHome` 共用）：忙碌闸、取飞机、取坐标、看门狗。
+    /// `onData` 只在 200 且代号仍有效时调用。
+    function _queryCandidates(task, onData) {
         _busyStage = "query"
         var gen = ++_gen
         _watchdog.restart()
@@ -79,9 +142,19 @@ Item {
                                    (data && data.error) || ("HTTP " + status))
                            return
                        }
-                       _candidates = data
-                       _dialog.open()
+                       onData(data)
                    })
+    }
+
+    /// 起飞机场在来路上的那个航点（判据与全部理由见 `OpsCommon.homeReturnWaypoint`，
+    /// 那里是**唯一**实现、`tst_OpsCommon.qml` 有单测钉住）。
+    /// 本函数只负责把两个**来源**拼上去：候选数组（`_queryCandidates` 的回调）与
+    /// 制单场地（`_task.takeoff_site_id`）。
+    /// 返回 `null` ⇒ 调用方**退回人工选点**（不静默、不猜）。
+    function _homeWaypoint() {
+        if (!_candidates) return null
+        return OpsCommon.homeReturnWaypoint(_candidates.waypoints,
+                                            _task ? _task.takeoff_site_id : 0)
     }
 
     function _confirm(seq) {
@@ -95,10 +168,19 @@ Item {
         _selectedSeq = seq
         _selectedWaypointId = w.waypoint_id
         _selectedSiteId = w.site_id
+        _homeMode = false   // 人工选点 ⇒ 按选点流程（带 landing_site_id）
         _dialog.close()
         var name = w.site_name || ("#" + w.site_id)
+        // 2026-11-24：选中的若就是**起飞机场**，后端走 A 支（预派原机位 + 补降落指挥交接），
+        // 与 07 稿「回航一律释放机位、到站再人工指派」不再一样 ⇒ 必须在**确认之前**说出来。
+        // 判据与后端 `homeReturn` 同源：目的地场地 == 制单场地（`takeoff_site_id`）。
+        // 文案只说**会发生什么**，不说"机位保留"——监控员这条路进来时 `current_slot_id`
+        // 通常在签入航线时已被清空，本就没有可保留的东西。
+        var homeNote = ""
+        if (_task && Number(w.site_id) === Number(_task.takeoff_site_id))
+            homeNote = qsTr("\n回本场：落点就是原机位，写库后自动预派并在本站签入降落指挥。")
         _confirmDialog.text = qsTr("目标：%1\n沿航线回退距离：%2")
-                .arg(name).arg(_fmtM(w.distance_m))
+                .arg(name).arg(_fmtM(w.distance_m)) + homeNote
         _confirmDialog.open()
     }
 
@@ -108,9 +190,12 @@ Item {
         _busyStage = "write"
         var gen = ++_gen
         _watchdog.restart()
+        // 回本场**不带** `landing_site_id`：后端缺省把它补成 `task.site_id`，并据此走
+        // 「保留机位 + 预派 + 补签 LANDING」那一支（设计稿 §3.1 A 支）。
+        var body = { lat: _aircraftLat, lon: _aircraftLon }
+        if (!_homeMode) body.landing_site_id = _selectedSiteId
         shell._post("/api/tasks/" + _task.task_id + "/return",
-                    { landing_site_id: _selectedSiteId,
-                      lat: _aircraftLat, lon: _aircraftLon },
+                    body,
                     function (status, data) {
                         if (gen !== _gen) return
                         _watchdog.stop()
@@ -122,9 +207,12 @@ Item {
                             // 409 = 「目标此刻不可用 / 飞机偏离过远 ⇒ 列表已过期」⇒ 重新拉候选，
                             // 不对旧列表重试（设计稿 §7）。403/404/500 不重拉：那不是列表过期，
                             // 重拉只会把同一个错误再弹一遍。
+                            // ‼️ 重拉要**留在原来那条路上**：回本场崩溃时弹回选点框，等于让操作员
+                            //    在应急时刻多做一次选择，而他要的落点从来没变过。
                             if (status === 409) {
                                 _candidates = null
-                                begin(_task)
+                                if (_homeMode) beginHome(_task)
+                                else begin(_task)
                             }
                             return
                         }
@@ -304,6 +392,12 @@ Item {
             root._busyStage = ""
             // 原航线轮询停掉，不再复用。由视图注入（`OpsView` 有 `_routeSyncs`，`RomView` 没有）。
             if (root.routeResetFn) root.routeResetFn(root._task)
+            // 回本场：把"接下来该谁做什么"说清楚——用户报障的正是"回航点了，然后呢"。
+            if (root._homeMode) {
+                root.message(qsTr("回航航线已上传"),
+                             qsTr("无人机沿原航线倒序飞回起飞机场。落点＝原机位（已保留），"
+                                  + "待飞机到达后点卡片上的【降落】即可完成降落。"))
+            }
         }
         onFailed: function (message, stage) {
             // 只有 "upload" 还留着可重试的在途动作；"mode" 是一次终局失败，

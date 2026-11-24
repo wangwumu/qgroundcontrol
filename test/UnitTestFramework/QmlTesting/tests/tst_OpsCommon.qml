@@ -3988,6 +3988,80 @@ TestCase {
     }
 
     //-------------------------------------------------------------------------
+    // 回本场：自动定位起飞机场航点（2026-11-24，站点视图【回航】不弹选点框）
+    //-------------------------------------------------------------------------
+    /// 造一个候选航点：`_rv` 之外再带站点 id 与站点名（`homeReturnWaypoint` 只看 `site_id`）。
+    function _hw(lat, seq, siteId, flown) {
+        var w = _rv(lat, seq)
+        w.site_id = siteId
+        w.flown = flown === undefined ? true : flown
+        return w
+    }
+
+    /// ① 正常情形：已飞段里 `site_id === takeoff_site_id` 的那一点胜出 ——
+    /// 即使它不是 `seq` 最小的那一个（中间航点也可能属于同一场地）。
+    /// ‼️ 判据方向：取的是**第一个**命中的已飞点（起点方向），不是"最后一个"。
+    function test_homeReturnWaypoint_matchesTakeoffSite() {
+        var wps = [_hw(1, 0, 9), _hw(2, 1, 9), _hw(3, 2, 7)]
+        var w = OpsCommon.homeReturnWaypoint(wps, 7)
+        verify(w !== null, "必须命中，不许回 null")
+        compare(w.seq, 2, "命中 site_id=7 的那一点")
+        verify(w === wps[2], "必须回原对象引用")
+    }
+
+    /// 场地 id 缺失（0 / undefined / null）⇒ 不走 ①，直接退化到 ②。
+    /// ‼️ 候选里必须有**两个**带站点的已飞点、且**数组顺序与 `seq` 顺序相反** ——
+    ///    否则「取 `seq` 最小」这条判据没有任何测试钉住（反向实现照样全绿）。
+    function test_homeReturnWaypoint_noSiteIdFallsBackToEarliestFlown() {
+        var wps = [_hw(1, 0, 0), _hw(2, 5, 5), _hw(3, 1, 5)]
+        var w = OpsCommon.homeReturnWaypoint(wps, 0)
+        compare(w.seq, 1, "无制单场地 ⇒ 取已飞段里 seq 最小且带站点的点（不是先遇到的）")
+        verify(OpsCommon.homeReturnWaypoint(wps, undefined) !== null, "undefined 同样是 0")
+        verify(OpsCommon.homeReturnWaypoint(wps, null) !== null, "null 同样是 0")
+    }
+
+    /// ② 退化支：起点航点未被任何场地认领（`site_id == 0`）⇒ 跳过它，取下一个带站点的已飞点。
+    /// 这是设计稿 §1.1「两层站点」的现实情形，不是构造出来的边界。
+    function test_homeReturnWaypoint_skipsUnclaimedStart() {
+        var wps = [_hw(1, 0, 0), _hw(2, 1, 5)]
+        var w = OpsCommon.homeReturnWaypoint(wps, 42)
+        compare(w.seq, 1, "起点没被认领 ⇒ 退到下一个带站点的已飞点")
+    }
+
+    /// 未飞点永不命中：`flown=false` 的点既不能在 ① 里命中，也不能在 ② 里当起点。
+    function test_homeReturnWaypoint_neverReturnsUnflown() {
+        var wps = [_hw(1, 0, 0, false), _hw(2, 1, 7, false), _hw(3, 2, 0)]
+        verify(OpsCommon.homeReturnWaypoint(wps, 7) === null, "全是未飞点 ⇒ null")
+        // 只有 seq=2 已飞，但它没有 site_id ⇒ 仍然 null
+        wps[2].flown = true
+        verify(OpsCommon.homeReturnWaypoint(wps, 7) === null, "已飞但没有 site_id ⇒ null")
+    }
+
+    /// 空输入 / 全无站点 ⇒ `null`（调用方据此退回人工选点）。
+    function test_homeReturnWaypoint_emptyOrNoSiteYieldsNull() {
+        verify(OpsCommon.homeReturnWaypoint(null, 7) === null, "null 输入 ⇒ null")
+        verify(OpsCommon.homeReturnWaypoint([], 7) === null, "空数组 ⇒ null")
+        var wps = [_hw(1, 0, 0), _hw(2, 1, 0)]
+        verify(OpsCommon.homeReturnWaypoint(wps, 7) === null, "一个带站点的点都没有 ⇒ null")
+    }
+
+    /// `site_id` 发成字符串时仍要命中（`===` 对不同类型恒假，会静默掉进退化支）。
+    function test_homeReturnWaypoint_coercesStringSiteId() {
+        var wps = [_hw(1, 0, 0), _hw(2, 1, "7")]
+        var w = OpsCommon.homeReturnWaypoint(wps, "7")
+        compare(w.seq, 1, "字符串形态的 site_id 也必须命中")
+    }
+
+    /// `seq` 缺失的点不参与 ② 的排序（`NaN` 比较恒假会让"第一个遇到的"胜出）。
+    function test_homeReturnWaypoint_skipsSequencelessCandidate() {
+        var bad = _hw(1, 0, 5)
+        delete bad.seq
+        var good = _hw(2, 1, 5)
+        var w = OpsCommon.homeReturnWaypoint([bad, good], 0)
+        compare(w.seq, 1, "没有 seq 的点不能当起点")
+    }
+
+    //-------------------------------------------------------------------------
     // 动作按钮语义档（2026-11-07 用户裁定：绿=正常流程、白=取消、红=应急/救济/有风险）
     //-------------------------------------------------------------------------
     /// 七档正常业务动作 ⇒ 绿（`primary`）。逐档列出来，**不要**只测其中一两个：

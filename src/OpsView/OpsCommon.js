@@ -441,12 +441,13 @@ function isTimeout(handover, nowMs) {
 //
 //   2. `RETURNING`（`task.disposition`）——回航是**人做过的动作**。它与 `TIMEOUT`
 //      也可能同真（站点方在超时边缘按了回航），此时说"回航"信息量更大。
-//      ⚠️ 本函数**不**读 `landing_accepted`：回航会顺手插一条 ACCEPTED 的 LANDING
-//      交接（`closeReturnLoopTx` ③），那个字段在**每一次**回航里都为真 ⇒ 拿它当归因
+//      ⚠️ 本函数**不**读 `landing_accepted`：回**本场**会顺手插一条 ACCEPTED 的 LANDING
+//      交接（`closeReturnLoopTx` A 支 ④），那个字段在那条路上必为真 ⇒ 拿它当归因
 //      判据会让它抢走别的档，且它并不比 `disposition` 更专一。
-//      `disposition === 'RETURNING'` 才是回航的**唯一**标记：改降/迫降那条路的
-//      `ReportDisposition` **不调用** `closeReturnLoopTx`，但它同样只看这一个字段
-//      ⇒ 两侧口径同源（这也是"只有 `/return` 会走到 `closeReturnLoopTx`"的另一面）。
+//      `disposition === 'RETURNING'` 才是回航的**唯一**标记：`/disposition`（只收
+//      RETURNING / EMERGENCY_LANDING）与 `/return` 两条入口都只写这一个字段 ⇒ 两侧
+//      口径同源。（`/divert` 走的是 `Divert`，它同样调用 `closeReturnLoopTx`，但写的是
+//      DIVERTED ⇒ 与回航不会撞档。）
 //
 //   3. `TIMEOUT`——`isTimeout` 用的 `deadlineMs` 与弹框倒计时**同一个**解析口径
 //      （`utcNaiveMs`）⇒ 框上写着"超时"的那一刻，这里给的就是 `TIMEOUT`，不会打架。
@@ -724,9 +725,12 @@ function monitorHoldsControl(device) {
 //
 // ‼️ `!landingAccepted` 不可省：监控员正常移交降落指挥、**本站签入(LANDING)** 之后
 // （`landing_accepted`），飞机已经进入本站的降落流程（`isInbound` 为真）⇒ 它不再是出站航班。
-// ⚠️ 2026-11-07 改口径：**回航本身不再自动签入 LANDING**（后端 `closeReturnLoopTx` 只作废在途
-//    交接、释放机位）⇒ 回航后 `landingAccepted` 仍为假、卡片**留在出站段**（可重新签出），
-//    要等监控员 Propose(LANDING) → 本站签入，这一条合取项才翻假。别把「回航」当成直接翻假的事件。
+// ⚠️ 2026-11-24 起**回航分两支**（后端 `closeReturnLoopTx` 的 A/B 支）：
+//    · **回本场**（目的地＝任务起飞机场）：自动补一条 ACCEPTED 的 LANDING（A 支 ④）⇒
+//      `landingAccepted` 当刻为真、卡片**直接进进站段**，【降落】在那边。
+//    · **回外站**：与 2026-11-07 口径一致——只作废在途交接、释放机位 ⇒ `landingAccepted`
+//      仍为假、卡片**留在出站段**（可重新签出），要等监控员 Propose(LANDING) → 本站签入。
+//    所以「回航」本身**不是**翻假的判据：翻不翻假要看目的地是不是本场。
 // 少了这一条，同一张卡会**同时**满足出站与进站，而 `siteTasks` 是 `if / else if`（出站优先）
 // ⇒ 用户看到的是"回航之后卡片没去进站、按钮还是出站那一套"，真正该露出来的
 // 【切换多旋翼降落】永远露不出来。
@@ -2136,6 +2140,57 @@ function returnRouteWaypoints(waypoints, targetSeq) {
         out.push(waypoints[k])
     }
     return out
+}
+
+/// 「回本场」要落到哪个航点 —— 站点视图【回航】**不弹选点框**时用它自动定位（2026-11-24）。
+///
+/// ① `flown && site_id === takeoffSiteId` —— 正常情形（起飞机场就是制单场地）。
+///    ‼️ 用 `takeoff_site_id` 而**不是** `site_id`：`overview` 下发的字段名就叫
+///    `takeoff_site_id`（后端 `opsOverviewItem.TakeoffSiteID` 装的是
+///    `table_flight_task.site_id`），**没有** `site_id` 这个键。
+///    `OpsCommon.isOutbound` 判「本站是否还持有控制权」时读的也是同一个字段 ——
+///    两处必须同源，否则会出现「卡片判成本场、回航却落到别的站」。
+/// ② 退化：已飞段里 **`seq` 最小**的、带站点的航点。`seq` 是后端拼装序列的**数组下标**
+///    （起点 → 中间点 → 终点，见 `handlers/return_candidates.go`）⇒ 下标最小的就是起点。
+///    ② 存在的理由：起点航点可能**没有被任何场地认领**（两层站点），此时它自己的
+///    `site_*` 高度字段是空的，`OpsReturnRoute._prepare` 会拒绝构造整条回航航线 ——
+///    退到「下一个带站点的已飞点」比让操作员从零手选更接近他原本的意图。
+///
+/// 都不成立 ⇒ `null`（**调用方必须退回人工选点**，不许拿 `null` 去构造航线）。
+///
+/// ⚠️ 本函数**只回答「哪个点」**，不判这个点`landable`/`available` —— 那是
+///    `_confirm` 与 `OpsReturnRoute._prepare` 的闸。把业务闸搬进来会让两处判据漂移。
+///
+/// @param waypoints `GET /tasks/:id/return-candidates` 的 `waypoints[]`（原航线顺序）
+/// @param takeoffSiteId 任务制单场地 id（`task.takeoff_site_id`）；`0`/缺失 ⇒ 只走 ②
+/// @return 命中的航点对象（**原引用**，不复制）或 `null`
+function homeReturnWaypoint(waypoints, takeoffSiteId) {
+    if (!waypoints || !waypoints.length) return null
+    var siteId = Number(takeoffSiteId)
+    var i
+    if (siteId > 0) {
+        for (i = 0; i < waypoints.length; i++) {
+            var w = waypoints[i]
+            if (!w || !w.flown) continue
+            // `Number(...)` 是刻意的：后端把 `site_id` 发成 JSON number，但离线夹具/
+            // 旧响应可能是字符串，而 `===` 对不同类型恒假 ⇒ 会静默掉进 ② 的退化支。
+            if (Number(w.site_id) === siteId && Number(w.site_id) > 0) return w
+        }
+    }
+    var best = null
+    for (i = 0; i < waypoints.length; i++) {
+        var c = waypoints[i]
+        if (!c || !c.flown) continue
+        if (!(Number(c.site_id) > 0)) continue
+        // `seq` 不可用 ⇒ 无法与其他点比较先后（`NaN` 参与的比较恒假，会让"第一个"胜出）。
+        // 后端保证 `seq` 就是数组下标，走到这里说明响应不合约 ⇒ fail-closed 跳过，
+        // 宁可回 `null` 让操作员手选，也不猜一个起点。
+        // ⚠️ 先排 `null`/`undefined` 再 `Number()`：两者都会变成有限数（0 / NaN 之外
+        //    还有 `""` → 0），直接 `Number` 会把缺字段的点当成「最早的起点」。
+        if (c.seq === null || c.seq === undefined || !isFinite(Number(c.seq))) continue
+        if (best === null || Number(c.seq) < Number(best.seq)) best = c
+    }
+    return best
 }
 
 /// 把航点端点的航点转成待下发的 mission 描述数组。

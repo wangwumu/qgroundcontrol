@@ -373,6 +373,9 @@ OpsShell {
     //    —— IN_FLIGHT 段照旧可点 ⇒ 死锁当时不成立。要把 `visible` 再收到连 IN_FLIGHT 也拦掉、
     //    且本判据又被改回来，死锁才成立（判据变迁的完整留档见 `TaskListPanel.qml` 两颗按钮处）。
     //    本列表项上的它现在只用于**回显当前落点**，不门控。
+    //    ⚠️ 2026-11-24 起本函数内部还会读它（`_ownAssignedSlot`），但用途是**决定要不要弹选机位框**，
+    //    不是"能不能点"：读不到/不满足时**照样放行**、退回选机位框。两者不可混为一谈 ——
+    //    上一条死锁的成因正是把"读不到"当成了"不许做"。
     // ⚠️ 口径：`assign_slot_id` 是「**指派**」（计划落点，**非占用**）；占用判据是 `current_uav_no`。
     //
     // `cardBottomY` 是**已经过 `mapToItem` 换算到 opsView 坐标系**的下缘（与另外七个
@@ -386,7 +389,34 @@ OpsShell {
         _assignSlotTask = task
         _slotDialogLandKind = kind
         _slotDialogMode = "land"
+        // 2026-11-24：落点**已经定了** —— 这架飞机此刻正占着它自己的原机位（回本场不释放），
+        // 库里也已指派给本任务 ⇒ 跳过选机位，直接进确认框（「机位：」那行仍会写明落点）。
+        // 用户原话：「不用选择机位，直接降落到起飞机位上」。
+        // ⚠️ 例外条件必须**极窄**（机位就是本机占着的那个 + 已核准 + 未停用）：任一不成立
+        //    就走原来的选机位流程，否则操作员会在一片空白的依据上确认一个落点。
+        var own = _ownAssignedSlot(task)
+        if (own) {
+            _pendingAction = { kind: kind, task: task, slot: own }
+            actionConfirmDialog.open()
+            return
+        }
         slotDialog.open()
+    }
+    /// 本任务**自己的**落点机位：库里指派给它的那个，且此刻正被**它自己**占着。
+    /// 返回 `_slots` 里的那一项（含 `slot_code` / `lat` / `lon`），任一条件不成立返回 `null`。
+    ///
+    /// ‼️ 只认「指派 + 自占」这一对：只指派不自占（例如还没回航、或回航外站）时落点并没有
+    ///    真的锁定在任何一格上，仍须让操作员自己选。
+    function _ownAssignedSlot(task) {
+        if (!task || !(task.assign_slot_id > 0) || !(task.uav_id > 0)) return null
+        for (var i = 0; i < _slots.length; i++) {
+            var s = _slots[i]
+            if (!s || s.id !== task.assign_slot_id) continue
+            if (!s.current_uav_id || s.current_uav_id !== task.uav_id) return null
+            if (!_slotAssignable(s)) return null
+            return s
+        }
+        return null
     }
     /// 确认框正文用**卡片式三行**（而不是解释性长句）的那两档：F1 保持固定翼 / F2 切换多旋翼。
     /// ‼️ **不含 F3**（`mcRescueLand`）：救济档的正文是**另一套版式**（见 `_isRescueKind`）——
@@ -547,10 +577,10 @@ OpsShell {
         // 译文表里永远缺这一条，界面上就它一个不跟着语言走。
         case "checkout":       h = qsTr("将把本任务的飞行责任签出给航线监控员，等待其签入接管；无人机继续按原航线飞行，签出后本站仍可取消或回航"); break
         case "cancelHandover": h = qsTr("将撤回本次签出，飞行责任仍留在本站；无人机继续按原航线飞行"); break
-        // 2026-11-07：回航改为**选点**流程。旧文案「返回起飞机场 / 降落回原机位 /
-        // 不可撤销」三句全不成立：目标由来路站点中选、机位到站后才指派、RETURNING
-        // 期间允许改选。这段字是用户在**点下去之前**唯一能看到的话。
-        case "return":         h = qsTr("将发出回航指令：随后选择来路上已飞过的站点作为落点，无人机沿原航线倒序飞回并悬停；落点与机位在到站后由签入/指派确定"); break
+        // 2026-11-24：站点视图的回航**固定回本场**（`_execReturn` → `beginHome`），
+        // 不弹选点框、落点就是原机位，机位在整个回航期间**保留**给这架飞机。
+        // 这段字是用户在**点下去之前**唯一能看到的话——必须与接下来真正发生的事逐句对得上。
+        case "return":         h = qsTr("将发出回航指令：无人机沿原航线倒序飞回起飞机场，并自动进入降落流程（落点＝原机位；该机位此刻不可用时需另行指定）；原机位在回航期间保留，不会被派给其它飞机"); break
         default:               return qsTr("无法识别的操作类型，请点「取消」并联系维护人员。")
         }
         // 「任务「%1」 · 无人机 %2」这一行是弹窗里**唯一**指明"对哪一单下手"的信息。
@@ -1492,23 +1522,31 @@ OpsShell {
         })
     }
 
-    // 回航（2026-11-07）：**选点**回航，不再是「一律回起飞机场原机位」。
+    // 回航。**站点视图走「回本场」那一支**（2026-11-24 用户裁定，设计稿《回航回本场》）：
     //
-    // 用户点「回航」后走 `OpsReturnFlow`：
-    //   ① GET /tasks/:id/return-candidates（来路上已飞、关联站点的航点，由近及远）；
-    //   ② 用户在弹窗里选点、确认；
-    //   ③ POST /tasks/:id/return（**先写库**：只改 `landing_site_id`、释放机位、
-    //      作废在途交接；不预派机位、不自动签入 LANDING）；
+    // 用户原话：「qgc2中，无人机起飞，但是未签出前选择回航应该包含自动降落原机位的流程。
+    // 不能与qgc1的回航等同，不用选择机位，直接降落到起飞机位上。」
+    //
+    // 判据是**本站还持有控制权**——这正是【回航】按钮的可见条件（`isOutbound` 对 IN_FLIGHT
+    // 要求 `checkoutState !== "ACCEPTED" && !landingAccepted`）。这个窗口里飞机仍占着它自己
+    // 起飞的机位，所以：
+    //   ① GET /tasks/:id/return-candidates（只为拿到倒序航线的航点数组，**不弹框**）；
+    //   ② 自动定位起飞机场航点（`OpsReturnFlow._homeWaypoint`），找不到就退回人工选点；
+    //   ③ POST /tasks/:id/return（**不带 `landing_site_id`**）⇒ 后端 A 支：**不释放原机位**、
+    //      预派原机位、补一条 ACCEPTED LANDING ⇒ 卡片上随后出现【降落】；
     //   ④ 写库成功后才构造倒序航线并上传（`OpsReturnRoute`），这之后才切 `AUTO_MISSION`。
     //
     // ‼️ 顺序是硬的——**先写库、再下指令**（用户 2026-09-23 工程指令）。反过来先发指令的话：
     //    指令下去了而库里没记，界面显示飞机还在原航线上，它却已经在往回飞——正是本项目
     //    反复防的那类"谎报成功"。
     //
-    // ‼️ **不再发 `guidedModeRTL`**：选点回航要求飞机沿原路倒着飞到选中点，RTL 只会回 home。
+    // ‼️ **不发 `guidedModeRTL`**：RTL 只把飞机送回 home 且**不降落**（VTOL 的 RTL 会在降落点
+    //    上空绕圈），回航的终点必须是"落地"。
+    // ⚠️ 监控员视图（`RomView`）**仍走选点流程**（`returnFlow.begin`）：它的权限覆盖整条航线，
+    //    落点本来就该由它选。若它选中的是起飞机场，后端同样按 A 支处理（两条路落库一致）。
     function _execReturn(task) {
         if (!task) return
-        returnFlow.begin(task)
+        returnFlow.beginHome(task)
     }
 
     //-------------------------------------------------------------------------
@@ -1547,14 +1585,26 @@ OpsShell {
     // 为停靠落点）。是否已核准由后端 ListSlots 缺省过滤保证（本列表只含 VALIDATED 机位），此处 review
     // 判断仅作异常数据防御，不再承担审批过滤；归属场地是否 VALIDATED 无机位级数据可查（载荷不含场地审核态），
     // 由后端在点按时 400 兜底（SITE_NOT_VALIDATED）。
+    /// 机位此刻能不能被指派/选中。
+    ///
+    /// ‼️ 2026-11-24 起，「**本任务自己的飞机**占着的那一格」也算可选：回本场（`closeReturnLoopTx`
+    ///    A 支）刻意不释放原机位，那架飞机在降落前一直挂着自己的原机位。不放宽的话，操作员会看到
+    ///    原机位被标成「（占用）」且点不动 —— 而它恰恰是唯一的落点。
+    ///    别人的飞机占着照样不可选（`current_uav_no` 非空且不是本机的 `uav_id`）。
     function _slotAssignable(s) {
-        return !!s && !s.current_uav_no
+        if (!s) return false
+        var own = opsView._assignSlotTask && s.current_uav_id
+                  && s.current_uav_id === opsView._assignSlotTask.uav_id
+        return (!s.current_uav_no || own)
                && s.review_status === "VALIDATED"
                && (!s.status || s.status === "FREE")
     }
     // 指定机位不可用原因标注（弹窗机位按钮后缀；未核准正常不会出现在列表中，分支仅作防御）
     function _slotAssignHint(s) {
         if (!s) return ""
+        // 本机占着的那一格是**唯一可选**的落点（回本场），不能标成「占用」把人劝退。
+        if (s.current_uav_id && opsView._assignSlotTask
+                && s.current_uav_id === opsView._assignSlotTask.uav_id) return qsTr("（本机）")
         if (s.current_uav_no) return qsTr("（占用）")
         if (s.review_status && s.review_status !== "VALIDATED") return qsTr("（未核准）")
         if (s.status === "MAINTENANCE") return qsTr("（维护）")
