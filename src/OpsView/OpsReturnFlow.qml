@@ -392,12 +392,13 @@ Item {
             root._busyStage = ""
             // 原航线轮询停掉，不再复用。由视图注入（`OpsView` 有 `_routeSyncs`，`RomView` 没有）。
             if (root.routeResetFn) root.routeResetFn(root._task)
-            // 回本场：把"接下来该谁做什么"说清楚——用户报障的正是"回航点了，然后呢"。
-            if (root._homeMode) {
-                root.message(qsTr("回航航线已上传"),
-                             qsTr("无人机沿原航线倒序飞回起飞机场。落点＝原机位（已保留），"
-                                  + "待飞机到达后点卡片上的【降落】即可完成降落。"))
-            }
+            // 2026-11-24 删掉「回航航线已上传」成功提示（原文：「无人机沿原航线倒序飞回起飞机场。落点＝
+            // 原机位（已保留），待飞机到达后点卡片上的【降落】即可完成降落。」）。它经 `OpsShell`
+            // 的 `onMessage` 走 `QGroundControl.showMessageDialog`（`QGCSimpleMessageDialog`，系统默认
+            // 样式），用户判定为"临时 debug 提示"、不是正式流程的 `OpsDialog`，要求去掉。
+            // ‼️ 只删这一条**成功**提示：本文件其余 `root.message(...)` 全是失败反馈（写库 / 上传 /
+            //    切模式失败），一条都不能删——没有它们，"框关了" 与 "回航生效了" 在界面上逐字相同。
+            //    回航是否真的开始，由任务卡状态（轮询）体现，不再另弹框。
         }
         onFailed: function (message, stage) {
             // 只有 "upload" 还留着可重试的在途动作；"mode" 是一次终局失败，
