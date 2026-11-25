@@ -2227,16 +2227,18 @@ OpsShell {
     commandBarExtras: Component {
         // 根项是 `Row`。⚠️ 骨架（`OpsShell.qml` 的 `commandBarExtras`）的 `spacing` 只作用于
         // 「操作员 ↔ 时钟 ↔ 本扩展区」这三段，**管不到本 Row 内部**；本 Row 自己的 spacing
-        // 才是下面三组之间的间隔（窄屏压缩时它不会跟着缩小——这里的 18 是独立的）。
+        // 才是下面两组之间的间隔（窄屏压缩时它不会跟着缩小——这里的 10 是独立的）。
+        // 10（原 18，2026-11-25 用户手机实测「按钮间距有点大」）：整块右锚，间距收窄后
+        // 左端（出站/进站）会随之右移，压到左侧原生控件的量相应减少。
         Row {
-            spacing: 18
+            spacing: 10
 
             // 出站/进站勾选（站点操作员；控制右侧列表过滤）
             //
-            // ‼️ 本条 Row 的**每个**子项（含下面三组 Row）都要自己 `anchors.verticalCenter`：
+            // ‼️ 本条 Row 的**每个**子项（含下面那个「北/东」按钮组）都要自己 `anchors.verticalCenter`：
             // QML 的 `Row` 定位器**不改子项的 y** —— 不设就恒为 0 ⇒ 顶端对齐。而这里各组高度不同
             //（勾选框 46px = indicator 34 + 样式内边距；按钮组 22px），不设就各贴各的顶，
-            // 看上去就是「机位 北 东」比「进站 / 出站」高了半个勾选框（2026-09-18 实测偏 **12px**，
+            // 看上去就是按钮组比「进站 / 出站」高了半个勾选框（2026-09-18 实测偏 **12px**，
             // 用户报的就是这个）。加了锚点之后本 Row 的中线实测 23 == 勾选框中线 23。
             Row {
                 anchors.verticalCenter: parent.verticalCenter
@@ -2309,16 +2311,14 @@ OpsShell {
             // 机位图朝向：北（上为北）/ 东（上为东）。样式与"双身份切换"同一套（56×22、
             // radius 3、选中 #2f6bd8、未选中描边 #9aa7bd），两个并排的切换组才不会看起来是两种控件。
             // ⚠️ 两个按钮的文案**不是枚举**（"N"/"E" 只活在代码里），故不需要走 uavStatusLabel 那类映射。
+            // ‼️ 前置的「机位」二字已删（2026-11-25 用户手机实测裁掉）：窄屏上两个字换不来
+            //    任何信息——「北/东」这两个按钮本身就是机位图朝向开关（`_showSlotLayout` 为真
+            //    才出现，即机位图在场时才出现）。
             Row {
                 anchors.verticalCenter: parent.verticalCenter   // 见上：本 Row 比勾选框矮 24px
                 spacing: 4
                 // 只在机位图真的在场时出现：监控员视图里没有机位图，切了也没有东西会转
                 visible: opsView._showSlotLayout
-                Text {
-                    anchors.verticalCenter: parent.verticalCenter
-                    color: "#8fa1bd"; font.pixelSize: Math.round(11 * ScreenTools.uiTextScaleFactor)
-                    text: qsTr("机位")
-                }
                 Repeater {
                     model: [qsTr("北"), qsTr("东")]
                     Rectangle {

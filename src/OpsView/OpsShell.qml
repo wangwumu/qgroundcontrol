@@ -1919,7 +1919,8 @@ Item {
                 // 进视图时按**实测字宽**算间距档与显隐：字号由设置参数（`uiScalePercent` ×
                 // `fontScalePercent`）决定，本块只做适配，**不改字号**、**不加新配置参数**。
                 // 退让顺序（用户 2026-11-25 裁定，按此顺序逐级，不许换行）：
-                //   ① 间距 18 → 10 → 6（各项之间**始终保留间隔**，6 px 为下限）
+                //   ① 间距 12 → 8 → 6（各项之间**始终保留间隔**，6 px 为下限）
+                //      首档由 18 收到 12（2026-11-25 手机实测：「各按钮间距有点大」）
                 //   ② 去掉「操作员」
                 //   ③ 去掉「日期时间」
                 //   ④ 再不够**不再处理**（已知极限：会压到左侧 Q 标/主状态/飞行模式上）
@@ -1930,7 +1931,7 @@ Item {
                 // ‼️ 宽度未就绪（进入首帧全为 0）⇒ 一律按"全显示 + 最宽间距"，避免闪一下。
                 readonly property real _scale:   ScreenTools.uiTextScaleFactor
                 readonly property real _fontPx:  Math.round(13 * _scale)
-                readonly property var  _spacings: [18, 10, 6]
+                readonly property var  _spacings: [12, 8, 6]
 
                 FontMetrics {
                     id: _extrasFm
